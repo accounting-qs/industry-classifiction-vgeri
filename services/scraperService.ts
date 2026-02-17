@@ -54,7 +54,7 @@ export async function fetchDigest(urlOrDomain: string, onRetry?: (msg: string) =
   const attemptProxy = async (index: number): Promise<string> => {
     const proxyUrl = PROXY_LIST[index](start_url);
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 12000);
+    const timeoutId = setTimeout(() => controller.abort(), 25000); // Increased to 25s
 
     try {
       console.log(`📡 [Scraper] Attempting proxy ${index} for: ${start_url}`);
