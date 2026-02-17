@@ -3,12 +3,12 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AppTab, Contact, Enrichment, BatchStats, MergedContact, FilterCondition, FilterOperator } from './types';
 import { db } from './services/supabaseClient';
 import { fetchDigest } from './services/scraperService';
-import { enrichBatch } from './services/enrichmentService'; 
-import { 
-  Users, 
-  Zap, 
-  Database, 
-  Loader2, 
+import { enrichBatch } from './services/enrichmentService';
+import {
+  Users,
+  Zap,
+  Database,
+  Loader2,
   DatabaseZap,
   ChevronLeft,
   ChevronRight,
@@ -40,7 +40,7 @@ export default function App() {
   const [totalCount, setTotalCount] = useState(0);
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
-  
+
   const [activeFilters, setActiveFilters] = useState<FilterCondition[]>(() => {
     const saved = localStorage.getItem('active_filters_v3');
     return saved ? JSON.parse(saved) : [];
@@ -50,7 +50,7 @@ export default function App() {
   const [logs, setLogs] = useState<string[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [isAllFilteredSelected, setIsAllFilteredSelected] = useState(false);
-  
+
   const stopRequestedRef = useRef(false);
   const [isStopping, setIsStopping] = useState(false);
 
@@ -62,9 +62,9 @@ export default function App() {
   const loadData = useCallback(async () => {
     try {
       const { data, count } = await db.getPaginatedContacts(
-        currentPage, 
-        pageSize, 
-        false, 
+        currentPage,
+        pageSize,
+        false,
         activeFilters
       );
       setContacts(data);
@@ -93,116 +93,20 @@ export default function App() {
   };
 
   /**
-   * Detached Background Logic (Option B)
-   * This function handles the actual OpenAI loop and Supabase syncs.
+   * Detached Background Logic (Moved to server.ts)
    */
   const processQuantumPipeline = async (batch: MergedContact[]) => {
-    if (stats.isProcessing) return;
-    
-    stopRequestedRef.current = false;
-    setIsStopping(false);
-    setStats({ total: batch.length, completed: 0, failed: 0, isProcessing: true });
-    
-    const BATCH_SIZE = 10; 
-    addLog(`🚀 [Background Worker] Pipeline active: ${batch.length} records.`);
-
-    let currentIndex = 0;
-
-    while (currentIndex < batch.length && !stopRequestedRef.current) {
-      const sprintItems = batch.slice(currentIndex, currentIndex + BATCH_SIZE);
-      currentIndex += BATCH_SIZE;
-      if (sprintItems.length === 0) break;
-
-      try {
-        addLog(`🔍 Scraping phase for ${sprintItems.length} records...`);
-        const scrapes = await Promise.all(sprintItems.map(async (c) => {
-          const domain = c.company_website || c.email.split('@')[1];
-          try {
-            const digest = await fetchDigest(domain);
-            updateContactUI(c.contact_id, { processing_stage: 'classifying' });
-            return { contact: c, digest, success: true };
-          } catch (e: any) {
-            updateContactUI(c.contact_id, { status: 'failed', processing_stage: 'idle' });
-            return { contact: c, digest: e.message, success: false };
-          }
-        }));
-
-        const validScrapes = scrapes.filter(s => s.success);
-        const failedScrapes = scrapes.filter(s => !s.success);
-
-        let aiResults: any[] = [];
-        if (validScrapes.length > 0) {
-          addLog(`🧠 OpenAI gpt-4.1-mini classification...`);
-          aiResults = await enrichBatch(validScrapes.map(s => ({
-            contact_id: s.contact.contact_id,
-            email: s.contact.email,
-            digest: s.digest
-          })));
-        }
-
-        addLog(`💾 Syncing results to Supabase (Upsert Only)...`);
-        const enrichmentsToUpsert: Partial<Enrichment>[] = [];
-        const contactsToUpdate: Partial<Contact>[] = [];
-
-        aiResults.forEach(res => {
-          const original = validScrapes.find(s => s.contact.contact_id === res.contact_id);
-          if (original) {
-            const isSuccess = res.status === 'completed' && res.classification !== 'ERROR';
-            enrichmentsToUpsert.push({
-              contact_id: res.contact_id,
-              status: isSuccess ? 'completed' : 'failed',
-              confidence: res.confidence, 
-              reasoning: res.reasoning,
-              classification: isSuccess ? res.classification : undefined,
-              cost: res.cost,
-              processed_at: new Date().toISOString()
-            });
-
-            if (isSuccess) {
-              contactsToUpdate.push({ 
-                id: original.contact.id, 
-                email: original.contact.email, 
-                industry: res.classification,
-                lead_list_name: original.contact.lead_list_name // Explicitly maintaining existing
-              } as any);
-              updateContactUI(res.contact_id, { status: 'completed', industry: res.classification, classification: res.classification, confidence: res.confidence });
-            }
-          }
-        });
-
-        failedScrapes.forEach(f => {
-          enrichmentsToUpsert.push({ contact_id: f.contact.contact_id, status: 'failed', error_message: f.digest, processed_at: new Date().toISOString() });
-          updateContactUI(f.contact.contact_id, { status: 'failed' });
-        });
-
-        if (enrichmentsToUpsert.length > 0) await db.bulkUpsertEnrichments(enrichmentsToUpsert);
-        if (contactsToUpdate.length > 0) await db.bulkUpdateContacts(contactsToUpdate);
-
-        const successes = aiResults.filter(r => r.status !== 'failed' && r.classification !== 'ERROR').length;
-        setStats(prev => ({
-          ...prev,
-          completed: prev.completed + successes,
-          failed: prev.failed + (sprintItems.length - successes)
-        }));
-        
-        loadData();
-      } catch (err: any) {
-        addLog(`🛑 Error: ${err.message}`);
-      }
-    }
-
-    setStats(prev => ({ ...prev, isProcessing: false }));
-    setIsStopping(false);
-    addLog("\n✨ Background task finalized.");
+    // This local logic is being deprecated in favor of server-side processing
+    addLog("ℹ️ Local worker is now deprecated. Requests are handled by the server.");
   };
 
+
   /**
-   * Immediate Response Handler (Option B)
-   * This simulates the 202 Accepted status by returning immediately to the caller.
+   * Core Enrichment Trigger (Calls Monolithic Backend)
    */
   const startEnrichmentQueue = async () => {
     let batch: MergedContact[] = [];
-    
+
     if (isAllFilteredSelected) {
       addLog(`📦 Preparing global batch: Fetching all ${totalCount} matching contacts...`);
       try {
@@ -218,23 +122,29 @@ export default function App() {
     if (batch.length === 0) return;
 
     try {
-      // Step 1: Mark as pending in DB (The "Acceptance" phase)
-      addLog(`📝 Enqueueing ${batch.length} records in database...`);
-      await db.enqueueContacts(batch.map(b => b.contact_id));
-      
-      // Step 2: Immediate response to UI
-      addLog(`✅ 202 Accepted: Pipeline started in background.`);
+      addLog(`🚀 Sending ${batch.length} records to backend for background enrichment...`);
+
+      const response = await fetch('/api/enrich', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contactIds: batch.map(b => b.contact_id) })
+      });
+
+      if (!response.ok) throw new Error(`Server Error: ${response.status}`);
+
+      addLog(`✅ 202 Accepted: Backend is processing ${batch.length} records.`);
       setActiveTab(AppTab.ENRICHMENT);
       setSelectedIds(new Set());
       setIsAllFilteredSelected(false);
 
-      // Step 3: Trigger detached worker (No await)
-      processQuantumPipeline(batch);
-      
+      // Update UI stats temporarily
+      setStats({ total: batch.length, completed: 0, failed: 0, isProcessing: true });
+
     } catch (e: any) {
-      addLog(`Error starting queue: ${e.message}`);
+      addLog(`❌ Error starting queue: ${e.message}`);
     }
   };
+
 
   const resumePendingQueue = async () => {
     addLog("🔍 Searching for pending records...");
@@ -266,7 +176,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `quantum_export_${new Date().toISOString().slice(0,10)}.csv`;
+    link.download = `quantum_export_${new Date().toISOString().slice(0, 10)}.csv`;
     link.click();
   };
 
@@ -292,14 +202,14 @@ export default function App() {
             <span>/</span> <span className="text-white font-semibold capitalize">{activeTab}</span>
           </div>
           <div className="flex items-center gap-3 text-[10px] text-gray-500 font-mono uppercase">
-             gpt-4.1-mini / Background Mode
+            gpt-4.1-mini / Background Mode
           </div>
         </header>
 
         <div className="flex-1 overflow-hidden flex flex-col">
           {activeTab === AppTab.MANAGER ? (
-            <DataTable 
-              data={contacts} 
+            <DataTable
+              data={contacts}
               activeFilters={activeFilters}
               onFiltersChange={setActiveFilters}
               columns={[
@@ -313,7 +223,7 @@ export default function App() {
                 { key: 'cost', label: 'cost', type: 'currency', defaultWidth: 90 },
                 { key: 'status', label: 'status', type: 'status', defaultWidth: 140 },
                 { key: 'processed_at', label: 'processed_at', type: 'date', defaultWidth: 130 }
-              ]} 
+              ]}
               selectedIds={selectedIds}
               isAllFilteredSelected={isAllFilteredSelected}
               onSetIsAllFilteredSelected={setIsAllFilteredSelected}
@@ -424,21 +334,21 @@ function StatCard({ label, value, color }: any) {
   );
 }
 
-function DataTable({ 
-  data, 
-  columns, 
-  selectedIds, 
+function DataTable({
+  data,
+  columns,
+  selectedIds,
   isAllFilteredSelected,
   onSetIsAllFilteredSelected,
-  onToggleRow, 
-  onToggleAll, 
-  onEnrichSelected, 
-  onExportCSV, 
-  isProcessing, 
-  currentPage, 
-  pageSize, 
-  totalCount, 
-  onPageChange, 
+  onToggleRow,
+  onToggleAll,
+  onEnrichSelected,
+  onExportCSV,
+  isProcessing,
+  currentPage,
+  pageSize,
+  totalCount,
+  onPageChange,
   onPageSizeChange,
   activeFilters = [],
   onFiltersChange
@@ -450,7 +360,7 @@ function DataTable({
   const filterRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    function handleClickOutside(e: MouseEvent) { 
+    function handleClickOutside(e: MouseEvent) {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) setShowPageSizeMenu(false);
       if (filterRef.current && !filterRef.current.contains(e.target as Node)) setShowFilterBuilder(false);
     }
@@ -498,21 +408,21 @@ function DataTable({
       <div className="h-12 border-b border-[#2e2e2e] px-4 flex items-center justify-between bg-[#1c1c1c] shrink-0">
         <div className="flex items-center gap-2">
           <div className="relative" ref={filterRef}>
-            <button 
+            <button
               onClick={() => setShowFilterBuilder(!showFilterBuilder)}
               className={`text-[11px] font-medium px-2.5 py-1.5 flex items-center gap-1.5 border border-[#2e2e2e] rounded transition-colors ${activeFilters.length > 0 ? 'bg-[#3ecf8e22] border-[#3ecf8e44] text-[#3ecf8e]' : 'text-gray-300 hover:text-white hover:bg-[#2e2e2e]'}`}
             >
-              <Filter className="w-3.5 h-3.5" /> 
+              <Filter className="w-3.5 h-3.5" />
               Filters {activeFilters.length > 0 && `(${activeFilters.length})`}
             </button>
-            
+
             {showFilterBuilder && (
               <div className="absolute top-full mt-2 left-0 w-[480px] bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl shadow-2xl z-50 p-4">
                 <div className="flex items-center justify-between mb-4">
                   <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Active Filters</span>
                   <button onClick={() => onFiltersChange([])} className="text-[10px] text-rose-400 hover:underline">Clear all</button>
                 </div>
-                
+
                 <div className="space-y-4 max-h-[400px] overflow-auto custom-scrollbar mb-4 pr-1">
                   {activeFilters.length === 0 ? (
                     <p className="text-[11px] text-gray-600 text-center py-4">No active filters.</p>
@@ -522,10 +432,10 @@ function DataTable({
                         <button onClick={() => removeFilter(filter.id)} className="absolute -top-2 -right-2 p-1 bg-[#1c1c1c] border border-[#2e2e2e] hover:bg-rose-900/20 hover:text-rose-400 rounded-full text-gray-500 opacity-0 group-hover:opacity-100 transition-opacity">
                           <X className="w-3 h-3" />
                         </button>
-                        
+
                         <div className="flex items-center gap-2">
-                          <select 
-                            value={filter.column} 
+                          <select
+                            value={filter.column}
                             onChange={(e) => updateFilter(filter.id, { column: e.target.value })}
                             className="bg-[#0e0e0e] border border-[#2e2e2e] text-[11px] rounded px-2 py-1 flex-1 text-gray-300 outline-none focus:border-[#3ecf8e]"
                           >
@@ -533,9 +443,9 @@ function DataTable({
                               <option key={c.key} value={c.key}>{c.label}</option>
                             ))}
                           </select>
-                          
-                          <select 
-                            value={filter.operator} 
+
+                          <select
+                            value={filter.operator}
                             onChange={(e) => updateFilter(filter.id, { operator: e.target.value as FilterOperator })}
                             className="bg-[#0e0e0e] border border-[#2e2e2e] text-[11px] rounded px-2 py-1 w-24 text-gray-300 outline-none focus:border-[#3ecf8e]"
                             disabled={filter.column === 'status'}
@@ -581,8 +491,8 @@ function DataTable({
                             </select>
                           </div>
                         ) : (
-                          <input 
-                            type="text" 
+                          <input
+                            type="text"
                             placeholder="Value..."
                             value={filter.value}
                             onChange={(e) => updateFilter(filter.id, { value: e.target.value })}
@@ -593,8 +503,8 @@ function DataTable({
                     ))
                   )}
                 </div>
-                
-                <button 
+
+                <button
                   onClick={addFilter}
                   className="w-full flex items-center justify-center gap-2 py-2 border border-dashed border-[#2e2e2e] rounded-lg text-[11px] text-gray-400 hover:text-white transition-all"
                 >
@@ -603,7 +513,7 @@ function DataTable({
               </div>
             )}
           </div>
-          
+
           <button onClick={onExportCSV} className="text-[11px] font-medium text-gray-300 hover:text-white px-2.5 py-1.5 flex items-center gap-1.5 border border-[#2e2e2e] rounded hover:bg-[#2e2e2e] transition-colors"><Download className="w-3.5 h-3.5" /> Export CSV</button>
           <div className="h-4 w-px bg-[#2e2e2e] mx-1"></div>
           {(selectedIds.size > 0 || isAllFilteredSelected) && (
@@ -628,7 +538,7 @@ function DataTable({
               <tr className="bg-[#3ecf8e]/5 border-b border-[#3ecf8e]/20 sticky top-[37px] z-10 shadow-sm">
                 <td colSpan={columns.length + 1} className="p-2 text-center text-[10px] font-medium text-gray-300">
                   {isAllFilteredSelected ? (
-                    <span>All matching records selected. <button onClick={() => {onSetIsAllFilteredSelected(false); onToggleAll();}} className="ml-2 text-[#3ecf8e] hover:underline font-bold">Clear selection</button></span>
+                    <span>All matching records selected. <button onClick={() => { onSetIsAllFilteredSelected(false); onToggleAll(); }} className="ml-2 text-[#3ecf8e] hover:underline font-bold">Clear selection</button></span>
                   ) : (
                     <span>All {data.length} records on this page selected. <button onClick={() => onSetIsAllFilteredSelected(true)} className="ml-2 text-[#3ecf8e] hover:underline font-bold underline-offset-2">Select all {totalCount.toLocaleString()} matching records?</button></span>
                   )}
@@ -667,7 +577,7 @@ function DataTable({
 
 function CellRenderer({ type, columnKey, value, row }: any) {
   if (value === null || value === undefined) return <span className="text-gray-700 italic">NULL</span>;
-  
+
   if (columnKey === 'company_website') {
     const url = String(value).startsWith('http') ? String(value) : `https://${value}`;
     return (
@@ -703,9 +613,9 @@ function StatusBadge({ status, stage, errorMessage }: { status: string, stage?: 
       </div>
     );
   }
-  const styles: any = { 
-    completed: 'text-[#3ecf8e] border-[#3ecf8e]/20 bg-[#3ecf8e]/10', 
-    failed: 'text-rose-400 border-rose-400/20 bg-rose-400/10', 
+  const styles: any = {
+    completed: 'text-[#3ecf8e] border-[#3ecf8e]/20 bg-[#3ecf8e]/10',
+    failed: 'text-rose-400 border-rose-400/20 bg-rose-400/10',
     new: 'text-gray-400 border-gray-400/20 bg-gray-400/5',
     pending: 'text-amber-400 border-amber-400/20 bg-amber-400/10'
   };

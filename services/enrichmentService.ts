@@ -4,10 +4,17 @@
  * Uses the specific v1/responses endpoint and prompt ID architecture.
  */
 
-const OPENAI_API_KEY = "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";
+const getEnv = (key: string) => {
+  if (typeof process !== 'undefined' && process.env) return process.env[key];
+  // @ts-ignore - Vite specific
+  if (typeof import.meta !== 'undefined' && import.meta.env) return import.meta.env[key];
+  return undefined;
+};
+
+const OPENAI_API_KEY = getEnv('VITE_OPENAI_API_KEY');
 const INPUT_COST_PER_1M = 0.80;
 const OUTPUT_COST_PER_1M = 3.20;
-const PROMPT_ID = "pmpt_698605f8b9008197b84a3fffee0e34cf0edc8f4086b94066";
+const PROMPT_ID = getEnv('VITE_OPENAI_PROMPT_ID');
 
 export interface BatchItem {
   contact_id: string;
@@ -23,17 +30,17 @@ function normalizeConfidence(val: any): number {
   if (val === null || val === undefined) return 5;
   let num = parseFloat(val);
   if (isNaN(num)) return 5;
-  
+
   // If model returns 0.0 - 1.0 (probabilities)
   if (num > 0 && num <= 1) num = num * 10;
   // If model returns 0 - 100
   else if (num > 10) num = num / 10;
-  
+
   // Clamp to 1-10 range and round
   let clamped = Math.round(num);
   if (clamped < 1) clamped = 1;
   if (clamped > 10) clamped = 10;
-  
+
   return clamped;
 }
 
@@ -94,7 +101,7 @@ async function enrichSingle(item: BatchItem): Promise<any> {
 
     const estimated_cost = parseFloat(
       ((input_tokens / 1_000_000 * INPUT_COST_PER_1M) +
-      (output_tokens / 1_000_000 * OUTPUT_COST_PER_1M)).toFixed(6)
+        (output_tokens / 1_000_000 * OUTPUT_COST_PER_1M)).toFixed(6)
     );
 
     return {
@@ -114,7 +121,7 @@ async function enrichSingle(item: BatchItem): Promise<any> {
       contact_id: item.contact_id,
       classification: "ERROR",
       industry: "ERROR",
-      confidence: 1, 
+      confidence: 1,
       reasoning: err.message,
       input_tokens: 0,
       output_tokens: 0,

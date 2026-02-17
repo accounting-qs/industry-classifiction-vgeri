@@ -2,8 +2,15 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { Contact, Enrichment, MergedContact, FilterCondition } from '../types';
 
-const SUPABASE_URL = 'https://zxnaxtdeujunujnjaweo.supabase.co';
-const DEFAULT_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp4bmF4dGRldWp1bnVqbmphd2VvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzAxMzE0OTksImV4cCI6MjA4NTcwNzQ5OX0.M0Nro9It_qUFlT0QAdV_a04xTd3gUlqdQRZ7Y6AnEok';
+const getEnv = (key: string) => {
+  if (typeof process !== 'undefined' && process.env) return process.env[key];
+  // @ts-ignore - Vite specific
+  if (typeof import.meta !== 'undefined' && import.meta.env) return import.meta.env[key];
+  return undefined;
+};
+
+const SUPABASE_URL = getEnv('VITE_SUPABASE_URL') || 'https://zxnaxtdeujunujnjaweo.supabase.co';
+const DEFAULT_ANON_KEY = getEnv('VITE_SUPABASE_ANON_KEY');
 
 class SupabaseService {
   private client: SupabaseClient | null = null;
@@ -69,15 +76,15 @@ class SupabaseService {
   private flattenData(data: any[] | null): MergedContact[] {
     return ((data as any[]) || []).map((item: any) => {
       const enrichmentList = item.enrichments;
-      const enrichmentData = Array.isArray(enrichmentList) && enrichmentList.length > 0 
-        ? enrichmentList[0] 
+      const enrichmentData = Array.isArray(enrichmentList) && enrichmentList.length > 0
+        ? enrichmentList[0]
         : (enrichmentList && !Array.isArray(enrichmentList) ? enrichmentList : {});
-        
+
       const { enrichments, ...contactData } = item;
       const finalStatus = enrichmentData.status || 'new';
 
-      return { 
-        ...contactData, 
+      return {
+        ...contactData,
         ...enrichmentData,
         status: finalStatus,
         enrichment_id: enrichmentData.id || null
@@ -88,21 +95,21 @@ class SupabaseService {
   private getJoinConfig(filters: FilterCondition[], enrichmentCols: string[], enrichedOnly: boolean) {
     const statusFilter = filters.find(f => f.column === 'status');
     const includesNew = statusFilter && Array.isArray(statusFilter.value) && statusFilter.value.includes('new');
-    
+
     // Check if any enrichment column (confidence, cost, classification) is being filtered
     const enrichmentFilters = filters.filter(f => enrichmentCols.includes(f.column) && f.column !== 'status');
     const hasEnrichmentFilters = enrichmentFilters.length > 0;
-    
+
     // We use !inner join if filtering for a specific enrichment attribute to exclude rows without that attribute.
     const needsEnrichmentRecord = (hasEnrichmentFilters || (statusFilter && !includesNew)) && !includesNew;
-    
+
     const useInnerJoin = needsEnrichmentRecord || enrichedOnly;
     return useInnerJoin ? `*, enrichments!inner(*)` : `*, enrichments(*)`;
   }
 
   async getPaginatedContacts(
-    page: number, 
-    pageSize: number, 
+    page: number,
+    pageSize: number,
     enrichedOnly: boolean = false,
     filters: FilterCondition[] = []
   ): Promise<{ data: MergedContact[], count: number }> {
@@ -111,7 +118,7 @@ class SupabaseService {
     const from = (page - 1) * pageSize;
     const to = from + pageSize - 1;
     const enrichmentCols = ['status', 'classification', 'confidence', 'cost', 'processed_at'];
-    
+
     const selectStr = this.getJoinConfig(filters, enrichmentCols, enrichedOnly);
 
     let query = this.client
@@ -123,12 +130,12 @@ class SupabaseService {
     const { data, error, count } = await query
       .order('id', { ascending: true })
       .range(from, to);
-    
+
     if (error) throw error;
-    
-    return { 
-      data: this.flattenData(data), 
-      count: count || 0 
+
+    return {
+      data: this.flattenData(data),
+      count: count || 0
     };
   }
 
@@ -145,15 +152,15 @@ class SupabaseService {
     query = this.applyFilters(query, filters, enrichmentCols);
 
     const { data, error } = await query.order('id', { ascending: true });
-    
+
     if (error) throw error;
-    
+
     return this.flattenData(data);
   }
 
   async enqueueContacts(contactIds: string[]) {
     if (!this.client) return;
-    
+
     const payloads = contactIds.map(id => ({
       contact_id: id,
       status: 'pending',
@@ -164,7 +171,7 @@ class SupabaseService {
     const { error } = await this.client
       .from('enrichments')
       .upsert(payloads, { onConflict: 'contact_id' });
-    
+
     if (error) throw error;
   }
 
@@ -194,8 +201,8 @@ class SupabaseService {
 
     const { error } = await this.client
       .from('contacts')
-      .upsert(cleaned, { onConflict: 'id' });
-    
+      .upsert(cleaned, { onConflict: 'email' });
+
     if (error) throw error;
   }
 }
