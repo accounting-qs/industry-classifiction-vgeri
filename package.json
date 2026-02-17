@@ -7,6 +7,7 @@
     "dev": "vite",
     "dev:server": "tsx server.ts",
     "build": "vite build",
+    "build:server": "echo 'No server build needed for tsx'",
     "start": "tsx server.ts",
     "preview": "vite preview"
   },
@@ -18,14 +19,14 @@
     "express": "^4.21.2",
     "lucide-react": "^0.563.0",
     "react": "^19.2.4",
-    "react-dom": "^19.2.4"
+    "react-dom": "^19.2.4",
+    "tsx": "^4.19.2"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/node": "^22.14.0",
     "@vitejs/plugin-react": "^5.0.0",
-    "tsx": "^4.19.2",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"
   }
