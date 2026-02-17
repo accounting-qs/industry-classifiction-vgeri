@@ -19,3 +19,4 @@ View your app in AI Studio: https://ai.studio/apps/drive/1SsZS6oTE5W2czc9diNkXfH
 3. Run the app:
    `npm run dev`
 # industry-classifiction-vgeri
+# industry-classifiction-vgeri
