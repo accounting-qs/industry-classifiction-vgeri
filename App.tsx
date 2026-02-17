@@ -38,8 +38,14 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<AppTab>(AppTab.MANAGER);
   const [contacts, setContacts] = useState<MergedContact[]>([]);
   const [totalCount, setTotalCount] = useState(0);
-  const [currentPage, setCurrentPage] = useState(1);
-  const [pageSize, setPageSize] = useState(25);
+  const [currentPage, setCurrentPage] = useState(() => {
+    const saved = localStorage.getItem('qs_current_page');
+    return saved ? parseInt(saved, 10) : 1;
+  });
+  const [pageSize, setPageSize] = useState(() => {
+    const saved = localStorage.getItem('qs_page_size');
+    return saved ? parseInt(saved, 10) : 25;
+  });
 
   const [activeFilters, setActiveFilters] = useState<FilterCondition[]>(() => {
     const saved = localStorage.getItem('active_filters_v3');
@@ -59,6 +65,11 @@ export default function App() {
     setIsAllFilteredSelected(false);
   }, [activeFilters]);
 
+  useEffect(() => {
+    localStorage.setItem('qs_current_page', currentPage.toString());
+    localStorage.setItem('qs_page_size', pageSize.toString());
+  }, [currentPage, pageSize]);
+
   const loadData = useCallback(async () => {
     try {
       const { data, count } = await db.getPaginatedContacts(
@@ -75,6 +86,35 @@ export default function App() {
   }, [currentPage, pageSize, activeFilters]);
 
   useEffect(() => { loadData(); }, [loadData]);
+
+  // Poll server for status during enrichment
+  useEffect(() => {
+    let interval: any;
+
+    if (stats.isProcessing) {
+      interval = setInterval(async () => {
+        try {
+          const res = await fetch('/api/status');
+          if (res.ok) {
+            const data = await res.json();
+            setLogs(data.logs);
+            setStats(data.stats);
+
+            // Periodically refresh table data during processing
+            if (activeTab === AppTab.MANAGER) {
+              loadData();
+            }
+          }
+        } catch (e) {
+          console.error("Polling error:", e);
+        }
+      }, 2500);
+    }
+
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [stats.isProcessing, activeTab, loadData]);
 
   const addLog = (msg: string) => {
     setLogs(prev => [`${new Date().toLocaleTimeString()}: ${msg}`, ...prev].slice(0, 500));
@@ -558,14 +598,30 @@ function DataTable({
       <div className="h-10 border-t border-[#2e2e2e] px-4 flex items-center justify-between bg-[#1c1c1c] shrink-0 text-[10px]">
         <div className="flex items-center gap-2">
           <button disabled={currentPage <= 1} onClick={() => onPageChange(currentPage - 1)} className="p-1 text-gray-400 hover:text-white disabled:opacity-20"><ChevronLeft className="w-4 h-4" /></button>
-          <span className="text-gray-400">Page <span className="text-white font-bold">{currentPage}</span> of {totalPages}</span>
+          <div className="flex items-center gap-1.5 text-gray-400">
+            <span>Page</span>
+            <input
+              type="number"
+              min={1}
+              max={totalPages}
+              value={currentPage}
+              onChange={(e) => {
+                const val = parseInt(e.target.value);
+                if (!isNaN(val) && val >= 1 && val <= totalPages) {
+                  onPageChange(val);
+                }
+              }}
+              className="w-10 bg-[#0e0e0e] border border-[#2e2e2e] rounded px-1.5 py-0.5 text-white font-bold text-center focus:border-[#3ecf8e] outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+            />
+            <span>of {totalPages}</span>
+          </div>
           <button disabled={currentPage >= totalPages} onClick={() => onPageChange(currentPage + 1)} className="p-1 text-gray-400 hover:text-white disabled:opacity-20"><ChevronRight className="w-4 h-4" /></button>
         </div>
         <div className="flex items-center gap-4 text-gray-500 relative" ref={menuRef}>
           <button onClick={() => setShowPageSizeMenu(!showPageSizeMenu)} className="px-2 py-0.5 border border-[#2e2e2e] rounded bg-[#0e0e0e] text-white font-bold">{pageSize} rows</button>
           {showPageSizeMenu && (
             <div className="absolute bottom-full mb-1 right-0 w-24 bg-[#1c1c1c] border border-[#2e2e2e] rounded py-1 shadow-2xl">
-              {[25, 50, 100, 500].map(s => (<button key={s} onClick={() => { onPageSizeChange(s); onPageChange(1); setShowPageSizeMenu(false); }} className={`w-full text-left px-3 py-1 hover:bg-[#2e2e2e] ${pageSize === s ? 'text-[#3ecf8e]' : ''}`}>{s}</button>))}
+              {[25, 50, 100, 500, 1000].map(s => (<button key={s} onClick={() => { onPageSizeChange(s); onPageChange(1); setShowPageSizeMenu(false); }} className={`w-full text-left px-3 py-1 hover:bg-[#2e2e2e] ${pageSize === s ? 'text-[#3ecf8e]' : ''}`}>{s}</button>))}
             </div>
           )}
           <span><span className="text-white font-bold">{totalCount.toLocaleString()}</span> records</span>

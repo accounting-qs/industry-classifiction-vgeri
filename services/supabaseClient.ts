@@ -3,14 +3,23 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { Contact, Enrichment, MergedContact, FilterCondition } from '../types';
 
 const getEnv = (key: string) => {
-  if (typeof process !== 'undefined' && process.env) return process.env[key];
   // @ts-ignore - Vite specific
-  if (typeof import.meta !== 'undefined' && import.meta.env) return import.meta.env[key];
+  if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env[key]) {
+    return import.meta.env[key];
+  }
+  if (typeof process !== 'undefined' && process.env && process.env[key]) {
+    return process.env[key];
+  }
   return undefined;
 };
 
-const SUPABASE_URL = getEnv('VITE_SUPABASE_URL') || 'https://zxnaxtdeujunujnjaweo.supabase.co';
-const DEFAULT_ANON_KEY = getEnv('VITE_SUPABASE_ANON_KEY');
+const SUPABASE_URL = getEnv('VITE_SUPABASE_URL') || getEnv('SUPABASE_URL');
+const DEFAULT_ANON_KEY = getEnv('VITE_SUPABASE_ANON_KEY') || getEnv('SUPABASE_ANON_KEY');
+
+console.log('🔍 Supabase Config Check:', {
+  url: SUPABASE_URL ? 'PRESENT' : 'MISSING',
+  key: DEFAULT_ANON_KEY ? 'PRESENT' : 'MISSING'
+});
 
 class SupabaseService {
   private client: SupabaseClient | null = null;
@@ -25,12 +34,16 @@ class SupabaseService {
 
   init(key: string) {
     try {
+      if (!SUPABASE_URL || !key) {
+        throw new Error(`Missing Supabase URL (${!!SUPABASE_URL}) or Key (${!!key})`);
+      }
       this.client = createClient(SUPABASE_URL, key);
       this.isConnected = true;
       localStorage.setItem('supabase_anon_key', key);
+      console.log("✅ Supabase initialized successfully");
       return true;
     } catch (e) {
-      console.error("Initialization failed", e);
+      console.error("❌ Supabase initialization failed:", e);
       return false;
     }
   }

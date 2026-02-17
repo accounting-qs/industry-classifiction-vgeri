@@ -1,11 +1,11 @@
 
-import { 
-  stripCssJs, 
-  extractOne, 
-  extractMany, 
-  getVisibleText, 
-  MAX_HTML_BYTES, 
-  VISIBLE_TEXT_CHARS 
+import {
+  stripCssJs,
+  extractOne,
+  extractMany,
+  getVisibleText,
+  MAX_HTML_BYTES,
+  VISIBLE_TEXT_CHARS
 } from './htmlCleaner';
 
 /**
@@ -57,30 +57,43 @@ export async function fetchDigest(urlOrDomain: string, onRetry?: (msg: string) =
     const timeoutId = setTimeout(() => controller.abort(), 12000);
 
     try {
-      const response = await fetch(proxyUrl, { 
+      console.log(`📡 [Scraper] Attempting proxy ${index} for: ${start_url}`);
+      const response = await fetch(proxyUrl, {
         signal: controller.signal,
-        headers: { 
+        headers: {
           'Accept': 'application/json, text/plain, */*',
-          'User-Agent': 'Mozilla/5.0 (compatible; RowZeroBot/1.0)' 
+          'User-Agent': 'Mozilla/5.0 (compatible; RowZeroBot/1.0)'
         }
       });
       clearTimeout(timeoutId);
 
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      
+      if (!response.ok) {
+        console.warn(`⚠️ [Scraper] Proxy ${index} failed with HTTP ${response.status}`);
+        throw new Error(`HTTP ${response.status}`);
+      }
+
       let raw_html = "";
       if (proxyUrl.includes('allorigins')) {
         const json = await response.json();
-        if (json.status && json.status.http_code >= 400) throw new Error(`Origin Error ${json.status.http_code}`);
+        if (json.status && json.status.http_code >= 400) {
+          console.warn(`⚠️ [Scraper] AllOrigins proxy returned error ${json.status.http_code}`);
+          throw new Error(`Origin Error ${json.status.http_code}`);
+        }
         raw_html = json.contents || "";
       } else {
         raw_html = await response.text();
       }
 
-      if (!raw_html || raw_html.trim().length < 100) throw new Error("Empty content");
+      if (!raw_html || raw_html.trim().length < 100) {
+        console.warn(`⚠️ [Scraper] Proxy ${index} returned empty or too short content (${raw_html?.length || 0} chars)`);
+        throw new Error("Empty content");
+      }
+
+      console.log(`✅ [Scraper] Proxy ${index} success! Content length: ${raw_html.length} chars`);
       return raw_html;
     } catch (e: any) {
       clearTimeout(timeoutId);
+      console.error(`❌ [Scraper] Proxy ${index} error:`, e.message || e);
       throw e;
     }
   };
@@ -89,11 +102,13 @@ export async function fetchDigest(urlOrDomain: string, onRetry?: (msg: string) =
     const raw_html = await promiseAny([attemptProxy(0), attemptProxy(1)]);
     return processHtmlToDigest(raw_html, start_url);
   } catch (err: any) {
+    console.warn(`⏳ [Scraper] Primary proxies failed or timed out. Detail: ${err.message}`);
     if (onRetry) onRetry(`Initial proxies failed. Attempting deep fallback...`);
     try {
       const raw_html = await attemptProxy(2);
       return processHtmlToDigest(raw_html, start_url);
     } catch (err2: any) {
+      console.error(`❌ [Scraper] All proxies exhausted for ${start_url}. Final error:`, err2.message);
       throw new Error(err2.message || "All proxies failed");
     }
   }
@@ -114,7 +129,7 @@ function processHtmlToDigest(raw_html: string, start_url: string): string {
 
   const parts: string[] = [];
   parts.push(`START_URL: ${start_url}`);
-  try { parts.push(`DOMAIN: ${new URL(start_url).hostname}`); } catch (e) {}
+  try { parts.push(`DOMAIN: ${new URL(start_url).hostname}`); } catch (e) { }
 
   parts.push("\n=== HOMEPAGE DIGEST ===");
   if (title) parts.push(`TITLE: ${title}`);

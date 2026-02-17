@@ -5,16 +5,28 @@
  */
 
 const getEnv = (key: string) => {
-  if (typeof process !== 'undefined' && process.env) return process.env[key];
   // @ts-ignore - Vite specific
-  if (typeof import.meta !== 'undefined' && import.meta.env) return import.meta.env[key];
+  if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env[key]) {
+    return import.meta.env[key];
+  }
+  if (typeof process !== 'undefined' && process.env && process.env[key]) {
+    return process.env[key];
+  }
   return undefined;
 };
 
-const OPENAI_API_KEY = getEnv('VITE_OPENAI_API_KEY');
+const getOpenAIKey = () => {
+  const key = getEnv('VITE_OPENAI_API_KEY');
+  return key ? key.trim() : undefined;
+};
+
 const INPUT_COST_PER_1M = 0.80;
 const OUTPUT_COST_PER_1M = 3.20;
-const PROMPT_ID = getEnv('VITE_OPENAI_PROMPT_ID');
+const getPromptId = () => getEnv('VITE_OPENAI_PROMPT_ID');
+
+console.log('🔍 OpenAI Config Check (Module Load):', {
+  key: getOpenAIKey() ? 'PRESENT' : 'MISSING'
+});
 
 export interface BatchItem {
   contact_id: string;
@@ -51,26 +63,35 @@ async function enrichSingle(item: BatchItem): Promise<any> {
   const html_snippet = (item.digest || "").slice(0, 12000);
 
   try {
+    const payload = {
+      model: "gpt-4.1-mini",
+      prompt: {
+        id: getPromptId(),
+        version: "1",
+        variables: {
+          html: html_snippet
+        }
+      }
+    };
+
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        "Authorization": `Bearer ${getOpenAIKey()}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        model: "gpt-4.1-mini",
-        prompt: {
-          id: PROMPT_ID,
-          version: "1",
-          variables: {
-            html: html_snippet
-          }
-        }
-      })
+      body: JSON.stringify(payload)
     });
 
     if (!response.ok) {
-      throw new Error(`OpenAI API Error: ${response.status}`);
+      let errorBody = "";
+      try {
+        errorBody = await response.text();
+      } catch (e) {
+        errorBody = "Could not parse error body";
+      }
+      console.error(`❌ OpenAI API Error [${response.status}]:`, errorBody);
+      throw new Error(`OpenAI API Error: ${response.status} - ${errorBody.slice(0, 500)}`);
     }
 
     const data = await response.json();

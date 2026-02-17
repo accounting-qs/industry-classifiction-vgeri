@@ -1,16 +1,14 @@
 
+import './loadEnv';
+
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { fetchDigest } from './services/scraperService';
 import { enrichBatch } from './services/enrichmentService';
 import { MergedContact, Contact, Enrichment } from './types';
-
-dotenv.config({ path: '.env.local' });
-dotenv.config(); // Fallback to .env for Render
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,14 +17,37 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Supabase Init (Using SERVICE_ROLE_KEY for background updates)
-const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || 'https://zxnaxtdeujunujnjaweo.supabase.co';
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
 
+if (!SUPABASE_URL) {
+    console.error("❌ CRITICAL: SUPABASE_URL is missing!");
+}
 if (!SUPABASE_SERVICE_KEY) {
-    console.error("CRITICAL: SUPABASE_SERVICE_ROLE_KEY is missing!");
+    console.error("❌ CRITICAL: SUPABASE_SERVICE_ROLE_KEY / ANON_KEY is missing!");
 }
 
+console.log('🔍 Server Supabase Config Check:', {
+    url: SUPABASE_URL ? 'PRESENT' : 'MISSING',
+    key: SUPABASE_SERVICE_KEY ? 'PRESENT' : 'MISSING'
+});
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY || '');
+
+// --- Real-time Status Tracking ---
+let serverLogs: string[] = [];
+let jobStats = {
+    total: 0,
+    completed: 0,
+    failed: 0,
+    isProcessing: false
+};
+
+const addServerLog = (msg: string) => {
+    const time = new Date().toLocaleTimeString();
+    const entry = `${time}: ${msg}`;
+    serverLogs = [entry, ...serverLogs].slice(0, 100);
+};
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -47,9 +68,16 @@ async function runBackgroundEnrichment(contactIds: string[]) {
         .in('contact_id', contactIds);
 
     if (error || !contacts) {
-        console.error("Error fetching contacts for enrichment:", error);
+        addServerLog(`❌ Error fetching contacts: ${error?.message || 'Unknown error'}`);
+        jobStats.isProcessing = false;
         return;
     }
+
+    jobStats.total = contactIds.length;
+    jobStats.completed = 0;
+    jobStats.failed = 0;
+    jobStats.isProcessing = true;
+    addServerLog(`🚀 Starting enrichment for ${contactIds.length} records.`);
 
     // Flatten contacts (MergedContact pattern)
     const batch: MergedContact[] = contacts.map((item: any) => {
@@ -68,7 +96,7 @@ async function runBackgroundEnrichment(contactIds: string[]) {
         currentIndex += BATCH_SIZE;
 
         try {
-            console.log(`🔍 [${currentIndex}/${batch.length}] Scraping phase...`);
+            addServerLog(`🔍 [${currentIndex}/${batch.length}] Scraping phase...`);
             const scrapes = await Promise.all(sprintItems.map(async (c) => {
                 const domain = c.company_website || c.email.split('@')[1];
                 try {
@@ -84,7 +112,7 @@ async function runBackgroundEnrichment(contactIds: string[]) {
 
             let aiResults: any[] = [];
             if (validScrapes.length > 0) {
-                console.log(`🧠 OpenAI classification...`);
+                addServerLog(`🧠 OpenAI classification for ${validScrapes.length} items...`);
                 aiResults = await enrichBatch(validScrapes.map(s => ({
                     contact_id: s.contact.contact_id,
                     email: s.contact.email,
@@ -92,7 +120,7 @@ async function runBackgroundEnrichment(contactIds: string[]) {
                 })));
             }
 
-            console.log(`💾 Syncing results to Supabase...`);
+            addServerLog(`💾 Syncing results to Supabase...`);
             const enrichmentsToUpsert: Partial<Enrichment>[] = [];
             const contactsToUpdate: Partial<Contact>[] = [];
 
@@ -137,13 +165,27 @@ async function runBackgroundEnrichment(contactIds: string[]) {
                 await supabase.from('contacts').upsert(contactsToUpdate, { onConflict: 'email' });
             }
 
+            // Update stats
+            jobStats.completed += aiResults.filter(r => r.status === 'completed' && r.classification !== 'ERROR').length;
+            jobStats.failed += failedScrapes.length + aiResults.filter(r => r.status === 'failed' || r.classification === 'ERROR').length;
+
+            addServerLog(`✅ Batch of ${sprintItems.length} processed. (${jobStats.completed} done, ${jobStats.failed} failed)`);
+
         } catch (err: any) {
-            console.error(`🛑 Batch Error: ${err.message}`);
+            addServerLog(`🛑 Batch Error: ${err.message}`);
         }
     }
 
-    console.log("✨ Background task finalized.");
+    jobStats.isProcessing = false;
+    addServerLog("✨ Background task finalized.");
 }
+
+app.get('/api/status', (req, res) => {
+    res.json({
+        logs: serverLogs,
+        stats: jobStats
+    });
+});
 
 /**
  * Endpoints
