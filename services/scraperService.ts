@@ -50,7 +50,22 @@ export async function fetchDigest(
   const start_url = normalizeUrl(urlOrDomain);
   if (!start_url) throw new Error("Invalid URL or domain");
 
-  // --- Waterfall Logic ---
+  // --- Phase 1: Direct Fetch (No Proxy) ---
+  try {
+    const pName = "Direct Fetch";
+    if (onProgress) onProgress(`📡 [Scraper] ${pName} for: ${start_url}`);
+    const raw_html = await attemptDirectFetch(start_url);
+    return {
+      digest: processHtmlToDigest(raw_html, start_url, pName),
+      proxyName: pName
+    };
+  } catch (err: any) {
+    const errorMsg = `⏳ [Scraper] Direct Fetch failed for ${start_url}: ${err.message}`;
+    console.warn(errorMsg);
+    if (onProgress) onProgress(errorMsg);
+  }
+
+  // --- Phase 2: Waterfall Proxies ---
   for (let i = 0; i < PROXY_LIST.length; i++) {
     const proxyName = PROXY_NAMES[i];
     try {
@@ -86,6 +101,31 @@ export async function fetchDigest(
   }
 
   throw new Error(`All proxies failed for ${start_url}`);
+}
+
+async function attemptDirectFetch(targetUrl: string): Promise<string> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000); // Direct fetch gets 15s
+
+  try {
+    const response = await fetch(targetUrl, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (compatible; QSbot/1.0; +http://www.accounting-qs.com)'
+      }
+    });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const raw_html = await response.text();
+    validateHtml(raw_html, targetUrl);
+    return raw_html;
+  } catch (e: any) {
+    clearTimeout(timeoutId);
+    throw e;
+  }
 }
 
 async function attemptStandardProxy(index: number, targetUrl: string): Promise<string> {

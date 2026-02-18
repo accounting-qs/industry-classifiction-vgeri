@@ -47,7 +47,45 @@ const addServerLog = (msg: string) => {
     const time = new Date().toLocaleTimeString();
     const entry = `${time}: ${msg}`;
     serverLogs = [entry, ...serverLogs].slice(0, 100);
+    // Explicit sync for important logs
+    if (msg.includes('🚀') || msg.includes('✅') || msg.includes('🛑') || msg.includes('✨')) {
+        persistPipelineState();
+    }
 };
+
+async function persistPipelineState() {
+    try {
+        await supabase.from('pipeline_state').upsert({
+            id: 1,
+            total: jobStats.total,
+            completed: jobStats.completed,
+            failed: jobStats.failed,
+            is_processing: jobStats.isProcessing,
+            logs: serverLogs,
+            updated_at: new Date().toISOString()
+        });
+    } catch (e) {
+        console.error("Failed to persist pipeline state:", e);
+    }
+}
+
+async function restorePipelineState() {
+    try {
+        const { data, error } = await supabase.from('pipeline_state').select('*').eq('id', 1).single();
+        if (data && !error) {
+            jobStats = {
+                total: data.total || 0,
+                completed: data.completed || 0,
+                failed: data.failed || 0,
+                isProcessing: data.is_processing || false
+            };
+            serverLogs = data.logs || [];
+            console.log("🟢 Restored pipeline state from Supabase");
+        }
+    } catch (e) {
+        console.warn("Could not restore pipeline state (table might not exist yet)");
+    }
+}
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -218,14 +256,17 @@ async function runBackgroundEnrichment(contactIds: string[]) {
             }
 
             addServerLog(`✅ Batch of ${sprintItems.length} processed. (${jobStats.completed} done, ${jobStats.failed} failed)`);
+            await persistPipelineState();
 
         } catch (err: any) {
             addServerLog(`🛑 Batch Error: ${err.message}`);
+            await persistPipelineState();
         }
     }
 
     jobStats.isProcessing = false;
     addServerLog("✨ Background task finalized.");
+    await persistPipelineState();
 }
 
 app.get('/api/status', (req, res) => {
@@ -256,6 +297,7 @@ app.post('/api/enrich', (req, res) => {
     jobStats.isProcessing = true;
     serverLogs = []; // Clear old logs for fresh start
     addServerLog(`🚀 Queuing ${contactIds.length} records...`);
+    persistPipelineState(); // Save initial state
 
     // 2. Fire-and-forget worker
     runBackgroundEnrichment(contactIds).catch(err => {
@@ -273,6 +315,7 @@ app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log(`🟢 Monolithic Server running on port ${PORT}`);
+    await restorePipelineState();
 });
