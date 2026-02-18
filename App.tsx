@@ -307,8 +307,8 @@ export default function App() {
               onSearchQueryChange={setSearchQuery}
             />
           ) : (
-            <div className="flex-1 p-6 overflow-hidden bg-[#1c1c1c] flex flex-col h-full">
-              <div className="max-w-5xl mx-auto w-full flex-1 flex flex-col space-y-6 min-h-0">
+            <div className="flex-1 p-6 overflow-hidden bg-[#1c1c1c] flex flex-col h-full min-h-0">
+              <div className="max-w-5xl mx-auto w-full flex-1 flex flex-col space-y-6 min-h-0 h-full">
                 <div className="flex items-center justify-between">
                   <div>
                     <h2 className="text-xl font-bold flex items-center gap-3">
