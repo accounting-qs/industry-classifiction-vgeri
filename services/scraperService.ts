@@ -13,31 +13,26 @@ import {
  * Fires multiple proxy requests in parallel and takes the first success.
  */
 
-async function promiseAny<T>(promises: Promise<T>[]): Promise<T> {
-  return new Promise((resolve, reject) => {
-    let rejectedCount = 0;
-    if (promises.length === 0) {
-      return reject(new Error("No promises provided"));
-    }
-    promises.forEach((p) => {
-      Promise.resolve(p)
-        .then(resolve)
-        .catch((err) => {
-          rejectedCount++;
-          if (rejectedCount === promises.length) {
-            reject(new Error("All proxies failed"));
-          }
-        });
-    });
-  });
-}
+const getZenRowsKey = () => {
+  // @ts-ignore
+  if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_ZENROWS_API_KEY) {
+    return import.meta.env.VITE_ZENROWS_API_KEY;
+  }
+  if (typeof process !== 'undefined' && process.env && process.env.VITE_ZENROWS_API_KEY) {
+    return process.env.VITE_ZENROWS_API_KEY;
+  }
+  return undefined;
+};
 
 const PROXY_LIST = [
   // Codetabs proxy works well most of the time
   (url: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
   (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-  // (url: string) => `https://cors.x2u.in/?url=${encodeURIComponent(url)}`,
+  (url: string) => `https://proxy.corsfix.com/?url=${encodeURIComponent(url)}`,
+  (url: string) => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
 ];
+
+const PROXY_NAMES = ["Codetabs", "Corsproxy.io", "Corsfix", "AllOrigins"];
 
 function normalizeUrl(url_or_domain: string): string {
   let s = (url_or_domain || "").trim();
@@ -48,98 +43,124 @@ function normalizeUrl(url_or_domain: string): string {
   return s;
 }
 
-const PROXY_NAMES = ["Codetabs", "CORS.lol", "CORS.x2u.in"];
-
-export async function fetchDigest(urlOrDomain: string, onRetry?: (msg: string) => void): Promise<{ digest: string, proxyName: string }> {
+export async function fetchDigest(
+  urlOrDomain: string,
+  onProgress?: (msg: string) => void
+): Promise<{ digest: string, proxyName: string }> {
   const start_url = normalizeUrl(urlOrDomain);
   if (!start_url) throw new Error("Invalid URL or domain");
 
-  const attemptProxy = async (index: number): Promise<{ raw_html: string, proxyName: string }> => {
-    const proxyUrl = PROXY_LIST[index](start_url);
-    const proxyName = PROXY_NAMES[index];
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 25000);
-
+  // --- Waterfall Logic ---
+  for (let i = 0; i < PROXY_LIST.length; i++) {
+    const proxyName = PROXY_NAMES[i];
     try {
-      console.log(`📡 [Scraper] Attempting ${proxyName} for: ${start_url}`);
-      const response = await fetch(proxyUrl, {
-        signal: controller.signal,
-        headers: {
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-      });
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      let raw_html = "";
-      if (proxyUrl.includes('allorigins')) {
-        const json = await response.json();
-        if (json.status && json.status.http_code >= 400) throw new Error(`Origin Error ${json.status.http_code}`);
-        raw_html = json.contents || "";
-      } else {
-        raw_html = await response.text();
-      }
-
-      const lowerHtml = (raw_html || "").toLowerCase();
-
-      // Validation: Detect if proxy is returning its own page instead of the target
-      const proxySignatures = [
-        "api.codetabs.com",
-        "cors.lol",
-        "cors.x2u.in",
-        "cloudflare.com/5xx-error",
-        "access denied",
-        "checking your browser",
-        "captcha-delivery.com"
-      ];
-
-      const matchedSignature = proxySignatures.find(sig => lowerHtml.includes(sig));
-
-      if (matchedSignature && !start_url.toLowerCase().includes(matchedSignature)) {
-        console.warn(`⚠️ [Scraper] ${proxyName} returned proxy-specific or blocked content: ${matchedSignature}`);
-        throw new Error(`Proxy spoofing detected (${matchedSignature})`);
-      }
-
-      if (!raw_html || raw_html.trim().length < 200) {
-        throw new Error("Empty or insufficient content");
-      }
-
-      console.log(`✅ [Scraper] ${proxyName} success! (${raw_html.length} chars)`);
-      return { raw_html, proxyName };
-    } catch (e: any) {
-      clearTimeout(timeoutId);
-      console.error(`❌ [Scraper] ${proxyName} error:`, e.message || e);
-      throw e;
-    }
-  };
-
-  try {
-    const { raw_html, proxyName } = await promiseAny([attemptProxy(0), attemptProxy(1)]);
-    return {
-      digest: processHtmlToDigest(raw_html, start_url),
-      proxyName
-    };
-  } catch (err: any) {
-    console.warn(`⏳ [Scraper] Primary proxies failed. Detail: ${err.message}`);
-    if (onRetry) onRetry(`Initial proxies failed. Attempting deep fallback...`);
-    try {
-      const { raw_html, proxyName } = await attemptProxy(2);
+      if (onProgress) onProgress(`📡 [Scraper] ${proxyName} for: ${start_url}`);
+      const raw_html = await attemptStandardProxy(i, start_url);
       return {
-        digest: processHtmlToDigest(raw_html, start_url),
+        digest: processHtmlToDigest(raw_html, start_url, proxyName),
         proxyName
       };
-    } catch (err2: any) {
-      console.error(`❌ [Scraper] All proxies exhausted for ${start_url}`);
-      throw new Error(err2.message || "All proxies failed");
+    } catch (err: any) {
+      const errorMsg = `⏳ [Scraper] ${proxyName} failed for ${start_url}: ${err.message}`;
+      console.warn(errorMsg);
+      if (onProgress) onProgress(errorMsg);
     }
+  }
+
+  // --- Final Fallback: ZenRows ---
+  const zenKey = getZenRowsKey();
+  if (zenKey) {
+    try {
+      const pName = "ZenRows (Premium)";
+      if (onProgress) onProgress(`🚀 [Scraper] Standard proxies exhausted for ${start_url}. Attempting ZenRows...`);
+      const raw_html = await attemptZenRows(zenKey, start_url);
+      return {
+        digest: processHtmlToDigest(raw_html, start_url, pName),
+        proxyName: pName
+      };
+    } catch (err: any) {
+      const errorMsg = `❌ [Scraper] ZenRows premium also failed for ${start_url}: ${err.message}`;
+      console.error(errorMsg);
+      if (onProgress) onProgress(errorMsg);
+    }
+  }
+
+  throw new Error(`All proxies failed for ${start_url}`);
+}
+
+async function attemptStandardProxy(index: number, targetUrl: string): Promise<string> {
+  const proxyUrl = PROXY_LIST[index](targetUrl);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 20000);
+
+  try {
+    const response = await fetch(proxyUrl, {
+      signal: controller.signal,
+      headers: {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Origin': 'https://corsproxy.io', // Spoof origin to satisfy some strict proxies
+        'Referer': 'https://corsproxy.io/'
+      }
+    });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    let raw_html = "";
+    if (proxyUrl.includes('allorigins')) {
+      const json = await response.json();
+      raw_html = json.contents || "";
+    } else {
+      raw_html = await response.text();
+    }
+
+    validateHtml(raw_html, targetUrl);
+    return raw_html;
+  } catch (e: any) {
+    clearTimeout(timeoutId);
+    throw e;
   }
 }
 
-function processHtmlToDigest(raw_html: string, start_url: string): string {
+async function attemptZenRows(apiKey: string, targetUrl: string): Promise<string> {
+  // NOTE: removed autoparse=true to get raw HTML for processHtmlToDigest consistency
+  const zenUrl = `https://api.zenrows.com/v1/?apikey=${apiKey}&url=${encodeURIComponent(targetUrl)}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // ZenRows gets 30s as it's deep fallback
+
+  try {
+    const response = await fetch(zenUrl, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (!response.ok) throw new Error(`ZenRows HTTP ${response.status}`);
+
+    const raw_html = await response.text();
+    validateHtml(raw_html, targetUrl);
+    return raw_html;
+  } catch (e: any) {
+    clearTimeout(timeoutId);
+    throw e;
+  }
+}
+
+function validateHtml(html: string, targetUrl: string) {
+  const lowerHtml = (html || "").toLowerCase();
+  const proxySignatures = [
+    "api.codetabs.com", "corsproxy.io", "corsfix.com", "corsfix_error", "zenrows.com", "allorigins.win",
+    "cloudflare.com/5xx-error", "access denied", "checking your browser",
+    "captcha-delivery.com", "error 403", "forbidden", "not found",
+    "cors error", "proxy error", "unusual traffic"
+  ];
+
+  const matchedSignature = proxySignatures.find(sig =>
+    lowerHtml.includes(sig) && !targetUrl.toLowerCase().includes(sig)
+  );
+
+  if (matchedSignature) throw new Error(`Blocked by proxy: ${matchedSignature}`);
+  if (!html || html.trim().length < 200) throw new Error("Insufficient content length");
+}
+
+function processHtmlToDigest(raw_html: string, start_url: string, proxyName: string): string {
   const capped_html = raw_html.slice(0, MAX_HTML_BYTES);
   const clean = stripCssJs(capped_html);
 
@@ -155,6 +176,7 @@ function processHtmlToDigest(raw_html: string, start_url: string): string {
   const parts: string[] = [];
   parts.push(`START_URL: ${start_url}`);
   try { parts.push(`DOMAIN: ${new URL(start_url).hostname}`); } catch (e) { }
+  parts.push(`PROXY_VIA: ${proxyName}`);
 
   parts.push("\n=== HOMEPAGE DIGEST ===");
   if (title) parts.push(`TITLE: ${title}`);
