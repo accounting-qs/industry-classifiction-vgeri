@@ -13,6 +13,18 @@ import { MergedContact, Contact, Enrichment } from './types';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Structured Log Type
+interface LogEntry {
+    id?: string;
+    timestamp: string;
+    instance_id: string;
+    module: string;
+    message: string;
+    level: 'info' | 'warn' | 'error' | 'phase';
+}
+
+const INSTANCE_ID = Math.random().toString(36).substring(2, 7); // e.g. "pp9n9"
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -35,7 +47,7 @@ console.log('🔍 Server Supabase Config Check:', {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY || '');
 
 // --- Real-time Status Tracking ---
-let serverLogs: string[] = [];
+let currentJobLogs: LogEntry[] = []; // Cache for current session
 let jobStats = {
     total: 0,
     completed: 0,
@@ -43,12 +55,27 @@ let jobStats = {
     isProcessing: false
 };
 
-const addServerLog = (msg: string) => {
-    const time = new Date().toLocaleTimeString();
-    const entry = `${time}: ${msg}`;
-    serverLogs = [entry, ...serverLogs].slice(0, 100);
-    // Explicit sync for important logs
-    if (msg.includes('🚀') || msg.includes('✅') || msg.includes('🛑') || msg.includes('✨')) {
+const addServerLog = async (msg: string, module: string = 'Pipeline', level: LogEntry['level'] = 'info') => {
+    const entry: LogEntry = {
+        timestamp: new Date().toISOString(),
+        instance_id: INSTANCE_ID,
+        module,
+        message: msg,
+        level
+    };
+
+    console.log(`[${module}] ${msg}`);
+
+    // 1. Internal cache (latest 100)
+    currentJobLogs = [entry, ...currentJobLogs].slice(0, 100);
+
+    // 2. Persist to Supabase logs table (fire-and-forget)
+    supabase.from('pipeline_logs').insert(entry).then(({ error }) => {
+        if (error) console.error("Log persistence failure:", error.message);
+    });
+
+    // 3. Sync stats singleton for high-level progress tracking
+    if (level === 'phase' || msg.includes('✨') || msg.includes('🚀')) {
         persistPipelineState();
     }
 };
@@ -61,11 +88,10 @@ async function persistPipelineState() {
             completed: jobStats.completed,
             failed: jobStats.failed,
             is_processing: jobStats.isProcessing,
-            logs: serverLogs,
             updated_at: new Date().toISOString()
         });
     } catch (e) {
-        console.error("Failed to persist pipeline state:", e);
+        console.error("Failed to persist job stats:", e);
     }
 }
 
@@ -79,11 +105,10 @@ async function restorePipelineState() {
                 failed: data.failed || 0,
                 isProcessing: data.is_processing || false
             };
-            serverLogs = data.logs || [];
-            console.log("🟢 Restored pipeline state from Supabase");
+            console.log("🟢 Restored pipeline stats from Supabase");
         }
     } catch (e) {
-        console.warn("Could not restore pipeline state (table might not exist yet)");
+        console.warn("Could not restore pipeline state");
     }
 }
 
@@ -98,7 +123,7 @@ app.use(express.static(path.join(__dirname, 'dist')));
  */
 async function runBackgroundEnrichment(contactIds: string[]) {
     try {
-        addServerLog(`📦 [Phase 1/3] Enqueuing ${contactIds.length} records in chunks...`);
+        addServerLog(`Enqueuing ${contactIds.length} records in chunks...`, 'Pipeline', 'phase');
         const ENQUEUE_CHUNK_SIZE = 100;
         for (let i = 0; i < contactIds.length; i += ENQUEUE_CHUNK_SIZE) {
             const chunk = contactIds.slice(i, i + ENQUEUE_CHUNK_SIZE);
@@ -107,18 +132,19 @@ async function runBackgroundEnrichment(contactIds: string[]) {
                 { onConflict: 'contact_id' }
             );
             if (enqueueError) throw enqueueError;
-            addServerLog(`   - Enqueued ${Math.min(i + ENQUEUE_CHUNK_SIZE, contactIds.length)}/${contactIds.length}...`);
+            addServerLog(`Enqueued ${Math.min(i + ENQUEUE_CHUNK_SIZE, contactIds.length)}/${contactIds.length}...`, 'Sync');
         }
     } catch (e: any) {
-        addServerLog(`🛑 [Enqueuer] Critical failure: ${e.message}`);
+        addServerLog(`Enqueuer Failure: ${e.message}`, 'Pipeline', 'error');
         jobStats.isProcessing = false;
+        persistPipelineState();
         return;
     }
 
     // 1. Fetch contact data from Supabase in chunks
     const contacts: any[] = [];
     try {
-        addServerLog(`📥 [Phase 2/3] Fetching data for ${contactIds.length} records...`);
+        addServerLog(`Fetching data for ${contactIds.length} records...`, 'Pipeline', 'phase');
         const FETCH_CHUNK_SIZE = 100;
         for (let i = 0; i < contactIds.length; i += FETCH_CHUNK_SIZE) {
             const chunkIds = contactIds.slice(i, i + FETCH_CHUNK_SIZE);
@@ -129,21 +155,23 @@ async function runBackgroundEnrichment(contactIds: string[]) {
 
             if (error) throw error;
             if (chunkData) contacts.push(...chunkData);
-            addServerLog(`   - Fetched ${contacts.length}/${contactIds.length}...`);
+            addServerLog(`Fetched ${contacts.length}/${contactIds.length}...`, 'Sync');
         }
     } catch (e: any) {
-        addServerLog(`❌ [Fetch] Error fetching contact details: ${e.message || 'Unknown error'}`);
+        addServerLog(`Fetch Error: ${e.message}`, 'Pipeline', 'error');
         jobStats.isProcessing = false;
+        persistPipelineState();
         return;
     }
 
     if (contacts.length === 0) {
-        addServerLog(`❌ [Fetch] No contact details found.`);
+        addServerLog(`No contact details found.`, 'Pipeline', 'warn');
         jobStats.isProcessing = false;
+        persistPipelineState();
         return;
     }
 
-    addServerLog(`🚀 [Phase 3/3] Starting Enrichment Pipeline for ${contacts.length} records.`);
+    addServerLog(`Starting Enrichment Pipeline for ${contacts.length} records.`, 'Pipeline', 'phase');
 
     // Flatten contacts (MergedContact pattern)
     const batch: MergedContact[] = contacts.map((item: any) => {
@@ -163,16 +191,20 @@ async function runBackgroundEnrichment(contactIds: string[]) {
 
         try {
             const sprintEnd = Math.min(currentIndex, batch.length);
-            addServerLog(`🔍 Sprint [${currentIndex - BATCH_SIZE + 1}-${sprintEnd}/${batch.length}]: Scraping websites...`);
+            addServerLog(`Sprint [${currentIndex - BATCH_SIZE + 1}-${sprintEnd}/${batch.length}]: Scraping websites...`, 'Pipeline', 'phase');
 
             const scrapes = await Promise.all(sprintItems.map(async (c) => {
                 const domain = c.company_website || c.email.split('@')[1];
                 try {
-                    const { digest, proxyName } = await fetchDigest(domain, msg => addServerLog(msg));
-                    addServerLog(`✅ [Scraper] ${domain} success via ${proxyName}`);
+                    const { digest, proxyName } = await fetchDigest(domain, msg => {
+                        // Map internal scraper logs to structured system
+                        const level = msg.includes('failed') || msg.includes('FATAL') ? 'warn' : 'info';
+                        addServerLog(msg, 'Scraper', level);
+                    });
+                    addServerLog(`${domain} success via ${proxyName}`, 'Scraper');
                     return { contact: c, digest, proxyName, success: true };
                 } catch (e: any) {
-                    addServerLog(`⚠️ [Scraper] ${domain} FATAL: ${e.message}`);
+                    addServerLog(`${domain} FATAL: ${e.message}`, 'Scraper', 'error');
                     return { contact: c, digest: e.message, success: false };
                 }
             }));
@@ -182,17 +214,17 @@ async function runBackgroundEnrichment(contactIds: string[]) {
 
             let aiResults: any[] = [];
             if (validScrapes.length > 0) {
-                addServerLog(`🧠 [OpenAI] Classifying ${validScrapes.length} items (Sprint Success: ${Math.round((validScrapes.length / sprintItems.length) * 100)}%)...`);
+                addServerLog(`Classifying ${validScrapes.length} items (Success: ${Math.round((validScrapes.length / sprintItems.length) * 100)}%)...`, 'OpenAI', 'phase');
                 aiResults = await enrichBatch(validScrapes.map(s => ({
                     contact_id: s.contact.contact_id,
                     email: s.contact.email,
                     digest: s.digest
                 })));
                 const aiSuccessCount = aiResults.filter(r => r.status === 'completed').length;
-                addServerLog(`✅ [OpenAI] Classification complete: ${aiSuccessCount}/${validScrapes.length} successful.`);
+                addServerLog(`Classification complete: ${aiSuccessCount}/${validScrapes.length} successful.`, 'OpenAI');
             }
 
-            addServerLog(`💾 Syncing results to Supabase...`);
+            addServerLog(`Syncing results to Supabase...`, 'Sync');
             const enrichmentsToUpsert: Partial<Enrichment>[] = [];
             const contactsToUpdate: Partial<Contact>[] = [];
 
@@ -252,26 +284,33 @@ async function runBackgroundEnrichment(contactIds: string[]) {
             }
             if (contactsToUpdate.length > 0) {
                 const { error: contactError } = await supabase.from('contacts').upsert(contactsToUpdate, { onConflict: 'email' });
-                if (contactError) addServerLog(`🛑 [Sync] Failed to update contact records: ${contactError.message}`);
+                if (contactError) addServerLog(`Failed to update contact records: ${contactError.message}`, 'Sync', 'error');
             }
 
-            addServerLog(`✅ Batch of ${sprintItems.length} processed. (${jobStats.completed} done, ${jobStats.failed} failed)`);
+            addServerLog(`Batch processed: ${jobStats.completed} done, ${jobStats.failed} failed`, 'Pipeline');
             await persistPipelineState();
 
         } catch (err: any) {
-            addServerLog(`🛑 Batch Error: ${err.message}`);
+            addServerLog(`Batch Error: ${err.message}`, 'Pipeline', 'error');
             await persistPipelineState();
         }
     }
 
     jobStats.isProcessing = false;
-    addServerLog("✨ Background task finalized.");
+    addServerLog("✨ Background task finalized.", 'Pipeline', 'phase');
     await persistPipelineState();
 }
 
-app.get('/api/status', (req, res) => {
+app.get('/api/status', async (req, res) => {
+    // Fetch latest 200 logs from Supabase
+    const { data: dbLogs } = await supabase
+        .from('pipeline_logs')
+        .select('*')
+        .order('timestamp', { ascending: false })
+        .limit(200);
+
     res.json({
-        logs: serverLogs,
+        logs: dbLogs || currentJobLogs,
         stats: jobStats
     });
 });
@@ -295,15 +334,16 @@ app.post('/api/enrich', (req, res) => {
     jobStats.completed = 0;
     jobStats.failed = 0;
     jobStats.isProcessing = true;
-    serverLogs = []; // Clear old logs for fresh start
-    addServerLog(`🚀 Queuing ${contactIds.length} records...`);
+    currentJobLogs = []; // Clear current session cache
+    addServerLog(`Queuing ${contactIds.length} records...`, 'Pipeline', 'phase');
     persistPipelineState(); // Save initial state
 
     // 2. Fire-and-forget worker
     runBackgroundEnrichment(contactIds).catch(err => {
         console.error("Worker fatal error:", err);
-        addServerLog(`🛑 Fatal Pipeline Error: ${err.message}`);
+        addServerLog(`Fatal Pipeline Error: ${err.message}`, 'Pipeline', 'error');
         jobStats.isProcessing = false;
+        persistPipelineState();
     });
 
     // 3. Immediate response (202 Accepted)

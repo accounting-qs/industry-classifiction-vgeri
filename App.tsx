@@ -25,6 +25,8 @@ import {
   Search,
   Settings2,
   ExternalLink,
+  Cpu,
+  Activity,
   Play
 } from 'lucide-react';
 
@@ -34,6 +36,15 @@ import {
  * startEnrichmentQueue enqueues the tasks in Supabase and returns immediately.
  * processQuantumPipeline is called without await to run in the background.
  */
+
+interface LogEntry {
+  id?: string;
+  timestamp: string;
+  instance_id: string;
+  module: string;
+  message: string;
+  level: 'info' | 'warn' | 'error' | 'phase';
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<AppTab>(AppTab.MANAGER);
@@ -54,7 +65,17 @@ export default function App() {
   });
 
   const [stats, setStats] = useState<BatchStats>({ total: 0, completed: 0, failed: 0, isProcessing: false });
-  const [logs, setLogs] = useState<string[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [logCurrentPage, setLogCurrentPage] = useState(1);
+  const [logPageSize, setLogPageSize] = useState(100);
+  const logContainerRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll logs to bottom
+  useEffect(() => {
+    if (logContainerRef.current) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+    }
+  }, [logs]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [isAllFilteredSelected, setIsAllFilteredSelected] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -101,28 +122,29 @@ export default function App() {
 
   useEffect(() => { loadData(); }, [loadData]);
 
-  // Poll server for status during enrichment
+  // Poll server for status
   useEffect(() => {
-    let interval: any;
-
-    if (stats.isProcessing) {
-      interval = setInterval(async () => {
-        try {
-          const res = await fetch('/api/status');
-          if (res.ok) {
-            const data = await res.json();
-            setLogs(data.logs);
-            setStats(data.stats);
-
-            // Periodically refresh table data during processing
-            if (activeTab === AppTab.MANAGER) {
-              loadData();
-            }
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch('/api/status');
+        if (res.ok) {
+          const data = await res.json();
+          setLogs(data.logs);
+          setStats(data.stats);
+          if (activeTab === AppTab.MANAGER && data.stats.isProcessing) {
+            loadData();
           }
-        } catch (e) {
-          console.error("Polling error:", e);
         }
-      }, 2500);
+      } catch (e) {
+        console.error("Status fetch error:", e);
+      }
+    };
+
+    fetchStatus(); // Fetch once on mount/tab change
+
+    let interval: any;
+    if (stats.isProcessing) {
+      interval = setInterval(fetchStatus, 2500);
     }
 
     return () => {
@@ -130,8 +152,15 @@ export default function App() {
     };
   }, [stats.isProcessing, activeTab, loadData]);
 
-  const addLog = (msg: string) => {
-    setLogs(prev => [`${new Date().toLocaleTimeString()}: ${msg}`, ...prev].slice(0, 500));
+  const addLog = (msg: string, module: string = 'Pipeline', level: LogEntry['level'] = 'info') => {
+    const entry: LogEntry = {
+      timestamp: new Date().toISOString(),
+      instance_id: 'local',
+      module,
+      message: msg,
+      level
+    };
+    setLogs(prev => [entry, ...prev].slice(0, 500));
   };
 
   const updateContactUI = useCallback((contactId: string, updates: Partial<MergedContact>) => {
@@ -340,34 +369,47 @@ export default function App() {
                   <StatCard label="Failures" value={stats.failed} color="text-rose-500" />
                   <StatCard label="In Queue" value={stats.total - (stats.completed + stats.failed)} color="text-indigo-400" />
                 </div>
-                <div className="bg-[#0e0e0e] rounded-xl border border-[#2e2e2e] p-5 font-mono text-[11px] flex-1 overflow-y-auto custom-scrollbar shadow-inner mb-6 relative ring-1 ring-white/5 min-h-0">
+                <div
+                  ref={logContainerRef}
+                  className="bg-[#0e0e0e] rounded-xl border border-[#2e2e2e] p-0 font-mono text-[11px] flex-1 overflow-y-auto custom-scrollbar shadow-inner mb-6 relative ring-1 ring-white/5 min-h-0"
+                >
                   {logs.length === 0 ? (
-                    <div className="h-full flex flex-col items-center justify-center opacity-30 text-center text-gray-500">
+                    <div className="h-full flex flex-col items-center justify-center opacity-30 text-center text-gray-500 py-20">
                       <DatabaseZap className="w-12 h-12 mb-4 animate-pulse" />
                       <p className="text-sm font-bold">Pipeline Idle</p>
                       <p className="mt-2 text-[10px] uppercase tracking-wider">Queue records to begin processing</p>
                     </div>
                   ) : (
-                    <div className="flex flex-col min-h-full pb-20">
+                    <div className="flex flex-col-reverse min-h-full">
                       {logs.map((l, i) => {
-                        const isSuccess = l.includes('✓') || l.includes('Result') || l.includes('Syncing') || l.includes('Accepted') || l.includes('✅') || l.includes('classified');
-                        const isError = l.includes('✗') || l.includes('Error') || l.includes('Failed') || l.includes('🛑') || l.includes('failed');
-                        const isPhase = l.includes('Phase') || l.includes('🚀') || l.includes('---') || l.includes('📦') || l.includes('Sprint');
-                        const isScraping = l.includes('Scraping') || l.includes('🔍');
-                        const isAI = l.includes('🧠') || l.includes('OpenAI');
+                        const date = new Date(l.timestamp);
+                        const timeStr = date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                        const isError = l.level === 'error';
+                        const isWarn = l.level === 'warn';
+                        const isPhase = l.level === 'phase';
 
                         return (
-                          <div key={i} className={`py-1.5 border-b border-[#1c1c1c] last:border-0 flex items-start gap-3
-                            ${isSuccess ? 'text-[#3ecf8e]' : ''}
-                            ${isError ? 'text-rose-400' : ''}
-                            ${isPhase ? 'text-indigo-400 font-bold bg-indigo-500/5 px-2 rounded -mx-2' : ''}
-                            ${!isSuccess && !isError && !isPhase ? 'text-gray-400' : ''}
+                          <div key={l.id || i} className={`group flex items-start gap-4 px-4 py-1 border-b border-white/5 hover:bg-white/[0.02] transition-colors
+                            ${isError ? 'bg-rose-500/10 border-rose-500/20 text-rose-300' : ''}
+                            ${isWarn ? 'text-amber-300' : ''}
+                            ${isPhase ? 'bg-indigo-500/5 text-indigo-300 font-bold' : 'text-gray-400'}
                           `}>
-                            <span className="opacity-30 shrink-0 tabular-nums">[{logs.length - i}]</span>
-                            <span className="flex-1 break-words leading-relaxed">
-                              {isScraping && <span className="mr-2">📡</span>}
-                              {isAI && <span className="mr-2">🤖</span>}
-                              {l}
+                            <span className="opacity-30 shrink-0 select-none w-16">{timeStr}</span>
+                            <span className="opacity-20 shrink-0 select-none w-12 text-[10px] font-bold">[{l.instance_id}]</span>
+                            <span className={`shrink-0 w-20 flex items-center gap-1.5 font-bold uppercase text-[9px] tracking-wider
+                              ${l.module === 'Scraper' ? 'text-blue-400' : ''}
+                              ${l.module === 'OpenAI' ? 'text-[#3ecf8e]' : ''}
+                              ${l.module === 'Sync' ? 'text-purple-400' : ''}
+                              ${l.module === 'Pipeline' ? 'text-indigo-400' : ''}
+                            `}>
+                              {l.module === 'Scraper' && <Zap className="w-2.5 h-2.5" />}
+                              {l.module === 'OpenAI' && <Cpu className="w-2.5 h-2.5" />}
+                              {l.module === 'Sync' && <Database className="w-2.5 h-2.5" />}
+                              {l.module === 'Pipeline' && <Activity className="w-2.5 h-2.5" />}
+                              {l.module}
+                            </span>
+                            <span className="flex-1 break-words leading-relaxed py-0.5">
+                              {l.message}
                             </span>
                           </div>
                         );
