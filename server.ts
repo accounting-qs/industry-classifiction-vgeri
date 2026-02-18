@@ -59,16 +59,48 @@ app.use(express.static(path.join(__dirname, 'dist')));
  * Background Enrichment Logic (Ported from App.tsx)
  */
 async function runBackgroundEnrichment(contactIds: string[]) {
-    console.log(`🚀 [Server Worker] Starting enrichment for ${contactIds.length} records.`);
+    try {
+        addServerLog(`📦 [Phase 1/3] Enqueuing ${contactIds.length} records in chunks...`);
+        const ENQUEUE_CHUNK_SIZE = 100;
+        for (let i = 0; i < contactIds.length; i += ENQUEUE_CHUNK_SIZE) {
+            const chunk = contactIds.slice(i, i + ENQUEUE_CHUNK_SIZE);
+            const { error: enqueueError } = await supabase.from('enrichments').upsert(
+                chunk.map(id => ({ contact_id: id, status: 'pending', processed_at: null, error_message: null })),
+                { onConflict: 'contact_id' }
+            );
+            if (enqueueError) throw enqueueError;
+            addServerLog(`   - Enqueued ${Math.min(i + ENQUEUE_CHUNK_SIZE, contactIds.length)}/${contactIds.length}...`);
+        }
+    } catch (e: any) {
+        addServerLog(`🛑 [Enqueuer] Critical failure: ${e.message}`);
+        jobStats.isProcessing = false;
+        return;
+    }
 
-    // 1. Fetch contact data from Supabase
-    const { data: contacts, error } = await supabase
-        .from('contacts')
-        .select('*, enrichments(*)')
-        .in('contact_id', contactIds);
+    // 1. Fetch contact data from Supabase in chunks
+    const contacts: any[] = [];
+    try {
+        addServerLog(`📥 [Phase 2/3] Fetching data for ${contactIds.length} records...`);
+        const FETCH_CHUNK_SIZE = 100;
+        for (let i = 0; i < contactIds.length; i += FETCH_CHUNK_SIZE) {
+            const chunkIds = contactIds.slice(i, i + FETCH_CHUNK_SIZE);
+            const { data: chunkData, error } = await supabase
+                .from('contacts')
+                .select('*, enrichments(*)')
+                .in('contact_id', chunkIds);
 
-    if (error || !contacts) {
-        addServerLog(`❌ Error fetching contacts: ${error?.message || 'Unknown error'}`);
+            if (error) throw error;
+            if (chunkData) contacts.push(...chunkData);
+            addServerLog(`   - Fetched ${contacts.length}/${contactIds.length}...`);
+        }
+    } catch (e: any) {
+        addServerLog(`❌ [Fetch] Error fetching contact details: ${e.message || 'Unknown error'}`);
+        jobStats.isProcessing = false;
+        return;
+    }
+
+    if (contacts.length === 0) {
+        addServerLog(`❌ [Fetch] No contact details found.`);
         jobStats.isProcessing = false;
         return;
     }
@@ -77,7 +109,7 @@ async function runBackgroundEnrichment(contactIds: string[]) {
     jobStats.completed = 0;
     jobStats.failed = 0;
     jobStats.isProcessing = true;
-    addServerLog(`🚀 Starting enrichment for ${contactIds.length} records.`);
+    addServerLog(`🚀 [Phase 3/3] Starting Enrichment Pipeline for ${contacts.length} records.`);
 
     // Flatten contacts (MergedContact pattern)
     const batch: MergedContact[] = contacts.map((item: any) => {
@@ -96,13 +128,16 @@ async function runBackgroundEnrichment(contactIds: string[]) {
         currentIndex += BATCH_SIZE;
 
         try {
-            addServerLog(`🔍 [${currentIndex}/${batch.length}] Scraping phase...`);
+            const sprintEnd = Math.min(currentIndex, batch.length);
+            addServerLog(`🔍 Sprint [${currentIndex - BATCH_SIZE + 1}-${sprintEnd}/${batch.length}]: Scraping websites...`);
+
             const scrapes = await Promise.all(sprintItems.map(async (c) => {
                 const domain = c.company_website || c.email.split('@')[1];
                 try {
                     const digest = await fetchDigest(domain);
                     return { contact: c, digest, success: true };
                 } catch (e: any) {
+                    addServerLog(`⚠️ [Scraper] Failed for ${domain}: ${e.message.slice(0, 50)}...`);
                     return { contact: c, digest: e.message, success: false };
                 }
             }));
@@ -112,12 +147,14 @@ async function runBackgroundEnrichment(contactIds: string[]) {
 
             let aiResults: any[] = [];
             if (validScrapes.length > 0) {
-                addServerLog(`🧠 OpenAI classification for ${validScrapes.length} items...`);
+                addServerLog(`🧠 [OpenAI] Classifying ${validScrapes.length} items (Sprint Success: ${Math.round((validScrapes.length / sprintItems.length) * 100)}%)...`);
                 aiResults = await enrichBatch(validScrapes.map(s => ({
                     contact_id: s.contact.contact_id,
                     email: s.contact.email,
                     digest: s.digest
                 })));
+                const aiSuccessCount = aiResults.filter(r => r.status === 'completed').length;
+                addServerLog(`✅ [OpenAI] Classification complete: ${aiSuccessCount}/${validScrapes.length} successful.`);
             }
 
             addServerLog(`💾 Syncing results to Supabase...`);
@@ -139,17 +176,21 @@ async function runBackgroundEnrichment(contactIds: string[]) {
                     });
 
                     if (isSuccess) {
+                        jobStats.completed++;
                         contactsToUpdate.push({
                             id: original.contact.id,
                             email: original.contact.email,
                             industry: res.classification,
                             lead_list_name: original.contact.lead_list_name
                         } as any);
+                    } else {
+                        jobStats.failed++;
                     }
                 }
             });
 
             failedScrapes.forEach(f => {
+                jobStats.failed++;
                 enrichmentsToUpsert.push({
                     contact_id: f.contact.contact_id,
                     status: 'failed',
@@ -159,15 +200,13 @@ async function runBackgroundEnrichment(contactIds: string[]) {
             });
 
             if (enrichmentsToUpsert.length > 0) {
-                await supabase.from('enrichments').upsert(enrichmentsToUpsert, { onConflict: 'contact_id' });
+                const { error: syncError } = await supabase.from('enrichments').upsert(enrichmentsToUpsert, { onConflict: 'contact_id' });
+                if (syncError) addServerLog(`🛑 [Sync] Failed to save enrichments: ${syncError.message}`);
             }
             if (contactsToUpdate.length > 0) {
-                await supabase.from('contacts').upsert(contactsToUpdate, { onConflict: 'email' });
+                const { error: contactError } = await supabase.from('contacts').upsert(contactsToUpdate, { onConflict: 'email' });
+                if (contactError) addServerLog(`🛑 [Sync] Failed to update contact records: ${contactError.message}`);
             }
-
-            // Update stats
-            jobStats.completed += aiResults.filter(r => r.status === 'completed' && r.classification !== 'ERROR').length;
-            jobStats.failed += failedScrapes.length + aiResults.filter(r => r.status === 'failed' || r.classification === 'ERROR').length;
 
             addServerLog(`✅ Batch of ${sprintItems.length} processed. (${jobStats.completed} done, ${jobStats.failed} failed)`);
 
@@ -197,21 +236,14 @@ app.post('/api/enrich', (req, res) => {
         return res.status(400).json({ error: 'Invalid contactIds' });
     }
 
-    // 1. Mark as pending immediately in DB (Atomic enqueue)
-    supabase.from('enrichments').upsert(
-        contactIds.map(id => ({ contact_id: id, status: 'pending', processed_at: null })),
-        { onConflict: 'contact_id' }
-    ).then(({ error }) => {
-        if (error) console.error("Enqueue error:", error);
+    // 1. Fire-and-forget worker
+    runBackgroundEnrichment(contactIds).catch(err => {
+        console.error("Worker fatal error:", err);
+        addServerLog(`🛑 Fatal Pipeline Error: ${err.message}`);
     });
 
     // 2. Immediate response (202 Accepted)
     res.status(202).json({ message: 'Enrichment started in background' });
-
-    // 3. Fire-and-forget worker
-    runBackgroundEnrichment(contactIds).catch(err => {
-        console.error("Worker fatal error:", err);
-    });
 });
 
 // All other GET requests serve React App

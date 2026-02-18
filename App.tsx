@@ -22,6 +22,7 @@ import {
   RefreshCw,
   Plus,
   X,
+  Search,
   Settings2,
   ExternalLink,
   Play
@@ -56,14 +57,26 @@ export default function App() {
   const [logs, setLogs] = useState<string[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [isAllFilteredSelected, setIsAllFilteredSelected] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
+  const [isStopping, setIsStopping] = useState(false);
 
   const stopRequestedRef = useRef(false);
-  const [isStopping, setIsStopping] = useState(false);
 
   useEffect(() => {
     localStorage.setItem('active_filters_v3', JSON.stringify(activeFilters));
     setIsAllFilteredSelected(false);
+    setCurrentPage(1);
   }, [activeFilters]);
+
+  // Debounce search query
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery);
+      setCurrentPage(1);
+    }, 400);
+    return () => clearTimeout(handler);
+  }, [searchQuery]);
 
   useEffect(() => {
     localStorage.setItem('qs_current_page', currentPage.toString());
@@ -76,14 +89,15 @@ export default function App() {
         currentPage,
         pageSize,
         false,
-        activeFilters
+        activeFilters,
+        debouncedSearchQuery
       );
       setContacts(data);
       setTotalCount(count);
     } catch (err: any) {
       addLog(`Error: ${err.message}`);
     }
-  }, [currentPage, pageSize, activeFilters]);
+  }, [currentPage, pageSize, activeFilters, debouncedSearchQuery]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
@@ -150,7 +164,7 @@ export default function App() {
     if (isAllFilteredSelected) {
       addLog(`📦 Preparing global batch: Fetching all ${totalCount} matching contacts...`);
       try {
-        batch = await db.getAllFilteredContacts(activeFilters);
+        batch = await db.getAllFilteredContacts(activeFilters, debouncedSearchQuery);
       } catch (e: any) {
         addLog(`Error fetching bulk contacts: ${e.message}`);
         return;
@@ -289,10 +303,12 @@ export default function App() {
               totalCount={totalCount}
               onPageChange={(p: number) => setCurrentPage(p)}
               onPageSizeChange={setPageSize}
+              searchQuery={searchQuery}
+              onSearchQueryChange={setSearchQuery}
             />
           ) : (
-            <div className="flex-1 p-8 overflow-auto bg-[#1c1c1c] space-y-6">
-              <div className="max-w-4xl mx-auto space-y-6">
+            <div className="flex-1 p-6 overflow-hidden bg-[#1c1c1c] flex flex-col h-full">
+              <div className="max-w-5xl mx-auto w-full flex-1 flex flex-col space-y-6">
                 <div className="flex items-center justify-between">
                   <div>
                     <h2 className="text-xl font-bold flex items-center gap-3">
@@ -324,28 +340,40 @@ export default function App() {
                   <StatCard label="Failures" value={stats.failed} color="text-rose-500" />
                   <StatCard label="In Queue" value={stats.total - (stats.completed + stats.failed)} color="text-indigo-400" />
                 </div>
-                <div className="bg-[#0e0e0e] rounded-lg border border-[#2e2e2e] p-5 font-mono text-[11px] h-[500px] overflow-auto custom-scrollbar shadow-inner">
+                <div className="bg-[#0e0e0e] rounded-xl border border-[#2e2e2e] p-5 font-mono text-[11px] flex-1 overflow-auto custom-scrollbar shadow-inner mb-6 relative ring-1 ring-white/5">
                   {logs.length === 0 ? (
                     <div className="h-full flex flex-col items-center justify-center opacity-30 text-center text-gray-500">
-                      <DatabaseZap className="w-12 h-12 mb-4" />
-                      <p>Pipeline is idle. Enqueue records to begin background processing.</p>
-                      <p className="mt-2 text-[9px]">Tasks continue to run until the current session ends.</p>
+                      <DatabaseZap className="w-12 h-12 mb-4 animate-pulse" />
+                      <p className="text-sm font-bold">Pipeline Idle</p>
+                      <p className="mt-2 text-[10px] uppercase tracking-wider">Queue records to begin processing</p>
                     </div>
-                  ) : logs.map((l, i) => {
-                    const isSuccess = l.includes('✓') || l.includes('Result') || l.includes('Syncing') || l.includes('Accepted') || l.includes('✅');
-                    const isError = l.includes('✗') || l.includes('Error') || l.includes('Failed') || l.includes('🛑');
-                    const isPhase = l.includes('Phase') || l.includes('🚀') || l.includes('---') || l.includes('📦');
-                    return (
-                      <div key={i} className={`py-0.5 border-b border-[#1c1c1c] last:border-0 
-                        ${isSuccess ? 'text-[#3ecf8e]' : ''}
-                        ${isError ? 'text-rose-400' : ''}
-                        ${isPhase ? 'text-indigo-400 font-bold' : ''}
-                        ${!isSuccess && !isError && !isPhase ? 'text-gray-500' : ''}
-                      `}>
-                        {l}
-                      </div>
-                    );
-                  })}
+                  ) : (
+                    <div className="flex flex-col min-h-full pb-20">
+                      {logs.map((l, i) => {
+                        const isSuccess = l.includes('✓') || l.includes('Result') || l.includes('Syncing') || l.includes('Accepted') || l.includes('✅') || l.includes('classified');
+                        const isError = l.includes('✗') || l.includes('Error') || l.includes('Failed') || l.includes('🛑') || l.includes('failed');
+                        const isPhase = l.includes('Phase') || l.includes('🚀') || l.includes('---') || l.includes('📦') || l.includes('Sprint');
+                        const isScraping = l.includes('Scraping') || l.includes('🔍');
+                        const isAI = l.includes('🧠') || l.includes('OpenAI');
+
+                        return (
+                          <div key={i} className={`py-1.5 border-b border-[#1c1c1c] last:border-0 flex items-start gap-3
+                            ${isSuccess ? 'text-[#3ecf8e]' : ''}
+                            ${isError ? 'text-rose-400' : ''}
+                            ${isPhase ? 'text-indigo-400 font-bold bg-indigo-500/5 px-2 rounded -mx-2' : ''}
+                            ${!isSuccess && !isError && !isPhase ? 'text-gray-400' : ''}
+                          `}>
+                            <span className="opacity-30 shrink-0 tabular-nums">[{logs.length - i}]</span>
+                            <span className="flex-1 break-words leading-relaxed">
+                              {isScraping && <span className="mr-2">📡</span>}
+                              {isAI && <span className="mr-2">🤖</span>}
+                              {l}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -391,7 +419,9 @@ function DataTable({
   onPageChange,
   onPageSizeChange,
   activeFilters = [],
-  onFiltersChange
+  onFiltersChange,
+  searchQuery = '',
+  onSearchQueryChange
 }: any) {
   const [showPageSizeMenu, setShowPageSizeMenu] = useState(false);
   const [showFilterBuilder, setShowFilterBuilder] = useState(false);
@@ -445,8 +475,40 @@ function DataTable({
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
-      <div className="h-12 border-b border-[#2e2e2e] px-4 flex items-center justify-between bg-[#1c1c1c] shrink-0">
-        <div className="flex items-center gap-2">
+      <div className="h-12 border-b border-[#2e2e2e] px-4 flex items-center justify-between bg-[#1c1c1c] shrink-0 gap-4">
+        <div className="flex items-center gap-4 flex-1">
+          <div className="relative flex-1 max-w-sm">
+            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500" />
+            <input
+              type="text"
+              placeholder="Search contacts..."
+              value={searchQuery}
+              onChange={(e) => onSearchQueryChange(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  // Explicitly set the debounced query now to trigger immediate search
+                  onSearchQueryChange(searchQuery);
+                }
+              }}
+              className="w-full bg-[#0e0e0e] border border-[#2e2e2e] rounded-lg py-1.5 pl-8 pr-3 text-[11px] text-gray-300 focus:border-[#3ecf8e] outline-none transition-all"
+            />
+          </div>
+
+          <div className="flex items-center gap-2 overflow-x-auto no-scrollbar py-1">
+            {activeFilters.map((f: FilterCondition) => (
+              <div key={f.id} className="flex items-center gap-1.5 px-2 py-1 bg-[#2e2e2e] rounded-md text-[10px] text-gray-300 border border-[#3e3e3e]">
+                <span className="font-bold text-[#3ecf8e]">{f.column}</span>
+                <span className="opacity-50">{f.operator}</span>
+                <span className="font-medium text-white truncate max-w-[80px]">
+                  {Array.isArray(f.value) ? f.value.join(', ') : f.value}
+                </span>
+                <button onClick={() => removeFilter(f.id)} className="hover:text-rose-400">
+                  <X className="w-2.5 h-2.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+
           <div className="relative" ref={filterRef}>
             <button
               onClick={() => setShowFilterBuilder(!showFilterBuilder)}
@@ -457,88 +519,100 @@ function DataTable({
             </button>
 
             {showFilterBuilder && (
-              <div className="absolute top-full mt-2 left-0 w-[480px] bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl shadow-2xl z-50 p-4">
-                <div className="flex items-center justify-between mb-4">
-                  <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Active Filters</span>
-                  <button onClick={() => onFiltersChange([])} className="text-[10px] text-rose-400 hover:underline">Clear all</button>
+              <div className="absolute top-full mt-2 left-0 w-[480px] bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl shadow-2xl z-50 p-5 ring-1 ring-black/50">
+                <div className="flex items-center justify-between mb-4 pb-2 border-b border-[#2e2e2e]">
+                  <div className="flex items-center gap-2">
+                    <Filter className="w-3.5 h-3.5 text-[#3ecf8e]" />
+                    <span className="text-[11px] font-bold text-gray-200 uppercase tracking-widest">Filter Conditions</span>
+                  </div>
+                  <button onClick={() => onFiltersChange([])} className="text-[10px] text-rose-400 hover:text-rose-300 font-bold uppercase transition-colors">Clear all</button>
                 </div>
 
-                <div className="space-y-4 max-h-[400px] overflow-auto custom-scrollbar mb-4 pr-1">
+                <div className="space-y-3 max-h-[400px] overflow-auto custom-scrollbar mb-4 pr-1">
                   {activeFilters.length === 0 ? (
-                    <p className="text-[11px] text-gray-600 text-center py-4">No active filters.</p>
+                    <div className="text-center py-8 opacity-40">
+                      <Filter className="w-8 h-8 mx-auto mb-2 text-gray-400" />
+                      <p className="text-[11px] text-gray-400">No active filters. Add a condition to start filtering.</p>
+                    </div>
                   ) : (
                     activeFilters.map((filter: FilterCondition) => (
-                      <div key={filter.id} className="flex flex-col gap-2 p-2 bg-[#0e0e0e]/50 border border-[#2e2e2e] rounded-lg relative group">
-                        <button onClick={() => removeFilter(filter.id)} className="absolute -top-2 -right-2 p-1 bg-[#1c1c1c] border border-[#2e2e2e] hover:bg-rose-900/20 hover:text-rose-400 rounded-full text-gray-500 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <X className="w-3 h-3" />
+                      <div key={filter.id} className="flex flex-col gap-3 p-3 bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl relative group hover:border-[#3ecf8e44] transition-all">
+                        <button onClick={() => removeFilter(filter.id)} className="absolute top-2 right-2 p-1.5 text-gray-500 hover:text-rose-400 transition-colors">
+                          <X className="w-3.5 h-3.5" />
                         </button>
 
-                        <div className="flex items-center gap-2">
-                          <select
-                            value={filter.column}
-                            onChange={(e) => updateFilter(filter.id, { column: e.target.value })}
-                            className="bg-[#0e0e0e] border border-[#2e2e2e] text-[11px] rounded px-2 py-1 flex-1 text-gray-300 outline-none focus:border-[#3ecf8e]"
-                          >
-                            {columns.map((c: any) => (
-                              <option key={c.key} value={c.key}>{c.label}</option>
-                            ))}
-                          </select>
+                        <div className="flex items-center gap-3">
+                          <div className="flex-1">
+                            <label className="text-[9px] font-bold text-gray-500 uppercase mb-1 block">Column</label>
+                            <select
+                              value={filter.column}
+                              onChange={(e) => updateFilter(filter.id, { column: e.target.value })}
+                              className="w-full bg-[#1c1c1c] border border-[#2e2e2e] text-[11px] rounded-lg px-2.5 py-1.5 text-gray-200 outline-none focus:border-[#3ecf8e] transition-all"
+                            >
+                              {columns.map((c: any) => (
+                                <option key={c.key} value={c.key}>{c.label}</option>
+                              ))}
+                            </select>
+                          </div>
 
-                          <select
-                            value={filter.operator}
-                            onChange={(e) => updateFilter(filter.id, { operator: e.target.value as FilterOperator })}
-                            className="bg-[#0e0e0e] border border-[#2e2e2e] text-[11px] rounded px-2 py-1 w-24 text-gray-300 outline-none focus:border-[#3ecf8e]"
-                            disabled={filter.column === 'status'}
-                          >
-                            <option value="equals">is</option>
-                            <option value="contains">contains</option>
-                            <option value="starts_with">starts with</option>
-                            <option value="greater_than">&gt;</option>
-                            <option value="less_than">&lt;</option>
-                            {filter.column === 'status' && <option value="in">any of</option>}
-                          </select>
+                          <div className="w-32">
+                            <label className="text-[9px] font-bold text-gray-500 uppercase mb-1 block">Operator</label>
+                            <select
+                              value={filter.operator}
+                              onChange={(e) => updateFilter(filter.id, { operator: e.target.value as FilterOperator })}
+                              className="w-full bg-[#1c1c1c] border border-[#2e2e2e] text-[11px] rounded-lg px-2.5 py-1.5 text-gray-200 outline-none focus:border-[#3ecf8e] disabled:opacity-50 transition-all"
+                              disabled={filter.column === 'status'}
+                            >
+                              <option value="equals">is</option>
+                              <option value="contains">contains</option>
+                              <option value="starts_with">starts with</option>
+                              <option value="greater_than">&gt;</option>
+                              <option value="less_than">&lt;</option>
+                            </select>
+                          </div>
                         </div>
 
-                        {filter.column === 'status' ? (
-                          <div className="flex flex-wrap gap-2 mt-1">
-                            {statusOptions.map(opt => {
-                              const isChecked = Array.isArray(filter.value) && filter.value.includes(opt);
-                              return (
-                                <button
-                                  key={opt}
-                                  onClick={() => {
-                                    const current = Array.isArray(filter.value) ? filter.value : [];
-                                    const next = isChecked ? current.filter(s => s !== opt) : [...current, opt];
-                                    updateFilter(filter.id, { value: next });
-                                  }}
-                                  className={`px-2 py-1 rounded text-[10px] font-bold uppercase transition-all border ${isChecked ? 'bg-[#3ecf8e22] border-[#3ecf8e44] text-[#3ecf8e]' : 'bg-[#1c1c1c] border-[#2e2e2e] text-gray-500 hover:text-gray-300'}`}
-                                >
-                                  {opt}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        ) : filter.column === 'confidence' ? (
-                          <div className="flex items-center gap-2 mt-1">
+                        <div>
+                          <label className="text-[9px] font-bold text-gray-500 uppercase mb-1 block">Value</label>
+                          {filter.column === 'status' ? (
+                            <div className="grid grid-cols-3 gap-2">
+                              {statusOptions.map(opt => {
+                                const isChecked = Array.isArray(filter.value) && filter.value.includes(opt);
+                                return (
+                                  <button
+                                    key={opt}
+                                    onClick={() => {
+                                      const current = Array.isArray(filter.value) ? filter.value : [];
+                                      const next = isChecked ? current.filter(s => s !== opt) : [...current, opt];
+                                      updateFilter(filter.id, { value: next });
+                                    }}
+                                    className={`px-2 py-1.5 rounded-lg text-[10px] font-bold uppercase transition-all border text-center ${isChecked ? 'bg-[#3ecf8e22] border-[#3ecf8e] text-[#3ecf8e]' : 'bg-[#1c1c1c] border-[#2e2e2e] text-gray-500 hover:border-gray-600'}`}
+                                  >
+                                    {opt}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          ) : filter.column === 'confidence' ? (
                             <select
                               value={filter.value}
                               onChange={(e) => updateFilter(filter.id, { value: e.target.value })}
-                              className="bg-[#0e0e0e] border border-[#2e2e2e] text-[11px] rounded px-2 py-1 flex-1 text-gray-300 outline-none focus:border-[#3ecf8e]"
+                              className="w-full bg-[#1c1c1c] border border-[#2e2e2e] text-[11px] rounded-lg px-2.5 py-1.5 text-gray-200 outline-none focus:border-[#3ecf8e] transition-all"
                             >
                               {confidenceOptions.map(opt => (
                                 <option key={opt} value={opt}>{opt}</option>
                               ))}
                             </select>
-                          </div>
-                        ) : (
-                          <input
-                            type="text"
-                            placeholder="Value..."
-                            value={filter.value}
-                            onChange={(e) => updateFilter(filter.id, { value: e.target.value })}
-                            className="bg-[#0e0e0e] border border-[#2e2e2e] text-[11px] rounded px-2 py-1 w-full text-gray-300 focus:border-[#3ecf8e] outline-none mt-1"
-                          />
-                        )}
+                          ) : (
+                            <input
+                              type="text"
+                              placeholder="Type value..."
+                              value={filter.value}
+                              onChange={(e) => updateFilter(filter.id, { value: e.target.value })}
+                              className="w-full bg-[#1c1c1c] border border-[#2e2e2e] text-[11px] rounded-lg px-2.5 py-1.5 text-gray-200 focus:border-[#3ecf8e] outline-none transition-all placeholder:text-gray-600"
+                            />
+                          )}
+                        </div>
                       </div>
                     ))
                   )}
@@ -546,9 +620,9 @@ function DataTable({
 
                 <button
                   onClick={addFilter}
-                  className="w-full flex items-center justify-center gap-2 py-2 border border-dashed border-[#2e2e2e] rounded-lg text-[11px] text-gray-400 hover:text-white transition-all"
+                  className="w-full flex items-center justify-center gap-2 py-2.5 border border-dashed border-[#2e2e2e] rounded-xl text-[11px] font-bold text-gray-400 hover:text-[#3ecf8e] hover:border-[#3ecf8e] hover:bg-[#3ecf8e]/5 transition-all"
                 >
-                  <Plus className="w-3.5 h-3.5" /> Add Condition
+                  <Plus className="w-3.5 h-3.5" /> Add New Condition
                 </button>
               </div>
             )}

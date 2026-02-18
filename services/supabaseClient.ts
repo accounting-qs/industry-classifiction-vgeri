@@ -48,7 +48,14 @@ class SupabaseService {
     }
   }
 
-  private applyFilters(query: any, filters: FilterCondition[], enrichmentCols: string[]) {
+  private applyFilters(query: any, filters: FilterCondition[], enrichmentCols: string[], searchQuery?: string) {
+    if (searchQuery) {
+      const q = `"%${searchQuery}%"`;
+      // Search across contacts and enrichment classification with correct joined syntax
+      // Quoting the value (q) is necessary for PostgREST to parse values with dots or special characters
+      query = query.or(`first_name.ilike.${q},last_name.ilike.${q},email.ilike.${q},company_website.ilike.${q},industry.ilike.${q},enrichments(classification.ilike.${q})`);
+    }
+
     filters.forEach(f => {
       const isEnrichmentCol = enrichmentCols.includes(f.column);
       const colPath = isEnrichmentCol ? `enrichments.${f.column}` : f.column;
@@ -124,7 +131,8 @@ class SupabaseService {
     page: number,
     pageSize: number,
     enrichedOnly: boolean = false,
-    filters: FilterCondition[] = []
+    filters: FilterCondition[] = [],
+    searchQuery?: string
   ): Promise<{ data: MergedContact[], count: number }> {
     if (!this.client) return { data: [], count: 0 };
 
@@ -138,7 +146,7 @@ class SupabaseService {
       .from('contacts')
       .select(selectStr, { count: 'exact' });
 
-    query = this.applyFilters(query, filters, enrichmentCols);
+    query = this.applyFilters(query, filters, enrichmentCols, searchQuery);
 
     const { data, error, count } = await query
       .order('id', { ascending: true })
@@ -152,7 +160,7 @@ class SupabaseService {
     };
   }
 
-  async getAllFilteredContacts(filters: FilterCondition[]): Promise<MergedContact[]> {
+  async getAllFilteredContacts(filters: FilterCondition[], searchQuery?: string): Promise<MergedContact[]> {
     if (!this.client) return [];
 
     const enrichmentCols = ['status', 'classification', 'confidence', 'cost', 'processed_at'];
@@ -162,7 +170,7 @@ class SupabaseService {
       .from('contacts')
       .select(selectStr);
 
-    query = this.applyFilters(query, filters, enrichmentCols);
+    query = this.applyFilters(query, filters, enrichmentCols, searchQuery);
 
     const { data, error } = await query.order('id', { ascending: true });
 

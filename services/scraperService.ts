@@ -35,6 +35,7 @@ async function promiseAny<T>(promises: Promise<T>[]): Promise<T> {
 const PROXY_LIST = [
   (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
   (url: string) => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+  // Codetabs proxy works well most of the time
   (url: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
 ];
 
