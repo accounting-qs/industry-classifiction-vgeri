@@ -14,25 +14,23 @@ import {
  */
 
 const getZenRowsKey = () => {
-  // @ts-ignore
-  if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_ZENROWS_API_KEY) {
-    return import.meta.env.VITE_ZENROWS_API_KEY;
+  try {
+    // @ts-ignore
+    const key = (import.meta as any)?.env?.VITE_ZENROWS_API_KEY || (process as any)?.env?.VITE_ZENROWS_API_KEY;
+    return key;
+  } catch (e) {
+    return undefined;
   }
-  if (typeof process !== 'undefined' && process.env && process.env.VITE_ZENROWS_API_KEY) {
-    return process.env.VITE_ZENROWS_API_KEY;
-  }
-  return undefined;
 };
 
 const getScrapingBeeKey = () => {
-  // @ts-ignore
-  if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_SCRAPINGBEE_API_KEY) {
-    return import.meta.env.VITE_SCRAPINGBEE_API_KEY;
+  try {
+    // @ts-ignore
+    const key = (import.meta as any)?.env?.VITE_SCRAPINGBEE_API_KEY || (process as any)?.env?.VITE_SCRAPINGBEE_API_KEY;
+    return key;
+  } catch (e) {
+    return undefined;
   }
-  if (typeof process !== 'undefined' && process.env && process.env.VITE_SCRAPINGBEE_API_KEY) {
-    return process.env.VITE_SCRAPINGBEE_API_KEY;
-  }
-  return undefined;
 };
 
 const PROXY_LIST = [
@@ -211,18 +209,11 @@ async function attemptStandardProxy(index: number, targetUrl: string): Promise<s
 }
 
 async function attemptZenRows(apiKey: string, targetUrl: string): Promise<string> {
-  // js_render=true and antibot=true for maximum bypassing power
-  const params = new URLSearchParams({
-    apikey: apiKey,
-    url: targetUrl,
-    js_render: 'true',
-    antibot: 'true',
-    wait_for: 'body'
-  });
+  // Use the user's successful "formula" first: apikey then url correctly encoded
+  const zenUrl = `https://api.zenrows.com/v1/?apikey=${apiKey}&url=${encodeURIComponent(targetUrl)}&js_render=true&antibot=true&premium_proxy=true`;
 
-  const zenUrl = `https://api.zenrows.com/v1/?${params.toString()}`;
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 45000); // 45s for premium fallback
+  const timeoutId = setTimeout(() => controller.abort(), 45000);
 
   try {
     const response = await fetch(zenUrl, { signal: controller.signal });
