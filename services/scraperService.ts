@@ -24,6 +24,17 @@ const getZenRowsKey = () => {
   return undefined;
 };
 
+const getScrapingBeeKey = () => {
+  // @ts-ignore
+  if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_SCRAPINGBEE_API_KEY) {
+    return import.meta.env.VITE_SCRAPINGBEE_API_KEY;
+  }
+  if (typeof process !== 'undefined' && process.env && process.env.VITE_SCRAPINGBEE_API_KEY) {
+    return process.env.VITE_SCRAPINGBEE_API_KEY;
+  }
+  return undefined;
+};
+
 const PROXY_LIST = [
   // Codetabs proxy works well most of the time
   (url: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
@@ -82,25 +93,43 @@ export async function fetchDigest(
     }
   }
 
-  // --- Final Fallback: ZenRows ---
+  // --- Phase 3: Premium Fallbacks (ZenRows & ScrapingBee) ---
   const zenKey = getZenRowsKey();
+  const beeKey = getScrapingBeeKey();
+
   if (zenKey) {
     try {
       const pName = "ZenRows (Premium)";
-      if (onProgress) onProgress(`🚀 [Scraper] Standard proxies exhausted for ${start_url}. Attempting ZenRows...`);
+      if (onProgress) onProgress(`🚀 [Scraper] Attempting ZenRows premium for ${start_url}...`);
       const raw_html = await attemptZenRows(zenKey, start_url);
       return {
         digest: processHtmlToDigest(raw_html, start_url, pName),
         proxyName: pName
       };
     } catch (err: any) {
-      const errorMsg = `❌ [Scraper] ZenRows premium also failed for ${start_url}: ${err.message}`;
-      console.error(errorMsg);
+      const errorMsg = `❌ [Scraper] ZenRows premium failed for ${start_url}: ${err.message}`;
+      console.warn(errorMsg);
       if (onProgress) onProgress(errorMsg);
     }
   }
 
-  throw new Error(`All proxies failed for ${start_url}`);
+  if (beeKey) {
+    try {
+      const pName = "ScrapingBee (Premium)";
+      if (onProgress) onProgress(`🚀 [Scraper] Attempting ScrapingBee premium for ${start_url}...`);
+      const raw_html = await attemptScrapingBee(beeKey, start_url);
+      return {
+        digest: processHtmlToDigest(raw_html, start_url, pName),
+        proxyName: pName
+      };
+    } catch (err: any) {
+      const errorMsg = `❌ [Scraper] ScrapingBee premium failed for ${start_url}: ${err.message}`;
+      console.warn(errorMsg);
+      if (onProgress) onProgress(errorMsg);
+    }
+  }
+
+  throw new Error(`Bulletproof scraping failed for ${start_url}`);
 }
 
 async function attemptDirectFetch(targetUrl: string): Promise<string> {
@@ -112,13 +141,30 @@ async function attemptDirectFetch(targetUrl: string): Promise<string> {
       signal: controller.signal,
       redirect: "follow",
       headers: {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'User-Agent': 'Mozilla/5.0 (compatible; QSbot/1.0; +http://www.accounting-qs.com)'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Sec-Ch-Ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1'
       }
     });
     clearTimeout(timeoutId);
 
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) {
+      // If HTTPS fails, try a quick HTTP fallback for old sites
+      if (targetUrl.startsWith('https://')) {
+        return attemptDirectFetch(targetUrl.replace('https://', 'http://'));
+      }
+      throw new Error(`HTTP ${response.status}`);
+    }
     const raw_html = await response.text();
     validateHtml(raw_html, targetUrl);
     return raw_html;
@@ -137,9 +183,10 @@ async function attemptStandardProxy(index: number, targetUrl: string): Promise<s
     const response = await fetch(proxyUrl, {
       signal: controller.signal,
       headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Origin': 'https://corsproxy.io', // Spoof origin to satisfy some strict proxies
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://corsproxy.io',
         'Referer': 'https://corsproxy.io/'
       }
     });
@@ -164,10 +211,18 @@ async function attemptStandardProxy(index: number, targetUrl: string): Promise<s
 }
 
 async function attemptZenRows(apiKey: string, targetUrl: string): Promise<string> {
-  // NOTE: removed autoparse=true to get raw HTML for processHtmlToDigest consistency
-  const zenUrl = `https://api.zenrows.com/v1/?apikey=${apiKey}&url=${encodeURIComponent(targetUrl)}`;
+  // js_render=true and antibot=true for maximum bypassing power
+  const params = new URLSearchParams({
+    apikey: apiKey,
+    url: targetUrl,
+    js_render: 'true',
+    antibot: 'true',
+    wait_for: 'body'
+  });
+
+  const zenUrl = `https://api.zenrows.com/v1/?${params.toString()}`;
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 30000); // ZenRows gets 30s as it's deep fallback
+  const timeoutId = setTimeout(() => controller.abort(), 45000); // 45s for premium fallback
 
   try {
     const response = await fetch(zenUrl, { signal: controller.signal });
@@ -183,13 +238,38 @@ async function attemptZenRows(apiKey: string, targetUrl: string): Promise<string
   }
 }
 
+async function attemptScrapingBee(apiKey: string, targetUrl: string): Promise<string> {
+  const params = new URLSearchParams({
+    api_key: apiKey,
+    url: targetUrl,
+    render_js: 'true',
+    premium_proxy: 'true'
+  });
+
+  const beeUrl = `https://app.scrapingbee.com/api/v1/?${params.toString()}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 45000);
+
+  try {
+    const response = await fetch(beeUrl, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (!response.ok) throw new Error(`ScrapingBee HTTP ${response.status}`);
+
+    const raw_html = await response.text();
+    validateHtml(raw_html, targetUrl);
+    return raw_html;
+  } catch (e: any) {
+    clearTimeout(timeoutId);
+    throw e;
+  }
+}
+
 function validateHtml(html: string, targetUrl: string) {
   const lowerHtml = (html || "").toLowerCase();
   const proxySignatures = [
-    "api.codetabs.com", "corsproxy.io", "corsfix.com", "corsfix_error", "zenrows.com", "allorigins.win",
-    "cloudflare.com/5xx-error", "access denied", "checking your browser",
-    "captcha-delivery.com", "error 403", "forbidden", "not found",
-    "cors error", "proxy error", "unusual traffic"
+    "cloudflare-error", "px-captcha", "captcha-delivery.com",
+    "access denied", "checking your browser", "unusual traffic",
+    "corsfix_error", "zenrows.com/error", "scrapingbee.com/error"
   ];
 
   const matchedSignature = proxySignatures.find(sig =>
