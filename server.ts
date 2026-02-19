@@ -182,6 +182,43 @@ async function runBackgroundEnrichment(contactIds: string[]) {
         return { ...contactData, ...enrichmentData, status: enrichmentData.status || 'new' };
     });
 
+    // --- ENRICHMENT CACHING (Scrape Once, Use Many) ---
+    // 1. Identify all unique websites in the batch
+    const uniqueWebsites = Array.from(new Set(batch.map(c => c.company_website).filter(Boolean)));
+    const domainCache: Record<string, any> = {};
+
+    if (uniqueWebsites.length > 0) {
+        addServerLog(`Checking cache for ${uniqueWebsites.length} unique websites...`, 'Sync');
+        const { data: cachedEnrichments } = await supabase
+            .from('enrichments')
+            .select(`
+                classification,
+                confidence,
+                reasoning,
+                contacts!inner(company_website)
+            `)
+            .eq('status', 'completed')
+            .gte('confidence', 7)
+            .in('contacts.company_website', uniqueWebsites);
+
+        if (cachedEnrichments) {
+            cachedEnrichments.forEach((row: any) => {
+                const website = row.contacts?.company_website;
+                if (website && !domainCache[website]) {
+                    domainCache[website] = {
+                        classification: row.classification,
+                        confidence: row.confidence,
+                        reasoning: row.reasoning
+                    };
+                }
+            });
+            const hitCount = Object.keys(domainCache).length;
+            if (hitCount > 0) {
+                addServerLog(`⚡ Cache Hit: Found high-confidence results for ${hitCount} domains.`, 'Sync');
+            }
+        }
+    }
+
     const BATCH_SIZE = 10;
     let currentIndex = 0;
 
@@ -191,24 +228,36 @@ async function runBackgroundEnrichment(contactIds: string[]) {
 
         try {
             const sprintEnd = Math.min(currentIndex, batch.length);
-            addServerLog(`Sprint [${currentIndex - BATCH_SIZE + 1}-${sprintEnd}/${batch.length}]: Scraping websites...`, 'Pipeline', 'phase');
 
-            const scrapes = await Promise.all(sprintItems.map(async (c) => {
-                const domain = c.company_website || c.email.split('@')[1];
-                try {
-                    const { digest, proxyName } = await fetchDigest(domain, msg => {
-                        // Map internal scraper logs to structured system
-                        const level = msg.includes('failed') || msg.includes('FATAL') ? 'warn' : 'info';
-                        addServerLog(msg, 'Scraper', level);
-                    });
-                    addServerLog(`${domain} success via ${proxyName}`, 'Scraper');
-                    return { contact: c, digest, proxyName, success: true };
-                } catch (e: any) {
-                    addServerLog(`${domain} FATAL: ${e.message}`, 'Scraper', 'error');
-                    return { contact: c, digest: e.message, success: false };
-                }
-            }));
+            // Separate items: Cached vs Needs Scraping
+            const itemsToScrape = sprintItems.filter(item => !domainCache[item.company_website]);
+            const itemsFromCache = sprintItems.filter(item => domainCache[item.company_website]);
 
+            if (itemsFromCache.length > 0) {
+                addServerLog(`♻️ Reusing cache for ${itemsFromCache.length} items.`, 'Sync');
+            }
+
+            let scrapes: any[] = [];
+            if (itemsToScrape.length > 0) {
+                addServerLog(`Sprint [${currentIndex - BATCH_SIZE + 1}-${sprintEnd}/${batch.length}]: Scraping ${itemsToScrape.length} websites...`, 'Pipeline', 'phase');
+                const scrapeResults = await Promise.all(itemsToScrape.map(async (c) => {
+                    const domain = c.company_website || c.email.split('@')[1];
+                    try {
+                        const { digest, proxyName } = await fetchDigest(domain, msg => {
+                            const level = msg.includes('failed') || msg.includes('FATAL') ? 'warn' : 'info';
+                            addServerLog(msg, 'Scraper', level);
+                        });
+                        addServerLog(`${domain} success via ${proxyName}`, 'Scraper');
+                        return { contact: c, digest, proxyName, success: true };
+                    } catch (e: any) {
+                        addServerLog(`${domain} FATAL: ${e.message}`, 'Scraper', 'error');
+                        return { contact: c, digest: e.message, success: false };
+                    }
+                }));
+                scrapes = scrapeResults;
+            }
+
+            // Results processing
             const validScrapes = scrapes.filter(s => s.success);
             const failedScrapes = scrapes.filter(s => !s.success);
 
@@ -228,7 +277,31 @@ async function runBackgroundEnrichment(contactIds: string[]) {
             const enrichmentsToUpsert: Partial<Enrichment>[] = [];
             const contactsToUpdate: Partial<Contact>[] = [];
 
-            // Result processing for successful scrapes (AI Results)
+            // 1. Process Cached Items (Bypass AI entirely)
+            itemsFromCache.forEach(item => {
+                const cached = domainCache[item.company_website];
+                if (cached) {
+                    jobStats.completed++;
+                    enrichmentsToUpsert.push({
+                        contact_id: item.contact_id,
+                        status: 'completed',
+                        confidence: cached.confidence,
+                        reasoning: `⚡ Reused high-confidence result (Score: ${cached.confidence}): ${cached.reasoning}`,
+                        classification: cached.classification,
+                        cost: 0, // Cache is free!
+                        processed_at: new Date().toISOString()
+                    });
+
+                    contactsToUpdate.push({
+                        id: item.id,
+                        email: item.email,
+                        industry: cached.classification,
+                        lead_list_name: item.lead_list_name
+                    } as any);
+                }
+            });
+
+            // 2. Result processing for successful scrapes (AI Results)
             aiResults.forEach(res => {
                 const original = validScrapes.find(s => s.contact.contact_id === res.contact_id);
                 if (original) {
