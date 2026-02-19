@@ -185,10 +185,13 @@ async function runBackgroundEnrichment(contactIds: string[]) {
     // --- ENRICHMENT CACHING (Scrape Once, Use Many) ---
     // 1. Identify all unique websites in the batch
     const uniqueWebsites = Array.from(new Set(batch.map(c => c.company_website).filter(Boolean)));
-    const domainCache: Record<string, any> = {};
+    const domainCache: Record<string, any> = {}; // Full classification cache
+    const digestCache: Record<string, string> = {}; // HTML content cache
 
     if (uniqueWebsites.length > 0) {
         addServerLog(`Checking cache for ${uniqueWebsites.length} unique websites...`, 'Sync');
+
+        // A. Check for existing high-confidence classifications
         const { data: cachedEnrichments } = await supabase
             .from('enrichments')
             .select(`
@@ -212,10 +215,24 @@ async function runBackgroundEnrichment(contactIds: string[]) {
                     };
                 }
             });
-            const hitCount = Object.keys(domainCache).length;
-            if (hitCount > 0) {
-                addServerLog(`⚡ Cache Hit: Found high-confidence results for ${hitCount} domains.`, 'Sync');
-            }
+        }
+
+        // B. Check for existing scraped HTML content (Global Digest Cache)
+        const { data: cachedDigests } = await supabase
+            .from('scraped_data')
+            .select('domain, content')
+            .in('domain', uniqueWebsites);
+
+        if (cachedDigests) {
+            cachedDigests.forEach(d => {
+                digestCache[d.domain] = d.content;
+            });
+        }
+
+        const hitCount = Object.keys(domainCache).length;
+        const digestHitCount = Object.keys(digestCache).length;
+        if (hitCount > 0 || digestHitCount > 0) {
+            addServerLog(`⚡ Cache Hit: ${hitCount} classifications, ${digestHitCount} HTML digests found.`, 'Sync');
         }
     }
 
@@ -229,15 +246,31 @@ async function runBackgroundEnrichment(contactIds: string[]) {
         try {
             const sprintEnd = Math.min(currentIndex, batch.length);
 
-            // Separate items: Cached vs Needs Scraping
-            const itemsToScrape = sprintItems.filter(item => !domainCache[item.company_website]);
-            const itemsFromCache = sprintItems.filter(item => domainCache[item.company_website]);
+            // Separate items: Cached vs Content Cache vs Needs Scraping
+            const itemsToScrape = sprintItems.filter(item => !domainCache[item.company_website] && !digestCache[item.company_website]);
+            const itemsFromDigestCache = sprintItems.filter(item => !domainCache[item.company_website] && digestCache[item.company_website]);
+            const itemsFromFullCache = sprintItems.filter(item => domainCache[item.company_website]);
 
-            if (itemsFromCache.length > 0) {
-                addServerLog(`♻️ Reusing cache for ${itemsFromCache.length} items.`, 'Sync');
+            if (itemsFromFullCache.length > 0) {
+                addServerLog(`♻️ Reusing classification for ${itemsFromFullCache.length} items.`, 'Sync');
+            }
+            if (itemsFromDigestCache.length > 0) {
+                addServerLog(`📄 Reusing HTML digest for ${itemsFromDigestCache.length} items (skipping scrape).`, 'Sync');
             }
 
             let scrapes: any[] = [];
+
+            // 1. Content already in cache
+            itemsFromDigestCache.forEach(item => {
+                scrapes.push({
+                    contact: item,
+                    digest: digestCache[item.company_website],
+                    proxyName: 'Cache',
+                    success: true
+                });
+            });
+
+            // 2. Perform live scraping for the rest
             if (itemsToScrape.length > 0) {
                 addServerLog(`Sprint [${currentIndex - BATCH_SIZE + 1}-${sprintEnd}/${batch.length}]: Scraping ${itemsToScrape.length} websites...`, 'Pipeline', 'phase');
                 const scrapeResults = await Promise.all(itemsToScrape.map(async (c) => {
@@ -248,13 +281,17 @@ async function runBackgroundEnrichment(contactIds: string[]) {
                             addServerLog(msg, 'Scraper', level);
                         });
                         addServerLog(`${domain} success via ${proxyName}`, 'Scraper');
+
+                        // PERSIST SCRAPED DATA (Fire and forget)
+                        supabase.from('scraped_data').upsert({ domain, content: digest }, { onConflict: 'domain' }).then(() => { });
+
                         return { contact: c, digest, proxyName, success: true };
                     } catch (e: any) {
                         addServerLog(`${domain} FATAL: ${e.message}`, 'Scraper', 'error');
                         return { contact: c, digest: e.message, success: false };
                     }
                 }));
-                scrapes = scrapeResults;
+                scrapes.push(...scrapeResults);
             }
 
             // Results processing
@@ -277,8 +314,8 @@ async function runBackgroundEnrichment(contactIds: string[]) {
             const enrichmentsToUpsert: Partial<Enrichment>[] = [];
             const contactsToUpdate: Partial<Contact>[] = [];
 
-            // 1. Process Cached Items (Bypass AI entirely)
-            itemsFromCache.forEach(item => {
+            // 1. Process Fully Cached Items
+            itemsFromFullCache.forEach(item => {
                 const cached = domainCache[item.company_website];
                 if (cached) {
                     jobStats.completed++;
@@ -288,7 +325,8 @@ async function runBackgroundEnrichment(contactIds: string[]) {
                         confidence: cached.confidence,
                         reasoning: `⚡ Reused high-confidence result (Score: ${cached.confidence}): ${cached.reasoning}`,
                         classification: cached.classification,
-                        cost: 0, // Cache is free!
+                        page_html: digestCache[item.company_website] || undefined,
+                        cost: 0,
                         processed_at: new Date().toISOString()
                     });
 
@@ -312,6 +350,7 @@ async function runBackgroundEnrichment(contactIds: string[]) {
                         confidence: res.confidence,
                         reasoning: res.reasoning,
                         classification: isSuccess ? res.classification : undefined,
+                        page_html: original.digest,
                         cost: res.cost,
                         processed_at: new Date().toISOString()
                     });
