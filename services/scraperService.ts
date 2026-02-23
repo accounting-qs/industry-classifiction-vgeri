@@ -266,7 +266,8 @@ function validateHtml(html: string, targetUrl: string) {
   const proxySignatures = [
     "cloudflare-error", "px-captcha", "captcha-delivery.com",
     "access denied", "checking your browser", "unusual traffic",
-    "corsfix_error", "zenrows.com/error", "scrapingbee.com/error"
+    "corsfix_error", "zenrows.com/error", "scrapingbee.com/error",
+    "attention required! | cloudflare", "sorry, you have been blocked"
   ];
 
   const matchedSignature = proxySignatures.find(sig =>
