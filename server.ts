@@ -173,13 +173,22 @@ async function runBackgroundEnrichment(contactIds: string[]) {
 
     addServerLog(`Starting Enrichment Pipeline for ${contacts.length} records.`, 'Pipeline', 'phase');
 
-    // Flatten contacts (MergedContact pattern)
+    // Flatten contacts (MergedContact pattern) safely
     const batch: MergedContact[] = contacts.map((item: any) => {
-        const enrichmentData = Array.isArray(item.enrichments) && item.enrichments.length > 0
+        const enrichmentDataRaw = Array.isArray(item.enrichments) && item.enrichments.length > 0
             ? item.enrichments[0]
             : (item.enrichments || {});
+
+        // Prevent enrichmentData.id from overwriting contactData.id!
+        const { id: eId, ...safeEnrichmentData } = enrichmentDataRaw;
         const { enrichments, ...contactData } = item;
-        return { ...contactData, ...enrichmentData, status: enrichmentData.status || 'new' };
+
+        return {
+            ...contactData,
+            ...safeEnrichmentData,
+            enrichment_id: eId,
+            status: safeEnrichmentData.status || 'new'
+        };
     });
 
     // --- ENRICHMENT CACHING (Scrape Once, Use Many) ---

@@ -96,18 +96,20 @@ class SupabaseService {
   private flattenData(data: any[] | null): MergedContact[] {
     return ((data as any[]) || []).map((item: any) => {
       const enrichmentList = item.enrichments;
-      const enrichmentData = Array.isArray(enrichmentList) && enrichmentList.length > 0
+      const enrichmentDataRaw = Array.isArray(enrichmentList) && enrichmentList.length > 0
         ? enrichmentList[0]
         : (enrichmentList && !Array.isArray(enrichmentList) ? enrichmentList : {});
 
+      // Prevent enrichmentData.id from overwriting contactData.id
+      const { id: eId, ...safeEnrichmentData } = enrichmentDataRaw;
       const { enrichments, ...contactData } = item;
-      const finalStatus = enrichmentData.status || 'new';
+      const finalStatus = safeEnrichmentData.status || 'new';
 
       return {
         ...contactData,
-        ...enrichmentData,
+        ...safeEnrichmentData,
         status: finalStatus,
-        enrichment_id: enrichmentData.id || null
+        enrichment_id: eId || null
       };
     });
   }
