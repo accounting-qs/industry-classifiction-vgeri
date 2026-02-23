@@ -16,7 +16,7 @@ import {
 const getZenRowsKey = () => {
   try {
     // @ts-ignore
-    const key = (import.meta as any)?.env?.VITE_ZENROWS_API_KEY || (process as any)?.env?.VITE_ZENROWS_API_KEY;
+    const key = (import.meta as any)?.env?.VITE_ZENROWS_API_KEY || (process as any)?.env?.VITE_ZENROWS_API_KEY || (typeof process !== 'undefined' ? process.env.VITE_ZENROWS_API_KEY : undefined);
     return key;
   } catch (e) {
     return undefined;
@@ -26,7 +26,7 @@ const getZenRowsKey = () => {
 const getScrapingBeeKey = () => {
   try {
     // @ts-ignore
-    const key = (import.meta as any)?.env?.VITE_SCRAPINGBEE_API_KEY || (process as any)?.env?.VITE_SCRAPINGBEE_API_KEY;
+    const key = (import.meta as any)?.env?.VITE_SCRAPINGBEE_API_KEY || (process as any)?.env?.VITE_SCRAPINGBEE_API_KEY || (typeof process !== 'undefined' ? process.env.VITE_SCRAPINGBEE_API_KEY : undefined);
     return key;
   } catch (e) {
     return undefined;
@@ -42,6 +42,12 @@ const PROXY_LIST = [
 ];
 
 const PROXY_NAMES = ["Codetabs", "Corsproxy.io", "Corsfix", "AllOrigins"];
+const PROXY_DOMAINS = [
+  "https://api.codetabs.com",
+  "https://corsproxy.io",
+  "https://proxy.corsfix.com",
+  "https://api.allorigins.win"
+];
 
 function normalizeUrl(url_or_domain: string): string {
   let s = (url_or_domain || "").trim();
@@ -178,14 +184,15 @@ async function attemptStandardProxy(index: number, targetUrl: string): Promise<s
   const timeoutId = setTimeout(() => controller.abort(), 20000);
 
   try {
+    const proxyDomain = PROXY_DOMAINS[index] || "https://corsproxy.io";
     const response = await fetch(proxyUrl, {
       signal: controller.signal,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Origin': 'https://corsproxy.io',
-        'Referer': 'https://corsproxy.io/'
+        'Origin': proxyDomain,
+        'Referer': proxyDomain + '/'
       }
     });
     clearTimeout(timeoutId);
@@ -208,7 +215,7 @@ async function attemptStandardProxy(index: number, targetUrl: string): Promise<s
   }
 }
 
-async function attemptZenRows(apiKey: string, targetUrl: string): Promise<string> {
+export async function attemptZenRows(apiKey: string, targetUrl: string): Promise<string> {
   // Use the user's successful "formula" first: apikey then url correctly encoded
   const zenUrl = `https://api.zenrows.com/v1/?apikey=${apiKey}&url=${encodeURIComponent(targetUrl)}&js_render=true&antibot=true&premium_proxy=true`;
 
@@ -229,12 +236,11 @@ async function attemptZenRows(apiKey: string, targetUrl: string): Promise<string
   }
 }
 
-async function attemptScrapingBee(apiKey: string, targetUrl: string): Promise<string> {
+export async function attemptScrapingBee(apiKey: string, targetUrl: string): Promise<string> {
   const params = new URLSearchParams({
     api_key: apiKey,
     url: targetUrl,
-    render_js: 'true',
-    premium_proxy: 'true'
+    render_js: 'true'
   });
 
   const beeUrl = `https://app.scrapingbee.com/api/v1/?${params.toString()}`;
@@ -272,8 +278,11 @@ function validateHtml(html: string, targetUrl: string) {
 }
 
 function processHtmlToDigest(raw_html: string, start_url: string, proxyName: string): string {
-  const capped_html = raw_html.slice(0, MAX_HTML_BYTES);
-  const clean = stripCssJs(capped_html);
+  // CRITICAL FIX: Strip CSS/JS *before* capping the HTML length!
+  // Otherwise a large style/script tag might get cut in half, leaving an unclosed <style> tag
+  // that defeats all regex stripping and spills CSS into the visible text.
+  const clean_full = stripCssJs(raw_html);
+  const clean = clean_full.slice(0, MAX_HTML_BYTES);
 
   const title = extractOne(clean, /<title[^>]*>([\s\S]*?)<\/title>/i);
   const meta_desc = extractOne(

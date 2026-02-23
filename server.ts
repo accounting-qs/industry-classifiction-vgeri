@@ -247,8 +247,14 @@ async function runBackgroundEnrichment(contactIds: string[]) {
             const sprintEnd = Math.min(currentIndex, batch.length);
 
             // Separate items: Cached vs Content Cache vs Needs Scraping
-            const itemsToScrape = sprintItems.filter(item => !domainCache[item.company_website] && !digestCache[item.company_website]);
-            const itemsFromDigestCache = sprintItems.filter(item => !domainCache[item.company_website] && digestCache[item.company_website]);
+            const itemsToScrape = sprintItems.filter(item => {
+                const isLowConfidence = item.confidence !== undefined && item.confidence !== null && item.confidence < 7;
+                return isLowConfidence || (!domainCache[item.company_website] && !digestCache[item.company_website]);
+            });
+            const itemsFromDigestCache = sprintItems.filter(item => {
+                const isLowConfidence = item.confidence !== undefined && item.confidence !== null && item.confidence < 7;
+                return !isLowConfidence && !domainCache[item.company_website] && digestCache[item.company_website];
+            });
             const itemsFromFullCache = sprintItems.filter(item => domainCache[item.company_website]);
 
             if (itemsFromFullCache.length > 0) {
@@ -257,6 +263,13 @@ async function runBackgroundEnrichment(contactIds: string[]) {
             if (itemsFromDigestCache.length > 0) {
                 addServerLog(`📄 Reusing HTML digest for ${itemsFromDigestCache.length} items (skipping scrape).`, 'Sync');
             }
+
+            // Explicit logging for items forced into rescrape
+            itemsToScrape.forEach(item => {
+                if (item.confidence !== undefined && item.confidence !== null && item.confidence < 7) {
+                    addServerLog(`♻️ Rescraping ${item.company_website || item.email} (Previous confidence ${item.confidence} < 7)`, 'Pipeline', 'warn');
+                }
+            });
 
             let scrapes: any[] = [];
 
@@ -395,7 +408,8 @@ async function runBackgroundEnrichment(contactIds: string[]) {
                 if (syncError) addServerLog(`🛑 [Sync] Failed to save enrichments: ${syncError.message}`);
             }
             if (contactsToUpdate.length > 0) {
-                const { error: contactError } = await supabase.from('contacts').upsert(contactsToUpdate, { onConflict: 'email' });
+                // Upsert by primary key "id" to avoid "contacts_pkey" constraint errors
+                const { error: contactError } = await supabase.from('contacts').upsert(contactsToUpdate, { onConflict: 'id' });
                 if (contactError) addServerLog(`Failed to update contact records: ${contactError.message}`, 'Sync', 'error');
             }
 
