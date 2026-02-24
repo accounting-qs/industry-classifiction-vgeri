@@ -27,7 +27,8 @@ import {
   ExternalLink,
   Cpu,
   Activity,
-  Play
+  Play,
+  BarChart2
 } from 'lucide-react';
 
 /**
@@ -276,6 +277,9 @@ export default function App() {
           <SidebarIconButton active={activeTab === AppTab.MANAGER} onClick={() => setActiveTab(AppTab.MANAGER)} icon={<Users className="w-5 h-5" />} label="Contacts" />
           <SidebarIconButton active={activeTab === AppTab.ENRICHMENT} onClick={() => setActiveTab(AppTab.ENRICHMENT)} icon={<Zap className={`w-5 h-5 ${stats.isProcessing ? 'text-[#3ecf8e] animate-pulse' : ''}`} />} label="Pipeline Monitor" />
         </nav>
+        <div className="p-2 border-t border-[#2e2e2e]">
+          <SidebarIconButton active={activeTab === AppTab.PROXIES} onClick={() => setActiveTab(AppTab.PROXIES)} icon={<BarChart2 className={`w-5 h-5 ${activeTab === AppTab.PROXIES ? 'text-[#3ecf8e]' : ''}`} />} label="Proxy Performance" />
+        </div>
       </aside>
 
       <main className="flex-1 flex flex-col min-w-0 bg-[#1c1c1c]">
@@ -290,7 +294,19 @@ export default function App() {
         </header>
 
         <div className="flex-1 overflow-hidden flex flex-col">
-          {activeTab === AppTab.MANAGER ? (
+          {activeTab === AppTab.PROXIES ? (
+            <ProxyStatsDashboard />
+          ) : activeTab === AppTab.ENRICHMENT ? (
+            <PipelineMonitor
+              stats={stats}
+              logs={logs}
+              resumePendingQueue={resumePendingQueue}
+              stopEnrichment={stopEnrichment}
+              isStopping={isStopping}
+              setLogs={setLogs}
+              logContainerRef={logContainerRef}
+            />
+          ) : activeTab === AppTab.MANAGER ? (
             <DataTable
               data={contacts}
               activeFilters={activeFilters}
@@ -381,7 +397,7 @@ export default function App() {
                     </div>
                   ) : (
                     <div className="flex flex-col-reverse min-h-full">
-                      {logs.map((l, i) => {
+                      {logs.map((l: any, i: number) => {
                         const date = new Date(l.timestamp);
                         const timeStr = date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
                         const isError = l.level === 'error';
@@ -793,3 +809,206 @@ function StatusBadge({ status, stage, errorMessage }: { status: string, stage?: 
   };
   return <span className={`px-1.5 py-0.5 rounded border text-[8px] font-bold uppercase tracking-wider ${styles[currentStatus] || ''}`} title={errorMessage}>{currentStatus}</span>;
 }
+
+function PipelineMonitor({ stats, logs, resumePendingQueue, stopEnrichment, isStopping, setLogs, logContainerRef }: any) {
+  return (
+    <div className="flex-1 p-6 overflow-hidden bg-[#1c1c1c] flex flex-col h-full min-h-0">
+      <div className="max-w-5xl mx-auto w-full flex-1 flex flex-col space-y-6 min-h-0 h-full">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-xl font-bold flex items-center gap-3">
+              <Zap className={stats.isProcessing ? 'text-[#3ecf8e] animate-pulse' : 'text-gray-500'} />
+              Background Pipeline Monitor
+            </h2>
+            <p className="text-[10px] text-gray-500 mt-1 uppercase tracking-widest font-bold">Asynchronous Processing Execution</p>
+          </div>
+          <div className="flex items-center gap-3">
+            {!stats.isProcessing && (
+              <button onClick={resumePendingQueue} className="flex items-center gap-2 px-4 py-2 bg-[#3ecf8e] hover:bg-[#2fb37a] text-black rounded-lg font-bold text-xs shadow-lg transition-all">
+                <Play className="w-3.5 h-3.5 fill-current" />
+                Resume Queue
+              </button>
+            )}
+            {stats.isProcessing && (
+              <button onClick={stopEnrichment} disabled={isStopping} className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-xs transition-all ${isStopping ? 'bg-rose-900/50 text-rose-300' : 'bg-rose-500 hover:bg-rose-600 text-white shadow-lg'}`}>
+                {isStopping ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />}
+                {isStopping ? 'Stopping...' : 'Stop Local Worker'}
+              </button>
+            )}
+            <button onClick={() => setLogs([])} className="flex items-center gap-2 px-3 py-2 text-gray-400 hover:text-white hover:bg-[#2e2e2e] rounded-lg text-xs border border-[#2e2e2e]">
+              <Trash2 className="w-3.5 h-3.5" /> Clear Logs
+            </button>
+          </div>
+        </div>
+        <div className="grid grid-cols-3 gap-6">
+          <StatCard label="Completed" value={stats.completed} color="text-[#3ecf8e]" />
+          <StatCard label="Failures" value={stats.failed} color="text-rose-500" />
+          <StatCard label="In Queue" value={stats.total - (stats.completed + stats.failed)} color="text-indigo-400" />
+        </div>
+        <div
+          ref={logContainerRef}
+          className="bg-[#0e0e0e] rounded-xl border border-[#2e2e2e] p-0 font-mono text-[11px] flex-1 overflow-y-auto custom-scrollbar shadow-inner mb-6 relative ring-1 ring-white/5 min-h-0"
+        >
+          {logs.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center opacity-30 text-center text-gray-500 py-20">
+              <DatabaseZap className="w-12 h-12 mb-4 animate-pulse" />
+              <p className="text-sm font-bold">Pipeline Idle</p>
+              <p className="mt-2 text-[10px] uppercase tracking-wider">Queue records to begin processing</p>
+            </div>
+          ) : (
+            <div className="flex flex-col-reverse min-h-full">
+              {logs.map((l: any, i: number) => {
+                const date = new Date(l.timestamp);
+                const timeStr = date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                const isError = l.level === 'error';
+                const isWarn = l.level === 'warn';
+                const isPhase = l.level === 'phase';
+
+                return (
+                  <div key={l.id || i} className={`group flex items-start gap-4 px-4 py-1 border-b border-white/5 hover:bg-white/[0.02] transition-colors
+                            ${isError ? 'bg-rose-500/10 border-rose-500/20 text-rose-300' : ''}
+                            ${isWarn ? 'text-amber-300' : ''}
+                            ${isPhase ? 'bg-indigo-500/5 text-indigo-300 font-bold' : 'text-gray-400'}
+                          `}>
+                    <span className="opacity-30 shrink-0 select-none w-16">{timeStr}</span>
+                    <span className="opacity-20 shrink-0 select-none w-12 text-[10px] font-bold">[{l.instance_id}]</span>
+                    <span className={`shrink-0 w-20 flex items-center gap-1.5 font-bold uppercase text-[9px] tracking-wider
+                              ${l.module === 'Scraper' ? 'text-blue-400' : ''}
+                              ${l.module === 'OpenAI' ? 'text-[#3ecf8e]' : ''}
+                              ${l.module === 'Sync' ? 'text-purple-400' : ''}
+                              ${l.module === 'Pipeline' ? 'text-indigo-400' : ''}
+                            `}>
+                      {l.module === 'Scraper' && <Zap className="w-2.5 h-2.5" />}
+                      {l.module === 'OpenAI' && <Cpu className="w-2.5 h-2.5" />}
+                      {l.module === 'Sync' && <Database className="w-2.5 h-2.5" />}
+                      {l.module === 'Pipeline' && <Activity className="w-2.5 h-2.5" />}
+                      {l.module}
+                    </span>
+                    <span className="flex-1 break-words leading-relaxed py-0.5">
+                      {l.message}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProxyStatsDashboard() {
+  const [stats, setStats] = useState<{ proxy_used: string, success_count: number }[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch('/api/stats/proxies')
+      .then(res => res.json())
+      .then(data => {
+        // Some robust checking in case db payload is weird
+        if (Array.isArray(data)) {
+          setStats(data);
+        }
+      })
+      .catch(console.error)
+      .finally(() => setLoading(false));
+  }, []);
+
+  const totalSuccesses = stats.reduce((sum, s) => sum + s.success_count, 0);
+
+  return (
+    <div className="flex-1 p-8 overflow-y-auto custom-scrollbar bg-[#1c1c1c]">
+      <div className="max-w-4xl mx-auto">
+        <div className="flex items-center justify-between mb-8">
+          <div>
+            <h2 className="text-2xl font-bold flex items-center gap-3 text-white">
+              <BarChart2 className="w-6 h-6 text-[#3ecf8e]" />
+              Proxy Performance Analytics
+            </h2>
+            <p className="text-sm text-gray-500 mt-2">Historical success rates across all scraping tiers.</p>
+          </div>
+          <button
+            onClick={() => {
+              setLoading(true);
+              fetch('/api/stats/proxies')
+                .then(res => res.json())
+                .then(setStats)
+                .finally(() => setLoading(false));
+            }}
+            className="flex items-center gap-2 px-4 py-2 bg-[#2e2e2e] hover:bg-[#3e3e3e] border border-[#3e3e3e] text-white rounded-lg font-bold text-xs transition-colors"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-[#3ecf8e]' : ''}`} />
+            Refresh
+          </button>
+        </div>
+
+        {loading ? (
+          <div className="flex flex-col items-center justify-center p-20 opacity-50">
+            <Loader2 className="w-8 h-8 animate-spin text-[#3ecf8e] mb-4" />
+            <p className="text-sm font-bold tracking-widest uppercase">Loading Analytics...</p>
+          </div>
+        ) : stats.length === 0 ? (
+          <div className="flex flex-col items-center justify-center p-20 opacity-30 border border-dashed border-[#2e2e2e] rounded-xl">
+            <BarChart2 className="w-12 h-12 mb-4 text-gray-400" />
+            <p className="text-sm font-bold">No Proxy Data Yet</p>
+            <p className="text-xs mt-2">Run the enrichment pipeline to start tracking proxy usage.</p>
+          </div>
+        ) : (
+          <div className="space-y-6">
+            <div className="grid grid-cols-2 gap-6 mb-8">
+              <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-6 shadow-sm">
+                <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Total Successful Scrapes</p>
+                <p className="text-4xl font-bold text-white">{totalSuccesses.toLocaleString()}</p>
+              </div>
+              <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-6 shadow-sm">
+                <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Top Performing Proxy</p>
+                <div className="flex items-center gap-3 mt-1">
+                  <p className="text-2xl font-bold text-[#3ecf8e] truncate flex-1">{stats[0]?.proxy_used}</p>
+                  <span className="text-sm font-bold px-2 py-1 bg-[#3ecf8e]/10 text-[#3ecf8e] rounded-md border border-[#3ecf8e]/20">
+                    {Math.round((stats[0]?.success_count / totalSuccesses) * 100)}%
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl p-6">
+              <h3 className="text-xs font-bold uppercase tracking-widest text-gray-400 border-b border-[#2e2e2e] pb-4 mb-6">Volume Leaderboard</h3>
+
+              <div className="space-y-5">
+                {stats.map((stat, idx) => {
+                  const percentage = Math.round((stat.success_count / totalSuccesses) * 100);
+                  const isPremium = stat.proxy_used.toLowerCase().includes('premium');
+                  return (
+                    <div key={stat.proxy_used} className="group">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-3">
+                          <span className="text-xs font-bold text-gray-600 w-4">{idx + 1}.</span>
+                          <span className={`text-sm font-bold ${isPremium ? 'text-amber-400' : 'text-gray-200'}`}>
+                            {stat.proxy_used}
+                          </span>
+                          {isPremium && <span className="text-[9px] px-1.5 py-0.5 rounded border border-amber-500/20 bg-amber-500/10 text-amber-500 uppercase font-bold tracking-wider">Premium Cost</span>}
+                        </div>
+                        <div className="text-right">
+                          <span className="text-sm font-bold text-white">{stat.success_count.toLocaleString()}</span>
+                          <span className="text-xs text-gray-500 ml-2 block">scrapes ({percentage}%)</span>
+                        </div>
+                      </div>
+                      <div className="w-full h-2 bg-[#2e2e2e] rounded-full overflow-hidden">
+                        <div
+                          className={`h-full rounded-full transition-all duration-1000 ease-out ${isPremium ? 'bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.3)]' : 'bg-[#3ecf8e] shadow-[0_0_10px_rgba(62,207,142,0.3)]'}`}
+                          style={{ width: `${percentage}%` }}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+

@@ -485,6 +485,38 @@ app.post('/api/enrich', (req, res) => {
     res.status(202).json({ message: 'Enrichment started in background' });
 });
 
+app.get('/api/stats/proxies', async (req, res) => {
+    try {
+        const { data, error } = await supabase.rpc('get_proxy_stats')
+
+        if (error) {
+            // If the RPC fails (maybe not created), fallback to grabbing all counts manually
+            // This is slower but safer out of the box
+            const { data: rawData, error: rawError } = await supabase
+                .from('scraped_data')
+                .select('proxy_used')
+                .not('proxy_used', 'is', null);
+
+            if (rawError) throw rawError;
+
+            const stats = (rawData || []).reduce((acc: any, row) => {
+                const proxy = row.proxy_used;
+                acc[proxy] = (acc[proxy] || 0) + 1;
+                return acc;
+            }, {});
+
+            const formattedStats = Object.keys(stats)
+                .map(key => ({ proxy_used: key, success_count: stats[key] }))
+                .sort((a, b) => b.success_count - a.success_count);
+
+            return res.json(formattedStats);
+        }
+        res.json(data);
+    } catch (e: any) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // All other GET requests serve React App
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'dist', 'index.html'));

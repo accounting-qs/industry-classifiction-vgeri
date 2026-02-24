@@ -35,14 +35,15 @@ export interface Enrichment {
   started_at?: string;
 }
 
-export type MergedContact = Contact & Partial<Enrichment> & { 
+export type MergedContact = Contact & Partial<Enrichment> & {
   enrichment_id?: number;
   processing_stage?: 'scraping' | 'classifying' | 'syncing' | 'idle';
 };
 
 export enum AppTab {
   MANAGER = 'contacts',
-  ENRICHMENT = 'enrichment'
+  ENRICHMENT = 'enrichment',
+  PROXIES = 'proxies'
 }
 
 export interface BatchStats {
