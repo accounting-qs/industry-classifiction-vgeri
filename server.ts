@@ -305,7 +305,7 @@ async function runBackgroundEnrichment(contactIds: string[]) {
                         addServerLog(`${domain} success via ${proxyName}`, 'Scraper');
 
                         // PERSIST SCRAPED DATA (Fire and forget)
-                        supabase.from('scraped_data').upsert({ domain, content: digest }, { onConflict: 'domain' }).then(() => { });
+                        supabase.from('scraped_data').upsert({ domain, content: digest, proxy_used: proxyName }, { onConflict: 'domain' }).then(() => { });
 
                         return { contact: c, digest, proxyName, success: true };
                     } catch (e: any) {
