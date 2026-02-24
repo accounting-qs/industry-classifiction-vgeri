@@ -245,7 +245,7 @@ async function runBackgroundEnrichment(contactIds: string[]) {
         }
     }
 
-    const BATCH_SIZE = 10;
+    const BATCH_SIZE = 20;
     let currentIndex = 0;
 
     while (currentIndex < batch.length) {

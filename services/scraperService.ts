@@ -65,39 +65,51 @@ export async function fetchDigest(
   const start_url = normalizeUrl(urlOrDomain);
   if (!start_url) throw new Error("Invalid URL or domain");
 
-  // --- Phase 1: Direct Fetch (No Proxy) ---
+  // --- Phase 1: Free Proxies Racing ---
+  const racePromises: Promise<{ raw_html: string, proxyName: string }>[] = [];
+
+  // 1. Direct Fetch
+  racePromises.push((async () => {
+    try {
+      if (onProgress) onProgress(`📡 [Scraper] Direct Fetch for: ${start_url}`);
+      const raw_html = await attemptDirectFetch(start_url, 8000);
+      return { raw_html, proxyName: "Direct Fetch" };
+    } catch (e: any) {
+      if (onProgress) onProgress(`⏳ [Scraper] Direct Fetch failed: ${e.message}`);
+      throw e;
+    }
+  })());
+
+  // 2. Free Proxies
+  for (let i = 0; i < PROXY_LIST.length; i++) {
+    const proxyName = PROXY_NAMES[i];
+    racePromises.push((async () => {
+      try {
+        if (onProgress) onProgress(`📡 [Scraper] ${proxyName} for: ${start_url}`);
+        const raw_html = await attemptStandardProxy(i, start_url, 8000);
+        return { raw_html, proxyName };
+      } catch (e: any) {
+        if (onProgress) onProgress(`⏳ [Scraper] ${proxyName} failed: ${e.message}`);
+        throw e;
+      }
+    })());
+  }
+
   try {
-    const pName = "Direct Fetch";
-    if (onProgress) onProgress(`📡 [Scraper] ${pName} for: ${start_url}`);
-    const raw_html = await attemptDirectFetch(start_url);
+    // Wait for the FIRST successful response
+    const { raw_html, proxyName } = await Promise.any(racePromises);
+    if (onProgress) onProgress(`✅ [Scraper] ${proxyName} won the race for: ${start_url}`);
     return {
-      digest: processHtmlToDigest(raw_html, start_url, pName),
-      proxyName: pName
+      digest: processHtmlToDigest(raw_html, start_url, proxyName),
+      proxyName
     };
   } catch (err: any) {
-    const errorMsg = `⏳ [Scraper] Direct Fetch failed for ${start_url}: ${err.message}`;
+    const errorMsg = `⏳ [Scraper] All free methods failed/timed out for ${start_url}.`;
     console.warn(errorMsg);
     if (onProgress) onProgress(errorMsg);
   }
 
-  // --- Phase 2: Waterfall Proxies ---
-  for (let i = 0; i < PROXY_LIST.length; i++) {
-    const proxyName = PROXY_NAMES[i];
-    try {
-      if (onProgress) onProgress(`📡 [Scraper] ${proxyName} for: ${start_url}`);
-      const raw_html = await attemptStandardProxy(i, start_url);
-      return {
-        digest: processHtmlToDigest(raw_html, start_url, proxyName),
-        proxyName
-      };
-    } catch (err: any) {
-      const errorMsg = `⏳ [Scraper] ${proxyName} failed for ${start_url}: ${err.message}`;
-      console.warn(errorMsg);
-      if (onProgress) onProgress(errorMsg);
-    }
-  }
-
-  // --- Phase 3: Premium Fallbacks (ZenRows & ScrapingBee) ---
+  // --- Phase 2: Premium Fallbacks (ZenRows & ScrapingBee) ---
   const zenKey = getZenRowsKey();
   const beeKey = getScrapingBeeKey();
 
@@ -136,9 +148,9 @@ export async function fetchDigest(
   throw new Error(`Bulletproof scraping failed for ${start_url}`);
 }
 
-async function attemptDirectFetch(targetUrl: string): Promise<string> {
+async function attemptDirectFetch(targetUrl: string, timeoutMs: number = 15000): Promise<string> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 15000); // Direct fetch gets 15s
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(targetUrl, {
@@ -165,7 +177,7 @@ async function attemptDirectFetch(targetUrl: string): Promise<string> {
     if (!response.ok) {
       // If HTTPS fails, try a quick HTTP fallback for old sites
       if (targetUrl.startsWith('https://')) {
-        return attemptDirectFetch(targetUrl.replace('https://', 'http://'));
+        return attemptDirectFetch(targetUrl.replace('https://', 'http://'), timeoutMs);
       }
       throw new Error(`HTTP ${response.status}`);
     }
@@ -178,10 +190,10 @@ async function attemptDirectFetch(targetUrl: string): Promise<string> {
   }
 }
 
-async function attemptStandardProxy(index: number, targetUrl: string): Promise<string> {
+async function attemptStandardProxy(index: number, targetUrl: string, timeoutMs: number = 20000): Promise<string> {
   const proxyUrl = PROXY_LIST[index](targetUrl);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 20000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const proxyDomain = PROXY_DOMAINS[index] || "https://corsproxy.io";
