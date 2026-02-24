@@ -245,7 +245,7 @@ async function runBackgroundEnrichment(contactIds: string[]) {
         }
     }
 
-    const BATCH_SIZE = 20;
+    const BATCH_SIZE = 20; // ScrapingBee Freelance Plan supports 10 concurrent, buffer up to 20 expecting free proxies to absorb halves
     let currentIndex = 0;
 
     while (currentIndex < batch.length) {

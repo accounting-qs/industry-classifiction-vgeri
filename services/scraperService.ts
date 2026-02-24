@@ -109,25 +109,9 @@ export async function fetchDigest(
     if (onProgress) onProgress(errorMsg);
   }
 
-  // --- Phase 2: Premium Fallbacks (ZenRows & ScrapingBee) ---
-  const zenKey = getZenRowsKey();
+  // --- Phase 2: Premium Fallbacks (ScrapingBee & ZenRows) ---
   const beeKey = getScrapingBeeKey();
-
-  if (zenKey) {
-    try {
-      const pName = "ZenRows (Premium)";
-      if (onProgress) onProgress(`🚀 [Scraper] Attempting ZenRows premium for ${start_url}...`);
-      const raw_html = await attemptZenRows(zenKey, start_url);
-      return {
-        digest: processHtmlToDigest(raw_html, start_url, pName),
-        proxyName: pName
-      };
-    } catch (err: any) {
-      const errorMsg = `❌ [Scraper] ZenRows premium failed for ${start_url}: ${err.message}`;
-      console.warn(errorMsg);
-      if (onProgress) onProgress(errorMsg);
-    }
-  }
+  const zenKey = getZenRowsKey();
 
   if (beeKey) {
     try {
@@ -140,6 +124,22 @@ export async function fetchDigest(
       };
     } catch (err: any) {
       const errorMsg = `❌ [Scraper] ScrapingBee premium failed for ${start_url}: ${err.message}`;
+      console.warn(errorMsg);
+      if (onProgress) onProgress(errorMsg);
+    }
+  }
+
+  if (zenKey) {
+    try {
+      const pName = "ZenRows (Premium)";
+      if (onProgress) onProgress(`🚀 [Scraper] Attempting ZenRows premium for ${start_url}...`);
+      const raw_html = await attemptZenRows(zenKey, start_url);
+      return {
+        digest: processHtmlToDigest(raw_html, start_url, pName),
+        proxyName: pName
+      };
+    } catch (err: any) {
+      const errorMsg = `❌ [Scraper] ZenRows premium failed for ${start_url}: ${err.message}`;
       console.warn(errorMsg);
       if (onProgress) onProgress(errorMsg);
     }
