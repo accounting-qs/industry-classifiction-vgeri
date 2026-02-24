@@ -245,7 +245,7 @@ async function runBackgroundEnrichment(contactIds: string[]) {
         }
     }
 
-    const BATCH_SIZE = 20; // ScrapingBee Freelance Plan supports 10 concurrent, buffer up to 20 expecting free proxies to absorb halves
+    const BATCH_SIZE = 30; // Assuming 10 fallbacks happen automatically in Free Proxies, leaving ~20 max for ZenRows limit
     let currentIndex = 0;
 
     while (currentIndex < batch.length) {
