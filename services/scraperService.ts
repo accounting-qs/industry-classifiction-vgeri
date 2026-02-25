@@ -67,12 +67,13 @@ export async function fetchDigest(
 
   // --- Phase 1: Free Proxies Racing ---
   const racePromises: Promise<{ raw_html: string, proxyName: string }>[] = [];
+  const raceController = new AbortController();
 
   // 1. Direct Fetch
   racePromises.push((async () => {
     try {
       if (onProgress) onProgress(`📡 [Scraper] Direct Fetch for: ${start_url}`);
-      const raw_html = await attemptDirectFetch(start_url, 8000);
+      const raw_html = await attemptDirectFetch(start_url, 8000, raceController.signal);
       return { raw_html, proxyName: "Direct Fetch" };
     } catch (e: any) {
       if (onProgress) onProgress(`⏳ [Scraper] Direct Fetch failed: ${e.message}`);
@@ -86,7 +87,7 @@ export async function fetchDigest(
     racePromises.push((async () => {
       try {
         if (onProgress) onProgress(`📡 [Scraper] ${proxyName} for: ${start_url}`);
-        const raw_html = await attemptStandardProxy(i, start_url, 8000);
+        const raw_html = await attemptStandardProxy(i, start_url, 8000, raceController.signal);
         return { raw_html, proxyName };
       } catch (e: any) {
         if (onProgress) onProgress(`⏳ [Scraper] ${proxyName} failed: ${e.message}`);
@@ -98,6 +99,8 @@ export async function fetchDigest(
   try {
     // Wait for the FIRST successful response
     const { raw_html, proxyName } = await Promise.any(racePromises);
+    raceController.abort(); // Cancel all the losers immediately to free memory/connections
+
     if (onProgress) onProgress(`✅ [Scraper] ${proxyName} won the race for: ${start_url}`);
     return {
       digest: processHtmlToDigest(raw_html, start_url, proxyName),
@@ -148,9 +151,22 @@ export async function fetchDigest(
   throw new Error(`Bulletproof scraping failed for ${start_url}`);
 }
 
-async function attemptDirectFetch(targetUrl: string, timeoutMs: number = 15000): Promise<string> {
+async function attemptDirectFetch(targetUrl: string, timeoutMs: number = 15000, parentSignal?: AbortSignal): Promise<string> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  const onParentAbort = () => {
+    controller.abort();
+    clearTimeout(timeoutId);
+  };
+
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      onParentAbort();
+      throw new Error('Aborted by parent before starting');
+    }
+    parentSignal.addEventListener('abort', onParentAbort);
+  }
 
   try {
     const response = await fetch(targetUrl, {
@@ -187,13 +203,31 @@ async function attemptDirectFetch(targetUrl: string, timeoutMs: number = 15000):
   } catch (e: any) {
     clearTimeout(timeoutId);
     throw e;
+  } finally {
+    if (parentSignal) {
+      parentSignal.removeEventListener('abort', onParentAbort);
+    }
+    clearTimeout(timeoutId);
   }
 }
 
-async function attemptStandardProxy(index: number, targetUrl: string, timeoutMs: number = 20000): Promise<string> {
+async function attemptStandardProxy(index: number, targetUrl: string, timeoutMs: number = 20000, parentSignal?: AbortSignal): Promise<string> {
   const proxyUrl = PROXY_LIST[index](targetUrl);
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  const onParentAbort = () => {
+    controller.abort();
+    clearTimeout(timeoutId);
+  };
+
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      onParentAbort();
+      throw new Error('Aborted by parent before starting');
+    }
+    parentSignal.addEventListener('abort', onParentAbort);
+  }
 
   try {
     const proxyDomain = PROXY_DOMAINS[index] || "https://corsproxy.io";
@@ -224,6 +258,11 @@ async function attemptStandardProxy(index: number, targetUrl: string, timeoutMs:
   } catch (e: any) {
     clearTimeout(timeoutId);
     throw e;
+  } finally {
+    if (parentSignal) {
+      parentSignal.removeEventListener('abort', onParentAbort);
+    }
+    clearTimeout(timeoutId);
   }
 }
 
