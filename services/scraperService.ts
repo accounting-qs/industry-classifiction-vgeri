@@ -1,4 +1,5 @@
 
+import dns from 'dns/promises';
 import {
   stripCssJs,
   extractOne,
@@ -71,6 +72,21 @@ export async function fetchDigest(
 ): Promise<{ digest: string, proxyName: string }> {
   const start_url = normalizeUrl(urlOrDomain);
   if (!start_url) throw new Error("Invalid URL or domain");
+
+  // --- Phase 0: Fast Fail DNS Check ---
+  let hostname = start_url;
+  try {
+    hostname = new URL(start_url).hostname;
+    await dns.lookup(hostname);
+  } catch (e: any) {
+    if (e.code === 'ENOTFOUND' || e.code === 'ESERVFAIL' || e.code === 'ENODATA') {
+      const errorMsg = `❌ [FastFail] Domain ${hostname} is unreachable (DNS ${e.code}). Skipping proxies.`;
+      console.warn(errorMsg);
+      if (onProgress) onProgress(errorMsg);
+      // Immediately throw so we skip Phase 1 & 2
+      throw new Error(`FastFail: Domain completely unreachable (${e.code})`);
+    }
+  }
 
   // --- Phase 1: Direct Fetch & Premium CorsProxy Racing (with Free Fallbacks) ---
   const racePromises: Promise<{ raw_html: string, proxyName: string }>[] = [];

@@ -2,7 +2,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AppTab, Contact, Enrichment, BatchStats, MergedContact, FilterCondition, FilterOperator } from './types';
 import { db } from './services/supabaseClient';
-import { fetchDigest } from './services/scraperService';
 import { enrichBatch } from './services/enrichmentService';
 import {
   Users,

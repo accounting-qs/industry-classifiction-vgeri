@@ -11,7 +11,7 @@ const __dirname = path.dirname(__filename);
 // Load environment variables from .env.local
 dotenv.config({ path: path.join(__dirname, '../.env.local') });
 
-const testUrl = 'http://www.petersfinancial.us';
+const testUrl = process.argv[2] || 'http://www.petersfinancial.us';
 
 async function runTests() {
     try {
