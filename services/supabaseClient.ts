@@ -3,9 +3,8 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { Contact, Enrichment, MergedContact, FilterCondition } from '../types';
 
 const getEnv = (key: string) => {
-  // @ts-ignore - Vite specific
-  if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env[key]) {
-    return import.meta.env[key];
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env && (import.meta as any).env[key]) {
+    return (import.meta as any).env[key];
   }
   if (typeof process !== 'undefined' && process.env && process.env[key]) {
     return process.env[key];
@@ -26,7 +25,8 @@ class SupabaseService {
   public isConnected: boolean = false;
 
   constructor() {
-    const key = localStorage.getItem('supabase_anon_key') || DEFAULT_ANON_KEY;
+    const isBrowser = typeof window !== 'undefined';
+    const key = (isBrowser ? localStorage.getItem('supabase_anon_key') : null) || DEFAULT_ANON_KEY;
     if (key) {
       this.init(key);
     }
@@ -39,7 +39,9 @@ class SupabaseService {
       }
       this.client = createClient(SUPABASE_URL, key);
       this.isConnected = true;
-      localStorage.setItem('supabase_anon_key', key);
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('supabase_anon_key', key);
+      }
       console.log("✅ Supabase initialized successfully");
       return true;
     } catch (e) {
