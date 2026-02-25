@@ -228,8 +228,8 @@ async function attemptStandardProxy(index: number, targetUrl: string, timeoutMs:
 }
 
 export async function attemptZenRows(apiKey: string, targetUrl: string): Promise<string> {
-  // Use the user's successful "formula" first: apikey then url correctly encoded
-  const zenUrl = `https://api.zenrows.com/v1/?apikey=${apiKey}&url=${encodeURIComponent(targetUrl)}&js_render=true&antibot=true`;
+  // Use the user's successful "formula" first: apikey then url correctly encoded + adaptive stealth mode
+  const zenUrl = `https://api.zenrows.com/v1/?apikey=${apiKey}&url=${encodeURIComponent(targetUrl)}&mode=auto`;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 45000);
