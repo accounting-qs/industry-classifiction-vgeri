@@ -23,6 +23,9 @@ import {
   X,
   Search,
   Settings2,
+  ChevronDown,
+  Clock,
+  ListFilter,
   ExternalLink,
   Cpu,
   Activity,
@@ -66,16 +69,44 @@ export default function App() {
 
   const [stats, setStats] = useState<BatchStats>({ total: 0, completed: 0, failed: 0, isProcessing: false });
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [logCurrentPage, setLogCurrentPage] = useState(1);
-  const [logPageSize, setLogPageSize] = useState(100);
+  const [activeLogFilter, setActiveLogFilter] = useState('live');
+  const [isLiveTail, setIsLiveTail] = useState(true);
+  const [hasNewLogs, setHasNewLogs] = useState(false);
+  const [isLogDropdownOpen, setIsLogDropdownOpen] = useState(false);
+  const lastLogTimeRef = useRef<number>(0);
+
   const logContainerRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll logs to bottom
   useEffect(() => {
     if (logContainerRef.current) {
-      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+      if (isLiveTail && activeLogFilter === 'live') {
+        logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+        setHasNewLogs(false);
+        if (logs.length > 0) lastLogTimeRef.current = new Date(logs[0].timestamp).getTime();
+      } else if (!isLiveTail && activeLogFilter === 'live' && logs.length > 0) {
+        const latestTime = new Date(logs[0].timestamp).getTime();
+        if (latestTime > lastLogTimeRef.current) {
+          setHasNewLogs(true);
+        }
+      }
     }
-  }, [logs]);
+  }, [logs, isLiveTail, activeLogFilter]);
+
+  const handleLogScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
+    const isAtBottom = scrollHeight - scrollTop - clientHeight < 20;
+
+    if (activeLogFilter === 'live') {
+      if (isAtBottom && !isLiveTail) {
+        setIsLiveTail(true);
+        setHasNewLogs(false);
+        if (logs.length > 0) lastLogTimeRef.current = new Date(logs[0].timestamp).getTime();
+      } else if (!isAtBottom && isLiveTail) {
+        setIsLiveTail(false);
+      }
+    }
+  };
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [isAllFilteredSelected, setIsAllFilteredSelected] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -126,7 +157,7 @@ export default function App() {
   useEffect(() => {
     const fetchStatus = async () => {
       try {
-        const res = await fetch('/api/status');
+        const res = await fetch(`/api/status?timeRange=${activeLogFilter}`);
         if (res.ok) {
           const data = await res.json();
           setLogs(data.logs);
@@ -140,17 +171,17 @@ export default function App() {
       }
     };
 
-    fetchStatus(); // Fetch once on mount/tab change
+    fetchStatus(); // Fetch once on mount/tab change/filter change
 
     let interval: any;
-    if (stats.isProcessing) {
+    if (stats.isProcessing || activeLogFilter === 'live') {
       interval = setInterval(fetchStatus, 2500);
     }
 
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [stats.isProcessing, activeTab, loadData]);
+  }, [stats.isProcessing, activeTab, loadData, activeLogFilter]);
 
   const addLog = (msg: string, module: string = 'Pipeline', level: LogEntry['level'] = 'info') => {
     const entry: LogEntry = {
@@ -318,6 +349,15 @@ export default function App() {
               isStopping={isStopping}
               setLogs={setLogs}
               logContainerRef={logContainerRef}
+              activeLogFilter={activeLogFilter}
+              setActiveLogFilter={setActiveLogFilter}
+              isLiveTail={isLiveTail}
+              setIsLiveTail={setIsLiveTail}
+              hasNewLogs={hasNewLogs}
+              setHasNewLogs={setHasNewLogs}
+              isLogDropdownOpen={isLogDropdownOpen}
+              setIsLogDropdownOpen={setIsLogDropdownOpen}
+              handleLogScroll={handleLogScroll}
             />
           ) : activeTab === AppTab.MANAGER ? (
             <DataTable
@@ -823,7 +863,24 @@ function StatusBadge({ status, stage, errorMessage }: { status: string, stage?: 
   return <span className={`px-1.5 py-0.5 rounded border text-[8px] font-bold uppercase tracking-wider ${styles[currentStatus] || ''}`} title={errorMessage}>{currentStatus}</span>;
 }
 
-function PipelineMonitor({ stats, logs, resumePendingQueue, stopEnrichment, isStopping, setLogs, logContainerRef }: any) {
+function PipelineMonitor({
+  stats,
+  logs,
+  resumePendingQueue,
+  stopEnrichment,
+  isStopping,
+  setLogs,
+  logContainerRef,
+  activeLogFilter,
+  setActiveLogFilter,
+  isLiveTail,
+  setIsLiveTail,
+  hasNewLogs,
+  setHasNewLogs,
+  isLogDropdownOpen,
+  setIsLogDropdownOpen,
+  handleLogScroll
+}: any) {
   return (
     <div className="flex-1 p-6 overflow-hidden bg-[#1c1c1c] flex flex-col h-full min-h-0">
       <div className="max-w-5xl mx-auto w-full flex-1 flex flex-col space-y-6 min-h-0 h-full">
@@ -848,7 +905,41 @@ function PipelineMonitor({ stats, logs, resumePendingQueue, stopEnrichment, isSt
                 {isStopping ? 'Stopping...' : 'Stop Local Worker'}
               </button>
             )}
-            <button onClick={() => setLogs([])} className="flex items-center gap-2 px-3 py-2 text-gray-400 hover:text-white hover:bg-[#2e2e2e] rounded-lg text-xs border border-[#2e2e2e]">
+
+            {/* Log Filter Dropdown */}
+            <div className="relative">
+              <button onClick={() => setIsLogDropdownOpen(!isLogDropdownOpen)} className="flex items-center gap-2 px-3 py-2 text-gray-300 hover:text-white bg-[#222] hover:bg-[#2e2e2e] rounded-lg text-xs border border-[#333] transition-colors relative">
+                {activeLogFilter === 'live' ? <Activity className="w-3.5 h-3.5 text-[#3ecf8e]" /> : <Clock className="w-3.5 h-3.5 text-indigo-400" />}
+                {activeLogFilter === 'live' ? 'Live Tail' : activeLogFilter === '1h' ? 'Last hour' : activeLogFilter === '4h' ? 'Last 4 hours' : activeLogFilter === '24h' ? 'Last 24 hours' : activeLogFilter === '2d' ? 'Last 2 days' : activeLogFilter === '7d' ? 'Last 7 days' : activeLogFilter === '14d' ? 'Last 14 days' : 'Last 30 days'}
+                <ChevronDown className={`w-3.5 h-3.5 opacity-50 transition-transform ${isLogDropdownOpen ? 'rotate-180' : ''}`} />
+              </button>
+
+              {isLogDropdownOpen && (
+                <div className="absolute right-0 top-full mt-2 w-48 bg-[#1e1e1e] border border-[#333] rounded-xl shadow-2xl py-1 z-50 overflow-hidden">
+                  {[
+                    { id: 'live', label: 'Live Tail', icon: Activity },
+                    { id: '1h', label: 'Last hour', icon: Clock },
+                    { id: '4h', label: 'Last 4 hours', icon: Clock },
+                    { id: '24h', label: 'Last 24 hours', icon: Clock },
+                    { id: '2d', label: 'Last 2 days', icon: Clock },
+                    { id: '7d', label: 'Last 7 days', icon: Clock },
+                    { id: '14d', label: 'Last 14 days', icon: Clock },
+                    { id: '30d', label: 'Last 30 days', icon: Clock }
+                  ].map(opt => (
+                    <button
+                      key={opt.id}
+                      onClick={() => { setActiveLogFilter(opt.id); setIsLogDropdownOpen(false); }}
+                      className={`w-full text-left px-4 py-2 text-xs flex items-center gap-3 transition-colors ${activeLogFilter === opt.id ? 'bg-indigo-500/10 text-indigo-300 font-bold' : 'text-gray-400 hover:bg-[#2e2e2e] hover:text-white'}`}
+                    >
+                      <opt.icon className={`w-3.5 h-3.5 ${activeLogFilter === opt.id ? 'text-indigo-400' : 'opacity-40'}`} />
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <button onClick={() => setLogs([])} className="flex items-center gap-2 px-3 py-2 text-gray-400 hover:text-white hover:bg-[#2e2e2e] rounded-lg text-xs border border-[#2e2e2e] transition-colors">
               <Trash2 className="w-3.5 h-3.5" /> Clear Logs
             </button>
           </div>
@@ -858,53 +949,67 @@ function PipelineMonitor({ stats, logs, resumePendingQueue, stopEnrichment, isSt
           <StatCard label="Failures" value={stats.failed} color="text-rose-500" />
           <StatCard label="In Queue" value={stats.total - (stats.completed + stats.failed)} color="text-indigo-400" />
         </div>
-        <div
-          ref={logContainerRef}
-          className="bg-[#0e0e0e] rounded-xl border border-[#2e2e2e] p-0 font-mono text-[11px] flex-1 overflow-y-auto custom-scrollbar shadow-inner mb-6 relative ring-1 ring-white/5 min-h-0"
-        >
-          {logs.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center opacity-30 text-center text-gray-500 py-20">
-              <DatabaseZap className="w-12 h-12 mb-4 animate-pulse" />
-              <p className="text-sm font-bold">Pipeline Idle</p>
-              <p className="mt-2 text-[10px] uppercase tracking-wider">Queue records to begin processing</p>
-            </div>
-          ) : (
-            <div className="flex flex-col-reverse min-h-full">
-              {logs.map((l: any, i: number) => {
-                const date = new Date(l.timestamp);
-                const timeStr = date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-                const isError = l.level === 'error';
-                const isWarn = l.level === 'warn';
-                const isPhase = l.level === 'phase';
+        <div className="relative flex-1 min-h-0 mb-6 group text-xs text-mono">
+          <div
+            ref={logContainerRef}
+            onScroll={handleLogScroll}
+            className="absolute inset-0 bg-[#0e0e0e] rounded-xl border border-[#2e2e2e] p-0 font-mono text-[11px] overflow-y-auto custom-scrollbar shadow-inner ring-1 ring-white/5"
+          >
+            {logs.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center opacity-30 text-center text-gray-500 py-20">
+                <DatabaseZap className="w-12 h-12 mb-4 animate-pulse" />
+                <p className="text-sm font-bold">Pipeline Idle</p>
+                <p className="mt-2 text-[10px] uppercase tracking-wider">Queue records to begin processing</p>
+              </div>
+            ) : (
+              <div className="flex flex-col-reverse min-h-full">
+                {logs.map((l: any, i: number) => {
+                  const date = new Date(l.timestamp);
+                  const timeStr = date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                  const isError = l.level === 'error';
+                  const isWarn = l.level === 'warn';
+                  const isPhase = l.level === 'phase';
 
-                return (
-                  <div key={l.id || i} className={`group flex items-start gap-4 px-4 py-1 border-b border-white/5 hover:bg-white/[0.02] transition-colors
+                  return (
+                    <div key={l.id || i} className={`group flex items-start gap-4 px-4 py-1 border-b border-white/5 hover:bg-white/[0.02] transition-colors
                             ${isError ? 'bg-rose-500/10 border-rose-500/20 text-rose-300' : ''}
                             ${isWarn ? 'text-amber-300' : ''}
                             ${isPhase ? 'bg-indigo-500/5 text-indigo-300 font-bold' : 'text-gray-400'}
                           `}>
-                    <span className="opacity-30 shrink-0 select-none w-16">{timeStr}</span>
-                    <span className="opacity-20 shrink-0 select-none w-12 text-[10px] font-bold">[{l.instance_id}]</span>
-                    <span className={`shrink-0 w-20 flex items-center gap-1.5 font-bold uppercase text-[9px] tracking-wider
+                      <span className="opacity-30 shrink-0 select-none w-16">{timeStr}</span>
+                      <span className="opacity-20 shrink-0 select-none w-12 text-[10px] font-bold">[{l.instance_id}]</span>
+                      <span className={`shrink-0 w-20 flex items-center gap-1.5 font-bold uppercase text-[9px] tracking-wider
                               ${l.module === 'Scraper' ? 'text-blue-400' : ''}
                               ${l.module === 'OpenAI' ? 'text-[#3ecf8e]' : ''}
                               ${l.module === 'Sync' ? 'text-purple-400' : ''}
                               ${l.module === 'Pipeline' ? 'text-indigo-400' : ''}
                             `}>
-                      {l.module === 'Scraper' && <Zap className="w-2.5 h-2.5" />}
-                      {l.module === 'OpenAI' && <Cpu className="w-2.5 h-2.5" />}
-                      {l.module === 'Sync' && <Database className="w-2.5 h-2.5" />}
-                      {l.module === 'Pipeline' && <Activity className="w-2.5 h-2.5" />}
-                      {l.module}
-                    </span>
-                    <span className="flex-1 break-words leading-relaxed py-0.5">
-                      {l.message}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+                        {l.module === 'Scraper' && <Zap className="w-2.5 h-2.5" />}
+                        {l.module === 'OpenAI' && <Cpu className="w-2.5 h-2.5" />}
+                        {l.module === 'Sync' && <Database className="w-2.5 h-2.5" />}
+                        {l.module === 'Pipeline' && <Activity className="w-2.5 h-2.5" />}
+                        {l.module}
+                      </span>
+                      <span className="flex-1 break-words leading-relaxed py-0.5">
+                        {l.message}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Floating Action Button for New Logs */}
+          <div className={`absolute bottom-6 left-1/2 -translate-x-1/2 transition-all duration-300 z-20 ${hasNewLogs && !isLiveTail && activeLogFilter === 'live' ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 translate-y-4 scale-95 pointer-events-none'}`}>
+            <button onClick={() => { setIsLiveTail(true); setHasNewLogs(false); if (logContainerRef.current) logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight; }} className="bg-[#111] border border-gray-600 hover:border-gray-400 text-gray-200 hover:text-white rounded-md px-4 py-2 shadow-2xl text-xs font-semibold flex items-center gap-2.5 transition-all">
+              <Activity className="w-3.5 h-3.5 text-[#3ecf8e] animate-pulse" />
+              New logs in Live Tail
+              <div className="w-px h-3 bg-gray-600 mx-1"></div>
+              <X className="w-3.5 h-3.5 text-gray-400 hover:text-white" onClick={(e) => { e.stopPropagation(); setHasNewLogs(false); }} />
+            </button>
+          </div>
+
         </div>
       </div>
     </div>

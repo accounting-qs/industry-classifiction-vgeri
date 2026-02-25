@@ -484,12 +484,32 @@ async function runBackgroundEnrichment(contactIds: string[]) {
 }
 
 app.get('/api/status', async (req, res) => {
-    // Fetch latest 200 logs from Supabase
-    const { data: dbLogs } = await supabase
+    const { timeRange } = req.query;
+
+    let query = supabase
         .from('pipeline_logs')
         .select('*')
-        .order('timestamp', { ascending: false })
-        .limit(200);
+        .order('timestamp', { ascending: false });
+
+    // Apply time filter if requested (e.g. '1h', '24h', '7d')
+    if (timeRange && timeRange !== 'live') {
+        const hoursMatch = (timeRange as string).match(/(\d+)h/);
+        const daysMatch = (timeRange as string).match(/(\d+)d/);
+
+        let msToSubtract = 0;
+        if (hoursMatch) msToSubtract = parseInt(hoursMatch[1]) * 60 * 60 * 1000;
+        else if (daysMatch) msToSubtract = parseInt(daysMatch[1]) * 24 * 60 * 60 * 1000;
+
+        if (msToSubtract > 0) {
+            const cutoff = new Date(Date.now() - msToSubtract).toISOString();
+            query = query.gte('timestamp', cutoff);
+        }
+        query = query.limit(1000); // Allow more logs for historical views
+    } else {
+        query = query.limit(200); // Standard live tail limit
+    }
+
+    const { data: dbLogs } = await query;
 
     res.json({
         logs: dbLogs || currentJobLogs,
