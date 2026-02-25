@@ -245,7 +245,7 @@ async function runBackgroundEnrichment(contactIds: string[]) {
         }
     }
 
-    const BATCH_SIZE = 30; // Assuming 10 fallbacks happen automatically in Free Proxies, leaving ~20 max for ZenRows limit
+    const BATCH_SIZE = 100; // Skyrocketed batch size utilizing Unlimited CorsProxy Business plan
     let currentIndex = 0;
 
     while (currentIndex < batch.length) {

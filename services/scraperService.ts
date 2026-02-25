@@ -33,18 +33,25 @@ const getScrapingBeeKey = () => {
   }
 };
 
+const CORSPROXY_API_KEY = "cf93a78a";
+
 const PROXY_LIST = [
-  // Codetabs proxy works well most of the time
+  (url: string) => `https://corsproxy.io/?key=${CORSPROXY_API_KEY}&url=${encodeURIComponent(url)}`,
+  // Free fallbacks if CorsProxy Business fails for some reason
   (url: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-  (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
   (url: string) => `https://proxy.corsfix.com/?url=${encodeURIComponent(url)}`,
   (url: string) => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
 ];
 
-const PROXY_NAMES = ["Codetabs", "Corsproxy.io", "Corsfix", "AllOrigins"];
+const PROXY_NAMES = [
+  "Corsproxy.io (Business)",
+  "Codetabs",
+  "Corsfix",
+  "AllOrigins"
+];
 const PROXY_DOMAINS = [
-  "https://api.codetabs.com",
   "https://corsproxy.io",
+  "https://api.codetabs.com",
   "https://proxy.corsfix.com",
   "https://api.allorigins.win"
 ];
@@ -65,7 +72,7 @@ export async function fetchDigest(
   const start_url = normalizeUrl(urlOrDomain);
   if (!start_url) throw new Error("Invalid URL or domain");
 
-  // --- Phase 1: Free Proxies Racing ---
+  // --- Phase 1: Direct Fetch & Premium CorsProxy Racing (with Free Fallbacks) ---
   const racePromises: Promise<{ raw_html: string, proxyName: string }>[] = [];
   const raceController = new AbortController();
 
@@ -81,7 +88,7 @@ export async function fetchDigest(
     }
   })());
 
-  // 2. Free Proxies
+  // 2. Premium CorsProxy + Free Fallbacks
   for (let i = 0; i < PROXY_LIST.length; i++) {
     const proxyName = PROXY_NAMES[i];
     racePromises.push((async () => {
