@@ -245,16 +245,52 @@ async function runBackgroundEnrichment(contactIds: string[]) {
         }
     }
 
+    // MOVED CACHE INITIALIZATION INSIDE THE WHILE LOOP TO FREE MEMORY PER BATCH
+
     const BATCH_SIZE = 100; // Skyrocketed batch size utilizing Unlimited CorsProxy Business plan
     let currentIndex = 0;
 
     while (currentIndex < batch.length) {
+        // Aggressively clear large memory objects at the START of each new batch to prevent RAM plateaus
+        // This forces V8 garbage collector to free up the previous batch's HTML digests
+        const domainCache: Record<string, any> = {};
+        const digestCache: Record<string, string> = {};
+        // Initialize Sprint Scope Variables First
         const sprintItems = batch.slice(currentIndex, currentIndex + BATCH_SIZE);
         currentIndex += BATCH_SIZE;
+        const sprintEnd = Math.min(currentIndex, batch.length);
+
+        // Fetch Cache ONLY for the current 100 items (Massive memory savings vs entire list)
+        const uniqueSprintWebsites = [...new Set(sprintItems.map((c: any) => c.company_website).filter(Boolean))];
+
+        if (uniqueSprintWebsites.length > 0) {
+            // A. Check for existing high-confidence classifications
+            const { data: cachedEnrichments } = await supabase
+                .from('enrichments')
+                .select(`classification, confidence, reasoning, contacts!inner(company_website)`)
+                .eq('status', 'completed')
+                .gte('confidence', 7)
+                .in('contacts.company_website', uniqueSprintWebsites);
+
+            if (cachedEnrichments) {
+                cachedEnrichments.forEach((row: any) => {
+                    const website = row.contacts?.company_website;
+                    if (website) domainCache[website] = row;
+                });
+            }
+
+            // B. Check for existing scraped HTML content
+            const { data: cachedDigests } = await supabase
+                .from('scraped_data')
+                .select('domain, content')
+                .in('domain', uniqueSprintWebsites);
+
+            if (cachedDigests) {
+                cachedDigests.forEach(d => digestCache[d.domain] = d.content);
+            }
+        }
 
         try {
-            const sprintEnd = Math.min(currentIndex, batch.length);
-
             // Separate items: Cached vs Content Cache vs Needs Scraping
             const itemsToScrape = sprintItems.filter(item => {
                 const isLowConfidence = item.confidence !== undefined && item.confidence !== null && item.confidence < 7;
@@ -424,6 +460,15 @@ async function runBackgroundEnrichment(contactIds: string[]) {
 
             addServerLog(`Batch processed: ${jobStats.completed} done, ${jobStats.failed} failed`, 'Pipeline');
             await persistPipelineState();
+
+            // MANUAL MEMORY CLEARING AFTER EACH BATCH
+            scrapes = null as any;
+            aiResults = null as any;
+            enrichmentsToUpsert.length = 0;
+            contactsToUpdate.length = 0;
+            if (global.gc) {
+                global.gc(); // Explicitly trigger V8 Garbage Collection if flag enabled
+            }
 
         } catch (err: any) {
             addServerLog(`Batch Error: ${err.message}`, 'Pipeline', 'error');
