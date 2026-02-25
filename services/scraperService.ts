@@ -77,10 +77,13 @@ export async function fetchDigest(
   let hostname = start_url;
   try {
     hostname = new URL(start_url).hostname;
-    await dns.lookup(hostname);
+    // Use resolve4 instead of lookup to bypass Node's libuv threadpool limits.
+    // lookup can get jammed under high concurrency and falsely throw ESERVFAIL.
+    await dns.resolve4(hostname);
   } catch (e: any) {
-    if (e.code === 'ENOTFOUND' || e.code === 'ESERVFAIL' || e.code === 'ENODATA') {
-      const errorMsg = `❌ [FastFail] Domain ${hostname} is unreachable (DNS ${e.code}). Skipping proxies.`;
+    // We strictly catch ENOTFOUND & ENODATA. ESERVFAIL and others might be temporary or DNS firewall issues (like Cloudflare)
+    if (e.code === 'ENOTFOUND' || e.code === 'ENODATA') {
+      const errorMsg = `❌ [FastFail] Domain ${hostname} is definitely not found (DNS ${e.code}). Skipping proxies.`;
       console.warn(errorMsg);
       if (onProgress) onProgress(errorMsg);
       // Immediately throw so we skip Phase 1 & 2
@@ -137,7 +140,8 @@ export async function fetchDigest(
 
   // --- Phase 2: Premium Fallbacks (ZenRows then ScrapingBee) ---
   const zenKey = getZenRowsKey();
-  const beeKey = getScrapingBeeKey();
+  // ScrapingBee is fully disabled per user request
+  // const beeKey = getScrapingBeeKey();
 
   if (zenKey) {
     try {
@@ -155,6 +159,8 @@ export async function fetchDigest(
     }
   }
 
+  // disabled
+  /*
   if (beeKey) {
     try {
       const pName = "ScrapingBee (Premium)";
@@ -170,6 +176,7 @@ export async function fetchDigest(
       if (onProgress) onProgress(errorMsg);
     }
   }
+  */
 
   throw new Error(`Bulletproof scraping failed for ${start_url}`);
 }
