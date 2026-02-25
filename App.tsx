@@ -167,11 +167,22 @@ export default function App() {
     setContacts(prev => prev.map(c => c.contact_id === contactId ? { ...c, ...updates } : c));
   }, []);
 
-  const stopEnrichment = () => {
+  const stopEnrichment = async () => {
     if (stats.isProcessing && !isStopping) {
-      stopRequestedRef.current = true;
       setIsStopping(true);
-      addLog("⚠️ Stop signal received. Halting background process...");
+      addLog("⚠️ Stop signal sent. Halting backend pipeline...");
+      try {
+        const response = await fetch('/api/stop', { method: 'POST' });
+        if (response.ok) {
+          addLog("🛑 Worker acknowledges stop command. Finalizing current batch...");
+        } else {
+          addLog("❌ Failed to send stop command to backend.");
+        }
+      } catch (err: any) {
+        addLog(`❌ Error stopping pipeline: ${err.message}`);
+      } finally {
+        setIsStopping(false);
+      }
     }
   };
 

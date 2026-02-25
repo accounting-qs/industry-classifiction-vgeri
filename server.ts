@@ -250,7 +250,8 @@ async function runBackgroundEnrichment(contactIds: string[]) {
     const BATCH_SIZE = 100; // Skyrocketed batch size utilizing Unlimited CorsProxy Business plan
     let currentIndex = 0;
 
-    while (currentIndex < batch.length) {
+    // Loop until we finish the batch OR until the user clicks "Stop" (isProcessing = false)
+    while (currentIndex < batch.length && jobStats.isProcessing) {
         // Aggressively clear large memory objects at the START of each new batch to prevent RAM plateaus
         // This forces V8 garbage collector to free up the previous batch's HTML digests
         const domainCache: Record<string, any> = {};
@@ -528,6 +529,16 @@ app.post('/api/enrich', (req, res) => {
 
     // 3. Immediate response (202 Accepted)
     res.status(202).json({ message: 'Enrichment started in background' });
+});
+
+app.post('/api/stop', async (req, res) => {
+    if (!jobStats.isProcessing) {
+        return res.status(400).json({ error: 'No job is currently running' });
+    }
+    addServerLog(`⚠️ Stop command received. Halting background pipeline...`, 'Pipeline', 'warn');
+    jobStats.isProcessing = false;
+    await persistPipelineState();
+    res.json({ message: 'Pipeline stopping gracefully...' });
 });
 
 app.get('/api/stats/proxies', async (req, res) => {
