@@ -168,34 +168,56 @@ class SupabaseService {
     const enrichmentCols = ['status', 'classification', 'confidence', 'cost', 'processed_at'];
     const selectStr = this.getJoinConfig(filters, enrichmentCols, false);
 
-    let query = this.client
-      .from('contacts')
-      .select(selectStr);
+    let allData: any[] = [];
+    let page = 0;
+    const pageSize = 1000;
 
-    query = this.applyFilters(query, filters, enrichmentCols, searchQuery);
+    while (true) {
+      let query = this.client
+        .from('contacts')
+        .select(selectStr);
 
-    const { data, error } = await query.order('id', { ascending: true });
+      query = this.applyFilters(query, filters, enrichmentCols, searchQuery);
 
-    if (error) throw error;
+      const { data, error } = await query
+        .order('id', { ascending: true })
+        .range(page * pageSize, (page + 1) * pageSize - 1);
 
-    return this.flattenData(data);
+      if (error) throw error;
+
+      if (!data || data.length === 0) break;
+      allData = allData.concat(data);
+      if (data.length < pageSize) break;
+
+      page++;
+    }
+
+    return this.flattenData(allData);
   }
 
   async enqueueContacts(contactIds: string[]) {
     if (!this.client) return;
 
-    const payloads = contactIds.map(id => ({
-      contact_id: id,
-      status: 'pending',
-      processed_at: null,
-      error_message: null
-    }));
+    const CHUNK_SIZE = 2000;
 
-    const { error } = await this.client
-      .from('enrichments')
-      .upsert(payloads, { onConflict: 'contact_id' });
+    for (let i = 0; i < contactIds.length; i += CHUNK_SIZE) {
+      const chunk = contactIds.slice(i, i + CHUNK_SIZE);
+      const payloads = chunk.map(id => ({
+        contact_id: id,
+        status: 'pending',
+        processed_at: null,
+        error_message: null
+      }));
 
-    if (error) throw error;
+      const { error } = await this.client
+        .from('enrichments')
+        .upsert(payloads, { onConflict: 'contact_id' });
+
+      if (error) {
+        console.error(`Error enqueuing chunk ${i}-${i + CHUNK_SIZE}:`, error);
+        throw error;
+      }
+    }
   }
 
   async bulkUpsertEnrichments(enrichments: Partial<Enrichment>[]) {
