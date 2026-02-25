@@ -199,40 +199,43 @@ export default function App() {
    * Core Enrichment Trigger (Calls Monolithic Backend)
    */
   const startEnrichmentQueue = async () => {
-    let batch: MergedContact[] = [];
+    let payload: any = {};
+    let totalBatchSize = 0;
 
     if (isAllFilteredSelected) {
-      addLog(`📦 Preparing global batch: Fetching all ${totalCount} matching contacts...`);
-      try {
-        batch = await db.getAllFilteredContacts(activeFilters, debouncedSearchQuery);
-      } catch (e: any) {
-        addLog(`Error fetching bulk contacts: ${e.message}`);
-        return;
-      }
+      addLog(`📦 Generating database query for all ${totalCount} matching contacts natively on the backend...`);
+      payload = { filters: activeFilters, searchQuery: debouncedSearchQuery };
+      totalBatchSize = totalCount;
     } else {
-      batch = contacts.filter(c => selectedIds.has(c.contact_id));
+      const selectedContacts = contacts.filter(c => selectedIds.has(c.contact_id));
+      if (selectedContacts.length === 0) return;
+      payload = { contactIds: selectedContacts.map(b => b.contact_id) };
+      totalBatchSize = selectedContacts.length;
     }
 
-    if (batch.length === 0) return;
+    if (totalBatchSize === 0) return;
 
     try {
-      addLog(`🚀 Sending ${batch.length} records to backend for background enrichment...`);
+      addLog(`🚀 Deploying background enrichment cluster for ${totalBatchSize} records...`);
 
       const response = await fetch('/api/enrich', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contactIds: batch.map(b => b.contact_id) })
+        body: JSON.stringify(payload)
       });
 
-      if (!response.ok) throw new Error(`Server Error: ${response.status}`);
+      if (!response.ok) {
+        const errData = await response.json();
+        throw new Error(`Server Error: ${errData.error || response.status}`);
+      }
 
-      addLog(`✅ 202 Accepted: Backend is processing ${batch.length} records.`);
+      addLog(`✅ 202 Accepted: Backend cluster is scaling up to process ${totalBatchSize} records asynchronously.`);
       setActiveTab(AppTab.ENRICHMENT);
       setSelectedIds(new Set());
       setIsAllFilteredSelected(false);
 
-      // Update UI stats temporarily
-      setStats({ total: batch.length, completed: 0, failed: 0, isProcessing: true });
+      // Initialize UI Stats temporarily until the polling grabs the real data 5s later
+      setStats({ total: totalBatchSize, completed: 0, failed: 0, isProcessing: true });
 
     } catch (e: any) {
       addLog(`❌ Error starting queue: ${e.message}`);

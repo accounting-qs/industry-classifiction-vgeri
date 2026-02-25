@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { fetchDigest } from './services/scraperService';
 import { enrichBatch } from './services/enrichmentService';
+import { db } from './services/supabaseClient';
 import { MergedContact, Contact, Enrichment } from './types';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -500,10 +501,21 @@ app.get('/api/status', async (req, res) => {
  * Endpoints
  */
 
-app.post('/api/enrich', (req, res) => {
-    const { contactIds } = req.body;
+app.post('/api/enrich', async (req, res) => {
+    let { contactIds, filters, searchQuery } = req.body;
+
+    // If frontend sends filters instead of raw IDs, resolve them on the backend securely
+    if (filters) {
+        try {
+            const batch = await db.getAllFilteredContacts(filters, searchQuery);
+            contactIds = batch.map((c: any) => c.contact_id);
+        } catch (e: any) {
+            return res.status(500).json({ error: 'Failed to resolve filtered contacts: ' + e.message });
+        }
+    }
+
     if (!contactIds || !Array.isArray(contactIds)) {
-        return res.status(400).json({ error: 'Invalid contactIds' });
+        return res.status(400).json({ error: 'Invalid contactIds or filters' });
     }
 
     if (jobStats.isProcessing) {
