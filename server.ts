@@ -150,9 +150,44 @@ app.get('/api/status', async (req, res) => {
 
     const { data: dbLogs } = await query;
 
+    // FETCH LIVE JOB STATS FROM DB
+    let liveStats = { ...jobStats };
+    if (jobStats.isProcessing) {
+        const { data: activeJob } = await supabase
+            .from('jobs')
+            .select('completed_items, failed_items, total_items')
+            .in('status', ['pending', 'processing'])
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .single();
+
+        if (activeJob) {
+            liveStats.completed = activeJob.completed_items || 0;
+            liveStats.failed = activeJob.failed_items || 0;
+            liveStats.total = activeJob.total_items || 0;
+
+            // Sync memory
+            jobStats.completed = liveStats.completed;
+            jobStats.failed = liveStats.failed;
+            jobStats.total = liveStats.total;
+        } else {
+            // Check if there are ANY jobs left to see if we're truly done
+            const { count } = await supabase
+                .from('jobs')
+                .select('*', { count: 'exact', head: true })
+                .in('status', ['pending', 'processing']);
+
+            if (count === 0) {
+                jobStats.isProcessing = false;
+                liveStats.isProcessing = false;
+                await supabase.from('pipeline_state').update({ is_processing: false, updated_at: new Date().toISOString() }).eq('id', 1).then();
+            }
+        }
+    }
+
     res.json({
         logs: dbLogs || currentJobLogs,
-        stats: jobStats
+        stats: liveStats
     });
 });
 

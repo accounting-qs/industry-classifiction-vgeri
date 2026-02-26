@@ -24,6 +24,17 @@ export class JobProcessor {
     private static isRunning = false;
     private static shouldStop = false;
 
+    private static log(msg: string, level: 'info' | 'warn' | 'error' | 'phase' = 'info') {
+        console.log(`[JobProcessor] ${msg}`);
+        supabase.from('pipeline_logs').insert({
+            timestamp: new Date().toISOString(),
+            instance_id: 'worker',
+            module: 'Pipeline',
+            message: msg,
+            level
+        }).then();
+    }
+
     /**
      * Starts the infinite background polling loop.
      */
@@ -31,7 +42,7 @@ export class JobProcessor {
         if (this.isRunning) return;
         this.isRunning = true;
         this.shouldStop = false;
-        console.log(`🚀 JobProcessor started [Chunk: ${QUEUE_FETCH_CHUNK_SIZE}, Scrape: C${CONCURRENCY_SCRAPE}, AI: C${CONCURRENCY_AI}]`);
+        this.log(`🚀 JobProcessor started [Chunk: ${QUEUE_FETCH_CHUNK_SIZE}, Scrape: C${CONCURRENCY_SCRAPE}, AI: C${CONCURRENCY_AI}]`, 'phase');
 
         this.pollLoop();
     }
@@ -40,7 +51,7 @@ export class JobProcessor {
    * Gracefully requests the background loop to stop after the current chunk.
    */
     public static stop() {
-        console.log('🛑 Stop signal received. JobProcessor will halt after current chunk.');
+        this.log('🛑 Stop signal received. JobProcessor will halt after current chunk.', 'warn');
         this.shouldStop = true;
     }
 
@@ -56,7 +67,7 @@ export class JobProcessor {
                 .select('id');
 
             if (!error && data && data.length > 0) {
-                console.log(`♻️ Recovered ${data.length} stale job items from previous crash.`);
+                this.log(`♻️ Recovered ${data.length} stale job items from previous crash.`, 'info');
             }
 
             // Auto-start if there are any jobs still incomplete
@@ -66,11 +77,11 @@ export class JobProcessor {
                 .in('status', ['pending', 'processing']);
 
             if (count && count > 0) {
-                console.log(`▶️ Active jobs found (${count}). Auto-starting processor...`);
+                this.log(`▶️ Active jobs found (${count}). Auto-starting processor...`, 'info');
                 this.start();
             }
-        } catch (e) {
-            console.error('⚠️ Recovery failed:', e);
+        } catch (e: any) {
+            this.log('⚠️ Recovery failed: ' + e.message, 'error');
         }
     }
 
@@ -93,12 +104,12 @@ export class JobProcessor {
                     global.gc();
                 }
             } catch (err: any) {
-                console.error('❌ JobProcessor Loop Error:', err.message);
+                this.log('❌ JobProcessor Loop Error: ' + err.message, 'error');
                 await new Promise(r => setTimeout(r, 5000)); // Backoff on unhandled error
             }
         }
         this.isRunning = false;
-        console.log('🛑 JobProcessor fully stopped.');
+        this.log('🛑 JobProcessor fully stopped.', 'phase');
     }
 
     private static async processNextChunk(): Promise<number> {
@@ -111,7 +122,7 @@ export class JobProcessor {
             .limit(QUEUE_FETCH_CHUNK_SIZE);
 
         if (fetchError || !itemIdsToClaim || itemIdsToClaim.length === 0) {
-            if (fetchError) console.error('Fetch Claim Error:', fetchError.message);
+            if (fetchError) this.log('Fetch Claim Error: ' + fetchError.message, 'error');
             return 0; // Queue empty or error
         }
 
@@ -132,7 +143,7 @@ export class JobProcessor {
             return 0; // Lost the race or error
         }
 
-        console.log(`📦 Claimed chunk of ${claimedItems.length} items from ${activeJobIds.length} job(s).`);
+        this.log(`📦 Claimed chunk of ${claimedItems.length} items from ${activeJobIds.length} job(s).`, 'phase');
 
         // --- CHUNK LOCAL CACHE ---
         const uniqueDomains = [...new Set(claimedItems.map((item: any) => item.company_website).filter(Boolean))];
