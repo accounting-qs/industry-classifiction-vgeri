@@ -137,16 +137,43 @@ export class JobProcessor {
                 locked_at: new Date().toISOString()
             })
             .in('id', ids)
-            .select('*, contacts(*)');
+            .select('*');
 
         if (lockError || !claimedItems || claimedItems.length === 0) {
+            this.log('Lock Error: ' + (lockError?.message || 'Lost race'), 'warn');
             return 0; // Lost the race or error
         }
 
-        this.log(`📦 Claimed chunk of ${claimedItems.length} items from ${activeJobIds.length} job(s).`, 'phase');
+        // 1.5 Manually fetch contacts since we dropped the Foreign Key to fix the UUID mismatch
+        const contactIds = [...new Set(claimedItems.map(item => item.contact_id))];
+        const { data: contactData, error: contactErr } = await supabase
+            .from('contacts')
+            .select('*')
+            .in('contact_id', contactIds);
+
+        if (contactErr) {
+            this.log('Contact Join Error: ' + contactErr.message, 'error');
+            // Revert claims
+            await supabase.from('job_items').update({ status: 'pending', locked_at: null }).in('id', ids);
+            return 0;
+        }
+
+        // Create dictionary for fast mapping
+        const contactMap: Record<string, any> = {};
+        if (contactData) {
+            contactData.forEach(c => contactMap[c.contact_id] = c);
+        }
+
+        // Attach contact data manually
+        const enrichedItems = claimedItems.map(item => ({
+            ...item,
+            contacts: contactMap[item.contact_id] || { contact_id: item.contact_id, email: '', id: 0 }
+        }));
+
+        this.log(`📦 Claimed chunk of ${enrichedItems.length} items from ${activeJobIds.length} job(s).`, 'phase');
 
         // --- CHUNK LOCAL CACHE ---
-        const uniqueDomains = [...new Set(claimedItems.map((item: any) => item.company_website).filter(Boolean))];
+        const uniqueDomains = [...new Set(enrichedItems.map((item: any) => item.company_website).filter(Boolean))];
         const domainCache: Record<string, any> = {};
         const digestCache: Record<string, string> = {};
 
@@ -178,7 +205,7 @@ export class JobProcessor {
         }
 
         // --- EXECUTION PIPELINE ---
-        const results = await Promise.all(claimedItems.map(async (jobItem: any) => {
+        const results = await Promise.all(enrichedItems.map(async (jobItem: any) => {
             const contact = jobItem.contacts;
             const domain = jobItem.company_website || (contact.email ? contact.email.split('@')[1] : null);
 
