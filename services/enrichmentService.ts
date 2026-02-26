@@ -58,7 +58,7 @@ function normalizeConfidence(val: any): number {
 /**
  * Enriches a single contact using the OpenAI responses API.
  */
-async function enrichSingle(item: BatchItem): Promise<any> {
+export async function enrichSingle(item: BatchItem): Promise<any> {
   const html_snippet = (item.digest || "").slice(0, 12000);
   const key = getOpenAIKey();
   const maskedKey = key ? `${key.slice(0, 7)}...${key.slice(-4)}` : 'MISSING';

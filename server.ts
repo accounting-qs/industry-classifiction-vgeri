@@ -6,10 +6,8 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
-import { fetchDigest } from './services/scraperService';
-import { enrichBatch } from './services/enrichmentService';
 import { db } from './services/supabaseClient';
-import { MergedContact, Contact, Enrichment } from './types';
+import { JobProcessor } from './services/jobProcessor';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -122,366 +120,7 @@ app.use(express.static(path.join(__dirname, 'dist')));
 /**
  * Background Enrichment Logic (Ported from App.tsx)
  */
-async function runBackgroundEnrichment(contactIds: string[]) {
-    try {
-        addServerLog(`Enqueuing ${contactIds.length} records in chunks...`, 'Pipeline', 'phase');
-        const ENQUEUE_CHUNK_SIZE = 100;
-        for (let i = 0; i < contactIds.length; i += ENQUEUE_CHUNK_SIZE) {
-            const chunk = contactIds.slice(i, i + ENQUEUE_CHUNK_SIZE);
-            const { error: enqueueError } = await supabase.from('enrichments').upsert(
-                chunk.map(id => ({ contact_id: id, status: 'pending', processed_at: null, error_message: null })),
-                { onConflict: 'contact_id' }
-            );
-            if (enqueueError) throw enqueueError;
-            addServerLog(`Enqueued ${Math.min(i + ENQUEUE_CHUNK_SIZE, contactIds.length)}/${contactIds.length}...`, 'Sync');
-        }
-    } catch (e: any) {
-        addServerLog(`Enqueuer Failure: ${e.message}`, 'Pipeline', 'error');
-        jobStats.isProcessing = false;
-        persistPipelineState();
-        return;
-    }
-
-    // 1. Fetch contact data from Supabase in chunks
-    const contacts: any[] = [];
-    try {
-        addServerLog(`Fetching data for ${contactIds.length} records...`, 'Pipeline', 'phase');
-        const FETCH_CHUNK_SIZE = 100;
-        for (let i = 0; i < contactIds.length; i += FETCH_CHUNK_SIZE) {
-            const chunkIds = contactIds.slice(i, i + FETCH_CHUNK_SIZE);
-            const { data: chunkData, error } = await supabase
-                .from('contacts')
-                .select('*, enrichments(*)')
-                .in('contact_id', chunkIds);
-
-            if (error) throw error;
-            if (chunkData) contacts.push(...chunkData);
-            addServerLog(`Fetched ${contacts.length}/${contactIds.length}...`, 'Sync');
-        }
-    } catch (e: any) {
-        addServerLog(`Fetch Error: ${e.message}`, 'Pipeline', 'error');
-        jobStats.isProcessing = false;
-        persistPipelineState();
-        return;
-    }
-
-    if (contacts.length === 0) {
-        addServerLog(`No contact details found.`, 'Pipeline', 'warn');
-        jobStats.isProcessing = false;
-        persistPipelineState();
-        return;
-    }
-
-    addServerLog(`Starting Enrichment Pipeline for ${contacts.length} records.`, 'Pipeline', 'phase');
-
-    // Flatten contacts (MergedContact pattern) safely
-    const batch: MergedContact[] = contacts.map((item: any) => {
-        const enrichmentDataRaw = Array.isArray(item.enrichments) && item.enrichments.length > 0
-            ? item.enrichments[0]
-            : (item.enrichments || {});
-
-        // Prevent enrichmentData.id from overwriting contactData.id!
-        const { id: eId, ...safeEnrichmentData } = enrichmentDataRaw;
-        const { enrichments, ...contactData } = item;
-
-        return {
-            ...contactData,
-            ...safeEnrichmentData,
-            enrichment_id: eId,
-            status: safeEnrichmentData.status || 'new'
-        };
-    });
-
-    // --- ENRICHMENT CACHING (Scrape Once, Use Many) ---
-    // 1. Identify all unique websites in the batch
-    const uniqueWebsites = Array.from(new Set(batch.map(c => c.company_website).filter(Boolean)));
-    const domainCache: Record<string, any> = {}; // Full classification cache
-    const digestCache: Record<string, string> = {}; // HTML content cache
-
-    if (uniqueWebsites.length > 0) {
-        addServerLog(`Checking cache for ${uniqueWebsites.length} unique websites...`, 'Sync');
-
-        // A. Check for existing high-confidence classifications
-        const { data: cachedEnrichments } = await supabase
-            .from('enrichments')
-            .select(`
-                classification,
-                confidence,
-                reasoning,
-                contacts!inner(company_website)
-            `)
-            .eq('status', 'completed')
-            .gte('confidence', 7)
-            .in('contacts.company_website', uniqueWebsites);
-
-        if (cachedEnrichments) {
-            cachedEnrichments.forEach((row: any) => {
-                const website = row.contacts?.company_website;
-                if (website && !domainCache[website]) {
-                    domainCache[website] = {
-                        classification: row.classification,
-                        confidence: row.confidence,
-                        reasoning: row.reasoning
-                    };
-                }
-            });
-        }
-
-        // B. Check for existing scraped HTML content (Global Digest Cache)
-        const { data: cachedDigests } = await supabase
-            .from('scraped_data')
-            .select('domain, content')
-            .in('domain', uniqueWebsites);
-
-        if (cachedDigests) {
-            cachedDigests.forEach(d => {
-                digestCache[d.domain] = d.content;
-            });
-        }
-
-        const hitCount = Object.keys(domainCache).length;
-        const digestHitCount = Object.keys(digestCache).length;
-        if (hitCount > 0 || digestHitCount > 0) {
-            addServerLog(`⚡ Cache Hit: ${hitCount} classifications, ${digestHitCount} HTML digests found.`, 'Sync');
-        }
-    }
-
-    // MOVED CACHE INITIALIZATION INSIDE THE WHILE LOOP TO FREE MEMORY PER BATCH
-
-    const BATCH_SIZE = 100; // Skyrocketed batch size utilizing Unlimited CorsProxy Business plan
-    let currentIndex = 0;
-
-    // Loop until we finish the batch OR until the user clicks "Stop" (isProcessing = false)
-    while (currentIndex < batch.length && jobStats.isProcessing) {
-        // Aggressively clear large memory objects at the START of each new batch to prevent RAM plateaus
-        // This forces V8 garbage collector to free up the previous batch's HTML digests
-        const domainCache: Record<string, any> = {};
-        const digestCache: Record<string, string> = {};
-        // Initialize Sprint Scope Variables First
-        const sprintItems = batch.slice(currentIndex, currentIndex + BATCH_SIZE);
-        currentIndex += BATCH_SIZE;
-        const sprintEnd = Math.min(currentIndex, batch.length);
-
-        // Fetch Cache ONLY for the current 100 items (Massive memory savings vs entire list)
-        const uniqueSprintWebsites = [...new Set(sprintItems.map((c: any) => c.company_website).filter(Boolean))];
-
-        if (uniqueSprintWebsites.length > 0) {
-            // A. Check for existing high-confidence classifications
-            const { data: cachedEnrichments } = await supabase
-                .from('enrichments')
-                .select(`classification, confidence, reasoning, contacts!inner(company_website)`)
-                .eq('status', 'completed')
-                .gte('confidence', 7)
-                .in('contacts.company_website', uniqueSprintWebsites);
-
-            if (cachedEnrichments) {
-                cachedEnrichments.forEach((row: any) => {
-                    const website = row.contacts?.company_website;
-                    if (website) domainCache[website] = row;
-                });
-            }
-
-            // B. Check for existing scraped HTML content
-            const { data: cachedDigests } = await supabase
-                .from('scraped_data')
-                .select('domain, content')
-                .in('domain', uniqueSprintWebsites);
-
-            if (cachedDigests) {
-                cachedDigests.forEach(d => digestCache[d.domain] = d.content);
-            }
-        }
-
-        try {
-            // Separate items: Cached vs Content Cache vs Needs Scraping
-            const itemsToScrape = sprintItems.filter(item => {
-                const isLowConfidence = item.confidence !== undefined && item.confidence !== null && item.confidence < 7;
-                return isLowConfidence || (!domainCache[item.company_website] && !digestCache[item.company_website]);
-            });
-            const itemsFromDigestCache = sprintItems.filter(item => {
-                const isLowConfidence = item.confidence !== undefined && item.confidence !== null && item.confidence < 7;
-                return !isLowConfidence && !domainCache[item.company_website] && digestCache[item.company_website];
-            });
-            const itemsFromFullCache = sprintItems.filter(item => domainCache[item.company_website]);
-
-            if (itemsFromFullCache.length > 0) {
-                addServerLog(`♻️ Reusing classification for ${itemsFromFullCache.length} items.`, 'Sync');
-            }
-            if (itemsFromDigestCache.length > 0) {
-                addServerLog(`📄 Reusing HTML digest for ${itemsFromDigestCache.length} items (skipping scrape).`, 'Sync');
-            }
-
-            // Explicit logging for items forced into rescrape
-            itemsToScrape.forEach(item => {
-                if (item.confidence !== undefined && item.confidence !== null && item.confidence < 7) {
-                    addServerLog(`♻️ Rescraping ${item.company_website || item.email} (Previous confidence ${item.confidence} < 7)`, 'Pipeline', 'warn');
-                }
-            });
-
-            let scrapes: any[] = [];
-
-            // 1. Content already in cache
-            itemsFromDigestCache.forEach(item => {
-                scrapes.push({
-                    contact: item,
-                    digest: digestCache[item.company_website],
-                    proxyName: 'Cache',
-                    success: true
-                });
-            });
-
-            // 2. Perform live scraping for the rest
-            if (itemsToScrape.length > 0) {
-                addServerLog(`Sprint [${currentIndex - BATCH_SIZE + 1}-${sprintEnd}/${batch.length}]: Scraping ${itemsToScrape.length} websites...`, 'Pipeline', 'phase');
-                const scrapeResults = await Promise.all(itemsToScrape.map(async (c) => {
-                    const domain = c.company_website || c.email.split('@')[1];
-                    try {
-                        const { digest, proxyName } = await fetchDigest(domain, msg => {
-                            const level = msg.includes('failed') || msg.includes('FATAL') ? 'warn' : 'info';
-                            addServerLog(msg, 'Scraper', level);
-                        });
-                        addServerLog(`${domain} success via ${proxyName}`, 'Scraper');
-
-                        // PERSIST SCRAPED DATA (Fire and forget)
-                        supabase.from('scraped_data').upsert({ domain, content: digest, proxy_used: proxyName }, { onConflict: 'domain' }).then(() => { });
-
-                        return { contact: c, digest, proxyName, success: true };
-                    } catch (e: any) {
-                        addServerLog(`${domain} FATAL: ${e.message}`, 'Scraper', 'error');
-                        return { contact: c, digest: e.message, success: false };
-                    }
-                }));
-                scrapes.push(...scrapeResults);
-            }
-
-            // Results processing
-            const validScrapes = scrapes.filter(s => s.success);
-            const failedScrapes = scrapes.filter(s => !s.success);
-
-            let aiResults: any[] = [];
-            if (validScrapes.length > 0) {
-                addServerLog(`Classifying ${validScrapes.length} items (Success: ${Math.round((validScrapes.length / sprintItems.length) * 100)}%)...`, 'OpenAI', 'phase');
-                aiResults = await enrichBatch(validScrapes.map(s => ({
-                    contact_id: s.contact.contact_id,
-                    email: s.contact.email,
-                    digest: s.digest
-                })));
-                const aiSuccessCount = aiResults.filter(r => r.status === 'completed').length;
-                addServerLog(`Classification complete: ${aiSuccessCount}/${validScrapes.length} successful.`, 'OpenAI');
-            }
-
-            addServerLog(`Syncing results to Supabase...`, 'Sync');
-            const enrichmentsToUpsert: Partial<Enrichment>[] = [];
-            const contactsToUpdate: Partial<Contact>[] = [];
-
-            // 1. Process Fully Cached Items
-            itemsFromFullCache.forEach(item => {
-                const cached = domainCache[item.company_website];
-                if (cached) {
-                    jobStats.completed++;
-                    enrichmentsToUpsert.push({
-                        contact_id: item.contact_id,
-                        status: 'completed',
-                        confidence: cached.confidence,
-                        reasoning: `⚡ Reused high-confidence result (Score: ${cached.confidence}): ${cached.reasoning}`,
-                        classification: cached.classification,
-                        page_html: digestCache[item.company_website] || undefined,
-                        cost: 0,
-                        processed_at: new Date().toISOString()
-                    });
-
-                    contactsToUpdate.push({
-                        id: item.id,
-                        email: item.email,
-                        industry: cached.classification,
-                        lead_list_name: item.lead_list_name
-                    } as any);
-                }
-            });
-
-            // 2. Result processing for successful scrapes (AI Results)
-            aiResults.forEach(res => {
-                const original = validScrapes.find(s => s.contact.contact_id === res.contact_id);
-                if (original) {
-                    const isSuccess = res.status === 'completed' && res.classification !== 'ERROR';
-                    enrichmentsToUpsert.push({
-                        contact_id: res.contact_id,
-                        status: isSuccess ? 'completed' : 'failed',
-                        confidence: res.confidence,
-                        reasoning: res.reasoning,
-                        classification: isSuccess ? res.classification : undefined,
-                        page_html: original.digest,
-                        cost: res.cost,
-                        processed_at: new Date().toISOString()
-                    });
-
-                    if (isSuccess) {
-                        jobStats.completed++;
-                        contactsToUpdate.push({
-                            id: original.contact.id,
-                            email: original.contact.email,
-                            industry: res.classification,
-                            lead_list_name: original.contact.lead_list_name
-                        } as any);
-                    } else {
-                        jobStats.failed++;
-                    }
-                }
-            });
-
-            // ENRICHMENT GUARD: Process failed scrapes WITHOUT calling OpenAI
-            failedScrapes.forEach(f => {
-                jobStats.completed++; // Marked as completed to move through the queue
-                enrichmentsToUpsert.push({
-                    contact_id: f.contact.contact_id,
-                    status: 'completed',
-                    classification: 'Scrape Error',
-                    confidence: 1,
-                    error_message: f.digest,
-                    processed_at: new Date().toISOString()
-                });
-
-                // Also update the industry in the contacts table so the user sees the error
-                contactsToUpdate.push({
-                    id: f.contact.id,
-                    email: f.contact.email,
-                    industry: 'Scrape Error',
-                    lead_list_name: f.contact.lead_list_name
-                } as any);
-            });
-
-            if (enrichmentsToUpsert.length > 0) {
-                const { error: syncError } = await supabase.from('enrichments').upsert(enrichmentsToUpsert, { onConflict: 'contact_id' });
-                if (syncError) addServerLog(`🛑 [Sync] Failed to save enrichments: ${syncError.message}`);
-            }
-            if (contactsToUpdate.length > 0) {
-                // Upsert by primary key "id" to avoid "contacts_pkey" constraint errors
-                const { error: contactError } = await supabase.from('contacts').upsert(contactsToUpdate, { onConflict: 'id' });
-                if (contactError) addServerLog(`Failed to update contact records: ${contactError.message}`, 'Sync', 'error');
-            }
-
-            addServerLog(`Batch processed: ${jobStats.completed} done, ${jobStats.failed} failed`, 'Pipeline');
-            await persistPipelineState();
-
-            // MANUAL MEMORY CLEARING AFTER EACH BATCH
-            scrapes = null as any;
-            aiResults = null as any;
-            enrichmentsToUpsert.length = 0;
-            contactsToUpdate.length = 0;
-            if (global.gc) {
-                global.gc(); // Explicitly trigger V8 Garbage Collection if flag enabled
-            }
-
-        } catch (err: any) {
-            addServerLog(`Batch Error: ${err.message}`, 'Pipeline', 'error');
-            await persistPipelineState();
-        }
-    }
-
-    jobStats.isProcessing = false;
-    addServerLog("✨ Background task finalized.", 'Pipeline', 'phase');
-    await persistPipelineState();
-}
+/* Legacy runBackgroundEnrichment removed in favor of JobProcessor */
 
 app.get('/api/status', async (req, res) => {
     const { timeRange } = req.query;
@@ -542,34 +181,65 @@ app.post('/api/enrich', async (req, res) => {
         return res.status(409).json({ error: 'A job is already in progress' });
     }
 
-    // 1. Initialize stats IMMEDIATELY so polling starts correctly
-    jobStats.total = contactIds.length;
-    jobStats.completed = 0;
-    jobStats.failed = 0;
-    jobStats.isProcessing = true;
-    currentJobLogs = []; // Clear current session cache
     addServerLog(`Queuing ${contactIds.length} records...`, 'Pipeline', 'phase');
-    persistPipelineState(); // Save initial state
 
-    // 2. Fire-and-forget worker
-    runBackgroundEnrichment(contactIds).catch(err => {
-        console.error("Worker fatal error:", err);
-        addServerLog(`Fatal Pipeline Error: ${err.message}`, 'Pipeline', 'error');
-        jobStats.isProcessing = false;
-        persistPipelineState();
-    });
+    try {
+        // 1. Create a new job
+        const { data: jobRaw, error: errJob } = await supabase.from('jobs').insert({
+            status: 'processing',
+            total_items: contactIds.length,
+            started_at: new Date().toISOString()
+        }).select('id').single();
 
-    // 3. Immediate response (202 Accepted)
-    res.status(202).json({ message: 'Enrichment started in background' });
+        if (errJob) throw errJob;
+        const jobId = jobRaw.id;
+
+        // 2. Insert items in chunks to avoid DB payload limit
+        const ENQUEUE_CHUNK_SIZE = 5000;
+        for (let i = 0; i < contactIds.length; i += ENQUEUE_CHUNK_SIZE) {
+            const chunk = contactIds.slice(i, i + ENQUEUE_CHUNK_SIZE);
+            const items = chunk.map(id => ({
+                job_id: jobId,
+                contact_id: id,
+                status: 'pending'
+            }));
+            const { error: errItems } = await supabase.from('job_items').insert(items);
+            if (errItems) throw errItems;
+
+            addServerLog(`Enqueued ${Math.min(i + ENQUEUE_CHUNK_SIZE, contactIds.length)}/${contactIds.length}...`, 'Sync');
+        }
+
+        // 3. Initiate legacy pipeline state for backward compat
+        jobStats = {
+            total: contactIds.length,
+            completed: 0,
+            failed: 0,
+            isProcessing: true
+        };
+        currentJobLogs = [];
+        await persistPipelineState();
+
+        // 4. Start the Background Processor immediately
+        JobProcessor.start();
+
+        // 5. Immediate response (202 Accepted)
+        res.status(202).json({ message: 'Enrichment successfully queued in the background' });
+    } catch (err: any) {
+        console.error("Queueing error:", err);
+        addServerLog(`Fatal Pipeline Enqueue Error: ${err.message}`, 'Pipeline', 'error');
+        res.status(500).json({ error: 'Failed to queue job: ' + err.message });
+    }
 });
 
 app.post('/api/stop', async (req, res) => {
-    if (!jobStats.isProcessing) {
-        return res.status(400).json({ error: 'No job is currently running' });
-    }
     addServerLog(`⚠️ Stop command received. Halting background pipeline...`, 'Pipeline', 'warn');
+    JobProcessor.stop();
     jobStats.isProcessing = false;
     await persistPipelineState();
+
+    // Attempt to mark the currently active jobs as cancelled
+    await supabase.from('jobs').update({ status: 'cancelled' }).eq('status', 'processing').then();
+
     res.json({ message: 'Pipeline stopping gracefully...' });
 });
 
@@ -611,6 +281,16 @@ app.get('*', (req, res) => {
 });
 
 app.listen(PORT, async () => {
-    console.log(`🟢 Monolithic Server running on port ${PORT}`);
+    console.log(`🟢 Job Processor Server running on port ${PORT}`);
     await restorePipelineState();
+
+    // Resume any stale jobs from previous unexpected crashes
+    await JobProcessor.recoverStaleJobs();
+});
+
+// Graceful Shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received. Shutting down gracefully...');
+    JobProcessor.stop();
+    setTimeout(() => process.exit(0), 5000);
 });
