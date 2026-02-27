@@ -199,7 +199,7 @@ async function attemptDirectFetch(targetUrl: string, timeoutMs: number = 15000, 
   }
 
   try {
-    const response = await fetch(targetUrl, {
+    const fetchOptions: RequestInit = {
       signal: controller.signal,
       redirect: "follow",
       headers: {
@@ -217,27 +217,25 @@ async function attemptDirectFetch(targetUrl: string, timeoutMs: number = 15000, 
         'Sec-Fetch-User': '?1',
         'Upgrade-Insecure-Requests': '1'
       }
-    });
-    clearTimeout(timeoutId);
+    };
 
-    if (!response.ok) {
-      // If HTTPS fails, try a quick HTTP fallback for old sites
-      if (targetUrl.startsWith('https://')) {
-        return attemptDirectFetch(targetUrl.replace('https://', 'http://'), timeoutMs);
-      }
-      throw new Error(`HTTP ${response.status}`);
+    let response = await fetch(targetUrl, fetchOptions);
+
+    // Manual HTTP fallback instead of recursive call to avoid dangling listeners
+    if (!response.ok && targetUrl.startsWith('https://')) {
+      const httpUrl = targetUrl.replace('https://', 'http://');
+      response = await fetch(httpUrl, fetchOptions);
     }
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const raw_html = await response.text();
     validateHtml(raw_html, targetUrl);
     return raw_html;
-  } catch (e: any) {
-    clearTimeout(timeoutId);
-    throw e;
   } finally {
+    clearTimeout(timeoutId);
     if (parentSignal) {
       parentSignal.removeEventListener('abort', onParentAbort);
     }
-    clearTimeout(timeoutId);
   }
 }
 
@@ -271,7 +269,6 @@ async function attemptStandardProxy(index: number, targetUrl: string, timeoutMs:
         'Referer': proxyDomain + '/'
       }
     });
-    clearTimeout(timeoutId);
 
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
@@ -285,14 +282,11 @@ async function attemptStandardProxy(index: number, targetUrl: string, timeoutMs:
 
     validateHtml(raw_html, targetUrl);
     return raw_html;
-  } catch (e: any) {
-    clearTimeout(timeoutId);
-    throw e;
   } finally {
+    clearTimeout(timeoutId);
     if (parentSignal) {
       parentSignal.removeEventListener('abort', onParentAbort);
     }
-    clearTimeout(timeoutId);
   }
 }
 

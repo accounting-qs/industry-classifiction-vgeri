@@ -329,7 +329,22 @@ export class JobProcessor {
             updated_at: new Date().toISOString()
         }).eq('id', 1).then();
 
-        return claimedItems.length;
+        // 🗑️ AGGRESSIVE MEMORY CLEANUP 🗑️
+        // Explicitly sever large object references so V8 garbage collector can reclaim them immediately
+        // rather than waiting for the entire module scope closure to resolve.
+        const returnedLength = claimedItems.length;
+
+        claimedItems.length = 0;
+        enrichedItems.length = 0;
+        results.length = 0;
+        itemsToUpsert.length = 0;
+        enrichmentsToUpsert.length = 0;
+        contactsToUpdate.length = 0;
+        Object.keys(domainCache).forEach(k => delete domainCache[k]);
+        Object.keys(digestCache).forEach(k => delete digestCache[k]);
+        Object.keys(jobsToUpdate).forEach(k => delete jobsToUpdate[k]);
+
+        return returnedLength;
     }
 
     // Helpers
