@@ -43,6 +43,7 @@ export type MergedContact = Contact & Partial<Enrichment> & {
 export enum AppTab {
   MANAGER = 'contacts',
   ENRICHMENT = 'enrichment',
+  IMPORT = 'import',
   PROXIES = 'proxies'
 }
 

@@ -310,6 +310,62 @@ app.get('/api/stats/proxies', async (req, res) => {
     }
 });
 
+app.post('/api/import', async (req, res) => {
+    const { contacts } = req.body;
+
+    if (!contacts || !Array.isArray(contacts) || contacts.length === 0) {
+        return res.status(400).json({ error: 'No contacts provided' });
+    }
+
+    try {
+        // Generate UUIDs for contacts that don't have a contact_id
+        const prepared = contacts.map((c: any) => {
+            const row: any = {};
+            // Only include non-empty fields
+            if (c.contact_id) row.contact_id = c.contact_id;
+            else row.contact_id = crypto.randomUUID();
+
+            if (c.email) row.email = c.email;
+            if (c.first_name) row.first_name = c.first_name;
+            if (c.last_name) row.last_name = c.last_name;
+            if (c.company_website) row.company_website = c.company_website;
+            if (c.company_name) row.company_name = c.company_name;
+            if (c.industry) row.industry = c.industry;
+            if (c.linkedin_url) row.linkedin_url = c.linkedin_url;
+            if (c.title) row.title = c.title;
+            if (c.lead_list_name) row.lead_list_name = c.lead_list_name;
+
+            return row;
+        });
+
+        // Upsert in sub-chunks of 1000 to respect Supabase payload limits
+        const CHUNK_SIZE = 1000;
+        let inserted = 0;
+
+        for (let i = 0; i < prepared.length; i += CHUNK_SIZE) {
+            const chunk = prepared.slice(i, i + CHUNK_SIZE);
+            const { error } = await supabase
+                .from('contacts')
+                .upsert(chunk, { onConflict: 'email' });
+
+            if (error) {
+                console.error(`Import chunk error at row ${i}:`, error);
+                return res.status(500).json({
+                    error: `Failed at row ${i}: ${error.message}`,
+                    inserted
+                });
+            }
+            inserted += chunk.length;
+        }
+
+        addServerLog(`📥 Imported ${inserted} contacts via CSV upload.`, 'Sync', 'info');
+        res.json({ inserted });
+    } catch (err: any) {
+        console.error('Import error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // All other GET requests serve React App
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'dist', 'index.html'));

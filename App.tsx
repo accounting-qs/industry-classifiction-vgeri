@@ -3,6 +3,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AppTab, Contact, Enrichment, BatchStats, MergedContact, FilterCondition, FilterOperator } from './types';
 import { db } from './services/supabaseClient';
 import { enrichBatch } from './services/enrichmentService';
+import Papa from 'papaparse';
 import {
   Users,
   Zap,
@@ -30,7 +31,16 @@ import {
   Cpu,
   Activity,
   Play,
-  BarChart2
+  BarChart2,
+  Upload,
+  FileSpreadsheet,
+  ArrowRight,
+  ArrowLeft,
+  CheckCircle2,
+  AlertCircle,
+  FileUp,
+  Columns3,
+  Import
 } from 'lucide-react';
 
 /**
@@ -320,6 +330,7 @@ export default function App() {
         <nav className="flex-1 px-2 py-4 space-y-1 overflow-hidden">
           <SidebarIconButton active={activeTab === AppTab.MANAGER} onClick={() => setActiveTab(AppTab.MANAGER)} icon={<Users className="w-5 h-5" />} label="Contacts" />
           <SidebarIconButton active={activeTab === AppTab.ENRICHMENT} onClick={() => setActiveTab(AppTab.ENRICHMENT)} icon={<Zap className={`w-5 h-5 ${stats.isProcessing ? 'text-[#3ecf8e] animate-pulse' : ''}`} />} label="Pipeline Monitor" />
+          <SidebarIconButton active={activeTab === AppTab.IMPORT} onClick={() => setActiveTab(AppTab.IMPORT)} icon={<Upload className="w-5 h-5" />} label="Import CSV" />
         </nav>
         <div className="p-2 border-t border-[#2e2e2e]">
           <SidebarIconButton active={activeTab === AppTab.PROXIES} onClick={() => setActiveTab(AppTab.PROXIES)} icon={<BarChart2 className={`w-5 h-5 ${activeTab === AppTab.PROXIES ? 'text-[#3ecf8e]' : ''}`} />} label="Proxy Performance" />
@@ -340,6 +351,8 @@ export default function App() {
         <div className="flex-1 overflow-hidden flex flex-col">
           {activeTab === AppTab.PROXIES ? (
             <ProxyStatsDashboard />
+          ) : activeTab === AppTab.IMPORT ? (
+            <CSVImportWizard onComplete={() => { setActiveTab(AppTab.MANAGER); loadData(); }} />
           ) : activeTab === AppTab.ENRICHMENT ? (
             <PipelineMonitor
               stats={stats}
@@ -1122,6 +1135,471 @@ function ProxyStatsDashboard() {
                   );
                 })}
               </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================
+// CSV IMPORT WIZARD COMPONENT
+// ============================================
+
+const CONTACTS_FIELDS = [
+  { key: 'contact_id', label: 'contact_id', description: 'UUID identifier' },
+  { key: 'lead_list_name', label: 'lead_list_name', description: 'Lead list source' },
+  { key: 'first_name', label: 'first_name', description: 'First name' },
+  { key: 'last_name', label: 'last_name', description: 'Last name' },
+  { key: 'email', label: 'email', description: 'Email address' },
+  { key: 'company_website', label: 'company_website', description: 'Company domain' },
+  { key: 'company_name', label: 'company_name', description: 'Company name' },
+  { key: 'industry', label: 'industry', description: 'Industry vertical' },
+  { key: 'linkedin_url', label: 'linkedin_url', description: 'LinkedIn profile URL' },
+  { key: 'title', label: 'title', description: 'Job title' },
+];
+
+function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
+  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [file, setFile] = useState<File | null>(null);
+  const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
+  const [previewRows, setPreviewRows] = useState<Record<string, string>[]>([]);
+  const [mapping, setMapping] = useState<Record<string, string>>({});
+  const [totalRows, setTotalRows] = useState(0);
+  const [importProgress, setImportProgress] = useState(0);
+  const [importStatus, setImportStatus] = useState<'idle' | 'importing' | 'done' | 'error'>('idle');
+  const [importResult, setImportResult] = useState<{ inserted: number; errors: string[] }>({ inserted: 0, errors: [] });
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Auto-map CSV headers to contacts fields (case-insensitive, common aliases)
+  const autoMap = (headers: string[]) => {
+    const aliases: Record<string, string[]> = {
+      email: ['email', 'e-mail', 'email_address', 'emailaddress', 'mail'],
+      first_name: ['first_name', 'firstname', 'first name', 'fname', 'given_name'],
+      last_name: ['last_name', 'lastname', 'last name', 'lname', 'surname', 'family_name'],
+      company_website: ['company_website', 'website', 'domain', 'url', 'company_domain', 'company_url', 'web'],
+      company_name: ['company_name', 'company', 'organization', 'organisation', 'org'],
+      industry: ['industry', 'sector', 'vertical'],
+      linkedin_url: ['linkedin_url', 'linkedin', 'linkedin_profile', 'li_url'],
+      title: ['title', 'job_title', 'jobtitle', 'position', 'role'],
+      lead_list_name: ['lead_list_name', 'lead_list', 'list_name', 'list', 'source'],
+      contact_id: ['contact_id', 'contactid', 'id', 'uuid'],
+    };
+
+    const result: Record<string, string> = {};
+    const usedTargets = new Set<string>();
+
+    headers.forEach(header => {
+      const normalized = header.toLowerCase().trim().replace(/[\s-]+/g, '_');
+      for (const [field, aliasList] of Object.entries(aliases)) {
+        if (!usedTargets.has(field) && aliasList.includes(normalized)) {
+          result[header] = field;
+          usedTargets.add(field);
+          break;
+        }
+      }
+      if (!result[header]) {
+        result[header] = '__skip__';
+      }
+    });
+    return result;
+  };
+
+  const handleFileSelect = (selectedFile: File) => {
+    if (!selectedFile || !selectedFile.name.endsWith('.csv')) return;
+    setFile(selectedFile);
+    setStep(1);
+    setImportStatus('idle');
+    setImportResult({ inserted: 0, errors: [] });
+    setImportProgress(0);
+
+    // Count total rows first (streaming, just counting)
+    let rowCount = 0;
+    Papa.parse(selectedFile, {
+      header: true,
+      skipEmptyLines: true,
+      step: () => { rowCount++; },
+      complete: () => { setTotalRows(rowCount); }
+    });
+
+    // Parse preview (first 5 rows)
+    Papa.parse(selectedFile, {
+      header: true,
+      preview: 5,
+      skipEmptyLines: true,
+      complete: (results: Papa.ParseResult<Record<string, string>>) => {
+        const headers = results.meta.fields || [];
+        setCsvHeaders(headers);
+        setPreviewRows(results.data);
+        setMapping(autoMap(headers));
+        setStep(2);
+      }
+    });
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const f = e.dataTransfer.files[0];
+    if (f) handleFileSelect(f);
+  };
+
+  const updateMapping = (csvHeader: string, targetField: string) => {
+    setMapping(prev => {
+      const next = { ...prev };
+      // If another CSV col is already mapped to this target, unmap it
+      if (targetField !== '__skip__') {
+        Object.keys(next).forEach(k => {
+          if (next[k] === targetField && k !== csvHeader) {
+            next[k] = '__skip__';
+          }
+        });
+      }
+      next[csvHeader] = targetField;
+      return next;
+    });
+  };
+
+  const mappedFields = Object.values(mapping).filter(v => v !== '__skip__');
+  const hasRequiredField = mappedFields.includes('email') || mappedFields.includes('company_website');
+
+  const startImport = () => {
+    if (!file) return;
+    setStep(3);
+    setImportStatus('importing');
+    setImportProgress(0);
+    setImportResult({ inserted: 0, errors: [] });
+
+    const activeMappings: [string, string][] = (Object.entries(mapping) as [string, string][]).filter(([_, v]) => v !== '__skip__');
+    let buffer: any[] = [];
+    let processed = 0;
+    let totalInserted = 0;
+    const errors: string[] = [];
+    const CHUNK_SIZE = 2000;
+
+    const sendChunk = async (chunk: any[]): Promise<void> => {
+      try {
+        const res = await fetch('/api/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contacts: chunk })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          errors.push(data.error || `HTTP ${res.status}`);
+        } else {
+          totalInserted += data.inserted || 0;
+        }
+      } catch (err: any) {
+        errors.push(err.message);
+      }
+    };
+
+    // Use a queue approach to handle async sending while streaming
+    let sendPromise = Promise.resolve();
+
+    Papa.parse(file, {
+      header: true,
+      skipEmptyLines: true,
+      step: (row: Papa.ParseStepResult<Record<string, string>>) => {
+        const mapped: any = {};
+        activeMappings.forEach(([csvCol, targetCol]) => {
+          const val = row.data[csvCol];
+          if (val !== undefined && val !== null && val !== '') {
+            mapped[targetCol] = val;
+          }
+        });
+
+        // Only include rows that have at least one mapped value
+        if (Object.keys(mapped).length > 0) {
+          buffer.push(mapped);
+        }
+
+        processed++;
+
+        if (buffer.length >= CHUNK_SIZE) {
+          const chunk = [...buffer];
+          buffer = [];
+          sendPromise = sendPromise.then(() => sendChunk(chunk)).then(() => {
+            setImportProgress(processed);
+            setImportResult({ inserted: totalInserted, errors: [...errors] });
+          });
+        }
+      },
+      complete: () => {
+        // Send remaining buffer
+        if (buffer.length > 0) {
+          const chunk = [...buffer];
+          buffer = [];
+          sendPromise = sendPromise.then(() => sendChunk(chunk));
+        }
+
+        sendPromise.then(() => {
+          setImportProgress(processed);
+          setImportResult({ inserted: totalInserted, errors: [...errors] });
+          setImportStatus(errors.length > 0 ? 'error' : 'done');
+        });
+      },
+      error: (err: Error) => {
+        errors.push(`Parse error: ${err.message}`);
+        setImportResult({ inserted: totalInserted, errors: [...errors] });
+        setImportStatus('error');
+      }
+    });
+  };
+
+  return (
+    <div className="flex-1 p-6 overflow-y-auto custom-scrollbar bg-[#1c1c1c]">
+      <div className="max-w-4xl mx-auto">
+        {/* Header */}
+        <div className="mb-8">
+          <h2 className="text-2xl font-bold flex items-center gap-3 text-white">
+            <FileSpreadsheet className="w-6 h-6 text-[#3ecf8e]" />
+            Import Contacts
+          </h2>
+          <p className="text-sm text-gray-500 mt-2">Upload a CSV file to add contacts for enrichment. Supports files up to 50MB.</p>
+        </div>
+
+        {/* Step Indicator */}
+        <div className="flex items-center gap-3 mb-8">
+          {[{ n: 1, label: 'Upload', icon: FileUp }, { n: 2, label: 'Map Fields', icon: Columns3 }, { n: 3, label: 'Import', icon: Import }].map((s, idx) => (
+            <React.Fragment key={s.n}>
+              <div className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-all ${step === s.n
+                ? 'bg-[#3ecf8e]/10 text-[#3ecf8e] border border-[#3ecf8e]/30'
+                : step > s.n
+                  ? 'bg-[#3ecf8e]/5 text-[#3ecf8e]/60 border border-[#3ecf8e]/10'
+                  : 'bg-[#0e0e0e] text-gray-600 border border-[#2e2e2e]'
+                }`}>
+                <s.icon className="w-3.5 h-3.5" />
+                {s.label}
+              </div>
+              {idx < 2 && <div className={`flex-1 h-px ${step > s.n ? 'bg-[#3ecf8e]/30' : 'bg-[#2e2e2e]'}`} />}
+            </React.Fragment>
+          ))}
+        </div>
+
+        {/* Step 1: Upload */}
+        {step === 1 && (
+          <div
+            className={`border-2 border-dashed rounded-2xl p-16 text-center transition-all cursor-pointer ${dragOver
+              ? 'border-[#3ecf8e] bg-[#3ecf8e]/5'
+              : 'border-[#2e2e2e] bg-[#0e0e0e] hover:border-[#3ecf8e]/40 hover:bg-[#0e0e0e]/80'
+              }`}
+            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={handleDrop}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv"
+              className="hidden"
+              onChange={(e) => e.target.files?.[0] && handleFileSelect(e.target.files[0])}
+            />
+            <Upload className={`w-12 h-12 mx-auto mb-4 ${dragOver ? 'text-[#3ecf8e]' : 'text-gray-600'}`} />
+            <p className="text-lg font-bold text-gray-300 mb-2">Drop your CSV file here</p>
+            <p className="text-sm text-gray-600">or click to browse • Max 50MB</p>
+          </div>
+        )}
+
+        {/* Step 2: Field Mapping */}
+        {step === 2 && (
+          <div className="space-y-6">
+            {/* File info */}
+            <div className="flex items-center gap-4 p-4 bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl">
+              <FileSpreadsheet className="w-8 h-8 text-[#3ecf8e]" />
+              <div className="flex-1">
+                <p className="text-sm font-bold text-white">{file?.name}</p>
+                <p className="text-[10px] text-gray-500 uppercase tracking-wider mt-0.5">
+                  {(file?.size ? (file.size / 1024 / 1024).toFixed(2) : '0')} MB • {totalRows.toLocaleString()} rows • {csvHeaders.length} columns
+                </p>
+              </div>
+              <button
+                onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); }}
+                className="text-xs text-gray-500 hover:text-white px-3 py-1.5 border border-[#2e2e2e] rounded-lg hover:bg-[#2e2e2e] transition-colors"
+              >
+                Change File
+              </button>
+            </div>
+
+            {/* Mapping Table */}
+            <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl overflow-hidden">
+              <div className="px-5 py-3 border-b border-[#2e2e2e] flex items-center gap-2">
+                <Columns3 className="w-4 h-4 text-[#3ecf8e]" />
+                <span className="text-xs font-bold text-gray-300 uppercase tracking-widest">Column Mapping</span>
+                <span className="text-[10px] text-gray-600 ml-auto">{mappedFields.length} of {csvHeaders.length} mapped</span>
+              </div>
+
+              <div className="divide-y divide-[#2e2e2e] max-h-[400px] overflow-y-auto custom-scrollbar">
+                {csvHeaders.map(header => (
+                  <div key={header} className="flex items-center gap-4 px-5 py-3 hover:bg-white/[0.02] transition-colors">
+                    <div className="flex-1">
+                      <span className="text-sm font-medium text-gray-300">{header}</span>
+                      {previewRows[0] && (
+                        <span className="text-[10px] text-gray-600 ml-3 truncate inline-block max-w-[150px] align-middle" title={previewRows[0][header]}>
+                          e.g. "{previewRows[0][header]}"
+                        </span>
+                      )}
+                    </div>
+                    <ArrowRight className="w-4 h-4 text-gray-700 shrink-0" />
+                    <select
+                      value={mapping[header] || '__skip__'}
+                      onChange={(e) => updateMapping(header, e.target.value)}
+                      className={`w-48 bg-[#1c1c1c] border rounded-lg px-3 py-1.5 text-[11px] outline-none transition-all ${mapping[header] && mapping[header] !== '__skip__'
+                        ? 'border-[#3ecf8e]/40 text-[#3ecf8e]'
+                        : 'border-[#2e2e2e] text-gray-500'
+                        } focus:border-[#3ecf8e]`}
+                    >
+                      <option value="__skip__">— Skip —</option>
+                      {CONTACTS_FIELDS.map(f => (
+                        <option key={f.key} value={f.key} disabled={mappedFields.includes(f.key) && mapping[header] !== f.key}>
+                          {f.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Validation message */}
+            {!hasRequiredField && (
+              <div className="flex items-center gap-3 px-4 py-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-400 text-xs font-medium">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                You must map at least <strong>email</strong> or <strong>company_website</strong> to proceed.
+              </div>
+            )}
+
+            {/* Preview Table */}
+            {previewRows.length > 0 && mappedFields.length > 0 && (
+              <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl overflow-hidden">
+                <div className="px-5 py-3 border-b border-[#2e2e2e]">
+                  <span className="text-xs font-bold text-gray-300 uppercase tracking-widest">Preview (first {previewRows.length} rows)</span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="border-b border-[#2e2e2e]">
+                        {Object.entries(mapping).filter(([_, v]) => v !== '__skip__').map(([csvH, target]) => (
+                          <th key={csvH} className="px-4 py-2 text-left text-[9px] font-bold text-[#3ecf8e] uppercase tracking-wider">{target}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#2e2e2e]">
+                      {previewRows.map((row, i) => (
+                        <tr key={i} className="hover:bg-white/[0.02]">
+                          {Object.entries(mapping).filter(([_, v]) => v !== '__skip__').map(([csvH]) => (
+                            <td key={csvH} className="px-4 py-2 text-gray-400 truncate max-w-[200px]">{row[csvH] || <span className="text-gray-700 italic">empty</span>}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Actions */}
+            <div className="flex items-center justify-between pt-2">
+              <button
+                onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); }}
+                className="flex items-center gap-2 px-4 py-2.5 text-gray-400 hover:text-white border border-[#2e2e2e] rounded-lg text-xs font-bold hover:bg-[#2e2e2e] transition-colors"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" /> Back
+              </button>
+              <button
+                onClick={startImport}
+                disabled={!hasRequiredField}
+                className={`flex items-center gap-2 px-6 py-2.5 rounded-lg text-xs font-bold transition-all ${hasRequiredField
+                  ? 'bg-[#3ecf8e] text-black hover:bg-[#2fb37a] shadow-lg shadow-[#3ecf8e]/20'
+                  : 'bg-[#2e2e2e] text-gray-600 cursor-not-allowed'
+                  }`}
+              >
+                Start Import <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Step 3: Import Progress */}
+        {step === 3 && (
+          <div className="space-y-6">
+            <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl p-8">
+              {importStatus === 'importing' && (
+                <div className="text-center">
+                  <Loader2 className="w-12 h-12 text-[#3ecf8e] animate-spin mx-auto mb-4" />
+                  <p className="text-lg font-bold text-white mb-2">Importing contacts...</p>
+                  <p className="text-sm text-gray-500 mb-6">
+                    {importProgress.toLocaleString()} of {totalRows.toLocaleString()} rows processed
+                  </p>
+                  <div className="w-full bg-[#2e2e2e] rounded-full h-3 overflow-hidden mb-2">
+                    <div
+                      className="h-full bg-gradient-to-r from-[#3ecf8e] to-[#2fb37a] rounded-full transition-all duration-300 shadow-[0_0_12px_rgba(62,207,142,0.4)]"
+                      style={{ width: `${totalRows > 0 ? Math.min((importProgress / totalRows) * 100, 100) : 0}%` }}
+                    />
+                  </div>
+                  <p className="text-[10px] text-gray-600 font-mono">
+                    {totalRows > 0 ? Math.round((importProgress / totalRows) * 100) : 0}% complete
+                  </p>
+                </div>
+              )}
+
+              {importStatus === 'done' && (
+                <div className="text-center">
+                  <CheckCircle2 className="w-14 h-14 text-[#3ecf8e] mx-auto mb-4" />
+                  <p className="text-xl font-bold text-white mb-2">Import Complete!</p>
+                  <p className="text-sm text-gray-400 mb-6">
+                    Successfully imported <span className="text-[#3ecf8e] font-bold">{importResult.inserted.toLocaleString()}</span> contacts.
+                  </p>
+                  <div className="flex items-center justify-center gap-4">
+                    <button
+                      onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); setImportStatus('idle'); }}
+                      className="flex items-center gap-2 px-4 py-2.5 text-gray-400 hover:text-white border border-[#2e2e2e] rounded-lg text-xs font-bold hover:bg-[#2e2e2e] transition-colors"
+                    >
+                      <Upload className="w-3.5 h-3.5" /> Import Another
+                    </button>
+                    <button
+                      onClick={onComplete}
+                      className="flex items-center gap-2 px-6 py-2.5 bg-[#3ecf8e] text-black rounded-lg text-xs font-bold hover:bg-[#2fb37a] shadow-lg shadow-[#3ecf8e]/20 transition-all"
+                    >
+                      Go to Contacts <ArrowRight className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {importStatus === 'error' && (
+                <div className="text-center">
+                  <AlertCircle className="w-14 h-14 text-amber-400 mx-auto mb-4" />
+                  <p className="text-xl font-bold text-white mb-2">Import Completed with Errors</p>
+                  <p className="text-sm text-gray-400 mb-4">
+                    Imported <span className="text-[#3ecf8e] font-bold">{importResult.inserted.toLocaleString()}</span> contacts.
+                    <span className="text-rose-400 font-bold ml-1">{importResult.errors.length}</span> error(s) occurred.
+                  </p>
+                  <div className="bg-rose-500/10 border border-rose-500/20 rounded-xl p-4 text-left max-h-[200px] overflow-y-auto custom-scrollbar mb-6">
+                    {importResult.errors.map((err, i) => (
+                      <p key={i} className="text-[11px] text-rose-300 py-1 border-b border-rose-500/10 last:border-0">{err}</p>
+                    ))}
+                  </div>
+                  <div className="flex items-center justify-center gap-4">
+                    <button
+                      onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); setImportStatus('idle'); }}
+                      className="flex items-center gap-2 px-4 py-2.5 text-gray-400 hover:text-white border border-[#2e2e2e] rounded-lg text-xs font-bold hover:bg-[#2e2e2e] transition-colors"
+                    >
+                      <Upload className="w-3.5 h-3.5" /> Try Again
+                    </button>
+                    <button
+                      onClick={onComplete}
+                      className="flex items-center gap-2 px-6 py-2.5 bg-[#3ecf8e] text-black rounded-lg text-xs font-bold hover:bg-[#2fb37a] shadow-lg shadow-[#3ecf8e]/20 transition-all"
+                    >
+                      Go to Contacts <ArrowRight className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
