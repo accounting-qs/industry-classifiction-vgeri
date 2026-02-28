@@ -53,9 +53,9 @@ class SupabaseService {
   private applyFilters(query: any, filters: FilterCondition[], enrichmentCols: string[], searchQuery?: string) {
     if (searchQuery) {
       const q = `"%${searchQuery}%"`;
-      // Search across contacts and enrichment classification with correct joined syntax
+      // Search across contacts table columns only
       // Quoting the value (q) is necessary for PostgREST to parse values with dots or special characters
-      query = query.or(`first_name.ilike.${q},last_name.ilike.${q},email.ilike.${q},company_website.ilike.${q},industry.ilike.${q},enrichments(classification.ilike.${q})`);
+      query = query.or(`first_name.ilike.${q},last_name.ilike.${q},email.ilike.${q},company_website.ilike.${q},company_name.ilike.${q},industry.ilike.${q}`);
     }
 
     filters.forEach(f => {
