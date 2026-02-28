@@ -379,6 +379,7 @@ export default function App() {
               onFiltersChange={setActiveFilters}
               columns={[
                 { key: 'contact_id', label: 'contact_id', type: 'uuid', defaultWidth: 140 },
+                { key: 'lead_list_name', label: 'lead_list', type: 'text', defaultWidth: 150 },
                 { key: 'email', label: 'email', type: 'text', defaultWidth: 200 },
                 { key: 'first_name', label: 'first_name', type: 'text', defaultWidth: 100 },
                 { key: 'last_name', label: 'last_name', type: 'text', defaultWidth: 100 },
@@ -549,9 +550,15 @@ function DataTable({
 }: any) {
   const [showPageSizeMenu, setShowPageSizeMenu] = useState(false);
   const [showFilterBuilder, setShowFilterBuilder] = useState(false);
+  const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
   const totalPages = Math.ceil(totalCount / pageSize) || 1;
   const menuRef = useRef<HTMLDivElement>(null);
   const filterRef = useRef<HTMLDivElement>(null);
+
+  // Fetch distinct lead_list_name values for the filter
+  useEffect(() => {
+    db.getDistinctValues('lead_list_name').then(setLeadListOptions).catch(() => { });
+  }, []);
 
   useEffect(() => {
     function handleClickOutside(e: MouseEvent) {
@@ -579,6 +586,10 @@ function DataTable({
       if (f.id === id) {
         const next = { ...f, ...updates };
         if (next.column === 'status' && !Array.isArray(next.value)) {
+          next.value = [];
+          next.operator = 'in';
+        }
+        if (next.column === 'lead_list_name' && !Array.isArray(next.value)) {
           next.value = [];
           next.operator = 'in';
         }
@@ -685,7 +696,7 @@ function DataTable({
                               value={filter.operator}
                               onChange={(e) => updateFilter(filter.id, { operator: e.target.value as FilterOperator })}
                               className="w-full bg-[#1c1c1c] border border-[#2e2e2e] text-[11px] rounded-lg px-2.5 py-1.5 text-gray-200 outline-none focus:border-[#3ecf8e] disabled:opacity-50 transition-all"
-                              disabled={filter.column === 'status'}
+                              disabled={filter.column === 'status' || filter.column === 'lead_list_name'}
                             >
                               <option value="equals">is</option>
                               <option value="contains">contains</option>
@@ -711,6 +722,28 @@ function DataTable({
                                       updateFilter(filter.id, { value: next });
                                     }}
                                     className={`px-2 py-1.5 rounded-lg text-[10px] font-bold uppercase transition-all border text-center ${isChecked ? 'bg-[#3ecf8e22] border-[#3ecf8e] text-[#3ecf8e]' : 'bg-[#1c1c1c] border-[#2e2e2e] text-gray-500 hover:border-gray-600'}`}
+                                  >
+                                    {opt}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          ) : filter.column === 'lead_list_name' ? (
+                            <div className="grid grid-cols-3 gap-2 max-h-[200px] overflow-y-auto custom-scrollbar">
+                              {leadListOptions.length === 0 ? (
+                                <p className="text-[10px] text-gray-600 col-span-3 text-center py-2">No lead lists found</p>
+                              ) : leadListOptions.map(opt => {
+                                const isChecked = Array.isArray(filter.value) && filter.value.includes(opt);
+                                return (
+                                  <button
+                                    key={opt}
+                                    onClick={() => {
+                                      const current = Array.isArray(filter.value) ? filter.value : [];
+                                      const next = isChecked ? current.filter((s: string) => s !== opt) : [...current, opt];
+                                      updateFilter(filter.id, { value: next });
+                                    }}
+                                    className={`px-2 py-1.5 rounded-lg text-[10px] font-bold transition-all border text-center truncate ${isChecked ? 'bg-[#3ecf8e22] border-[#3ecf8e] text-[#3ecf8e]' : 'bg-[#1c1c1c] border-[#2e2e2e] text-gray-500 hover:border-gray-600'}`}
+                                    title={opt}
                                   >
                                     {opt}
                                   </button>

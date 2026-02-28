@@ -55,7 +55,7 @@ class SupabaseService {
       const q = `"%${searchQuery}%"`;
       // Search across contacts table columns only
       // Quoting the value (q) is necessary for PostgREST to parse values with dots or special characters
-      query = query.or(`first_name.ilike.${q},last_name.ilike.${q},email.ilike.${q},company_website.ilike.${q},company_name.ilike.${q},industry.ilike.${q}`);
+      query = query.or(`first_name.ilike.${q},last_name.ilike.${q},email.ilike.${q},company_website.ilike.${q},company_name.ilike.${q},industry.ilike.${q},lead_list_name.ilike.${q}`);
     }
 
     filters.forEach(f => {
@@ -153,7 +153,7 @@ class SupabaseService {
     query = this.applyFilters(query, filters, enrichmentCols, searchQuery);
 
     const { data, error, count } = await query
-      .order('id', { ascending: true })
+      .order('created_at', { ascending: true })
       .range(from, to);
 
     if (error) throw error;
@@ -182,7 +182,7 @@ class SupabaseService {
       query = this.applyFilters(query, filters, enrichmentCols, searchQuery);
 
       const { data, error } = await query
-        .order('id', { ascending: true })
+        .order('created_at', { ascending: true })
         .range(page * pageSize, (page + 1) * pageSize - 1);
 
       if (error) throw error;
@@ -195,6 +195,29 @@ class SupabaseService {
     }
 
     return this.flattenData(allData);
+  }
+
+  async getDistinctValues(column: string): Promise<string[]> {
+    if (!this.client) return [];
+    const allValues: string[] = [];
+    let page = 0;
+    const pageSize = 1000;
+
+    while (true) {
+      const { data, error } = await this.client
+        .from('contacts')
+        .select(column)
+        .not(column, 'is', null)
+        .neq(column, '')
+        .range(page * pageSize, (page + 1) * pageSize - 1);
+
+      if (error || !data || data.length === 0) break;
+      allValues.push(...data.map((d: any) => d[column]));
+      if (data.length < pageSize) break;
+      page++;
+    }
+
+    return [...new Set(allValues)].sort();
   }
 
   async enqueueContacts(contactIds: string[]) {
