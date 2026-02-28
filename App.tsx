@@ -163,8 +163,12 @@ export default function App() {
 
   useEffect(() => { loadData(); }, [loadData]);
 
-  // Poll server for status
+  // Poll server for status — only when on the Pipeline tab or actively processing
   useEffect(() => {
+    // Skip polling entirely when on the Contacts tab and nothing is processing
+    const shouldPoll = activeTab === AppTab.ENRICHMENT || stats.isProcessing;
+    if (!shouldPoll) return;
+
     const fetchStatus = async () => {
       try {
         const res = await fetch(`/api/status?timeRange=${activeLogFilter}`);
@@ -172,26 +176,20 @@ export default function App() {
           const data = await res.json();
           setLogs(data.logs);
           setStats(data.stats);
-          if (activeTab === AppTab.MANAGER && data.stats.isProcessing) {
-            loadData();
-          }
         }
       } catch (e) {
         console.error("Status fetch error:", e);
       }
     };
 
-    fetchStatus(); // Fetch once on mount/tab change/filter change
+    fetchStatus(); // Fetch once on mount/tab change
 
-    let interval: any;
-    if (stats.isProcessing || activeLogFilter === 'live') {
-      interval = setInterval(fetchStatus, 2500);
-    }
+    const interval = setInterval(fetchStatus, 2500);
 
     return () => {
-      if (interval) clearInterval(interval);
+      clearInterval(interval);
     };
-  }, [stats.isProcessing, activeTab, loadData, activeLogFilter]);
+  }, [stats.isProcessing, activeTab, activeLogFilter]);
 
   const addLog = (msg: string, module: string = 'Pipeline', level: LogEntry['level'] = 'info') => {
     const entry: LogEntry = {
