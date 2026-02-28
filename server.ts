@@ -310,6 +310,32 @@ app.get('/api/stats/proxies', async (req, res) => {
     }
 });
 
+// Fetch distinct values for a column (single efficient query)
+app.get('/api/distinct/:column', async (req, res) => {
+    const allowedColumns = ['lead_list_name', 'industry', 'company_name'];
+    const column = req.params.column;
+
+    if (!allowedColumns.includes(column)) {
+        return res.status(400).json({ error: 'Column not allowed' });
+    }
+
+    try {
+        const { data, error } = await supabase
+            .from('contacts')
+            .select(column)
+            .not(column, 'is', null)
+            .neq(column, '')
+            .limit(10000);
+
+        if (error) throw error;
+
+        const unique = [...new Set((data || []).map((d: any) => d[column]))].sort();
+        res.json(unique);
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.post('/api/import', async (req, res) => {
     const { contacts } = req.body;
 

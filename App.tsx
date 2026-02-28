@@ -122,6 +122,7 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
   const [isStopping, setIsStopping] = useState(false);
+  const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
 
   const stopRequestedRef = useRef(false);
 
@@ -162,6 +163,14 @@ export default function App() {
   }, [currentPage, pageSize, activeFilters, debouncedSearchQuery]);
 
   useEffect(() => { loadData(); }, [loadData]);
+
+  // Fetch distinct lead_list_name values once at app level
+  useEffect(() => {
+    fetch('/api/distinct/lead_list_name')
+      .then(res => res.json())
+      .then(data => { if (Array.isArray(data)) setLeadListOptions(data); })
+      .catch(() => { });
+  }, []);
 
   // Poll server for status — only when on the Pipeline tab or actively processing
   useEffect(() => {
@@ -415,6 +424,7 @@ export default function App() {
               onPageSizeChange={setPageSize}
               searchQuery={searchQuery}
               onSearchQueryChange={setSearchQuery}
+              leadListOptions={leadListOptions}
             />
           ) : (
             <div className="flex-1 p-6 overflow-hidden bg-[#1c1c1c] flex flex-col h-full min-h-0">
@@ -544,19 +554,16 @@ function DataTable({
   activeFilters = [],
   onFiltersChange,
   searchQuery = '',
-  onSearchQueryChange
+  onSearchQueryChange,
+  leadListOptions = []
 }: any) {
   const [showPageSizeMenu, setShowPageSizeMenu] = useState(false);
   const [showFilterBuilder, setShowFilterBuilder] = useState(false);
-  const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
   const totalPages = Math.ceil(totalCount / pageSize) || 1;
   const menuRef = useRef<HTMLDivElement>(null);
   const filterRef = useRef<HTMLDivElement>(null);
 
-  // Fetch distinct lead_list_name values for the filter
-  useEffect(() => {
-    db.getDistinctValues('lead_list_name').then(setLeadListOptions).catch(() => { });
-  }, []);
+  // leadListOptions comes from props (fetched once at App level)
 
   useEffect(() => {
     function handleClickOutside(e: MouseEvent) {
