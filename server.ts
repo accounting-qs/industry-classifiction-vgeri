@@ -343,15 +343,72 @@ app.post('/api/import', async (req, res) => {
         return res.status(400).json({ error: 'No contacts provided' });
     }
 
-    try {
-        // Generate UUIDs for contacts that don't have a contact_id
-        const prepared = contacts.map((c: any) => {
-            const row: any = {};
-            // Only include non-empty fields
-            if (c.contact_id) row.contact_id = c.contact_id;
-            else row.contact_id = crypto.randomUUID();
+    // Email validation: reject emails with disallowed characters
+    const DISALLOWED_CHARS = /[()<>\[\]:;,\\"!#$%^&*=+{}|?~`\s]/;
+    const validateEmail = (email: string): string | null => {
+        if (!email || email.trim() === '') return 'Email is empty';
+        const trimmed = email.trim();
+        if (DISALLOWED_CHARS.test(trimmed)) {
+            const bad = trimmed.match(DISALLOWED_CHARS);
+            return `Contains invalid character: "${bad?.[0]}"`;
+        }
+        if (!trimmed.includes('@')) return 'Missing @ symbol';
+        const [local, domain] = trimmed.split('@');
+        if (!local || local.length === 0) return 'Missing local part before @';
+        if (!domain || !domain.includes('.')) return 'Invalid domain (missing dot)';
+        return null; // valid
+    };
 
-            if (c.email) row.email = c.email;
+    try {
+        // 1. Validate emails and separate valid from invalid
+        const failedContacts: { email: string; row: number; reason: string }[] = [];
+        const validContacts: any[] = [];
+
+        contacts.forEach((c: any, idx: number) => {
+            const email = c.email?.trim();
+            if (email) {
+                const validationError = validateEmail(email);
+                if (validationError) {
+                    failedContacts.push({ email, row: idx + 1, reason: validationError });
+                    return; // Skip invalid
+                }
+            }
+            validContacts.push(c);
+        });
+
+        // 2. Extract all valid emails for duplicate check
+        const allEmails = validContacts
+            .map((c: any) => c.email?.trim()?.toLowerCase())
+            .filter(Boolean);
+
+        // 3. Check which emails already exist in the database
+        const existingEmails = new Set<string>();
+        const EMAIL_CHECK_CHUNK = 500;
+        for (let i = 0; i < allEmails.length; i += EMAIL_CHECK_CHUNK) {
+            const emailChunk = allEmails.slice(i, i + EMAIL_CHECK_CHUNK);
+            const { data: existing } = await supabase
+                .from('contacts')
+                .select('email')
+                .in('email', emailChunk);
+            if (existing) {
+                existing.forEach((r: any) => existingEmails.add(r.email?.toLowerCase()));
+            }
+        }
+
+        // 4. Prepare only NEW contacts (skip duplicates)
+        let duplicates = 0;
+        const newContacts: any[] = [];
+
+        validContacts.forEach((c: any) => {
+            const email = c.email?.trim()?.toLowerCase();
+            if (email && existingEmails.has(email)) {
+                duplicates++;
+                return; // Skip duplicate
+            }
+
+            const row: any = {};
+            row.contact_id = c.contact_id || crypto.randomUUID();
+            if (c.email) row.email = c.email.trim();
             if (c.first_name) row.first_name = c.first_name;
             if (c.last_name) row.last_name = c.last_name;
             if (c.company_website) row.company_website = c.company_website;
@@ -361,31 +418,33 @@ app.post('/api/import', async (req, res) => {
             if (c.title) row.title = c.title;
             if (c.lead_list_name) row.lead_list_name = c.lead_list_name;
 
-            return row;
+            newContacts.push(row);
         });
 
-        // Upsert in sub-chunks of 1000 to respect Supabase payload limits
+        // 5. Insert only new contacts in chunks
         const CHUNK_SIZE = 1000;
         let inserted = 0;
+        let dbFailed = 0;
+        const errors: string[] = [];
 
-        for (let i = 0; i < prepared.length; i += CHUNK_SIZE) {
-            const chunk = prepared.slice(i, i + CHUNK_SIZE);
+        for (let i = 0; i < newContacts.length; i += CHUNK_SIZE) {
+            const chunk = newContacts.slice(i, i + CHUNK_SIZE);
             const { error } = await supabase
                 .from('contacts')
-                .upsert(chunk, { onConflict: 'email' });
+                .insert(chunk);
 
             if (error) {
                 console.error(`Import chunk error at row ${i}:`, error);
-                return res.status(500).json({
-                    error: `Failed at row ${i}: ${error.message}`,
-                    inserted
-                });
+                errors.push(`Chunk ${i}: ${error.message}`);
+                dbFailed += chunk.length;
+            } else {
+                inserted += chunk.length;
             }
-            inserted += chunk.length;
         }
 
-        addServerLog(`📥 Imported ${inserted} contacts via CSV upload.`, 'Sync', 'info');
-        res.json({ inserted });
+        const totalFailed = failedContacts.length + dbFailed;
+        addServerLog(`📥 Import complete: ${inserted} new, ${duplicates} duplicates, ${totalFailed} failed (${failedContacts.length} invalid emails).`, 'Sync', 'info');
+        res.json({ inserted, duplicates, failed: totalFailed, errors, failedContacts });
     } catch (err: any) {
         console.error('Import error:', err);
         res.status(500).json({ error: err.message });

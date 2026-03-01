@@ -1207,8 +1207,9 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
   const [totalRows, setTotalRows] = useState(0);
   const [importProgress, setImportProgress] = useState(0);
   const [importStatus, setImportStatus] = useState<'idle' | 'importing' | 'done' | 'error'>('idle');
-  const [importResult, setImportResult] = useState<{ inserted: number; errors: string[] }>({ inserted: 0, errors: [] });
+  const [importResult, setImportResult] = useState<{ inserted: number; duplicates: number; failed: number; errors: string[]; failedContacts: { email: string; row: number; reason: string }[] }>({ inserted: 0, duplicates: 0, failed: 0, errors: [], failedContacts: [] });
   const [dragOver, setDragOver] = useState(false);
+  const [showFailedModal, setShowFailedModal] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Auto-map CSV headers to contacts fields (case-insensitive, common aliases)
@@ -1308,13 +1309,16 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
     setStep(3);
     setImportStatus('importing');
     setImportProgress(0);
-    setImportResult({ inserted: 0, errors: [] });
+    setImportResult({ inserted: 0, duplicates: 0, failed: 0, errors: [], failedContacts: [] });
 
     const activeMappings: [string, string][] = (Object.entries(mapping) as [string, string][]).filter(([_, v]) => v !== '__skip__');
     let buffer: any[] = [];
     let processed = 0;
     let totalInserted = 0;
+    let totalDuplicates = 0;
+    let totalFailed = 0;
     const errors: string[] = [];
+    const allFailedContacts: { email: string; row: number; reason: string }[] = [];
     const CHUNK_SIZE = 2000;
 
     const sendChunk = async (chunk: any[]): Promise<void> => {
@@ -1329,6 +1333,10 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
           errors.push(data.error || `HTTP ${res.status}`);
         } else {
           totalInserted += data.inserted || 0;
+          totalDuplicates += data.duplicates || 0;
+          totalFailed += data.failed || 0;
+          if (data.errors?.length) errors.push(...data.errors);
+          if (data.failedContacts?.length) allFailedContacts.push(...data.failedContacts);
         }
       } catch (err: any) {
         errors.push(err.message);
@@ -1362,7 +1370,7 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
           buffer = [];
           sendPromise = sendPromise.then(() => sendChunk(chunk)).then(() => {
             setImportProgress(processed);
-            setImportResult({ inserted: totalInserted, errors: [...errors] });
+            setImportResult({ inserted: totalInserted, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
           });
         }
       },
@@ -1376,13 +1384,13 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
 
         sendPromise.then(() => {
           setImportProgress(processed);
-          setImportResult({ inserted: totalInserted, errors: [...errors] });
-          setImportStatus(errors.length > 0 ? 'error' : 'done');
+          setImportResult({ inserted: totalInserted, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
+          setImportStatus(totalFailed > 0 || errors.length > 0 ? 'error' : 'done');
         });
       },
       error: (err: Error) => {
         errors.push(`Parse error: ${err.message}`);
-        setImportResult({ inserted: totalInserted, errors: [...errors] });
+        setImportResult({ inserted: totalInserted, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
         setImportStatus('error');
       }
     });
@@ -1589,9 +1597,31 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
                 <div className="text-center">
                   <CheckCircle2 className="w-14 h-14 text-[#3ecf8e] mx-auto mb-4" />
                   <p className="text-xl font-bold text-white mb-2">Import Complete!</p>
-                  <p className="text-sm text-gray-400 mb-6">
-                    Successfully imported <span className="text-[#3ecf8e] font-bold">{importResult.inserted.toLocaleString()}</span> contacts.
-                  </p>
+
+                  {/* Stats grid */}
+                  <div className="grid grid-cols-3 gap-4 mb-6 max-w-md mx-auto">
+                    <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
+                      <p className="text-2xl font-bold text-[#3ecf8e]">{importResult.inserted.toLocaleString()}</p>
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mt-1">Imported</p>
+                    </div>
+                    <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
+                      <p className="text-2xl font-bold text-amber-400">{importResult.duplicates.toLocaleString()}</p>
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mt-1">Duplicates</p>
+                    </div>
+                    <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
+                      <p className="text-2xl font-bold text-gray-600">{importResult.failed.toLocaleString()}</p>
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mt-1">Failed</p>
+                      {importResult.failed > 0 && (
+                        <button
+                          onClick={() => setShowFailedModal(true)}
+                          className="text-[9px] text-[#3ecf8e] hover:underline mt-1 cursor-pointer"
+                        >
+                          View details
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
                   <div className="flex items-center justify-center gap-4">
                     <button
                       onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); setImportStatus('idle'); }}
@@ -1613,10 +1643,31 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
                 <div className="text-center">
                   <AlertCircle className="w-14 h-14 text-amber-400 mx-auto mb-4" />
                   <p className="text-xl font-bold text-white mb-2">Import Completed with Errors</p>
-                  <p className="text-sm text-gray-400 mb-4">
-                    Imported <span className="text-[#3ecf8e] font-bold">{importResult.inserted.toLocaleString()}</span> contacts.
-                    <span className="text-rose-400 font-bold ml-1">{importResult.errors.length}</span> error(s) occurred.
-                  </p>
+
+                  {/* Stats grid */}
+                  <div className="grid grid-cols-3 gap-4 mb-4 max-w-md mx-auto">
+                    <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
+                      <p className="text-2xl font-bold text-[#3ecf8e]">{importResult.inserted.toLocaleString()}</p>
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mt-1">Imported</p>
+                    </div>
+                    <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
+                      <p className="text-2xl font-bold text-amber-400">{importResult.duplicates.toLocaleString()}</p>
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mt-1">Duplicates</p>
+                    </div>
+                    <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
+                      <p className="text-2xl font-bold text-rose-400">{importResult.failed.toLocaleString()}</p>
+                      <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mt-1">Failed</p>
+                      {importResult.failedContacts.length > 0 && (
+                        <button
+                          onClick={() => setShowFailedModal(true)}
+                          className="text-[9px] text-[#3ecf8e] hover:underline mt-1 cursor-pointer"
+                        >
+                          View details
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
                   <div className="bg-rose-500/10 border border-rose-500/20 rounded-xl p-4 text-left max-h-[200px] overflow-y-auto custom-scrollbar mb-6">
                     {importResult.errors.map((err, i) => (
                       <p key={i} className="text-[11px] text-rose-300 py-1 border-b border-rose-500/10 last:border-0">{err}</p>
@@ -1642,6 +1693,59 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
           </div>
         )}
       </div>
+
+      {/* Failed Contacts Modal */}
+      {showFailedModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowFailedModal(false)}>
+          <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-2xl max-h-[80vh] flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>
+            {/* Modal Header */}
+            <div className="flex items-center justify-between px-6 py-4 border-b border-[#2e2e2e]">
+              <div>
+                <h3 className="text-sm font-bold text-white">Failed Contacts</h3>
+                <p className="text-[10px] text-gray-500 mt-0.5">{importResult.failedContacts.length} contacts failed validation</p>
+              </div>
+              <button
+                onClick={() => setShowFailedModal(false)}
+                className="text-gray-500 hover:text-white text-lg font-bold w-8 h-8 flex items-center justify-center rounded-lg hover:bg-[#2e2e2e] transition-colors"
+              >
+                ×
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="flex-1 overflow-y-auto custom-scrollbar">
+              <table className="w-full text-[11px]">
+                <thead className="sticky top-0 bg-[#0e0e0e]">
+                  <tr className="border-b border-[#2e2e2e]">
+                    <th className="px-6 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider w-12">#</th>
+                    <th className="px-4 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider">Email</th>
+                    <th className="px-4 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider">Reason</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#2e2e2e]">
+                  {importResult.failedContacts.map((fc, i) => (
+                    <tr key={i} className="hover:bg-white/[0.02]">
+                      <td className="px-6 py-2.5 text-gray-600 font-mono">{fc.row}</td>
+                      <td className="px-4 py-2.5 text-gray-300 font-mono">{fc.email}</td>
+                      <td className="px-4 py-2.5 text-rose-400">{fc.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-6 py-3 border-t border-[#2e2e2e] flex justify-end">
+              <button
+                onClick={() => setShowFailedModal(false)}
+                className="px-4 py-2 bg-[#2e2e2e] text-gray-300 rounded-lg text-xs font-bold hover:bg-[#3e3e3e] transition-colors"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
