@@ -724,7 +724,9 @@ function DataTable({
                               className="w-full bg-[#1c1c1c] border border-[#2e2e2e] text-[11px] rounded-lg px-2.5 py-1.5 text-gray-200 outline-none focus:border-[#3ecf8e] disabled:opacity-50 transition-all"
                               disabled={filter.column === 'status'}
                             >
-                              {filter.column === 'lead_list_name' ? (
+                              {filter.column === 'status' ? (
+                                <option value="in">is</option>
+                              ) : filter.column === 'lead_list_name' ? (
                                 <>
                                   <option value="in">is</option>
                                   <option value="not_in">is not</option>
