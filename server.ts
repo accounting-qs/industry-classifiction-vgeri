@@ -384,13 +384,14 @@ app.get('/api/distinct/:column', async (req, res) => {
         let page = 0;
         const pageSize = 10000;
 
-        // Paginate to ensure we scan all rows in large tables
+        // Paginate with consistent ordering to ensure all rows are scanned
         while (true) {
             const { data, error } = await supabase
                 .from('contacts')
                 .select(column)
                 .not(column, 'is', null)
                 .neq(column, '')
+                .order('id', { ascending: true })
                 .range(page * pageSize, (page + 1) * pageSize - 1);
 
             if (error) throw error;
@@ -402,6 +403,7 @@ app.get('/api/distinct/:column', async (req, res) => {
         }
 
         const unique = [...allValues].sort();
+        console.log(`[Distinct] ${column}: found ${unique.length} unique values`);
         res.json(unique);
     } catch (err: any) {
         res.status(500).json({ error: err.message });
