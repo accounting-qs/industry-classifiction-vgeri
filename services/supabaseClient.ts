@@ -136,6 +136,30 @@ class SupabaseService {
     return useInnerJoin ? `*, enrichments!inner(*)` : `*, enrichments(*)`;
   }
 
+  /**
+   * Detects mixed status filter: includes 'new' (no enrichment) AND other statuses (has enrichment).
+   * This case cannot be handled in a single PostgREST query because:
+   * - 'new' requires LEFT JOIN + enrichments IS null
+   * - Other statuses require INNER JOIN + enrichments.status IN (...)
+   * - Combining with LEFT JOIN + .or({foreignTable}) doesn't filter parent rows
+   */
+  private getMixedStatusInfo(filters: FilterCondition[]): { isMixed: boolean; newOnly: boolean; otherStatuses: string[]; nonStatusFilters: FilterCondition[] } {
+    const statusFilter = filters.find(f => f.column === 'status');
+    if (!statusFilter || !Array.isArray(statusFilter.value)) {
+      return { isMixed: false, newOnly: false, otherStatuses: [], nonStatusFilters: filters };
+    }
+    const statuses = statusFilter.value as string[];
+    const hasNew = statuses.includes('new');
+    const others = statuses.filter(s => s !== 'new');
+    const nonStatusFilters = filters.filter(f => f.column !== 'status');
+    return {
+      isMixed: hasNew && others.length > 0,
+      newOnly: hasNew && others.length === 0,
+      otherStatuses: others,
+      nonStatusFilters
+    };
+  }
+
   async getPaginatedContacts(
     page: number,
     pageSize: number,
@@ -145,10 +169,65 @@ class SupabaseService {
   ): Promise<{ data: MergedContact[], count: number }> {
     if (!this.client) return { data: [], count: 0 };
 
-    const from = (page - 1) * pageSize;
-    const to = from + pageSize - 1;
     const enrichmentCols = ['status', 'classification', 'confidence', 'cost', 'processed_at'];
+    const { isMixed, otherStatuses, nonStatusFilters } = this.getMixedStatusInfo(filters);
 
+    // Mixed status: split into two queries and merge
+    if (isMixed) {
+      // Query 1: contacts with enrichment status in otherStatuses (INNER JOIN)
+      let q1 = this.client.from('contacts')
+        .select('*, enrichments!inner(*)', { count: 'exact' });
+      q1 = this.applyFilters(q1, nonStatusFilters, enrichmentCols, searchQuery);
+      q1 = q1.in('enrichments.status', otherStatuses);
+
+      // Query 2: "new" contacts with no enrichment (LEFT JOIN + is null)
+      let q2 = this.client.from('contacts')
+        .select('*, enrichments(*)', { count: 'exact' });
+      q2 = this.applyFilters(q2, nonStatusFilters, enrichmentCols, searchQuery);
+      q2 = q2.filter('enrichments', 'is', 'null');
+
+      // Get counts from both
+      const [r1Count, r2Count] = await Promise.all([
+        q1.order('created_at', { ascending: true }).limit(0),
+        q2.order('created_at', { ascending: true }).limit(0)
+      ]);
+
+      const count1 = r1Count.count || 0;
+      const count2 = r2Count.count || 0;
+      const totalCount = count1 + count2;
+      const from = (page - 1) * pageSize;
+
+      // Fetch data: "other status" contacts first, then "new" contacts
+      let data: any[] = [];
+
+      if (from < count1) {
+        // Need items from query 1 (enrichment-based statuses)
+        const q1Data = this.client.from('contacts')
+          .select('*, enrichments!inner(*)');
+        const applied1 = this.applyFilters(q1Data, nonStatusFilters, enrichmentCols, searchQuery);
+        const r1 = await applied1.in('enrichments.status', otherStatuses)
+          .order('created_at', { ascending: true })
+          .range(from, Math.min(from + pageSize - 1, count1 - 1));
+        data = data.concat(r1.data || []);
+      }
+
+      const remaining = pageSize - data.length;
+      if (remaining > 0 && from + data.length >= count1) {
+        // Need items from query 2 ("new" contacts)
+        const newOffset = Math.max(0, from - count1);
+        const q2Data = this.client.from('contacts')
+          .select('*, enrichments(*)');
+        const applied2 = this.applyFilters(q2Data, nonStatusFilters, enrichmentCols, searchQuery);
+        const r2 = await applied2.filter('enrichments', 'is', 'null')
+          .order('created_at', { ascending: true })
+          .range(newOffset, newOffset + remaining - 1);
+        data = data.concat(r2.data || []);
+      }
+
+      return { data: this.flattenData(data), count: totalCount };
+    }
+
+    // Standard (non-mixed) query
     const selectStr = this.getJoinConfig(filters, enrichmentCols, enrichedOnly);
 
     let query = this.client
@@ -159,7 +238,7 @@ class SupabaseService {
 
     const { data, error, count } = await query
       .order('created_at', { ascending: true })
-      .range(from, to);
+      .range((page - 1) * pageSize, page * pageSize - 1);
 
     if (error) throw error;
 
@@ -204,12 +283,26 @@ class SupabaseService {
 
   /**
    * Lightweight: only fetches contact_id for the enrich endpoint.
-   * Avoids full join which causes statement timeout on large filtered queries.
+   * Handles mixed status filters (new + other) by splitting into two queries.
    */
   async getAllFilteredContactIds(filters: FilterCondition[], searchQuery?: string): Promise<string[]> {
     if (!this.client) return [];
 
     const enrichmentCols = ['status', 'classification', 'confidence', 'cost', 'processed_at'];
+    const { isMixed, otherStatuses, nonStatusFilters } = this.getMixedStatusInfo(filters);
+
+    if (isMixed) {
+      // Split: fetch IDs for "new" and for "other statuses" separately, then merge
+      const newFilter: FilterCondition = { id: '_new', column: 'status', operator: 'in', value: ['new'] };
+      const otherFilter: FilterCondition = { id: '_other', column: 'status', operator: 'in', value: otherStatuses };
+
+      const [newIds, otherIds] = await Promise.all([
+        this.getAllFilteredContactIds([...nonStatusFilters, newFilter], searchQuery),
+        this.getAllFilteredContactIds([...nonStatusFilters, otherFilter], searchQuery)
+      ]);
+
+      return [...new Set([...newIds, ...otherIds])];
+    }
 
     // Determine if we need enrichment join for the filter
     const hasEnrichmentFilter = filters.some(f => enrichmentCols.includes(f.column));
@@ -217,14 +310,19 @@ class SupabaseService {
       ? 'contact_id, enrichments!inner(status)'
       : 'contact_id';
 
+    // Check for "new" status (no enrichment) — needs LEFT join
+    const statusFilter = filters.find(f => f.column === 'status');
+    const isNewOnly = statusFilter && Array.isArray(statusFilter.value) && statusFilter.value.includes('new') && statusFilter.value.length === 1;
+    const actualSelect = isNewOnly ? 'contact_id, enrichments(status)' : selectStr;
+
     let allIds: string[] = [];
     let page = 0;
-    const pageSize = 5000; // Larger page since we only fetch IDs
+    const pageSize = 5000;
 
     while (true) {
       let query = this.client
         .from('contacts')
-        .select(selectStr);
+        .select(actualSelect);
 
       query = this.applyFilters(query, filters, enrichmentCols, searchQuery);
 
