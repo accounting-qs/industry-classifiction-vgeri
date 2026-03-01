@@ -89,6 +89,11 @@ class SupabaseService {
           case 'greater_than': query = query.gt(colPath, f.value); break;
           case 'less_than': query = query.lt(colPath, f.value); break;
           case 'in': query = query.in(colPath, Array.isArray(f.value) ? f.value : [f.value]); break;
+          case 'not_in': {
+            const vals = Array.isArray(f.value) ? f.value : [f.value];
+            if (vals.length > 0) query = query.not(colPath, 'in', `(${vals.join(',')})`);
+            break;
+          }
         }
       }
     });

@@ -54,7 +54,7 @@ export interface BatchStats {
   isProcessing: boolean;
 }
 
-export type FilterOperator = 'equals' | 'contains' | 'starts_with' | 'greater_than' | 'less_than' | 'in';
+export type FilterOperator = 'equals' | 'contains' | 'starts_with' | 'greater_than' | 'less_than' | 'in' | 'not_in';
 
 export interface FilterCondition {
   id: string;

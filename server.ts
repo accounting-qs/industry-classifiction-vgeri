@@ -380,32 +380,41 @@ app.get('/api/distinct/:column', async (req, res) => {
     }
 
     try {
-        const allValues = new Set<string>();
-        let page = 0;
-        const pageSize = 10000;
+        // Use Supabase RPC for instant DISTINCT queries (single SQL roundtrip)
+        if (column === 'lead_list_name') {
+            const { data, error } = await supabase.rpc('get_distinct_lead_list_names');
+            if (error) throw error;
+            const unique = (data || []).map((r: any) => r.name).filter(Boolean);
+            console.log(`[Distinct] ${column}: ${unique.length} values (via RPC)`);
+            return res.json(unique);
+        }
 
-        // Paginate with consistent ordering to ensure all rows are scanned
+        // Fallback: cursor-based pagination for other columns
+        const allValues = new Set<string>();
+        let lastId = 0;
+
         while (true) {
-            const { data, error } = await supabase
+            const { data: rows, error } = await supabase
                 .from('contacts')
-                .select(column)
+                .select(`id, ${column}`)
                 .not(column, 'is', null)
                 .neq(column, '')
+                .gt('id', lastId)
                 .order('id', { ascending: true })
-                .range(page * pageSize, (page + 1) * pageSize - 1);
+                .limit(1000);
 
             if (error) throw error;
-            if (!data || data.length === 0) break;
+            if (!rows || rows.length === 0) break;
 
-            data.forEach((d: any) => { if (d[column]) allValues.add(d[column]); });
-            if (data.length < pageSize) break;
-            page++;
+            (rows as any[]).forEach((d: any) => { if (d[column]) allValues.add(d[column]); });
+            lastId = (rows as any[])[rows.length - 1].id;
         }
 
         const unique = [...allValues].sort();
-        console.log(`[Distinct] ${column}: found ${unique.length} unique values`);
+        console.log(`[Distinct] ${column}: ${unique.length} values (via cursor scan)`);
         res.json(unique);
     } catch (err: any) {
+        console.error(`[Distinct] Error fetching ${column}:`, err.message);
         res.status(500).json({ error: err.message });
     }
 });

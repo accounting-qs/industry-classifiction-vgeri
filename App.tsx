@@ -612,7 +612,7 @@ function DataTable({
         }
         if (next.column === 'lead_list_name' && !Array.isArray(next.value)) {
           next.value = [];
-          next.operator = 'in';
+          if (next.operator !== 'in' && next.operator !== 'not_in') next.operator = 'in';
         }
         if (next.column === 'confidence' && (next.value === '' || Array.isArray(next.value))) {
           next.value = "1";
@@ -654,7 +654,7 @@ function DataTable({
             {activeFilters.map((f: FilterCondition) => (
               <div key={f.id} className="flex items-center gap-1.5 px-2 py-1 bg-[#2e2e2e] rounded-md text-[10px] text-gray-300 border border-[#3e3e3e]">
                 <span className="font-bold text-[#3ecf8e]">{f.column}</span>
-                <span className="opacity-50">{f.operator}</span>
+                <span className="opacity-50">{f.operator === 'not_in' ? 'not in' : f.operator === 'starts_with' ? 'starts with' : f.operator === 'greater_than' ? '>' : f.operator === 'less_than' ? '<' : f.operator}</span>
                 <span className="font-medium text-white truncate max-w-[80px]">
                   {Array.isArray(f.value) ? f.value.join(', ') : f.value}
                 </span>
@@ -722,13 +722,22 @@ function DataTable({
                               value={filter.operator}
                               onChange={(e) => updateFilter(filter.id, { operator: e.target.value as FilterOperator })}
                               className="w-full bg-[#1c1c1c] border border-[#2e2e2e] text-[11px] rounded-lg px-2.5 py-1.5 text-gray-200 outline-none focus:border-[#3ecf8e] disabled:opacity-50 transition-all"
-                              disabled={filter.column === 'status' || filter.column === 'lead_list_name'}
+                              disabled={filter.column === 'status'}
                             >
-                              <option value="equals">is</option>
-                              <option value="contains">contains</option>
-                              <option value="starts_with">starts with</option>
-                              <option value="greater_than">&gt;</option>
-                              <option value="less_than">&lt;</option>
+                              {filter.column === 'lead_list_name' ? (
+                                <>
+                                  <option value="in">is</option>
+                                  <option value="not_in">is not</option>
+                                </>
+                              ) : (
+                                <>
+                                  <option value="equals">is</option>
+                                  <option value="contains">contains</option>
+                                  <option value="starts_with">starts with</option>
+                                  <option value="greater_than">&gt;</option>
+                                  <option value="less_than">&lt;</option>
+                                </>
+                              )}
                             </select>
                           </div>
                         </div>
