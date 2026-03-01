@@ -380,16 +380,28 @@ app.get('/api/distinct/:column', async (req, res) => {
     }
 
     try {
-        const { data, error } = await supabase
-            .from('contacts')
-            .select(column)
-            .not(column, 'is', null)
-            .neq(column, '')
-            .limit(10000);
+        const allValues = new Set<string>();
+        let page = 0;
+        const pageSize = 10000;
 
-        if (error) throw error;
+        // Paginate to ensure we scan all rows in large tables
+        while (true) {
+            const { data, error } = await supabase
+                .from('contacts')
+                .select(column)
+                .not(column, 'is', null)
+                .neq(column, '')
+                .range(page * pageSize, (page + 1) * pageSize - 1);
 
-        const unique = [...new Set((data || []).map((d: any) => d[column]))].sort();
+            if (error) throw error;
+            if (!data || data.length === 0) break;
+
+            data.forEach((d: any) => { if (d[column]) allValues.add(d[column]); });
+            if (data.length < pageSize) break;
+            page++;
+        }
+
+        const unique = [...allValues].sort();
         res.json(unique);
     } catch (err: any) {
         res.status(500).json({ error: err.message });

@@ -667,7 +667,12 @@ function DataTable({
 
           <div className="relative" ref={filterRef}>
             <button
-              onClick={() => setShowFilterBuilder(!showFilterBuilder)}
+              onClick={() => {
+                if (!showFilterBuilder && activeFilters.length === 0) {
+                  addFilter(); // Auto-add a filter row when opening with no filters
+                }
+                setShowFilterBuilder(!showFilterBuilder);
+              }}
               className={`text-[11px] font-medium px-2.5 py-1.5 flex items-center gap-1.5 border border-[#2e2e2e] rounded transition-colors ${activeFilters.length > 0 ? 'bg-[#3ecf8e22] border-[#3ecf8e44] text-[#3ecf8e]' : 'text-gray-300 hover:text-white hover:bg-[#2e2e2e]'}`}
             >
               <Filter className="w-3.5 h-3.5" />
@@ -750,9 +755,9 @@ function DataTable({
                               })}
                             </div>
                           ) : filter.column === 'lead_list_name' ? (
-                            <div className="grid grid-cols-3 gap-2 max-h-[200px] overflow-y-auto custom-scrollbar">
+                            <div className="flex flex-col gap-2 max-h-[200px] overflow-y-auto custom-scrollbar">
                               {leadListOptions.length === 0 ? (
-                                <p className="text-[10px] text-gray-600 col-span-3 text-center py-2">No lead lists found</p>
+                                <p className="text-[10px] text-gray-600 text-center py-2">No lead lists found</p>
                               ) : leadListOptions.map(opt => {
                                 const isChecked = Array.isArray(filter.value) && filter.value.includes(opt);
                                 return (
@@ -763,8 +768,7 @@ function DataTable({
                                       const next = isChecked ? current.filter((s: string) => s !== opt) : [...current, opt];
                                       updateFilter(filter.id, { value: next });
                                     }}
-                                    className={`px-2 py-1.5 rounded-lg text-[10px] font-bold transition-all border text-center truncate ${isChecked ? 'bg-[#3ecf8e22] border-[#3ecf8e] text-[#3ecf8e]' : 'bg-[#1c1c1c] border-[#2e2e2e] text-gray-500 hover:border-gray-600'}`}
-                                    title={opt}
+                                    className={`w-full text-left px-3 py-2 rounded-lg text-[11px] font-bold transition-all border ${isChecked ? 'bg-[#3ecf8e22] border-[#3ecf8e] text-[#3ecf8e]' : 'bg-[#1c1c1c] border-[#2e2e2e] text-gray-500 hover:border-gray-600'}`}
                                   >
                                     {opt}
                                   </button>
