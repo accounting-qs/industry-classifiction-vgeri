@@ -278,6 +278,67 @@ app.post('/api/stop', async (req, res) => {
     res.json({ message: 'Pipeline stopping gracefully...' });
 });
 
+app.post('/api/resume', async (req, res) => {
+    if (jobStats.isProcessing) {
+        return res.status(409).json({ error: 'Pipeline is already running' });
+    }
+
+    try {
+        // 1. Find jobs that were cancelled or still have pending items
+        const { data: stoppedJobs, error: jobErr } = await supabase
+            .from('jobs')
+            .select('id, total_items')
+            .in('status', ['cancelled', 'pending', 'processing'])
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .single();
+
+        if (jobErr || !stoppedJobs) {
+            // No existing jobs to resume, check if there are any pending job_items orphaned
+            const { count: orphanCount } = await supabase.from('job_items')
+                .select('*', { count: 'exact', head: true })
+                .in('status', ['pending', 'retrying', 'processing']);
+
+            if (!orphanCount || orphanCount === 0) {
+                return res.json({ message: 'No pending jobs to resume', resumed: 0 });
+            }
+        }
+
+        // 2. Reset any stuck processing items back to pending
+        await supabase.from('job_items')
+            .update({ status: 'pending', locked_at: null })
+            .eq('status', 'processing');
+
+        // 3. Mark the job as processing again
+        if (stoppedJobs) {
+            await supabase.from('jobs')
+                .update({ status: 'processing' })
+                .eq('id', stoppedJobs.id);
+        }
+
+        // 4. Count remaining items to process
+        const { count: remainingCount } = await supabase.from('job_items')
+            .select('*', { count: 'exact', head: true })
+            .in('status', ['pending', 'retrying']);
+
+        const remaining = remainingCount || 0;
+
+        // 5. Update pipeline state and restart processor
+        jobStats.isProcessing = true;
+        jobStats.total = stoppedJobs?.total_items || remaining;
+        await persistPipelineState();
+
+        addServerLog(`▶️ Resuming pipeline: ${remaining} items remaining.`, 'Pipeline', 'phase');
+        JobProcessor.start();
+
+        res.json({ message: `Pipeline resumed with ${remaining} pending items`, resumed: remaining });
+    } catch (err: any) {
+        console.error('Resume error:', err);
+        addServerLog(`❌ Resume failed: ${err.message}`, 'Pipeline', 'error');
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/stats/proxies', async (req, res) => {
     try {
         const { data, error } = await supabase.rpc('get_proxy_stats')

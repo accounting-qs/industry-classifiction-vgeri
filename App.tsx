@@ -183,7 +183,20 @@ export default function App() {
         const res = await fetch(`/api/status?timeRange=${activeLogFilter}`);
         if (res.ok) {
           const data = await res.json();
-          setLogs(data.logs);
+          // Merge: keep client-side log entries (instance_id='local') and combine with server logs
+          setLogs(prevLogs => {
+            const clientLogs = prevLogs.filter(l => l.instance_id === 'local');
+            const serverLogs = data.logs || [];
+            // Merge and deduplicate by timestamp+message, keep newest first
+            const merged = [...clientLogs, ...serverLogs];
+            const seen = new Set<string>();
+            return merged.filter(l => {
+              const key = `${l.timestamp}|${l.message}`;
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            }).sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()).slice(0, 500);
+          });
           setStats(data.stats);
         }
       } catch (e) {
@@ -292,19 +305,22 @@ export default function App() {
 
 
   const resumePendingQueue = async () => {
-    addLog("🔍 Searching for pending records...");
+    addLog("▶️ Sending resume command to server...");
     try {
-      const { data } = await db.getPaginatedContacts(1, 1000, false, [
-        { id: 'resumer', column: 'status', operator: 'in', value: ['pending'] }
-      ]);
-      if (data.length > 0) {
-        addLog(`🔄 Resuming background execution for ${data.length} records.`);
-        processQuantumPipeline(data);
+      const response = await fetch('/api/resume', { method: 'POST' });
+      const data = await response.json();
+      if (response.ok) {
+        if (data.resumed > 0) {
+          addLog(`✅ Pipeline resumed: ${data.resumed} items to process.`);
+          setStats(prev => ({ ...prev, isProcessing: true }));
+        } else {
+          addLog("ℹ️ No pending jobs found to resume.");
+        }
       } else {
-        addLog("ℹ️ No pending tasks found.");
+        addLog(`⚠️ ${data.error || 'Failed to resume'}`);
       }
     } catch (e: any) {
-      addLog(`Error: ${e.message}`);
+      addLog(`❌ Resume error: ${e.message}`);
     }
   };
 
