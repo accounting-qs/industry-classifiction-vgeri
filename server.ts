@@ -201,8 +201,7 @@ app.post('/api/enrich', async (req, res) => {
     // If frontend sends filters instead of raw IDs, resolve them on the backend securely
     if (filters) {
         try {
-            const batch = await db.getAllFilteredContacts(filters, searchQuery);
-            contactIds = batch.map((c: any) => c.contact_id);
+            contactIds = await db.getAllFilteredContactIds(filters, searchQuery);
         } catch (e: any) {
             return res.status(500).json({ error: 'Failed to resolve filtered contacts: ' + e.message });
         }

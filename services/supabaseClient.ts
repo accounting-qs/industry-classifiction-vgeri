@@ -197,6 +197,48 @@ class SupabaseService {
     return this.flattenData(allData);
   }
 
+  /**
+   * Lightweight: only fetches contact_id for the enrich endpoint.
+   * Avoids full join which causes statement timeout on large filtered queries.
+   */
+  async getAllFilteredContactIds(filters: FilterCondition[], searchQuery?: string): Promise<string[]> {
+    if (!this.client) return [];
+
+    const enrichmentCols = ['status', 'classification', 'confidence', 'cost', 'processed_at'];
+
+    // Determine if we need enrichment join for the filter
+    const hasEnrichmentFilter = filters.some(f => enrichmentCols.includes(f.column));
+    const selectStr = hasEnrichmentFilter
+      ? 'contact_id, enrichments!inner(status)'
+      : 'contact_id';
+
+    let allIds: string[] = [];
+    let page = 0;
+    const pageSize = 5000; // Larger page since we only fetch IDs
+
+    while (true) {
+      let query = this.client
+        .from('contacts')
+        .select(selectStr);
+
+      query = this.applyFilters(query, filters, enrichmentCols, searchQuery);
+
+      const { data, error } = await query
+        .order('created_at', { ascending: true })
+        .range(page * pageSize, (page + 1) * pageSize - 1);
+
+      if (error) throw error;
+
+      if (!data || data.length === 0) break;
+      allIds = allIds.concat(data.map((d: any) => d.contact_id));
+      if (data.length < pageSize) break;
+
+      page++;
+    }
+
+    return allIds;
+  }
+
   async getDistinctValues(column: string): Promise<string[]> {
     if (!this.client) return [];
     const allValues: string[] = [];
