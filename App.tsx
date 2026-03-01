@@ -1329,10 +1329,10 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
 
     const activeMappings: [string, string][] = (Object.entries(mapping) as [string, string][]).filter(([_, v]) => v !== '__skip__');
     let buffer: any[] = [];
-    let processed = 0;
     let totalInserted = 0;
     let totalDuplicates = 0;
     let totalFailed = 0;
+    let sentToServer = 0; // Tracks rows actually sent (after API response), not just parsed
     const errors: string[] = [];
     const allFailedContacts: { email: string; row: number; reason: string }[] = [];
     const CHUNK_SIZE = 2000;
@@ -1357,6 +1357,10 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
       } catch (err: any) {
         errors.push(err.message);
       }
+      // Update progress AFTER the API call completes
+      sentToServer += chunk.length;
+      setImportProgress(sentToServer);
+      setImportResult({ inserted: totalInserted, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
     };
 
     // Use a queue approach to handle async sending while streaming
@@ -1379,15 +1383,10 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
           buffer.push(mapped);
         }
 
-        processed++;
-
         if (buffer.length >= CHUNK_SIZE) {
           const chunk = [...buffer];
           buffer = [];
-          sendPromise = sendPromise.then(() => sendChunk(chunk)).then(() => {
-            setImportProgress(processed);
-            setImportResult({ inserted: totalInserted, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
-          });
+          sendPromise = sendPromise.then(() => sendChunk(chunk));
         }
       },
       complete: () => {
@@ -1399,7 +1398,7 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
         }
 
         sendPromise.then(() => {
-          setImportProgress(processed);
+          setImportProgress(sentToServer);
           setImportResult({ inserted: totalInserted, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
           setImportStatus(totalFailed > 0 || errors.length > 0 ? 'error' : 'done');
         });
@@ -1595,7 +1594,7 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
                   <Loader2 className="w-12 h-12 text-[#3ecf8e] animate-spin mx-auto mb-4" />
                   <p className="text-lg font-bold text-white mb-2">Importing contacts...</p>
                   <p className="text-sm text-gray-500 mb-6">
-                    {importProgress.toLocaleString()} of {totalRows.toLocaleString()} rows processed
+                    {importProgress.toLocaleString()} of {totalRows.toLocaleString()} rows uploaded
                   </p>
                   <div className="w-full bg-[#2e2e2e] rounded-full h-3 overflow-hidden mb-2">
                     <div
