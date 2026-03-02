@@ -587,6 +587,22 @@ app.listen(PORT, async () => {
 
     // Resume any stale jobs from previous unexpected crashes
     await JobProcessor.recoverStaleJobs();
+
+    // TRUTH CHECK: Verify isProcessing against the actual DB state.
+    // If pipeline_state says "processing" but there are no active jobs/items,
+    // force-reset to prevent the 409 guard from permanently blocking new enrichments.
+    if (jobStats.isProcessing) {
+        const { count } = await supabase
+            .from('job_items')
+            .select('*', { count: 'exact', head: true })
+            .in('status', ['pending', 'processing', 'retrying']);
+
+        if (!count || count === 0) {
+            console.log('⚠️ Stale isProcessing detected — no active job items. Resetting.');
+            jobStats.isProcessing = false;
+            await persistPipelineState();
+        }
+    }
 });
 
 // Graceful Shutdown
