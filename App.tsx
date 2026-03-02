@@ -474,7 +474,19 @@ export default function App() {
                 <div className="grid grid-cols-3 gap-6">
                   <StatCard label="Completed" value={stats.completed} color="text-[#3ecf8e]" />
                   <StatCard label="Failures" value={stats.failed} color="text-rose-500" />
-                  <StatCard label="In Queue" value={stats.total - (stats.completed + stats.failed)} color="text-indigo-400" />
+                  {stats.queueingPhase ? (
+                    <div className="bg-[#161616] rounded-xl border border-[#2e2e2e] p-4 shadow-lg ring-1 ring-white/5">
+                      <div className="text-[10px] font-bold uppercase tracking-wider text-amber-400/60 mb-1">Queueing...</div>
+                      <div className="text-2xl font-black text-amber-400 tabular-nums">
+                        {(stats.queued || 0).toLocaleString()} <span className="text-sm font-normal text-gray-500">/ {stats.total.toLocaleString()}</span>
+                      </div>
+                      <div className="mt-2 h-1 bg-[#2e2e2e] rounded-full overflow-hidden">
+                        <div className="h-full bg-amber-400 rounded-full transition-all duration-500" style={{ width: `${stats.total > 0 ? ((stats.queued || 0) / stats.total * 100) : 0}%` }} />
+                      </div>
+                    </div>
+                  ) : (
+                    <StatCard label="In Queue" value={stats.total - (stats.completed + stats.failed)} color="text-indigo-400" />
+                  )}
                 </div>
                 <div
                   ref={logContainerRef}
@@ -1029,7 +1041,19 @@ function PipelineMonitor({
         <div className="grid grid-cols-3 gap-6">
           <StatCard label="Completed" value={stats.completed} color="text-[#3ecf8e]" />
           <StatCard label="Failures" value={stats.failed} color="text-rose-500" />
-          <StatCard label="In Queue" value={stats.total - (stats.completed + stats.failed)} color="text-indigo-400" />
+          {stats.queueingPhase ? (
+            <div className="bg-[#161616] rounded-xl border border-[#2e2e2e] p-4 shadow-lg ring-1 ring-white/5">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-amber-400/60 mb-1">Queueing...</div>
+              <div className="text-2xl font-black text-amber-400 tabular-nums">
+                {(stats.queued || 0).toLocaleString()} <span className="text-sm font-normal text-gray-500">/ {stats.total.toLocaleString()}</span>
+              </div>
+              <div className="mt-2 h-1 bg-[#2e2e2e] rounded-full overflow-hidden">
+                <div className="h-full bg-amber-400 rounded-full transition-all duration-500" style={{ width: `${stats.total > 0 ? ((stats.queued || 0) / stats.total * 100) : 0}%` }} />
+              </div>
+            </div>
+          ) : (
+            <StatCard label="In Queue" value={stats.total - (stats.completed + stats.failed)} color="text-indigo-400" />
+          )}
         </div>
         <div className="relative flex-1 min-h-0 mb-6 group text-xs text-mono">
           <div

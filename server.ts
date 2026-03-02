@@ -51,7 +51,9 @@ let jobStats = {
     total: 0,
     completed: 0,
     failed: 0,
-    isProcessing: false
+    isProcessing: false,
+    queueingPhase: false,
+    queued: 0
 };
 
 const addServerLog = async (msg: string, module: string = 'Pipeline', level: LogEntry['level'] = 'info') => {
@@ -102,7 +104,9 @@ async function restorePipelineState() {
                 total: data.total || 0,
                 completed: data.completed || 0,
                 failed: data.failed || 0,
-                isProcessing: data.is_processing || false
+                isProcessing: data.is_processing || false,
+                queueingPhase: false,
+                queued: 0
             };
             console.log("🟢 Restored pipeline stats from Supabase");
         }
@@ -187,7 +191,11 @@ app.get('/api/status', async (req, res) => {
 
     res.json({
         logs: dbLogs || currentJobLogs,
-        stats: liveStats
+        stats: {
+            ...liveStats,
+            queueingPhase: jobStats.queueingPhase || false,
+            queued: jobStats.queued || 0
+        }
     });
 });
 
@@ -196,29 +204,67 @@ app.get('/api/status', async (req, res) => {
  */
 
 app.post('/api/enrich', async (req, res) => {
-    let { contactIds, filters, searchQuery } = req.body;
+    const { contactIds, filters, searchQuery } = req.body;
 
-    // If frontend sends filters instead of raw IDs, resolve them on the backend securely
-    if (filters) {
+    if (jobStats.isProcessing || jobStats.queueingPhase) {
+        return res.status(409).json({ error: 'A job is already in progress or queueing' });
+    }
+
+    if (!contactIds && !filters) {
+        return res.status(400).json({ error: 'Provide contactIds or filters' });
+    }
+
+    // Set queueing state and respond 202 immediately — no timeout risk
+    jobStats = { total: 0, completed: 0, failed: 0, isProcessing: true, queueingPhase: true, queued: 0 };
+    currentJobLogs = [];
+
+    res.status(202).json({ message: 'Enrichment queueing started in background' });
+
+    // Fire-and-forget: resolve IDs + create job + insert items in background
+    backgroundEnqueue(contactIds, filters, searchQuery).catch(err => {
+        console.error('Background enqueue fatal error:', err);
+        addServerLog(`❌ Fatal enqueue error: ${err.message}`, 'Pipeline', 'error');
+        jobStats.isProcessing = false;
+        jobStats.queueingPhase = false;
+    });
+});
+
+/**
+ * Background enqueue: resolves contact IDs from filters, creates job + job_items.
+ * Runs AFTER the HTTP response is sent, so there's no timeout risk.
+ */
+async function backgroundEnqueue(
+    rawContactIds: string[] | undefined,
+    filters: any | undefined,
+    searchQuery: string | undefined
+) {
+    let contactIds = rawContactIds;
+
+    // Step 1: Resolve IDs from filters if needed
+    if (filters && !contactIds) {
+        addServerLog(`🔍 Resolving contacts from filters...`, 'Pipeline', 'phase');
         try {
             contactIds = await db.getAllFilteredContactIds(filters, searchQuery);
         } catch (e: any) {
-            return res.status(500).json({ error: 'Failed to resolve filtered contacts: ' + e.message });
+            addServerLog(`❌ Failed to resolve filters: ${e.message}`, 'Pipeline', 'error');
+            jobStats.isProcessing = false;
+            jobStats.queueingPhase = false;
+            return;
         }
     }
 
-    if (!contactIds || !Array.isArray(contactIds)) {
-        return res.status(400).json({ error: 'Invalid contactIds or filters' });
+    if (!contactIds || contactIds.length === 0) {
+        addServerLog(`⚠️ No contacts found matching filters.`, 'Pipeline', 'warn');
+        jobStats.isProcessing = false;
+        jobStats.queueingPhase = false;
+        return;
     }
 
-    if (jobStats.isProcessing) {
-        return res.status(409).json({ error: 'A job is already in progress' });
-    }
-
-    addServerLog(`Queuing ${contactIds.length} records...`, 'Pipeline', 'phase');
+    jobStats.total = contactIds.length;
+    addServerLog(`📦 Queueing ${contactIds.length} records...`, 'Pipeline', 'phase');
 
     try {
-        // 1. Create a new job
+        // Step 2: Create a new job
         const { data: jobRaw, error: errJob } = await supabase.from('jobs').insert({
             status: 'processing',
             total_items: contactIds.length,
@@ -228,7 +274,7 @@ app.post('/api/enrich', async (req, res) => {
         if (errJob) throw errJob;
         const jobId = jobRaw.id;
 
-        // 2. Insert items in chunks to avoid DB payload limit
+        // Step 3: Insert job_items in chunks (with progress updates)
         const ENQUEUE_CHUNK_SIZE = 5000;
         for (let i = 0; i < contactIds.length; i += ENQUEUE_CHUNK_SIZE) {
             const chunk = contactIds.slice(i, i + ENQUEUE_CHUNK_SIZE);
@@ -240,30 +286,26 @@ app.post('/api/enrich', async (req, res) => {
             const { error: errItems } = await supabase.from('job_items').insert(items);
             if (errItems) throw errItems;
 
-            addServerLog(`Enqueued ${Math.min(i + ENQUEUE_CHUNK_SIZE, contactIds.length)}/${contactIds.length}...`, 'Sync');
+            jobStats.queued = Math.min(i + ENQUEUE_CHUNK_SIZE, contactIds.length);
+            addServerLog(`📥 Enqueued ${jobStats.queued}/${contactIds.length}...`, 'Sync');
         }
 
-        // 3. Initiate legacy pipeline state for backward compat
-        jobStats = {
-            total: contactIds.length,
-            completed: 0,
-            failed: 0,
-            isProcessing: true
-        };
-        currentJobLogs = [];
+        // Step 4: Queueing complete — switch to processing phase
+        jobStats.queueingPhase = false;
+        jobStats.queued = contactIds.length;
         await persistPipelineState();
 
-        // 4. Start the Background Processor immediately
-        JobProcessor.start();
+        addServerLog(`✅ All ${contactIds.length} records queued. Starting enrichment...`, 'Pipeline', 'phase');
 
-        // 5. Immediate response (202 Accepted)
-        res.status(202).json({ message: 'Enrichment successfully queued in the background' });
+        // Step 5: Start the Background Processor
+        JobProcessor.start();
     } catch (err: any) {
-        console.error("Queueing error:", err);
-        addServerLog(`Fatal Pipeline Enqueue Error: ${err.message}`, 'Pipeline', 'error');
-        res.status(500).json({ error: 'Failed to queue job: ' + err.message });
+        console.error('Enqueue error:', err);
+        addServerLog(`❌ Fatal enqueue error: ${err.message}`, 'Pipeline', 'error');
+        jobStats.isProcessing = false;
+        jobStats.queueingPhase = false;
     }
-});
+}
 
 app.post('/api/stop', async (req, res) => {
     addServerLog(`⚠️ Stop command received. Halting background pipeline...`, 'Pipeline', 'warn');
