@@ -61,11 +61,6 @@ function normalizeConfidence(val: any): number {
 export async function enrichSingle(item: BatchItem): Promise<any> {
   const html_snippet = (item.digest || "").slice(0, 12000);
   const key = getOpenAIKey();
-  const maskedKey = key ? `${key.slice(0, 7)}...${key.slice(-4)}` : 'MISSING';
-
-  console.log(`🔑 [Enrichment] API Key: ${maskedKey} | Length: ${key?.length || 0}`);
-  console.log(`🆔 [Enrichment] Prompt ID: ${getPromptId()}`);
-
   try {
     const payload = {
       model: "gpt-4.1-mini",

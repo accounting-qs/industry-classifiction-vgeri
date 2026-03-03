@@ -154,48 +154,49 @@ app.get('/api/status', async (req, res) => {
 
     const { data: dbLogs } = await query;
 
-    // FETCH LIVE JOB STATS FROM DB
+    // FETCH LIVE JOB STATS FROM DB (Issue #8: job_items is the single source of truth)
     let liveStats = { ...jobStats };
-    if (jobStats.isProcessing) {
-        const { data: activeJob } = await supabase
-            .from('jobs')
-            .select('completed_items, failed_items, total_items')
-            .in('status', ['pending', 'processing'])
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .single();
 
-        if (activeJob) {
-            liveStats.completed = activeJob.completed_items || 0;
-            liveStats.failed = activeJob.failed_items || 0;
-            liveStats.total = activeJob.total_items || 0;
+    // Always fetch real counts from job_items — this is the ground truth
+    const [
+        { count: completedCount },
+        { count: failedCount },
+        { count: pendingCount },
+    ] = await Promise.all([
+        supabase.from('job_items').select('*', { count: 'exact', head: true }).eq('status', 'completed'),
+        supabase.from('job_items').select('*', { count: 'exact', head: true }).eq('status', 'failed'),
+        supabase.from('job_items').select('*', { count: 'exact', head: true }).in('status', ['pending', 'retrying']),
+    ]);
 
-            // Sync memory
-            jobStats.completed = liveStats.completed;
-            jobStats.failed = liveStats.failed;
-            jobStats.total = liveStats.total;
-        } else {
-            // Check if there are ANY jobs left to see if we're truly done
-            const { count } = await supabase
-                .from('jobs')
+    const dbCompleted = completedCount || 0;
+    const dbFailed = failedCount || 0;
+    const inQueue = pendingCount || 0;
+
+    // If processing, use DB counts; if not, use whatever memory has (which may be stale but matches last known state)
+    if (jobStats.isProcessing || inQueue > 0) {
+        liveStats.completed = dbCompleted;
+        liveStats.failed = dbFailed;
+        liveStats.total = dbCompleted + dbFailed + inQueue;
+
+        // Sync memory
+        jobStats.completed = liveStats.completed;
+        jobStats.failed = liveStats.failed;
+        jobStats.total = liveStats.total;
+
+        // Auto-detect if processing actually finished
+        if (inQueue === 0 && !jobStats.queueingPhase) {
+            const { count: processingCount } = await supabase
+                .from('job_items')
                 .select('*', { count: 'exact', head: true })
-                .in('status', ['pending', 'processing']);
+                .eq('status', 'processing');
 
-            if (count === 0) {
+            if (!processingCount || processingCount === 0) {
                 jobStats.isProcessing = false;
                 liveStats.isProcessing = false;
                 await supabase.from('pipeline_state').update({ is_processing: false, updated_at: new Date().toISOString() }).eq('id', 1).then();
             }
         }
     }
-
-    // ALWAYS fetch the real queue depth from job_items (source of truth)
-    const { count: pendingCount } = await supabase
-        .from('job_items')
-        .select('*', { count: 'exact', head: true })
-        .in('status', ['pending', 'retrying']);
-
-    const inQueue = pendingCount || 0;
 
     res.json({
         logs: dbLogs || currentJobLogs,

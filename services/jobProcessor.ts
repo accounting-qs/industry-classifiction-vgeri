@@ -11,10 +11,23 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // Tuning Parameters from Environment (with aggressive default fallbacks for speed)
 const QUEUE_FETCH_CHUNK_SIZE = parseInt(process.env.QUEUE_FETCH_CHUNK_SIZE || '200', 10);
-const CONCURRENCY_SCRAPE = parseInt(process.env.CONCURRENCY_SCRAPE || '30', 10);
+const CONCURRENCY_SCRAPE = parseInt(process.env.CONCURRENCY_SCRAPE || '15', 10);  // Issue #6: Reduced from 30 to 15
 const CONCURRENCY_AI = parseInt(process.env.CONCURRENCY_AI || '15', 10);
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10);
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '2000', 10);
+const STALE_PROCESSING_MINUTES = 5; // Issue #7: Auto-reset items stuck processing longer than this
+
+// Issue #9: Common email domains that should be skipped (scraping gmail.com is pointless)
+const PERSONAL_EMAIL_DOMAINS = new Set([
+    'gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'msn.com',
+    'yahoo.com', 'yahoo.co.uk', 'yahoo.fr', 'yahoo.de', 'ymail.com',
+    'aol.com', 'icloud.com', 'me.com', 'mac.com',
+    'protonmail.com', 'proton.me', 'tutanota.com', 'zoho.com',
+    'mail.com', 'gmx.com', 'gmx.net', 'web.de', 'yandex.com', 'yandex.ru',
+    'qq.com', '163.com', '126.com', 'sina.com',
+    'comcast.net', 'verizon.net', 'att.net', 'sbcglobal.net', 'cox.net',
+    'earthlink.net', 'charter.net', 'optonline.net'
+]);
 
 // Concurrency Limiters
 const scrapeLimit = pLimit(CONCURRENCY_SCRAPE);
@@ -44,7 +57,40 @@ export class JobProcessor {
         this.shouldStop = false;
         this.log(`🚀 JobProcessor started [Chunk: ${QUEUE_FETCH_CHUNK_SIZE}, Scrape: C${CONCURRENCY_SCRAPE}, AI: C${CONCURRENCY_AI}]`, 'phase');
 
-        this.pollLoop();
+        // Issue #3: Watchdog wrapper — auto-restarts the loop if it dies unexpectedly
+        this.runWithWatchdog();
+    }
+
+    /**
+     * Issue #3: Watchdog that auto-restarts pollLoop on unexpected death.
+     */
+    private static async runWithWatchdog() {
+        const MAX_CONSECUTIVE_CRASHES = 5;
+        let consecutiveCrashes = 0;
+
+        while (!this.shouldStop) {
+            try {
+                await this.pollLoop();
+                // pollLoop exited cleanly (shouldStop or queue drained)
+                break;
+            } catch (fatal: any) {
+                consecutiveCrashes++;
+                this.log(`💀 pollLoop crashed unexpectedly (${consecutiveCrashes}/${MAX_CONSECUTIVE_CRASHES}): ${fatal.message}`, 'error');
+
+                if (consecutiveCrashes >= MAX_CONSECUTIVE_CRASHES) {
+                    this.log(`🚨 Too many consecutive crashes. Giving up. Manual restart required.`, 'error');
+                    break;
+                }
+
+                // Exponential backoff: 5s, 10s, 20s, 40s, 80s
+                const backoffMs = Math.min(5000 * Math.pow(2, consecutiveCrashes - 1), 80000);
+                this.log(`🔄 Restarting pollLoop in ${backoffMs / 1000}s...`, 'warn');
+                await new Promise(r => setTimeout(r, backoffMs));
+            }
+        }
+
+        this.isRunning = false;
+        this.log('🛑 JobProcessor fully stopped.', 'phase');
     }
 
     /**
@@ -88,6 +134,9 @@ export class JobProcessor {
     private static async pollLoop() {
         while (!this.shouldStop) {
             try {
+                // Issue #7: Auto-reset items stuck in 'processing' for too long
+                await this.resetStaleProcessingItems();
+
                 const processedCount = await this.processNextChunk();
 
                 // If we processed items, the queue is active, so poll immediately again without waiting.
@@ -129,8 +178,29 @@ export class JobProcessor {
                 await new Promise(r => setTimeout(r, 5000)); // Backoff on unhandled error
             }
         }
-        this.isRunning = false;
-        this.log('🛑 JobProcessor fully stopped.', 'phase');
+    }
+
+    /**
+     * Issue #7: Reset items stuck in 'processing' state for more than STALE_PROCESSING_MINUTES.
+     * This handles cases where a chunk failed mid-processing and left items locked.
+     */
+    private static async resetStaleProcessingItems() {
+        try {
+            const cutoff = new Date(Date.now() - STALE_PROCESSING_MINUTES * 60 * 1000).toISOString();
+            const { data, error } = await supabase
+                .from('job_items')
+                .update({ status: 'pending', locked_at: null })
+                .eq('status', 'processing')
+                .lt('locked_at', cutoff)
+                .select('id');
+
+            if (!error && data && data.length > 0) {
+                this.log(`♻️ Auto-recovered ${data.length} items stuck in processing for >${STALE_PROCESSING_MINUTES}min.`, 'warn');
+            }
+        } catch (e: any) {
+            // Non-fatal — just log and continue
+            console.warn('[JobProcessor] Stale item cleanup failed:', e.message);
+        }
     }
 
     private static async processNextChunk(): Promise<number> {
@@ -194,44 +264,62 @@ export class JobProcessor {
         this.log(`📦 Claimed chunk of ${enrichedItems.length} items from ${activeJobIds.length} job(s).`, 'phase');
 
         // --- CHUNK LOCAL CACHE ---
-        const uniqueDomains = [...new Set(enrichedItems.map((item: any) => item.company_website).filter(Boolean))];
+        // Issue #5: Use contact.company_website, not jobItem.company_website (which doesn't exist on job_items table)
+        const uniqueDomains = [...new Set(enrichedItems.map((item: any) => item.contacts?.company_website).filter(Boolean))];
         const domainCache: Record<string, any> = {};
         const digestCache: Record<string, string> = {};
 
+        // Issue #1: Wrap cache-prefetch in try/catch — a failed cache query should NOT kill the chunk
         if (uniqueDomains.length > 0) {
-            // Fetch prior high-confidence classifications to reuse
-            const { data: cachedEnrichments } = await supabase
-                .from('enrichments')
-                .select(`classification, confidence, reasoning, contacts!inner(company_website)`)
-                .eq('status', 'completed')
-                .gte('confidence', 7)
-                .in('contacts.company_website', uniqueDomains);
+            try {
+                // Fetch prior high-confidence classifications to reuse
+                const { data: cachedEnrichments } = await supabase
+                    .from('enrichments')
+                    .select(`classification, confidence, reasoning, contacts!inner(company_website)`)
+                    .eq('status', 'completed')
+                    .gte('confidence', 7)
+                    .in('contacts.company_website', uniqueDomains);
 
-            if (cachedEnrichments) {
-                cachedEnrichments.forEach((row: any) => {
-                    const w = row.contacts?.company_website;
-                    if (w) domainCache[w] = row;
-                });
+                if (cachedEnrichments) {
+                    cachedEnrichments.forEach((row: any) => {
+                        const w = row.contacts?.company_website;
+                        if (w) domainCache[w] = row;
+                    });
+                }
+            } catch (cacheErr: any) {
+                // Non-fatal: cache miss just means we scrape/classify fresh — no big deal
+                this.log(`⚠️ Enrichment cache prefetch failed (non-fatal): ${cacheErr.message}`, 'warn');
             }
 
-            // Fetch prior scraped digests
-            const { data: cachedDigests } = await supabase
-                .from('scraped_data')
-                .select('domain, content')
-                .in('domain', uniqueDomains);
+            try {
+                // Fetch prior scraped digests
+                const { data: cachedDigests } = await supabase
+                    .from('scraped_data')
+                    .select('domain, content')
+                    .in('domain', uniqueDomains);
 
-            if (cachedDigests) {
-                cachedDigests.forEach((d: any) => digestCache[d.domain] = d.content);
+                if (cachedDigests) {
+                    cachedDigests.forEach((d: any) => digestCache[d.domain] = d.content);
+                }
+            } catch (digestErr: any) {
+                // Non-fatal: we'll just re-scrape
+                this.log(`⚠️ Digest cache prefetch failed (non-fatal): ${digestErr.message}`, 'warn');
             }
         }
 
         // --- EXECUTION PIPELINE ---
         const results = await Promise.all(enrichedItems.map(async (jobItem: any) => {
             const contact = jobItem.contacts;
-            const domain = jobItem.company_website || (contact.email ? contact.email.split('@')[1] : null);
+            // Issue #5: Use contact.company_website, not jobItem.company_website
+            const domain = contact.company_website || (contact.email ? contact.email.split('@')[1] : null);
 
             if (!domain) {
                 return this.createResult(jobItem, false, 'failed', 'No domain or email to extract domain from.');
+            }
+
+            // Issue #9: Skip personal email domains — scraping gmail.com is pointless
+            if (PERSONAL_EMAIL_DOMAINS.has(domain.toLowerCase())) {
+                return this.createResult(jobItem, false, 'failed', `Skipped: personal email domain (${domain})`);
             }
 
             // A. Check Domain Cache (High Confidence)
@@ -247,8 +335,8 @@ export class JobProcessor {
                 try {
                     // Bounded Scraping
                     const scrapeRes = await scrapeLimit(() => fetchDigest(domain, undefined));
-                    digest = scrapeRes.digest; // Fix the return access pattern
-                    proxyUsed = scrapeRes.proxyName; // Fix the return access pattern
+                    digest = scrapeRes.digest;
+                    proxyUsed = scrapeRes.proxyName;
 
                     // Fire-and-forget digest persist
                     supabase.from('scraped_data').upsert({ domain, content: digest, proxy_used: proxyUsed }, { onConflict: 'domain' }).then();
@@ -256,8 +344,6 @@ export class JobProcessor {
                     digestCache[domain] = digest;
                 } catch (e: any) {
                     // Scrape failed. Determine if retryable.
-                    const isNetworkError = e.message.includes('timeout') || e.message.includes('socket') || e.message.includes('ENOTFOUND');
-                    // For simplicity, let's treat FastFail as terminal.
                     const isTerminal = e.message.includes('FastFail');
 
                     if (!isTerminal && jobItem.attempt_count < MAX_RETRIES) {
@@ -272,7 +358,7 @@ export class JobProcessor {
             try {
                 // Bounded AI
                 const aiOutput = await aiLimit(() => enrichSingle({
-                    contact_id: contact.contact_id, // the UUID or int8 - enrichSingle takes contact_id
+                    contact_id: contact.contact_id,
                     email: contact.email,
                     digest: digest
                 }));
@@ -316,30 +402,49 @@ export class JobProcessor {
             }
         });
 
-        // 1. Update Job Items
+        // Issue #4: All bulk writes now have error handling
+        // 1. Update Job Items (most critical — tracks item state)
         if (itemsToUpsert.length > 0) {
-            await supabase.from('job_items').upsert(itemsToUpsert, { onConflict: 'id' });
+            const { error: itemErr } = await supabase.from('job_items').upsert(itemsToUpsert, { onConflict: 'id' });
+            if (itemErr) this.log(`⚠️ job_items upsert error: ${itemErr.message}`, 'error');
         }
 
         // 2. Update Contacts
         if (contactsToUpdate.length > 0) {
-            await supabase.from('contacts').upsert(contactsToUpdate, { onConflict: 'id' });
+            const { error: contactErr } = await supabase.from('contacts').upsert(contactsToUpdate, { onConflict: 'id' });
+            if (contactErr) this.log(`⚠️ contacts upsert error: ${contactErr.message}`, 'error');
         }
 
         // 3. Update Enrichments
         if (enrichmentsToUpsert.length > 0) {
-            await supabase.from('enrichments').upsert(enrichmentsToUpsert, { onConflict: 'contact_id' }); // contact_id is UUID in enrichments
+            const { error: enrichErr } = await supabase.from('enrichments').upsert(enrichmentsToUpsert, { onConflict: 'contact_id' });
+            if (enrichErr) this.log(`⚠️ enrichments upsert error: ${enrichErr.message}`, 'error');
         }
 
-        // 4. Increment Job Counters
+        // Issue #2: Atomic job counter increments — avoids read-then-write race condition
+        // Uses a single UPDATE with raw SQL increment instead of SELECT + UPDATE
         for (const [jid, tallies] of Object.entries(jobsToUpdate)) {
             if (tallies.completed > 0 || tallies.failed > 0) {
-                const { data: currentJob } = await supabase.from('jobs').select('completed_items, failed_items').eq('id', jid).single();
-                if (currentJob) {
-                    await supabase.from('jobs').update({
-                        completed_items: currentJob.completed_items + tallies.completed,
-                        failed_items: currentJob.failed_items + tallies.failed
-                    }).eq('id', jid);
+                // Use RPC for atomic increment, falling back to direct update if RPC doesn't exist
+                try {
+                    const { error: rpcError } = await supabase.rpc('increment_job_counters', {
+                        job_id_input: jid,
+                        completed_increment: tallies.completed,
+                        failed_increment: tallies.failed
+                    });
+
+                    if (rpcError) {
+                        // Fallback to read-then-write if RPC not available yet
+                        const { data: currentJob } = await supabase.from('jobs').select('completed_items, failed_items').eq('id', jid).single();
+                        if (currentJob) {
+                            await supabase.from('jobs').update({
+                                completed_items: (currentJob.completed_items || 0) + tallies.completed,
+                                failed_items: (currentJob.failed_items || 0) + tallies.failed
+                            }).eq('id', jid);
+                        }
+                    }
+                } catch (counterErr: any) {
+                    this.log(`⚠️ Job counter update failed for job ${jid}: ${counterErr.message}`, 'error');
                 }
             }
         }
@@ -351,8 +456,6 @@ export class JobProcessor {
         }).eq('id', 1).then();
 
         // 🗑️ AGGRESSIVE MEMORY CLEANUP 🗑️
-        // Explicitly sever large object references so V8 garbage collector can reclaim them immediately
-        // rather than waiting for the entire module scope closure to resolve.
         const returnedLength = claimedItems.length;
 
         claimedItems.length = 0;
