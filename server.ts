@@ -189,12 +189,21 @@ app.get('/api/status', async (req, res) => {
         }
     }
 
+    // ALWAYS fetch the real queue depth from job_items (source of truth)
+    const { count: pendingCount } = await supabase
+        .from('job_items')
+        .select('*', { count: 'exact', head: true })
+        .in('status', ['pending', 'retrying']);
+
+    const inQueue = pendingCount || 0;
+
     res.json({
         logs: dbLogs || currentJobLogs,
         stats: {
             ...liveStats,
             queueingPhase: jobStats.queueingPhase || false,
-            queued: jobStats.queued || 0
+            queued: jobStats.queued || 0,
+            inQueue
         }
     });
 });

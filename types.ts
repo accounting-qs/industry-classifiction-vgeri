@@ -54,6 +54,7 @@ export interface BatchStats {
   isProcessing: boolean;
   queueingPhase?: boolean;
   queued?: number;
+  inQueue?: number;
 }
 
 export type FilterOperator = 'equals' | 'contains' | 'starts_with' | 'greater_than' | 'less_than' | 'in' | 'not_in';

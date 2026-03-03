@@ -485,7 +485,7 @@ export default function App() {
                       </div>
                     </div>
                   ) : (
-                    <StatCard label="In Queue" value={stats.total - (stats.completed + stats.failed)} color="text-indigo-400" />
+                    <StatCard label="In Queue" value={stats.inQueue ?? 0} color="text-indigo-400" />
                   )}
                 </div>
                 <div
@@ -1052,7 +1052,7 @@ function PipelineMonitor({
               </div>
             </div>
           ) : (
-            <StatCard label="In Queue" value={stats.total - (stats.completed + stats.failed)} color="text-indigo-400" />
+            <StatCard label="In Queue" value={stats.inQueue ?? 0} color="text-indigo-400" />
           )}
         </div>
         <div className="relative flex-1 min-h-0 mb-6 group text-xs text-mono">
