@@ -91,8 +91,29 @@ export class JobProcessor {
                 const processedCount = await this.processNextChunk();
 
                 // If we processed items, the queue is active, so poll immediately again without waiting.
-                // If 0 items were found, wait a few seconds before checking the DB again.
+                // If 0 items were found, check if the queue is truly empty.
                 if (processedCount === 0) {
+                    // Check if the queue is genuinely drained (no pending/retrying/processing items)
+                    const { count } = await supabase
+                        .from('job_items')
+                        .select('*', { count: 'exact', head: true })
+                        .in('status', ['pending', 'retrying', 'processing']);
+
+                    if (!count || count === 0) {
+                        // Queue fully drained — mark active jobs as completed and auto-stop
+                        await supabase.from('jobs')
+                            .update({ status: 'completed', finished_at: new Date().toISOString() })
+                            .eq('status', 'processing');
+
+                        await supabase.from('pipeline_state').update({
+                            is_processing: false,
+                            updated_at: new Date().toISOString()
+                        }).eq('id', 1);
+
+                        this.log('✅ All items processed. Queue empty — auto-stopping.', 'phase');
+                        break;
+                    }
+
                     await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
                 } else {
                     // Micro-sleep to allow event loop to breathe
