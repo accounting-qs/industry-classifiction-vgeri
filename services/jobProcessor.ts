@@ -498,6 +498,8 @@ export class JobProcessor {
             newStatus: status,
             jobItemUpdate: {
                 id: jobItem.id,
+                job_id: jobItem.job_id,
+                contact_id: jobItem.contact_id,
                 status: status,
                 error_message: isSuccess ? null : errorOrReasoning,
                 finished_at: new Date().toISOString(),
@@ -516,6 +518,8 @@ export class JobProcessor {
             newStatus: 'retrying',
             jobItemUpdate: {
                 id: jobItem.id,
+                job_id: jobItem.job_id,
+                contact_id: jobItem.contact_id,
                 status: 'retrying',
                 attempt_count: jobItem.attempt_count + 1,
                 next_retry_at: new Date(Date.now() + nextRetryMs).toISOString(),
