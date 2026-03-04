@@ -323,45 +323,66 @@ async function backgroundEnqueue(
 }
 
 /**
- * Resolves contact IDs from filters using the server's SERVICE ROLE supabase client.
- * Uses keyset pagination (id > last_id) for reliable large-dataset traversal,
- * bypassing the 1000-row PostgREST limit that affects the anon-key client.
+ * Resolves contact IDs from filters.
+ * Strategy 1: Try the `resolve_enrichment_targets` RPC (runs in DB with 120s timeout, no row limits)
+ * Strategy 2: Fall back to paginated PostgREST queries (1000 rows per page due to max-rows)
  */
 async function resolveFilteredContactIds(filters: any, searchQuery?: string): Promise<string[]> {
-    const allIds: string[] = [];
-    let lastId = 0;
-    const PAGE_SIZE = 5000;
+    // --- Strategy 1: RPC (preferred — runs in DB, no row limits, 120s timeout) ---
+    try {
+        const leadListFilter = (filters || []).find((f: any) => f.column === 'lead_list_name' && f.operator === 'in');
+        const statusFilter = (filters || []).find((f: any) => f.column === 'status');
 
-    // Determine if any filter touches enrichment columns
+        const rpcParams: any = {};
+        if (leadListFilter) rpcParams.p_lead_list_names = leadListFilter.value;
+        if (statusFilter) rpcParams.p_statuses = statusFilter.value;
+        if (searchQuery) rpcParams.p_search = searchQuery;
+
+        addServerLog(`🔍 Trying RPC resolve_enrichment_targets...`, 'Pipeline', 'info');
+        const { data: rpcData, error: rpcError } = await supabase.rpc('resolve_enrichment_targets', rpcParams);
+
+        if (!rpcError && rpcData) {
+            const ids = rpcData.map((r: any) => r.cid);
+            addServerLog(`✅ RPC resolved ${ids.length} contact IDs.`, 'Pipeline', 'info');
+            return ids;
+        }
+
+        if (rpcError) {
+            addServerLog(`⚠️ RPC not available (${rpcError.message}), falling back to pagination...`, 'Pipeline', 'warn');
+        }
+    } catch (e: any) {
+        addServerLog(`⚠️ RPC call failed (${e.message}), falling back to pagination...`, 'Pipeline', 'warn');
+    }
+
+    // --- Strategy 2: Paginated PostgREST fallback ---
+    const allIds: string[] = [];
+    const PAGE_SIZE = 1000; // Supabase PostgREST max-rows cap
+    let page = 0;
+
     const enrichmentCols = ['status', 'classification', 'confidence', 'cost', 'processed_at'];
     const hasEnrichmentFilter = (filters || []).some((f: any) => enrichmentCols.includes(f.column));
-
-    // For status=new filter, we need LEFT join and filter for null enrichments
     const statusFilter = (filters || []).find((f: any) => f.column === 'status');
     const isNewOnly = statusFilter && Array.isArray(statusFilter.value) && statusFilter.value.includes('new') && statusFilter.value.length === 1;
 
     while (true) {
-        let selectStr = 'id, contact_id';
+        let selectStr = 'contact_id';
         if (hasEnrichmentFilter && !isNewOnly) {
-            selectStr = 'id, contact_id, enrichments!inner(status)';
+            selectStr = 'contact_id, enrichments!inner(status)';
         } else if (isNewOnly) {
-            selectStr = 'id, contact_id, enrichments(status)';
+            selectStr = 'contact_id, enrichments(status)';
         }
 
         let query: any = supabase
             .from('contacts')
             .select(selectStr)
-            .gt('id', lastId)
-            .order('id', { ascending: true })
-            .limit(PAGE_SIZE);
+            .order('created_at', { ascending: true })
+            .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
 
-        // Apply search query
         if (searchQuery) {
             const q = `"%${searchQuery}%"`;
             query = query.or(`first_name.ilike.${q},last_name.ilike.${q},email.ilike.${q},company_website.ilike.${q},company_name.ilike.${q},industry.ilike.${q},lead_list_name.ilike.${q}`);
         }
 
-        // Apply filters
         for (const f of (filters || [])) {
             const isEnrichmentCol = enrichmentCols.includes(f.column);
             const colPath = isEnrichmentCol ? `enrichments.${f.column}` : f.column;
@@ -370,7 +391,6 @@ async function resolveFilteredContactIds(filters: any, searchQuery?: string): Pr
                 const statuses = f.value;
                 const hasNew = statuses.includes('new');
                 const others = statuses.filter((s: string) => s !== 'new');
-
                 if (hasNew && others.length === 0) {
                     query = query.filter('enrichments', 'is', 'null');
                 } else if (!hasNew && others.length > 0) {
@@ -378,7 +398,7 @@ async function resolveFilteredContactIds(filters: any, searchQuery?: string): Pr
                 }
             } else {
                 switch (f.operator) {
-                    case 'equals': query = (query as any).eq(colPath, f.value); break;
+                    case 'equals': query = query.eq(colPath, f.value); break;
                     case 'contains': query = query.ilike(colPath, `%${f.value}%`); break;
                     case 'starts_with': query = query.ilike(colPath, `${f.value}%`); break;
                     case 'greater_than': query = query.gt(colPath, f.value); break;
@@ -394,23 +414,20 @@ async function resolveFilteredContactIds(filters: any, searchQuery?: string): Pr
         }
 
         const { data, error } = await query;
-
         if (error) {
-            addServerLog(`⚠️ Filter resolve page error (lastId=${lastId}): ${error.message}`, 'Pipeline', 'warn');
+            addServerLog(`⚠️ Filter resolve page error (page=${page}): ${error.message}`, 'Pipeline', 'warn');
             throw error;
         }
-
         if (!data || data.length === 0) break;
 
         allIds.push(...data.map((d: any) => d.contact_id));
-        lastId = (data[data.length - 1] as any).id;
 
-        // Progress log every 10K
         if (allIds.length % 10000 < PAGE_SIZE) {
             addServerLog(`🔍 Resolved ${allIds.length} contact IDs so far...`, 'Pipeline', 'info');
         }
 
-        if (data.length < PAGE_SIZE) break; // Last page
+        if (data.length < PAGE_SIZE) break;
+        page++;
     }
 
     addServerLog(`✅ Resolved ${allIds.length} total contact IDs from filters.`, 'Pipeline', 'info');
