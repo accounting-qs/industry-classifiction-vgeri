@@ -274,22 +274,26 @@ async function backgroundEnqueue(
         return;
     }
 
-    jobStats.total = contactIds.length;
-    addServerLog(`📦 Queueing ${contactIds.length} records...`, 'Pipeline', 'phase');
+    const totalToEnrich = contactIds.length;
+    jobStats.total = totalToEnrich;
+    addServerLog(`📊 Total contacts to enrich: ${totalToEnrich.toLocaleString()}`, 'Pipeline', 'phase');
+    addServerLog(`📦 Starting queue insertion for ${totalToEnrich.toLocaleString()} records...`, 'Pipeline', 'phase');
 
     try {
         // Step 2: Create a new job
         const { data: jobRaw, error: errJob } = await supabase.from('jobs').insert({
             status: 'processing',
-            total_items: contactIds.length,
+            total_items: totalToEnrich,
             started_at: new Date().toISOString()
         }).select('id').single();
 
         if (errJob) throw errJob;
         const jobId = jobRaw.id;
+        addServerLog(`🆔 Job created: ${jobId} (${totalToEnrich.toLocaleString()} items)`, 'Pipeline', 'info');
 
         // Step 3: Insert job_items in chunks (with progress updates)
         const ENQUEUE_CHUNK_SIZE = 5000;
+        let enqueued = 0;
         for (let i = 0; i < contactIds.length; i += ENQUEUE_CHUNK_SIZE) {
             const chunk = contactIds.slice(i, i + ENQUEUE_CHUNK_SIZE);
             const items = chunk.map(id => ({
@@ -301,16 +305,18 @@ async function backgroundEnqueue(
             const { error: errItems } = await supabase.from('job_items').insert(items);
             if (errItems) throw errItems;
 
-            jobStats.queued = Math.min(i + ENQUEUE_CHUNK_SIZE, contactIds.length);
-            addServerLog(`📥 Enqueued ${jobStats.queued}/${contactIds.length}...`, 'Sync');
+            enqueued += chunk.length;
+            jobStats.queued = enqueued;
+            addServerLog(`📥 Queued ${enqueued.toLocaleString()} / ${totalToEnrich.toLocaleString()} (${Math.round(enqueued / totalToEnrich * 100)}%)`, 'Sync');
         }
 
         // Step 4: Queueing complete — switch to processing phase
         jobStats.queueingPhase = false;
-        jobStats.queued = contactIds.length;
+        jobStats.queued = totalToEnrich;
         await persistPipelineState();
 
-        addServerLog(`✅ All ${contactIds.length} records queued. Starting enrichment...`, 'Pipeline', 'phase');
+        addServerLog(`✅ All ${totalToEnrich.toLocaleString()} records queued. Starting enrichment...`, 'Pipeline', 'phase');
+        addServerLog(`📊 Pipeline summary: ${totalToEnrich.toLocaleString()} submitted → ${totalToEnrich.toLocaleString()} queued → 0 completed, 0 failed`, 'Pipeline', 'info');
 
         // Step 5: Start the Background Processor
         JobProcessor.start();
@@ -341,10 +347,9 @@ async function resolveFilteredContactIds(filters: any, searchQuery?: string): Pr
         addServerLog(`🔍 Trying RPC resolve_enrichment_targets...`, 'Pipeline', 'info');
         const { data: rpcData, error: rpcError } = await supabase.rpc('resolve_enrichment_targets', rpcParams);
 
-        if (!rpcError && rpcData) {
-            const ids = rpcData.map((r: any) => r.cid);
-            addServerLog(`✅ RPC resolved ${ids.length} contact IDs.`, 'Pipeline', 'info');
-            return ids;
+        if (!rpcError && rpcData && Array.isArray(rpcData) && rpcData.length > 0) {
+            addServerLog(`✅ RPC resolved ${rpcData.length} contact IDs.`, 'Pipeline', 'info');
+            return rpcData as string[];
         }
 
         if (rpcError) {
