@@ -501,6 +501,7 @@ export class JobProcessor {
                 job_id: jobItem.job_id,
                 contact_id: jobItem.contact_id,
                 status: status,
+                attempt_count: jobItem.attempt_count || 0,
                 error_message: isSuccess ? null : errorOrReasoning,
                 finished_at: new Date().toISOString(),
             },

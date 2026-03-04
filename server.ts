@@ -242,6 +242,8 @@ app.post('/api/enrich', async (req, res) => {
 /**
  * Background enqueue: resolves contact IDs from filters, creates job + job_items.
  * Runs AFTER the HTTP response is sent, so there's no timeout risk.
+ * Uses the server's service-role supabase client for ID resolution to bypass
+ * the 1000-row PostgREST limit that the anon-key db singleton has.
  */
 async function backgroundEnqueue(
     rawContactIds: string[] | undefined,
@@ -251,10 +253,12 @@ async function backgroundEnqueue(
     let contactIds = rawContactIds;
 
     // Step 1: Resolve IDs from filters if needed
+    // IMPORTANT: Uses the server's `supabase` client (service role key) for full access,
+    // NOT the `db` singleton which uses the anon key (capped at 1000 rows by PostgREST).
     if (filters && !contactIds) {
         addServerLog(`🔍 Resolving contacts from filters...`, 'Pipeline', 'phase');
         try {
-            contactIds = await db.getAllFilteredContactIds(filters, searchQuery);
+            contactIds = await resolveFilteredContactIds(filters, searchQuery);
         } catch (e: any) {
             addServerLog(`❌ Failed to resolve filters: ${e.message}`, 'Pipeline', 'error');
             jobStats.isProcessing = false;
@@ -291,7 +295,8 @@ async function backgroundEnqueue(
             const items = chunk.map(id => ({
                 job_id: jobId,
                 contact_id: id,
-                status: 'pending'
+                status: 'pending',
+                attempt_count: 0
             }));
             const { error: errItems } = await supabase.from('job_items').insert(items);
             if (errItems) throw errItems;
@@ -315,6 +320,101 @@ async function backgroundEnqueue(
         jobStats.isProcessing = false;
         jobStats.queueingPhase = false;
     }
+}
+
+/**
+ * Resolves contact IDs from filters using the server's SERVICE ROLE supabase client.
+ * Uses keyset pagination (id > last_id) for reliable large-dataset traversal,
+ * bypassing the 1000-row PostgREST limit that affects the anon-key client.
+ */
+async function resolveFilteredContactIds(filters: any, searchQuery?: string): Promise<string[]> {
+    const allIds: string[] = [];
+    let lastId = 0;
+    const PAGE_SIZE = 5000;
+
+    // Determine if any filter touches enrichment columns
+    const enrichmentCols = ['status', 'classification', 'confidence', 'cost', 'processed_at'];
+    const hasEnrichmentFilter = (filters || []).some((f: any) => enrichmentCols.includes(f.column));
+
+    // For status=new filter, we need LEFT join and filter for null enrichments
+    const statusFilter = (filters || []).find((f: any) => f.column === 'status');
+    const isNewOnly = statusFilter && Array.isArray(statusFilter.value) && statusFilter.value.includes('new') && statusFilter.value.length === 1;
+
+    while (true) {
+        let selectStr = 'id, contact_id';
+        if (hasEnrichmentFilter && !isNewOnly) {
+            selectStr = 'id, contact_id, enrichments!inner(status)';
+        } else if (isNewOnly) {
+            selectStr = 'id, contact_id, enrichments(status)';
+        }
+
+        let query: any = supabase
+            .from('contacts')
+            .select(selectStr)
+            .gt('id', lastId)
+            .order('id', { ascending: true })
+            .limit(PAGE_SIZE);
+
+        // Apply search query
+        if (searchQuery) {
+            const q = `"%${searchQuery}%"`;
+            query = query.or(`first_name.ilike.${q},last_name.ilike.${q},email.ilike.${q},company_website.ilike.${q},company_name.ilike.${q},industry.ilike.${q},lead_list_name.ilike.${q}`);
+        }
+
+        // Apply filters
+        for (const f of (filters || [])) {
+            const isEnrichmentCol = enrichmentCols.includes(f.column);
+            const colPath = isEnrichmentCol ? `enrichments.${f.column}` : f.column;
+
+            if (f.column === 'status' && Array.isArray(f.value)) {
+                const statuses = f.value;
+                const hasNew = statuses.includes('new');
+                const others = statuses.filter((s: string) => s !== 'new');
+
+                if (hasNew && others.length === 0) {
+                    query = query.filter('enrichments', 'is', 'null');
+                } else if (!hasNew && others.length > 0) {
+                    query = query.in('enrichments.status', others);
+                }
+            } else {
+                switch (f.operator) {
+                    case 'equals': query = (query as any).eq(colPath, f.value); break;
+                    case 'contains': query = query.ilike(colPath, `%${f.value}%`); break;
+                    case 'starts_with': query = query.ilike(colPath, `${f.value}%`); break;
+                    case 'greater_than': query = query.gt(colPath, f.value); break;
+                    case 'less_than': query = query.lt(colPath, f.value); break;
+                    case 'in': query = query.in(colPath, Array.isArray(f.value) ? f.value : [f.value]); break;
+                    case 'not_in': {
+                        const vals = Array.isArray(f.value) ? f.value : [f.value];
+                        if (vals.length > 0) query = query.not(colPath, 'in', `(${vals.join(',')})`);
+                        break;
+                    }
+                }
+            }
+        }
+
+        const { data, error } = await query;
+
+        if (error) {
+            addServerLog(`⚠️ Filter resolve page error (lastId=${lastId}): ${error.message}`, 'Pipeline', 'warn');
+            throw error;
+        }
+
+        if (!data || data.length === 0) break;
+
+        allIds.push(...data.map((d: any) => d.contact_id));
+        lastId = (data[data.length - 1] as any).id;
+
+        // Progress log every 10K
+        if (allIds.length % 10000 < PAGE_SIZE) {
+            addServerLog(`🔍 Resolved ${allIds.length} contact IDs so far...`, 'Pipeline', 'info');
+        }
+
+        if (data.length < PAGE_SIZE) break; // Last page
+    }
+
+    addServerLog(`✅ Resolved ${allIds.length} total contact IDs from filters.`, 'Pipeline', 'info');
+    return allIds;
 }
 
 app.post('/api/stop', async (req, res) => {
