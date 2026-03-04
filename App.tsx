@@ -1125,26 +1125,73 @@ function PipelineMonitor({
 function ProxyStatsDashboard() {
   const [stats, setStats] = useState<{ proxy_used: string, success_count: number }[]>([]);
   const [loading, setLoading] = useState(true);
+  const [dateRange, setDateRange] = useState<string>('all');
+  const [customStart, setCustomStart] = useState('');
+  const [customEnd, setCustomEnd] = useState('');
 
-  useEffect(() => {
-    fetch('/api/stats/proxies')
+  const DATE_PRESETS: { label: string; value: string }[] = [
+    { label: 'Last 1 Hour', value: '1h' },
+    { label: 'Last 4 Hours', value: '4h' },
+    { label: 'Today', value: 'today' },
+    { label: '1 Week', value: '1w' },
+    { label: '1 Month', value: '1m' },
+    { label: 'All Time', value: 'all' },
+    { label: 'Custom', value: 'custom' },
+  ];
+
+  const getDateBounds = useCallback((): { startDate?: string; endDate?: string } => {
+    const now = new Date();
+    switch (dateRange) {
+      case '1h': return { startDate: new Date(now.getTime() - 60 * 60 * 1000).toISOString() };
+      case '4h': return { startDate: new Date(now.getTime() - 4 * 60 * 60 * 1000).toISOString() };
+      case 'today': {
+        const start = new Date(now);
+        start.setHours(0, 0, 0, 0);
+        return { startDate: start.toISOString() };
+      }
+      case '1w': return { startDate: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString() };
+      case '1m': return { startDate: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString() };
+      case 'custom': {
+        const result: { startDate?: string; endDate?: string } = {};
+        if (customStart) result.startDate = new Date(customStart).toISOString();
+        if (customEnd) {
+          const end = new Date(customEnd);
+          end.setHours(23, 59, 59, 999);
+          result.endDate = end.toISOString();
+        }
+        return result;
+      }
+      default: return {};
+    }
+  }, [dateRange, customStart, customEnd]);
+
+  const fetchStats = useCallback(() => {
+    setLoading(true);
+    const bounds = getDateBounds();
+    const params = new URLSearchParams();
+    if (bounds.startDate) params.set('startDate', bounds.startDate);
+    if (bounds.endDate) params.set('endDate', bounds.endDate);
+    const qs = params.toString();
+
+    fetch(`/api/stats/proxies${qs ? `?${qs}` : ''}`)
       .then(res => res.json())
       .then(data => {
-        // Some robust checking in case db payload is weird
-        if (Array.isArray(data)) {
-          setStats(data);
-        }
+        if (Array.isArray(data)) setStats(data);
       })
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, []);
+  }, [getDateBounds]);
+
+  useEffect(() => {
+    fetchStats();
+  }, [dateRange, customStart, customEnd]);
 
   const totalSuccesses = stats.reduce((sum, s) => sum + s.success_count, 0);
 
   return (
     <div className="flex-1 p-8 overflow-y-auto custom-scrollbar bg-[#1c1c1c]">
       <div className="max-w-4xl mx-auto">
-        <div className="flex items-center justify-between mb-8">
+        <div className="flex items-center justify-between mb-6">
           <div>
             <h2 className="text-2xl font-bold flex items-center gap-3 text-white">
               <BarChart2 className="w-6 h-6 text-[#3ecf8e]" />
@@ -1153,19 +1200,53 @@ function ProxyStatsDashboard() {
             <p className="text-sm text-gray-500 mt-2">Historical success rates across all scraping tiers.</p>
           </div>
           <button
-            onClick={() => {
-              setLoading(true);
-              fetch('/api/stats/proxies')
-                .then(res => res.json())
-                .then(setStats)
-                .finally(() => setLoading(false));
-            }}
+            onClick={fetchStats}
             className="flex items-center gap-2 px-4 py-2 bg-[#2e2e2e] hover:bg-[#3e3e3e] border border-[#3e3e3e] text-white rounded-lg font-bold text-xs transition-colors"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-[#3ecf8e]' : ''}`} />
             Refresh
           </button>
         </div>
+
+        {/* Date Range Filter Bar */}
+        <div className="flex flex-wrap items-center gap-2 mb-6 p-3 bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl">
+          {DATE_PRESETS.map(preset => (
+            <button
+              key={preset.value}
+              onClick={() => setDateRange(preset.value)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${dateRange === preset.value
+                  ? 'bg-[#3ecf8e] text-black shadow-[0_0_12px_rgba(62,207,142,0.3)]'
+                  : 'bg-[#1c1c1c] text-gray-400 hover:text-white hover:bg-[#2e2e2e] border border-[#2e2e2e]'
+                }`}
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Custom Date Inputs */}
+        {dateRange === 'custom' && (
+          <div className="flex items-center gap-4 mb-6 p-4 bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl">
+            <div className="flex items-center gap-2">
+              <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">From</label>
+              <input
+                type="date"
+                value={customStart}
+                onChange={e => setCustomStart(e.target.value)}
+                className="px-3 py-1.5 bg-[#1c1c1c] border border-[#3e3e3e] rounded-lg text-sm text-white focus:border-[#3ecf8e] focus:outline-none"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">To</label>
+              <input
+                type="date"
+                value={customEnd}
+                onChange={e => setCustomEnd(e.target.value)}
+                className="px-3 py-1.5 bg-[#1c1c1c] border border-[#3e3e3e] rounded-lg text-sm text-white focus:border-[#3ecf8e] focus:outline-none"
+              />
+            </div>
+          </div>
+        )}
 
         {loading ? (
           <div className="flex flex-col items-center justify-center p-20 opacity-50">

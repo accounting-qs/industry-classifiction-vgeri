@@ -492,31 +492,68 @@ app.post('/api/resume', async (req, res) => {
 
 app.get('/api/stats/proxies', async (req, res) => {
     try {
-        const { data, error } = await supabase.rpc('get_proxy_stats')
+        const startDate = req.query.startDate as string | undefined;
+        const endDate = req.query.endDate as string | undefined;
 
-        if (error) {
-            // If the RPC fails (maybe not created), fallback to grabbing all counts manually
-            // This is slower but safer out of the box
-            const { data: rawData, error: rawError } = await supabase
+        // Try RPC first (if it supports date params)
+        if (!startDate && !endDate) {
+            const { data, error } = await supabase.rpc('get_proxy_stats');
+            if (!error && data) {
+                return res.json(data);
+            }
+        }
+
+        // Fallback: paginate through ALL scraped_data rows to bypass PostgREST 1000-row limit
+        const stats: Record<string, number> = {};
+        let lastCreatedAt: string | null = null;
+        let lastId: string | null = null;
+        const PAGE_SIZE = 5000;
+
+        while (true) {
+            let query = supabase
                 .from('scraped_data')
-                .select('proxy_used')
-                .not('proxy_used', 'is', null);
+                .select('id, proxy_used, created_at')
+                .not('proxy_used', 'is', null)
+                .order('created_at', { ascending: true })
+                .order('id', { ascending: true })
+                .limit(PAGE_SIZE);
+
+            // Date range filters
+            if (startDate) {
+                query = query.gte('created_at', startDate);
+            }
+            if (endDate) {
+                query = query.lte('created_at', endDate);
+            }
+
+            // Keyset pagination: skip past what we already fetched
+            if (lastCreatedAt && lastId) {
+                query = query.or(`created_at.gt.${lastCreatedAt},and(created_at.eq.${lastCreatedAt},id.gt.${lastId})`);
+            }
+
+            const { data: rawData, error: rawError } = await query;
 
             if (rawError) throw rawError;
+            if (!rawData || rawData.length === 0) break;
 
-            const stats = (rawData || []).reduce((acc: any, row) => {
+            for (const row of rawData) {
                 const proxy = row.proxy_used;
-                acc[proxy] = (acc[proxy] || 0) + 1;
-                return acc;
-            }, {});
+                if (proxy) stats[proxy] = (stats[proxy] || 0) + 1;
+            }
 
-            const formattedStats = Object.keys(stats)
-                .map(key => ({ proxy_used: key, success_count: stats[key] }))
-                .sort((a, b) => b.success_count - a.success_count);
+            // Update cursor for next page
+            const lastRow = rawData[rawData.length - 1];
+            lastCreatedAt = lastRow.created_at;
+            lastId = lastRow.id;
 
-            return res.json(formattedStats);
+            if (rawData.length < PAGE_SIZE) break;
         }
-        res.json(data);
+
+        const formattedStats = Object.keys(stats)
+            .map(key => ({ proxy_used: key, success_count: stats[key] }))
+            .sort((a, b) => b.success_count - a.success_count);
+
+        return res.json(formattedStats);
     } catch (e: any) {
         res.status(500).json({ error: e.message });
     }
