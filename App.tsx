@@ -123,6 +123,7 @@ export default function App() {
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
   const [isStopping, setIsStopping] = useState(false);
   const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
+  const [contactsLoading, setContactsLoading] = useState(false);
 
   const stopRequestedRef = useRef(false);
 
@@ -147,6 +148,7 @@ export default function App() {
   }, [currentPage, pageSize]);
 
   const loadData = useCallback(async () => {
+    setContactsLoading(true);
     try {
       const { data, count } = await db.getPaginatedContacts(
         currentPage,
@@ -159,6 +161,8 @@ export default function App() {
       setTotalCount(count);
     } catch (err: any) {
       addLog(`Error: ${err.message}`);
+    } finally {
+      setContactsLoading(false);
     }
   }, [currentPage, pageSize, activeFilters, debouncedSearchQuery]);
 
@@ -441,6 +445,7 @@ export default function App() {
               searchQuery={searchQuery}
               onSearchQueryChange={setSearchQuery}
               leadListOptions={leadListOptions}
+              isLoadingContacts={contactsLoading}
             />
           ) : (
             <div className="flex-1 p-6 overflow-hidden bg-[#1c1c1c] flex flex-col h-full min-h-0">
@@ -583,7 +588,8 @@ function DataTable({
   onFiltersChange,
   searchQuery = '',
   onSearchQueryChange,
-  leadListOptions = []
+  leadListOptions = [],
+  isLoadingContacts = false
 }: any) {
   const [showPageSizeMenu, setShowPageSizeMenu] = useState(false);
   const [showFilterBuilder, setShowFilterBuilder] = useState(false);
@@ -845,6 +851,23 @@ function DataTable({
       </div>
 
       <div className="flex-1 overflow-auto custom-scrollbar relative">
+        {/* Loading indicator — indeterminate sliding bar */}
+        {isLoadingContacts && (
+          <>
+            <style>{`
+              @keyframes loading-slide {
+                0% { transform: translateX(-100%); }
+                100% { transform: translateX(250%); }
+              }
+            `}</style>
+            <div className="absolute top-0 left-0 right-0 z-30 h-[3px] bg-[#2e2e2e] overflow-hidden">
+              <div
+                className="h-full w-[40%] bg-[#3ecf8e] rounded-full shadow-[0_0_12px_rgba(62,207,142,0.6)]"
+                style={{ animation: 'loading-slide 1s ease-in-out infinite' }}
+              />
+            </div>
+          </>
+        )}
         <table className="w-full border-collapse table-fixed text-[#ededed]">
           <thead className="sticky top-0 z-20 bg-[#1c1c1c] shadow-[0_1px_0_rgba(46,46,46,1)]">
             <tr>
@@ -1215,8 +1238,8 @@ function ProxyStatsDashboard() {
               key={preset.value}
               onClick={() => setDateRange(preset.value)}
               className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${dateRange === preset.value
-                  ? 'bg-[#3ecf8e] text-black shadow-[0_0_12px_rgba(62,207,142,0.3)]'
-                  : 'bg-[#1c1c1c] text-gray-400 hover:text-white hover:bg-[#2e2e2e] border border-[#2e2e2e]'
+                ? 'bg-[#3ecf8e] text-black shadow-[0_0_12px_rgba(62,207,142,0.3)]'
+                : 'bg-[#1c1c1c] text-gray-400 hover:text-white hover:bg-[#2e2e2e] border border-[#2e2e2e]'
                 }`}
             >
               {preset.label}
