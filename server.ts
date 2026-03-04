@@ -495,7 +495,7 @@ app.get('/api/stats/proxies', async (req, res) => {
         const startDate = req.query.startDate as string | undefined;
         const endDate = req.query.endDate as string | undefined;
 
-        // Try RPC first (if it supports date params)
+        // Try RPC first (only when no date filters)
         if (!startDate && !endDate) {
             const { data, error } = await supabase.rpc('get_proxy_stats');
             if (!error && data) {
@@ -503,20 +503,20 @@ app.get('/api/stats/proxies', async (req, res) => {
             }
         }
 
-        // Fallback: paginate through ALL scraped_data rows to bypass PostgREST 1000-row limit
+        // Paginate through ALL scraped_data rows using offset-based pagination.
+        // Supabase PostgREST enforces max-rows=1000 per request regardless of .limit(),
+        // so we paginate in 1000-row pages to ensure we fetch everything.
         const stats: Record<string, number> = {};
-        let lastCreatedAt: string | null = null;
-        let lastId: string | null = null;
-        const PAGE_SIZE = 5000;
+        const PAGE_SIZE = 1000;
+        let page = 0;
 
         while (true) {
-            let query = supabase
+            let query: any = supabase
                 .from('scraped_data')
-                .select('id, proxy_used, created_at')
+                .select('proxy_used')
                 .not('proxy_used', 'is', null)
                 .order('created_at', { ascending: true })
-                .order('id', { ascending: true })
-                .limit(PAGE_SIZE);
+                .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
 
             // Date range filters
             if (startDate) {
@@ -524,11 +524,6 @@ app.get('/api/stats/proxies', async (req, res) => {
             }
             if (endDate) {
                 query = query.lte('created_at', endDate);
-            }
-
-            // Keyset pagination: skip past what we already fetched
-            if (lastCreatedAt && lastId) {
-                query = query.or(`created_at.gt.${lastCreatedAt},and(created_at.eq.${lastCreatedAt},id.gt.${lastId})`);
             }
 
             const { data: rawData, error: rawError } = await query;
@@ -541,12 +536,8 @@ app.get('/api/stats/proxies', async (req, res) => {
                 if (proxy) stats[proxy] = (stats[proxy] || 0) + 1;
             }
 
-            // Update cursor for next page
-            const lastRow = rawData[rawData.length - 1];
-            lastCreatedAt = lastRow.created_at;
-            lastId = lastRow.id;
-
             if (rawData.length < PAGE_SIZE) break;
+            page++;
         }
 
         const formattedStats = Object.keys(stats)

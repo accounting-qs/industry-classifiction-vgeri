@@ -1145,6 +1145,74 @@ function PipelineMonitor({
   );
 }
 
+function MiniCalendar({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+  const parsed = value ? new Date(value + 'T00:00:00') : null;
+  const [viewYear, setViewYear] = useState(parsed ? parsed.getFullYear() : new Date().getFullYear());
+  const [viewMonth, setViewMonth] = useState(parsed ? parsed.getMonth() : new Date().getMonth());
+
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const DAYS = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
+
+  const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
+  const firstDayOfWeek = new Date(viewYear, viewMonth, 1).getDay();
+  const today = new Date();
+  const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+
+  const prevMonth = () => {
+    if (viewMonth === 0) { setViewMonth(11); setViewYear(y => y - 1); }
+    else setViewMonth(m => m - 1);
+  };
+  const nextMonth = () => {
+    if (viewMonth === 11) { setViewMonth(0); setViewYear(y => y + 1); }
+    else setViewMonth(m => m + 1);
+  };
+
+  const selectDay = (day: number) => {
+    const dateStr = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    onChange(dateStr);
+  };
+
+  return (
+    <div className="flex-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-3">
+      <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-3">{label}</p>
+      {/* Month/Year Navigation */}
+      <div className="flex items-center justify-between mb-3">
+        <button onClick={() => setViewYear(y => y - 1)} className="text-gray-500 hover:text-white text-xs font-bold px-1">{'‹‹'}</button>
+        <button onClick={prevMonth} className="text-gray-400 hover:text-white p-0.5"><ChevronLeft className="w-3.5 h-3.5" /></button>
+        <span className="text-sm font-bold text-white">{MONTHS[viewMonth]} {viewYear}</span>
+        <button onClick={nextMonth} className="text-gray-400 hover:text-white p-0.5"><ChevronRight className="w-3.5 h-3.5" /></button>
+        <button onClick={() => setViewYear(y => y + 1)} className="text-gray-500 hover:text-white text-xs font-bold px-1">{'››'}</button>
+      </div>
+      {/* Day Headers */}
+      <div className="grid grid-cols-7 gap-0.5 mb-1">
+        {DAYS.map(d => <div key={d} className="text-center text-[9px] font-bold text-gray-600 py-0.5">{d}</div>)}
+      </div>
+      {/* Day Grid */}
+      <div className="grid grid-cols-7 gap-0.5">
+        {Array.from({ length: firstDayOfWeek }).map((_, i) => <div key={`e${i}`} />)}
+        {Array.from({ length: daysInMonth }).map((_, i) => {
+          const day = i + 1;
+          const dateStr = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+          const isSelected = dateStr === value;
+          const isToday = dateStr === todayStr;
+          return (
+            <button
+              key={day}
+              onClick={() => selectDay(day)}
+              className={`text-xs h-7 w-full rounded-md font-medium transition-all
+                ${isSelected ? 'bg-[#3ecf8e] text-black font-bold shadow-[0_0_8px_rgba(62,207,142,0.4)]' :
+                  isToday ? 'bg-[#2e2e2e] text-[#3ecf8e] font-bold ring-1 ring-[#3ecf8e]/30' :
+                    'text-gray-300 hover:bg-[#2e2e2e] hover:text-white'}`}
+            >
+              {day}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ProxyStatsDashboard() {
   const [stats, setStats] = useState<{ proxy_used: string, success_count: number }[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1247,26 +1315,34 @@ function ProxyStatsDashboard() {
           ))}
         </div>
 
-        {/* Custom Date Inputs */}
+        {/* Custom Date Picker */}
         {dateRange === 'custom' && (
-          <div className="flex items-center gap-4 mb-6 p-4 bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl">
-            <div className="flex items-center gap-2">
-              <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">From</label>
-              <input
-                type="date"
-                value={customStart}
-                onChange={e => setCustomStart(e.target.value)}
-                className="px-3 py-1.5 bg-[#1c1c1c] border border-[#3e3e3e] rounded-lg text-sm text-white focus:border-[#3ecf8e] focus:outline-none"
-              />
+          <div className="mb-6 p-4 bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl">
+            <div className="flex items-center gap-4 mb-4">
+              <div className="flex items-center gap-2 flex-1">
+                <label className="text-xs font-bold text-gray-500 uppercase tracking-wider shrink-0">From</label>
+                <input
+                  type="text"
+                  placeholder="YYYY-MM-DD"
+                  value={customStart}
+                  onChange={e => setCustomStart(e.target.value)}
+                  className="px-3 py-1.5 bg-[#1c1c1c] border border-[#3e3e3e] rounded-lg text-sm text-white focus:border-[#3ecf8e] focus:outline-none w-full max-w-[160px] font-mono"
+                />
+              </div>
+              <div className="flex items-center gap-2 flex-1">
+                <label className="text-xs font-bold text-gray-500 uppercase tracking-wider shrink-0">To</label>
+                <input
+                  type="text"
+                  placeholder="YYYY-MM-DD"
+                  value={customEnd}
+                  onChange={e => setCustomEnd(e.target.value)}
+                  className="px-3 py-1.5 bg-[#1c1c1c] border border-[#3e3e3e] rounded-lg text-sm text-white focus:border-[#3ecf8e] focus:outline-none w-full max-w-[160px] font-mono"
+                />
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">To</label>
-              <input
-                type="date"
-                value={customEnd}
-                onChange={e => setCustomEnd(e.target.value)}
-                className="px-3 py-1.5 bg-[#1c1c1c] border border-[#3e3e3e] rounded-lg text-sm text-white focus:border-[#3ecf8e] focus:outline-none"
-              />
+            <div className="flex gap-4">
+              <MiniCalendar label="Start Date" value={customStart} onChange={setCustomStart} />
+              <MiniCalendar label="End Date" value={customEnd} onChange={setCustomEnd} />
             </div>
           </div>
         )}
