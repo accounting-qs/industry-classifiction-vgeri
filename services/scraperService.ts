@@ -126,6 +126,8 @@ export async function fetchDigest(
     // Wait for the FIRST successful response
     const { raw_html, proxyName } = await Promise.any(racePromises);
     raceController.abort(); // Cancel all the losers immediately to free memory/connections
+    // Fix #8: Yield to event loop so abort signals are processed, closing TCP sockets faster
+    await new Promise(r => setImmediate(r));
 
     if (onProgress) onProgress(`✅ [Scraper] ${proxyName} won the race for: ${start_url}`);
     return {

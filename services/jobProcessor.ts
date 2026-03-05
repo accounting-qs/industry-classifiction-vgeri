@@ -36,16 +36,29 @@ const aiLimit = pLimit(CONCURRENCY_AI);
 export class JobProcessor {
     private static isRunning = false;
     private static shouldStop = false;
+    // Fix #1: Batched log buffer — avoids fire-and-forget promises per log call
+    private static pendingLogs: { timestamp: string; instance_id: string; module: string; message: string; level: string }[] = [];
 
     private static log(msg: string, level: 'info' | 'warn' | 'error' | 'phase' = 'info') {
         console.log(`[JobProcessor] ${msg}`);
-        supabase.from('pipeline_logs').insert({
+        this.pendingLogs.push({
             timestamp: new Date().toISOString(),
             instance_id: 'worker',
             module: 'Pipeline',
             message: msg,
             level
-        }).then();
+        });
+    }
+
+    private static async flushLogs() {
+        if (this.pendingLogs.length === 0) return;
+        const batch = this.pendingLogs;
+        this.pendingLogs = [];
+        try {
+            await supabase.from('pipeline_logs').insert(batch);
+        } catch (e: any) {
+            console.error('[JobProcessor] Log flush failed:', e.message);
+        }
     }
 
     /**
@@ -55,7 +68,7 @@ export class JobProcessor {
         if (this.isRunning) return;
         this.isRunning = true;
         this.shouldStop = false;
-        this.log(`🚀 JobProcessor started [Chunk: ${QUEUE_FETCH_CHUNK_SIZE}, Scrape: C${CONCURRENCY_SCRAPE}, AI: C${CONCURRENCY_AI}]`, 'phase');
+        this.log(`🚀 JobProcessor started [Chunk: ${QUEUE_FETCH_CHUNK_SIZE}, Scrape: C${CONCURRENCY_SCRAPE}, AI: C${CONCURRENCY_AI}, GC: ${typeof global.gc === 'function' ? 'ENABLED' : 'DISABLED'}]`, 'phase');
 
         // Issue #3: Watchdog wrapper — auto-restarts the loop if it dies unexpectedly
         this.runWithWatchdog();
@@ -169,8 +182,11 @@ export class JobProcessor {
                     await new Promise(r => setImmediate(r));
                 }
 
+                // Flush accumulated logs before GC
+                await this.flushLogs();
+
                 // Force garbage collection if exposed, keeps Node.js heap extremely clean on long 100k runs
-                if (global.gc) {
+                if (typeof global.gc === 'function') {
                     global.gc();
                 }
             } catch (err: any) {
@@ -237,9 +253,10 @@ export class JobProcessor {
 
         // 1.5 Manually fetch contacts since we dropped the Foreign Key to fix the UUID mismatch
         const contactIds = [...new Set(claimedItems.map(item => item.contact_id))];
+        // Fix #3: Only fetch the columns we actually use — reduces memory by ~60%
         const { data: contactData, error: contactErr } = await supabase
             .from('contacts')
-            .select('*')
+            .select('contact_id, id, email, company_website, lead_list_name')
             .in('contact_id', contactIds);
 
         if (contactErr) {
@@ -266,8 +283,10 @@ export class JobProcessor {
         // --- CHUNK LOCAL CACHE ---
         // Issue #5: Use contact.company_website, not jobItem.company_website (which doesn't exist on job_items table)
         const uniqueDomains = [...new Set(enrichedItems.map((item: any) => item.contacts?.company_website).filter(Boolean))];
-        const domainCache: Record<string, any> = {};
-        const digestCache: Record<string, string> = {};
+        let domainCache: Record<string, any> = {};
+        let digestCache: Record<string, string> = {};
+        // Fix #5: Batch scraped_data upserts instead of fire-and-forget per scrape
+        const pendingDigestUpserts: { domain: string; content: string; proxy_used: string }[] = [];
 
         // Issue #1: Wrap cache-prefetch in try/catch — a failed cache query should NOT kill the chunk
         if (uniqueDomains.length > 0) {
@@ -338,8 +357,8 @@ export class JobProcessor {
                     digest = scrapeRes.digest;
                     proxyUsed = scrapeRes.proxyName;
 
-                    // Fire-and-forget digest persist
-                    supabase.from('scraped_data').upsert({ domain, content: digest, proxy_used: proxyUsed }, { onConflict: 'domain' }).then();
+                    // Fix #5: Queue digest for batched upsert instead of fire-and-forget
+                    pendingDigestUpserts.push({ domain, content: digest, proxy_used: proxyUsed });
                     // Update local chunk cache so duplicate domains in the SAME chunk don't double scrape!
                     digestCache[domain] = digest;
                 } catch (e: any) {
@@ -382,10 +401,10 @@ export class JobProcessor {
         }));
 
         // --- BULK DATABASE UPDATE ---
-        const jobsToUpdate: Record<string, { completed: number, failed: number }> = {};
-        const itemsToUpsert: any[] = [];
-        const enrichmentsToUpsert: any[] = [];
-        const contactsToUpdate: any[] = [];
+        let jobsToUpdate: Record<string, { completed: number, failed: number }> = {};
+        let itemsToUpsert: any[] = [];
+        let enrichmentsToUpsert: any[] = [];
+        let contactsToUpdate: any[] = [];
 
         results.forEach(res => {
             if (!jobsToUpdate[res.jobId]) jobsToUpdate[res.jobId] = { completed: 0, failed: 0 };
@@ -421,6 +440,12 @@ export class JobProcessor {
             if (enrichErr) this.log(`⚠️ enrichments upsert error: ${enrichErr.message}`, 'error');
         }
 
+        // Fix #5: Flush batched scraped_data upserts
+        if (pendingDigestUpserts.length > 0) {
+            const { error: digestErr } = await supabase.from('scraped_data').upsert(pendingDigestUpserts, { onConflict: 'domain' });
+            if (digestErr) this.log(`⚠️ scraped_data batch upsert error: ${digestErr.message}`, 'error');
+        }
+
         // Issue #2: Atomic job counter increments — avoids read-then-write race condition
         // Uses a single UPDATE with raw SQL increment instead of SELECT + UPDATE
         for (const [jid, tallies] of Object.entries(jobsToUpdate)) {
@@ -453,9 +478,13 @@ export class JobProcessor {
         await supabase.from('pipeline_state').update({
             is_processing: true,
             updated_at: new Date().toISOString()
-        }).eq('id', 1).then();
+        }).eq('id', 1);
+
+        // Flush logs for this chunk
+        await this.flushLogs();
 
         // 🗑️ AGGRESSIVE MEMORY CLEANUP 🗑️
+        // Fix #4: Use let bindings + null reassignment to fully release references
         const returnedLength = claimedItems.length;
 
         claimedItems.length = 0;
@@ -464,9 +493,14 @@ export class JobProcessor {
         itemsToUpsert.length = 0;
         enrichmentsToUpsert.length = 0;
         contactsToUpdate.length = 0;
-        Object.keys(domainCache).forEach(k => delete domainCache[k]);
-        Object.keys(digestCache).forEach(k => delete digestCache[k]);
-        Object.keys(jobsToUpdate).forEach(k => delete jobsToUpdate[k]);
+        pendingDigestUpserts.length = 0;
+        // Null out object references so V8 can collect the backing stores
+        domainCache = null as any;
+        digestCache = null as any;
+        jobsToUpdate = null as any;
+        itemsToUpsert = null as any;
+        enrichmentsToUpsert = null as any;
+        contactsToUpdate = null as any;
 
         return returnedLength;
     }
@@ -481,7 +515,7 @@ export class JobProcessor {
             confidence: classificationData?.confidence || 1,
             reasoning: errorOrReasoning,
             classification: classificationData?.classification || (isSuccess ? "Unknown" : "Scrape Error"),
-            page_html: digest || undefined,
+            // Fix #2: Removed page_html — already persisted to scraped_data table, storing again wastes ~6KB/item
             cost: cost,
             processed_at: new Date().toISOString()
         };

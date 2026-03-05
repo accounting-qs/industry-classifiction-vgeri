@@ -8,7 +8,7 @@
     "dev:server": "tsx server.ts",
     "build": "vite build",
     "build:server": "echo 'No server build needed for tsx'",
-    "start": "tsx server.ts",
+    "start": "node --expose-gc --import tsx server.ts",
     "preview": "vite preview"
   },
   "dependencies": {

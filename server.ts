@@ -67,8 +67,9 @@ const addServerLog = async (msg: string, module: string = 'Pipeline', level: Log
 
     console.log(`[${module}] ${msg}`);
 
-    // 1. Internal cache (latest 100)
-    currentJobLogs = [entry, ...currentJobLogs].slice(0, 100);
+    // 1. Internal cache (latest 100) — Fix #7: ring buffer instead of spread+slice
+    currentJobLogs.unshift(entry);
+    if (currentJobLogs.length > 100) currentJobLogs.length = 100;
 
     // 2. Persist to Supabase logs table (fire-and-forget)
     supabase.from('pipeline_logs').insert(entry).then(({ error }) => {
