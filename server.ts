@@ -623,7 +623,7 @@ app.get('/api/distinct/:column', async (req, res) => {
 });
 
 app.post('/api/import', async (req, res) => {
-    const { contacts } = req.body;
+    const { contacts, overwriteDuplicates } = req.body;
 
     if (!contacts || !Array.isArray(contacts) || contacts.length === 0) {
         return res.status(400).json({ error: 'No contacts provided' });
@@ -681,17 +681,12 @@ app.post('/api/import', async (req, res) => {
             }
         }
 
-        // 4. Prepare only NEW contacts (skip duplicates)
+        // 4. Separate new vs existing contacts
         let duplicates = 0;
         const newContacts: any[] = [];
+        const updateContacts: any[] = [];
 
-        validContacts.forEach((c: any) => {
-            const email = c.email?.trim()?.toLowerCase();
-            if (email && existingEmails.has(email)) {
-                duplicates++;
-                return; // Skip duplicate
-            }
-
+        const buildRow = (c: any) => {
             const row: any = {};
             row.contact_id = c.contact_id || crypto.randomUUID();
             if (c.email) row.email = c.email.trim();
@@ -703,16 +698,30 @@ app.post('/api/import', async (req, res) => {
             if (c.linkedin_url) row.linkedin_url = c.linkedin_url;
             if (c.title) row.title = c.title;
             if (c.lead_list_name) row.lead_list_name = c.lead_list_name;
+            return row;
+        };
 
-            newContacts.push(row);
+        validContacts.forEach((c: any) => {
+            const email = c.email?.trim()?.toLowerCase();
+            if (email && existingEmails.has(email)) {
+                if (overwriteDuplicates) {
+                    updateContacts.push(buildRow(c));
+                } else {
+                    duplicates++;
+                }
+                return;
+            }
+            newContacts.push(buildRow(c));
         });
 
-        // 5. Insert only new contacts in chunks
+        // 5. Insert new contacts + upsert existing (if overwrite enabled)
         const CHUNK_SIZE = 1000;
         let inserted = 0;
+        let updated = 0;
         let dbFailed = 0;
         const errors: string[] = [];
 
+        // Insert new contacts
         for (let i = 0; i < newContacts.length; i += CHUNK_SIZE) {
             const chunk = newContacts.slice(i, i + CHUNK_SIZE);
             const { error } = await supabase
@@ -728,11 +737,63 @@ app.post('/api/import', async (req, res) => {
             }
         }
 
+        // Update existing contacts (overwrite mode)
+        for (let i = 0; i < updateContacts.length; i += CHUNK_SIZE) {
+            const chunk = updateContacts.slice(i, i + CHUNK_SIZE);
+            const { error } = await supabase
+                .from('contacts')
+                .upsert(chunk, { onConflict: 'email' });
+
+            if (error) {
+                console.error(`Upsert chunk error at row ${i}:`, error);
+                errors.push(`Upsert chunk ${i}: ${error.message}`);
+                dbFailed += chunk.length;
+            } else {
+                updated += chunk.length;
+            }
+        }
+
         const totalFailed = failedContacts.length + dbFailed;
-        addServerLog(`📥 Import complete: ${inserted} new, ${duplicates} duplicates, ${totalFailed} failed (${failedContacts.length} invalid emails).`, 'Sync', 'info');
-        res.json({ inserted, duplicates, failed: totalFailed, errors, failedContacts });
+        addServerLog(`📥 Import complete: ${inserted} new, ${updated} updated, ${duplicates} duplicates, ${totalFailed} failed (${failedContacts.length} invalid emails).`, 'Sync', 'info');
+        res.json({ inserted, updated, duplicates, failed: totalFailed, errors, failedContacts });
     } catch (err: any) {
         console.error('Import error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ============================================
+// IMPORT LISTS (history)
+// ============================================
+
+app.get('/api/import-lists', async (_req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('import_lists')
+            .select('*')
+            .order('created_at', { ascending: false });
+
+        if (error) return res.status(500).json({ error: error.message });
+        res.json(data || []);
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/import-lists', async (req, res) => {
+    const { name, contact_count } = req.body;
+    if (!name) return res.status(400).json({ error: 'Name is required' });
+
+    try {
+        const { data, error } = await supabase
+            .from('import_lists')
+            .insert({ name, contact_count: contact_count || 0 })
+            .select()
+            .single();
+
+        if (error) return res.status(500).json({ error: error.message });
+        res.json(data);
+    } catch (err: any) {
         res.status(500).json({ error: err.message });
     }
 });

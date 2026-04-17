@@ -34,7 +34,7 @@ const getScrapingBeeKey = () => {
   }
 };
 
-const CORSPROXY_API_KEY = "cf93a78a";
+const CORSPROXY_API_KEY = process.env.CORSPROXY_API_KEY || "";
 
 const PROXY_LIST = [
   (url: string) => `https://corsproxy.io/?key=${CORSPROXY_API_KEY}&url=${encodeURIComponent(url)}`,

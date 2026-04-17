@@ -123,6 +123,7 @@ export default function App() {
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
   const [isStopping, setIsStopping] = useState(false);
   const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
+  const [activeListFilter, setActiveListFilter] = useState<string | null>(null);
   const [contactsLoading, setContactsLoading] = useState(false);
 
   const stopRequestedRef = useRef(false);
@@ -132,6 +133,11 @@ export default function App() {
     setIsAllFilteredSelected(false);
     setCurrentPage(1);
   }, [activeFilters]);
+
+  // Reset page when list filter changes
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [activeListFilter]);
 
   // Debounce search query
   useEffect(() => {
@@ -150,11 +156,14 @@ export default function App() {
   const loadData = useCallback(async () => {
     setContactsLoading(true);
     try {
+      const combinedFilters: FilterCondition[] = activeListFilter
+        ? [...activeFilters, { id: '__list_pill__', column: 'lead_list_name', operator: 'equals' as FilterOperator, value: activeListFilter }]
+        : activeFilters;
       const { data, count } = await db.getPaginatedContacts(
         currentPage,
         pageSize,
         false,
-        activeFilters,
+        combinedFilters,
         debouncedSearchQuery
       );
       setContacts(data);
@@ -164,7 +173,7 @@ export default function App() {
     } finally {
       setContactsLoading(false);
     }
-  }, [currentPage, pageSize, activeFilters, debouncedSearchQuery]);
+  }, [currentPage, pageSize, activeFilters, activeListFilter, debouncedSearchQuery]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
@@ -269,7 +278,10 @@ export default function App() {
 
     if (isAllFilteredSelected) {
       addLog(`📦 Generating database query for all ${totalCount} matching contacts natively on the backend...`);
-      payload = { filters: activeFilters, searchQuery: debouncedSearchQuery };
+      const enrichFilters: FilterCondition[] = activeListFilter
+        ? [...activeFilters, { id: '__list_pill__', column: 'lead_list_name', operator: 'equals' as FilterOperator, value: activeListFilter }]
+        : activeFilters;
+      payload = { filters: enrichFilters, searchQuery: debouncedSearchQuery };
       totalBatchSize = totalCount;
     } else {
       const selectedContacts = contacts.filter(c => selectedIds.has(c.contact_id));
@@ -379,7 +391,7 @@ export default function App() {
           {activeTab === AppTab.PROXIES ? (
             <ProxyStatsDashboard />
           ) : activeTab === AppTab.IMPORT ? (
-            <CSVImportWizard onComplete={() => { setActiveTab(AppTab.MANAGER); loadData(); }} />
+            <CSVImportWizard onComplete={() => { setActiveTab(AppTab.MANAGER); loadData(); fetch('/api/distinct/lead_list_name').then(r => r.json()).then(d => { if (Array.isArray(d)) setLeadListOptions(d); }).catch(() => {}); }} />
           ) : activeTab === AppTab.ENRICHMENT ? (
             <PipelineMonitor
               stats={stats}
@@ -445,6 +457,8 @@ export default function App() {
               searchQuery={searchQuery}
               onSearchQueryChange={setSearchQuery}
               leadListOptions={leadListOptions}
+              activeListFilter={activeListFilter}
+              onListFilterChange={setActiveListFilter}
               isLoadingContacts={contactsLoading}
             />
           ) : (
@@ -589,6 +603,8 @@ function DataTable({
   searchQuery = '',
   onSearchQueryChange,
   leadListOptions = [],
+  activeListFilter = null,
+  onListFilterChange,
   isLoadingContacts = false
 }: any) {
   const [showPageSizeMenu, setShowPageSizeMenu] = useState(false);
@@ -849,6 +865,31 @@ function DataTable({
         </div>
         <div className="flex items-center gap-2 text-gray-500"><Settings2 className="w-3.5 h-3.5 hover:text-white cursor-pointer" /><Maximize2 className="w-3.5 h-3.5 hover:text-white cursor-pointer" /><MoreHorizontal className="w-4 h-4 hover:text-white cursor-pointer" /></div>
       </div>
+
+      {/* List switcher pills */}
+      {leadListOptions.length > 0 && (
+        <div className="px-4 py-2 border-b border-[#2e2e2e] flex items-center gap-2 overflow-x-auto no-scrollbar bg-[#1c1c1c] shrink-0">
+          <button
+            onClick={() => onListFilterChange(null)}
+            className={`px-3 py-1 rounded-full text-[11px] font-bold whitespace-nowrap transition-all border ${
+              !activeListFilter
+                ? 'bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30'
+                : 'bg-[#0e0e0e] text-gray-500 border-[#2e2e2e] hover:border-gray-500'
+            }`}
+          >All</button>
+          {leadListOptions.map((list: string) => (
+            <button
+              key={list}
+              onClick={() => onListFilterChange(activeListFilter === list ? null : list)}
+              className={`px-3 py-1 rounded-full text-[11px] font-bold whitespace-nowrap transition-all border ${
+                activeListFilter === list
+                  ? 'bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30'
+                  : 'bg-[#0e0e0e] text-gray-500 border-[#2e2e2e] hover:border-gray-500'
+              }`}
+            >{list}</button>
+          ))}
+        </div>
+      )}
 
       <div className="flex-1 overflow-auto custom-scrollbar relative">
         {/* Loading indicator — indeterminate sliding bar */}
@@ -1442,10 +1483,18 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
   const [totalRows, setTotalRows] = useState(0);
   const [importProgress, setImportProgress] = useState(0);
   const [importStatus, setImportStatus] = useState<'idle' | 'importing' | 'done' | 'error'>('idle');
-  const [importResult, setImportResult] = useState<{ inserted: number; duplicates: number; failed: number; errors: string[]; failedContacts: { email: string; row: number; reason: string }[] }>({ inserted: 0, duplicates: 0, failed: 0, errors: [], failedContacts: [] });
+  const [importResult, setImportResult] = useState<{ inserted: number; updated: number; duplicates: number; failed: number; errors: string[]; failedContacts: { email: string; row: number; reason: string }[] }>({ inserted: 0, updated: 0, duplicates: 0, failed: 0, errors: [], failedContacts: [] });
   const [dragOver, setDragOver] = useState(false);
   const [showFailedModal, setShowFailedModal] = useState(false);
+  const [listNameOverride, setListNameOverride] = useState('');
+  const [overwriteDuplicates, setOverwriteDuplicates] = useState(false);
+  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string }[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Fetch import history on mount
+  useEffect(() => {
+    fetch('/api/import-lists').then(r => r.json()).then(data => { if (Array.isArray(data)) setImportLists(data); }).catch(() => {});
+  }, []);
 
   // Auto-map CSV headers to contacts fields (case-insensitive, common aliases)
   const autoMap = (headers: string[]) => {
@@ -1544,11 +1593,12 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
     setStep(3);
     setImportStatus('importing');
     setImportProgress(0);
-    setImportResult({ inserted: 0, duplicates: 0, failed: 0, errors: [], failedContacts: [] });
+    setImportResult({ inserted: 0, updated: 0, duplicates: 0, failed: 0, errors: [], failedContacts: [] });
 
     const activeMappings: [string, string][] = (Object.entries(mapping) as [string, string][]).filter(([_, v]) => v !== '__skip__');
     let buffer: any[] = [];
     let totalInserted = 0;
+    let totalUpdated = 0;
     let totalDuplicates = 0;
     let totalFailed = 0;
     let sentToServer = 0; // Tracks rows actually sent (after API response), not just parsed
@@ -1561,13 +1611,14 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
         const res = await fetch('/api/import', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contacts: chunk })
+          body: JSON.stringify({ contacts: chunk, overwriteDuplicates })
         });
         const data = await res.json();
         if (!res.ok) {
           errors.push(data.error || `HTTP ${res.status}`);
         } else {
           totalInserted += data.inserted || 0;
+          totalUpdated += data.updated || 0;
           totalDuplicates += data.duplicates || 0;
           totalFailed += data.failed || 0;
           if (data.errors?.length) errors.push(...data.errors);
@@ -1579,7 +1630,7 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
       // Update progress AFTER the API call completes
       sentToServer += chunk.length;
       setImportProgress(sentToServer);
-      setImportResult({ inserted: totalInserted, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
+      setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
     };
 
     // Use a queue approach to handle async sending while streaming
@@ -1596,6 +1647,11 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
             mapped[targetCol] = val;
           }
         });
+
+        // Override lead_list_name if user specified a list name
+        if (listNameOverride.trim()) {
+          mapped.lead_list_name = listNameOverride.trim();
+        }
 
         // Only include rows that have at least one mapped value
         if (Object.keys(mapped).length > 0) {
@@ -1616,15 +1672,32 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
           sendPromise = sendPromise.then(() => sendChunk(chunk));
         }
 
-        sendPromise.then(() => {
+        sendPromise.then(async () => {
           setImportProgress(sentToServer);
-          setImportResult({ inserted: totalInserted, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
+          setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
           setImportStatus(totalFailed > 0 || errors.length > 0 ? 'error' : 'done');
+
+          // Record import list if a name was provided and contacts were imported/updated
+          const listName = listNameOverride.trim();
+          const totalAffected = totalInserted + totalUpdated;
+          if (listName && totalAffected > 0) {
+            try {
+              await fetch('/api/import-lists', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: listName, contact_count: totalAffected })
+              });
+              // Refresh import lists
+              const res = await fetch('/api/import-lists');
+              const data = await res.json();
+              if (Array.isArray(data)) setImportLists(data);
+            } catch {}
+          }
         });
       },
       error: (err: Error) => {
         errors.push(`Parse error: ${err.message}`);
-        setImportResult({ inserted: totalInserted, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
+        setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
         setImportStatus('error');
       }
     });
@@ -1698,11 +1771,57 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
                 </p>
               </div>
               <button
-                onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); }}
+                onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); setListNameOverride(''); setOverwriteDuplicates(false); }}
                 className="text-xs text-gray-500 hover:text-white px-3 py-1.5 border border-[#2e2e2e] rounded-lg hover:bg-[#2e2e2e] transition-colors"
               >
                 Change File
               </button>
+            </div>
+
+            {/* Import Settings */}
+            <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl p-5 space-y-4">
+              <div className="flex items-center gap-2 mb-1">
+                <ListFilter className="w-4 h-4 text-[#3ecf8e]" />
+                <span className="text-xs font-bold text-gray-300 uppercase tracking-widest">Import Settings</span>
+              </div>
+
+              {/* List Name */}
+              <div>
+                <label className="text-xs text-gray-400 font-medium mb-1.5 block">List Name</label>
+                <input
+                  type="text"
+                  value={listNameOverride}
+                  onChange={(e) => setListNameOverride(e.target.value)}
+                  placeholder="e.g. Q2 Prospects"
+                  className="w-full bg-[#1c1c1c] border border-[#2e2e2e] rounded-lg px-3 py-2 text-sm text-gray-300 placeholder-gray-600 focus:border-[#3ecf8e] focus:outline-none transition-colors"
+                />
+                <p className="text-[10px] text-gray-600 mt-1">Applied to all contacts. Leave blank to use mapped CSV column value.</p>
+              </div>
+
+              {/* Duplicate Handling */}
+              <div>
+                <label className="text-xs text-gray-400 font-medium mb-1.5 block">If contact already exists (matched by email)</label>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setOverwriteDuplicates(false)}
+                    className={`flex-1 px-3 py-2 rounded-lg text-xs font-bold transition-all border ${!overwriteDuplicates
+                      ? 'bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30'
+                      : 'bg-[#1c1c1c] text-gray-500 border-[#2e2e2e] hover:border-gray-500'
+                    }`}
+                  >
+                    Skip (ignore)
+                  </button>
+                  <button
+                    onClick={() => setOverwriteDuplicates(true)}
+                    className={`flex-1 px-3 py-2 rounded-lg text-xs font-bold transition-all border ${overwriteDuplicates
+                      ? 'bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30'
+                      : 'bg-[#1c1c1c] text-gray-500 border-[#2e2e2e] hover:border-gray-500'
+                    }`}
+                  >
+                    Overwrite (update)
+                  </button>
+                </div>
+              </div>
             </div>
 
             {/* Mapping Table */}
@@ -1785,7 +1904,7 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
             {/* Actions */}
             <div className="flex items-center justify-between pt-2">
               <button
-                onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); }}
+                onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); setListNameOverride(''); setOverwriteDuplicates(false); }}
                 className="flex items-center gap-2 px-4 py-2.5 text-gray-400 hover:text-white border border-[#2e2e2e] rounded-lg text-xs font-bold hover:bg-[#2e2e2e] transition-colors"
               >
                 <ArrowLeft className="w-3.5 h-3.5" /> Back
@@ -1833,11 +1952,17 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
                   <p className="text-xl font-bold text-white mb-2">Import Complete!</p>
 
                   {/* Stats grid */}
-                  <div className="grid grid-cols-3 gap-4 mb-6 max-w-md mx-auto">
+                  <div className={`grid ${importResult.updated > 0 ? 'grid-cols-4' : 'grid-cols-3'} gap-4 mb-6 max-w-lg mx-auto`}>
                     <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
                       <p className="text-2xl font-bold text-[#3ecf8e]">{importResult.inserted.toLocaleString()}</p>
                       <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mt-1">Imported</p>
                     </div>
+                    {importResult.updated > 0 && (
+                      <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
+                        <p className="text-2xl font-bold text-blue-400">{importResult.updated.toLocaleString()}</p>
+                        <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mt-1">Updated</p>
+                      </div>
+                    )}
                     <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
                       <p className="text-2xl font-bold text-amber-400">{importResult.duplicates.toLocaleString()}</p>
                       <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mt-1">Duplicates</p>
@@ -1879,11 +2004,17 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
                   <p className="text-xl font-bold text-white mb-2">Import Completed with Errors</p>
 
                   {/* Stats grid */}
-                  <div className="grid grid-cols-3 gap-4 mb-4 max-w-md mx-auto">
+                  <div className={`grid ${importResult.updated > 0 ? 'grid-cols-4' : 'grid-cols-3'} gap-4 mb-4 max-w-lg mx-auto`}>
                     <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
                       <p className="text-2xl font-bold text-[#3ecf8e]">{importResult.inserted.toLocaleString()}</p>
                       <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mt-1">Imported</p>
                     </div>
+                    {importResult.updated > 0 && (
+                      <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
+                        <p className="text-2xl font-bold text-blue-400">{importResult.updated.toLocaleString()}</p>
+                        <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mt-1">Updated</p>
+                      </div>
+                    )}
                     <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
                       <p className="text-2xl font-bold text-amber-400">{importResult.duplicates.toLocaleString()}</p>
                       <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mt-1">Duplicates</p>
@@ -1927,6 +2058,37 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
           </div>
         )}
       </div>
+
+      {/* Import History */}
+      {importLists.length > 0 && (
+        <div className="max-w-4xl mx-auto mt-8">
+          <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl overflow-hidden">
+            <div className="px-5 py-3 border-b border-[#2e2e2e] flex items-center gap-2">
+              <Clock className="w-4 h-4 text-[#3ecf8e]" />
+              <span className="text-xs font-bold text-gray-300 uppercase tracking-widest">Import History</span>
+              <span className="text-[10px] text-gray-600 ml-auto">{importLists.length} imports</span>
+            </div>
+            <table className="w-full text-[11px]">
+              <thead>
+                <tr className="border-b border-[#2e2e2e]">
+                  <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider">List Name</th>
+                  <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Contacts</th>
+                  <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Imported</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#2e2e2e]">
+                {importLists.map(il => (
+                  <tr key={il.id} className="hover:bg-white/[0.02]">
+                    <td className="px-5 py-2.5 text-gray-300 font-medium">{il.name}</td>
+                    <td className="px-5 py-2.5 text-gray-400 text-right font-mono">{il.contact_count.toLocaleString()}</td>
+                    <td className="px-5 py-2.5 text-gray-500 text-right">{new Date(il.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* Failed Contacts Modal */}
       {showFailedModal && (
