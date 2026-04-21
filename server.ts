@@ -3,6 +3,7 @@ import './loadEnv';
 
 import express from 'express';
 import cors from 'cors';
+import compression from 'compression';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
@@ -117,6 +118,7 @@ async function restorePipelineState() {
 }
 
 app.use(cors());
+app.use(compression());
 app.use(express.json({ limit: '50mb' }));
 
 // Serve static files from Vite build
@@ -795,6 +797,85 @@ app.post('/api/import-lists', async (req, res) => {
         res.json(data);
     } catch (err: any) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// Stream a full list as CSV. Uses keyset pagination (WHERE contact_id > last_id)
+// so batch cost stays O(log n) regardless of list size, and awaits `drain` so slow
+// clients don't bloat Node's memory with buffered writes.
+// Enrichment columns live on the `enrichments` table — embedded via the PostgREST
+// relationship so one page still == one roundtrip.
+app.get('/api/export-list', async (req, res) => {
+    const name = String(req.query.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'name is required' });
+
+    const safeFile = name.replace(/[^a-z0-9-_]+/gi, '_');
+    const contactCols = ['contact_id', 'email', 'first_name', 'last_name', 'company_website', 'lead_list_name'];
+    const enrichmentCols = ['classification', 'confidence', 'cost', 'status', 'processed_at'];
+    const headerCols = [...contactCols, ...enrichmentCols];
+    const selectStr = `${contactCols.join(',')},enrichments(${enrichmentCols.join(',')})`;
+
+    const csvEscape = (v: unknown): string => {
+        if (v === null || v === undefined) return '';
+        const s = String(v).replace(/"/g, '""');
+        return /[",\n\r]/.test(s) ? `"${s}"` : s;
+    };
+
+    const write = (chunk: string): Promise<void> => {
+        if (res.write(chunk)) return Promise.resolve();
+        return new Promise(resolve => res.once('drain', () => resolve()));
+    };
+
+    let aborted = false;
+    res.on('close', () => { aborted = true; });
+
+    try {
+        const PAGE = 1000;
+        let lastId: string | null = null;
+        let firstPage = true;
+        let totalRows = 0;
+        while (!aborted) {
+            let query: any = supabase
+                .from('contacts')
+                .select(selectStr)
+                .eq('lead_list_name', name)
+                .order('contact_id', { ascending: true })
+                .limit(PAGE);
+            if (lastId) query = query.gt('contact_id', lastId);
+
+            const { data, error } = await query;
+            if (error) throw error;
+
+            // Defer writing headers until the first successful page so errors can still produce a JSON 500.
+            if (firstPage) {
+                res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+                res.setHeader('Content-Disposition', `attachment; filename="${safeFile}.csv"`);
+                await write(headerCols.join(',') + '\n');
+                firstPage = false;
+            }
+
+            if (!data || data.length === 0) break;
+
+            for (const row of data as any[]) {
+                const enr = Array.isArray(row.enrichments) ? row.enrichments[0] : row.enrichments;
+                const line = headerCols.map(c => {
+                    if (contactCols.includes(c)) return csvEscape(row[c]);
+                    return csvEscape(enr ? enr[c] : null);
+                }).join(',');
+                await write(line + '\n');
+                if (aborted) break;
+            }
+            totalRows += data.length;
+
+            lastId = (data[data.length - 1] as any).contact_id;
+            if (data.length < PAGE) break;
+        }
+        console.log(`[Export] "${name}": ${totalRows} rows streamed`);
+        res.end();
+    } catch (err: any) {
+        console.error(`[Export] Error for "${name}":`, err.message);
+        if (!res.headersSent) res.status(500).json({ error: err.message });
+        else res.end();
     }
 });
 

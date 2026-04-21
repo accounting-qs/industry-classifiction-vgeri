@@ -26,6 +26,7 @@ import {
   Settings2,
   ChevronDown,
   Clock,
+  List,
   ListFilter,
   ExternalLink,
   Cpu,
@@ -125,6 +126,8 @@ export default function App() {
   const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
   const [activeListFilter, setActiveListFilter] = useState<string | null>(null);
   const [contactsLoading, setContactsLoading] = useState(false);
+  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string }[]>([]);
+  const [showListModal, setShowListModal] = useState(false);
 
   const stopRequestedRef = useRef(false);
 
@@ -177,13 +180,19 @@ export default function App() {
 
   useEffect(() => { loadData(); }, [loadData]);
 
-  // Fetch distinct lead_list_name values once at app level
-  useEffect(() => {
+  // Refresh both the distinct list names (used by filter builder) and the rich import_lists metadata (used by the list modal).
+  const refreshLists = useCallback(() => {
     fetch('/api/distinct/lead_list_name')
       .then(res => res.json())
       .then(data => { if (Array.isArray(data)) setLeadListOptions(data); })
       .catch(() => { });
+    fetch('/api/import-lists')
+      .then(res => res.json())
+      .then(data => { if (Array.isArray(data)) setImportLists(data); })
+      .catch(() => { });
   }, []);
+
+  useEffect(() => { refreshLists(); }, [refreshLists]);
 
   // Poll server for status — only when on the Pipeline tab or actively processing
   useEffect(() => {
@@ -357,6 +366,49 @@ export default function App() {
     link.click();
   };
 
+  const openList = (name: string | null) => {
+    setActiveListFilter(name);
+    setShowListModal(false);
+  };
+
+  const enrichList = async (name: string, contactCount: number) => {
+    setShowListModal(false);
+    // Use 'in' operator so resolveFilteredContactIds (server.ts) takes the
+    // DB-side RPC fast-path (resolve_enrichment_targets) instead of paginating
+    // thousands of IDs one 1000-row PostgREST page at a time.
+    const filters: FilterCondition[] = [
+      { id: '__list_modal__', column: 'lead_list_name', operator: 'in' as FilterOperator, value: [name] }
+    ];
+    addLog(`🚀 Deploying enrichment for list "${name}" (${contactCount.toLocaleString()} contacts)...`);
+    try {
+      const res = await fetch('/api/enrich', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filters, searchQuery: '' })
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        addLog(`❌ Enrich error: ${err.error || res.status}`);
+        return;
+      }
+      addLog(`✅ 202 Accepted: Backend cluster scaling up for list "${name}".`);
+      setActiveTab(AppTab.ENRICHMENT);
+      setStats({ total: contactCount, completed: 0, failed: 0, isProcessing: true });
+    } catch (e: any) {
+      addLog(`❌ Enrich error: ${e.message}`);
+    }
+  };
+
+  const exportList = (name: string) => {
+    const safe = name.replace(/[^a-z0-9-_]+/gi, '_');
+    const a = document.createElement('a');
+    a.href = `/api/export-list?name=${encodeURIComponent(name)}`;
+    a.download = `${safe}_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
   return (
     <div className="flex h-screen bg-[#1c1c1c] overflow-hidden text-[#ededed] font-sans">
       <aside className="w-64 bg-[#1c1c1c] border-r border-[#2e2e2e] flex flex-col shrink-0 z-50">
@@ -391,7 +443,7 @@ export default function App() {
           {activeTab === AppTab.PROXIES ? (
             <ProxyStatsDashboard />
           ) : activeTab === AppTab.IMPORT ? (
-            <CSVImportWizard onComplete={() => { setActiveTab(AppTab.MANAGER); loadData(); fetch('/api/distinct/lead_list_name').then(r => r.json()).then(d => { if (Array.isArray(d)) setLeadListOptions(d); }).catch(() => {}); }} />
+            <CSVImportWizard onComplete={() => { setActiveTab(AppTab.MANAGER); loadData(); refreshLists(); }} />
           ) : activeTab === AppTab.ENRICHMENT ? (
             <PipelineMonitor
               stats={stats}
@@ -459,6 +511,7 @@ export default function App() {
               leadListOptions={leadListOptions}
               activeListFilter={activeListFilter}
               onListFilterChange={setActiveListFilter}
+              onOpenListModal={() => setShowListModal(true)}
               isLoadingContacts={contactsLoading}
             />
           ) : (
@@ -560,6 +613,143 @@ export default function App() {
           )}
         </div>
       </main>
+
+      {showListModal && (
+        <ListSelectorModal
+          lists={importLists}
+          activeListFilter={activeListFilter}
+          onClose={() => setShowListModal(false)}
+          onOpenList={openList}
+          onEnrichList={enrichList}
+          onExportList={exportList}
+          onGoToImport={() => { setShowListModal(false); setActiveTab(AppTab.IMPORT); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function ListSelectorModal({
+  lists,
+  activeListFilter,
+  onClose,
+  onOpenList,
+  onEnrichList,
+  onExportList,
+  onGoToImport,
+}: {
+  lists: { id: string; name: string; contact_count: number; created_at: string }[];
+  activeListFilter: string | null;
+  onClose: () => void;
+  onOpenList: (name: string | null) => void;
+  onEnrichList: (name: string, contactCount: number) => void;
+  onExportList: (name: string) => void;
+  onGoToImport: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-4xl max-h-[85vh] flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-6 py-4 border-b border-[#2e2e2e]">
+          <div>
+            <h3 className="text-sm font-bold text-white flex items-center gap-2"><List className="w-4 h-4 text-[#3ecf8e]" /> Select list</h3>
+            <p className="text-[10px] text-gray-500 mt-0.5">{lists.length} {lists.length === 1 ? 'list' : 'lists'} · sorted by upload date</p>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-gray-500 hover:text-white text-lg font-bold w-8 h-8 flex items-center justify-center rounded-lg hover:bg-[#2e2e2e] transition-colors"
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto custom-scrollbar">
+          {lists.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-20 px-6 text-center">
+              <Upload className="w-10 h-10 text-gray-700 mb-3" />
+              <p className="text-sm font-bold text-gray-400">No lists yet</p>
+              <p className="text-[11px] text-gray-600 mt-1 mb-5">Import a CSV to get started.</p>
+              <button
+                onClick={onGoToImport}
+                className="px-4 py-2 bg-[#3ecf8e] text-black rounded-lg text-xs font-bold hover:bg-[#2fb37a] transition-colors flex items-center gap-1.5"
+              >
+                <Upload className="w-3.5 h-3.5" /> Import CSV
+              </button>
+            </div>
+          ) : (
+            <table className="w-full text-[11px]">
+              <thead className="sticky top-0 bg-[#0e0e0e] z-10">
+                <tr className="border-b border-[#2e2e2e]">
+                  <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider">List Name</th>
+                  <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Contacts</th>
+                  <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Imported</th>
+                  <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#2e2e2e]">
+                <tr
+                  onClick={() => onOpenList(null)}
+                  className={`cursor-pointer transition-colors ${!activeListFilter ? 'bg-[#3ecf8e]/10 text-[#3ecf8e]' : 'hover:bg-white/[0.02] text-gray-300'}`}
+                >
+                  <td className="px-5 py-2.5 font-bold">All lists</td>
+                  <td className="px-5 py-2.5 text-right text-gray-500 font-mono">—</td>
+                  <td className="px-5 py-2.5 text-right text-gray-500">—</td>
+                  <td className="px-5 py-2.5 text-right text-[10px] text-gray-500 italic">Click to view all</td>
+                </tr>
+                {lists.map(l => {
+                  const active = activeListFilter === l.name;
+                  return (
+                    <tr
+                      key={l.id}
+                      onClick={() => onOpenList(l.name)}
+                      className={`cursor-pointer transition-colors ${active ? 'bg-[#3ecf8e]/10' : 'hover:bg-white/[0.02]'}`}
+                    >
+                      <td className={`px-5 py-2.5 font-medium ${active ? 'text-[#3ecf8e]' : 'text-gray-300'}`}>{l.name}</td>
+                      <td className="px-5 py-2.5 text-gray-400 text-right font-mono">{l.contact_count.toLocaleString()}</td>
+                      <td className="px-5 py-2.5 text-gray-500 text-right">
+                        {new Date(l.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                      </td>
+                      <td className="px-5 py-2.5 text-right">
+                        <div className="flex items-center justify-end gap-1.5">
+                          <button
+                            onClick={e => { e.stopPropagation(); onOpenList(l.name); }}
+                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white transition-colors flex items-center gap-1"
+                            title="Open contacts"
+                          >
+                            <ExternalLink className="w-3 h-3" /> Open
+                          </button>
+                          <button
+                            onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count); }}
+                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] transition-colors flex items-center gap-1"
+                            title="Enrich all contacts in this list"
+                          >
+                            <Zap className="w-3 h-3" /> Enrich
+                          </button>
+                          <button
+                            onClick={e => { e.stopPropagation(); onExportList(l.name); }}
+                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white transition-colors flex items-center gap-1"
+                            title="Export list as CSV"
+                          >
+                            <Download className="w-3 h-3" /> Export
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        <div className="px-6 py-3 border-t border-[#2e2e2e] flex justify-end">
+          <button
+            onClick={onClose}
+            className="px-4 py-2 bg-[#2e2e2e] text-gray-300 rounded-lg text-xs font-bold hover:bg-[#3e3e3e] transition-colors"
+          >
+            Close
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -605,6 +795,7 @@ function DataTable({
   leadListOptions = [],
   activeListFilter = null,
   onListFilterChange,
+  onOpenListModal,
   isLoadingContacts = false
 }: any) {
   const [showPageSizeMenu, setShowPageSizeMenu] = useState(false);
@@ -866,30 +1057,26 @@ function DataTable({
         <div className="flex items-center gap-2 text-gray-500"><Settings2 className="w-3.5 h-3.5 hover:text-white cursor-pointer" /><Maximize2 className="w-3.5 h-3.5 hover:text-white cursor-pointer" /><MoreHorizontal className="w-4 h-4 hover:text-white cursor-pointer" /></div>
       </div>
 
-      {/* List switcher pills */}
-      {leadListOptions.length > 0 && (
-        <div className="px-4 py-2 border-b border-[#2e2e2e] flex items-center gap-2 overflow-x-auto no-scrollbar bg-[#1c1c1c] shrink-0">
-          <button
-            onClick={() => onListFilterChange(null)}
-            className={`px-3 py-1 rounded-full text-[11px] font-bold whitespace-nowrap transition-all border ${
-              !activeListFilter
-                ? 'bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30'
-                : 'bg-[#0e0e0e] text-gray-500 border-[#2e2e2e] hover:border-gray-500'
-            }`}
-          >All</button>
-          {leadListOptions.map((list: string) => (
-            <button
-              key={list}
-              onClick={() => onListFilterChange(activeListFilter === list ? null : list)}
-              className={`px-3 py-1 rounded-full text-[11px] font-bold whitespace-nowrap transition-all border ${
-                activeListFilter === list
-                  ? 'bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30'
-                  : 'bg-[#0e0e0e] text-gray-500 border-[#2e2e2e] hover:border-gray-500'
-              }`}
-            >{list}</button>
-          ))}
-        </div>
-      )}
+      {/* Select list button + active list chip */}
+      <div className="px-4 py-2 border-b border-[#2e2e2e] flex items-center gap-2 bg-[#1c1c1c] shrink-0">
+        <button
+          onClick={() => onOpenListModal && onOpenListModal()}
+          className="flex items-center gap-1.5 px-3 py-1 rounded-md text-[11px] font-bold bg-[#0e0e0e] border border-[#2e2e2e] text-gray-300 hover:border-[#3ecf8e] hover:text-[#3ecf8e] transition-colors"
+        >
+          <List className="w-3.5 h-3.5" /> Select list
+        </button>
+        {activeListFilter ? (
+          <div className="flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-bold bg-[#3ecf8e]/10 text-[#3ecf8e] border border-[#3ecf8e]/30">
+            <span className="opacity-60 font-medium">Currently:</span>
+            <span className="truncate max-w-[220px]">{activeListFilter}</span>
+            <button onClick={() => onListFilterChange(null)} className="hover:text-white" title="Clear list filter">
+              <X className="w-3 h-3" />
+            </button>
+          </div>
+        ) : (
+          <span className="text-[11px] text-gray-600 font-medium">All lists</span>
+        )}
+      </div>
 
       <div className="flex-1 overflow-auto custom-scrollbar relative">
         {/* Loading indicator — indeterminate sliding bar */}
