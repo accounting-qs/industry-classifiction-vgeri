@@ -1,6 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import pLimit from 'p-limit';
-import { fetchDigest } from './scraperService';
+import { fetchDigest, proxyStats } from './scraperService';
 import { enrichSingle } from './enrichmentService';
 
 // Supabase Init (Service Role Key preferred for background processor)
@@ -353,6 +353,10 @@ export class JobProcessor {
             let digest = digestCache[domain];
             let proxyUsed = 'Cache';
 
+            if (digest) {
+                proxyStats.recordCacheHit();
+            }
+
             if (!digest) {
                 try {
                     // Bounded Scraping
@@ -507,6 +511,9 @@ export class JobProcessor {
             is_processing: true,
             updated_at: new Date().toISOString()
         }).eq('id', 1);
+
+        // One-line summary of which proxies won this chunk (and how many fell back to cache / all failed).
+        this.log(`📊 [Scraper Stats] chunk: ${proxyStats.flushSummary()}`, 'info');
 
         // Flush logs for this chunk
         await this.flushLogs();

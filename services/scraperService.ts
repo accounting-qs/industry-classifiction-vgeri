@@ -57,6 +57,37 @@ const PROXY_DOMAINS = [
   "https://api.allorigins.win"
 ];
 
+// Per-chunk proxy win/fail stats. JobProcessor flushes this at the end of
+// each chunk so Render logs show one summary line instead of ~200 noisy per-
+// scrape lines. Lets us spot a dying proxy without drowning the log stream.
+export const proxyStats = {
+  wins: {} as Record<string, number>,
+  allFailed: 0,
+  cacheHits: 0,
+  record(name: string) {
+    this.wins[name] = (this.wins[name] || 0) + 1;
+  },
+  recordAllFailed() {
+    this.allFailed++;
+  },
+  recordCacheHit() {
+    this.cacheHits++;
+  },
+  flushSummary(): string {
+    const parts: string[] = [];
+    for (const [name, n] of Object.entries(this.wins).sort((a, b) => b[1] - a[1])) {
+      parts.push(`${name}=${n}`);
+    }
+    if (this.cacheHits > 0) parts.push(`cache=${this.cacheHits}`);
+    if (this.allFailed > 0) parts.push(`all_failed=${this.allFailed}`);
+    const summary = parts.length ? parts.join(", ") : "idle";
+    this.wins = {};
+    this.allFailed = 0;
+    this.cacheHits = 0;
+    return summary;
+  }
+};
+
 function normalizeUrl(url_or_domain: string): string {
   let s = (url_or_domain || "").trim();
   if (!s) return "";
@@ -130,6 +161,7 @@ export async function fetchDigest(
     await new Promise(r => setImmediate(r));
 
     if (onProgress) onProgress(`✅ [Scraper] ${proxyName} won the race for: ${start_url}`);
+    proxyStats.record(proxyName);
     return {
       digest: processHtmlToDigest(raw_html, start_url, proxyName),
       proxyName
@@ -138,6 +170,7 @@ export async function fetchDigest(
     const errorMsg = `⏳ [Scraper] All proxies failed/timed out for ${start_url}.`;
     console.warn(errorMsg);
     if (onProgress) onProgress(errorMsg);
+    proxyStats.recordAllFailed();
   }
 
   // --- Phase 2: Premium Fallbacks (ZenRows then ScrapingBee) ---
