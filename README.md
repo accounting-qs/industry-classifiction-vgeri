@@ -23,6 +23,33 @@ View your app in AI Studio: https://ai.studio/apps/drive/1SsZS6oTE5W2czc9diNkXfH
 # industry-classifiction-vgeri
 
 
+## Enrichment `source` values
+
+Every row in `enrichments` is tagged with a `source` string describing
+*how* that classification was obtained. The Proxy Performance dashboard
+(`/api/stats/proxies`) groups on this column and expects every completed
+or failed enrichment to fall into exactly one bucket. If you add a new
+code path that writes to `enrichments`, add a new `source` value here and
+in `server.ts` (`REUSE_LABELS` / `ERROR_LABELS`).
+
+| source | bucket | meaning |
+|---|---|---|
+| `Direct Fetch` | Proxy | Scraped directly from the origin (no proxy), then classified by OpenAI. |
+| `Corsproxy.io (Business)` | Proxy | Scraped via Corsproxy.io paid tier (`CORSPROXY_API_KEY`), then classified. |
+| `Codetabs` | Proxy | Scraped via Codetabs free proxy, then classified. |
+| `Corsfix` | Proxy | Scraped via Corsfix free proxy, then classified. |
+| `AllOrigins` | Proxy | Scraped via AllOrigins free proxy, then classified. |
+| `digest_cache` | Reuse | Same domain was already scraped in this chunk (or earlier and persisted in `scraped_data`) — reused the HTML digest, still ran OpenAI. |
+| `domain_intelligence` | Reuse | Same domain already has a high-confidence (≥7) classification in `enrichments` — short-circuited: no scrape, no AI call. |
+| `error:no_domain` | Error | Contact had no `company_website` and no usable email domain — nothing to scrape. |
+| `error:personal_email` | Error | Domain is a personal-email provider (`gmail.com`, `outlook.com`, …) — intentionally skipped. |
+| `error:scrape` | Error | Terminal scrape failure after all proxies retried and exhausted. |
+| `error:ai` | Error | Terminal OpenAI failure after `MAX_RETRIES_TRANSIENT` (for 5xx / timeout) or `MAX_RETRIES` (for 4xx / parse) attempts. |
+| `unknown` / `NULL` | — | Legacy rows written before the `source` column was added. Count toward total volume but aren't attributed to any bucket in the dashboard. |
+
+The reuse sources (`digest_cache`, `domain_intelligence`) are the reason
+the dashboard's "Total Volume" is usually larger than the sum of live
+proxy scrapes in the same date range.
 
 
 

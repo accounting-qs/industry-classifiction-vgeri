@@ -1483,8 +1483,19 @@ function MiniCalendar({ label, value, onChange }: { label: string; value: string
   );
 }
 
+type ProxyStat = { source: string; count: number };
+type ReuseStat = { source: string; label: string; count: number };
+type ErrorStat = { source: string; label: string; count: number };
+type StatsResponse = {
+  byProxy: ProxyStat[];
+  byReuse: ReuseStat[];
+  byError: ErrorStat[];
+  unknown: number;
+  total: number;
+};
+
 function ProxyStatsDashboard() {
-  const [stats, setStats] = useState<{ proxy_used: string, success_count: number }[]>([]);
+  const [stats, setStats] = useState<StatsResponse>({ byProxy: [], byReuse: [], byError: [], unknown: 0, total: 0 });
   const [loading, setLoading] = useState(true);
   const [dateRange, setDateRange] = useState<string>('all');
   const [customStart, setCustomStart] = useState('');
@@ -1537,7 +1548,9 @@ function ProxyStatsDashboard() {
     fetch(`/api/stats/proxies${qs ? `?${qs}` : ''}`)
       .then(res => res.json())
       .then(data => {
-        if (Array.isArray(data)) setStats(data);
+        if (data && Array.isArray(data.byProxy)) {
+          setStats(data);
+        }
       })
       .catch(console.error)
       .finally(() => setLoading(false));
@@ -1547,7 +1560,12 @@ function ProxyStatsDashboard() {
     fetchStats();
   }, [dateRange, customStart, customEnd]);
 
-  const totalSuccesses = stats.reduce((sum, s) => sum + s.success_count, 0);
+  const { byProxy, byReuse, byError, unknown, total } = stats;
+  const liveScrapes = byProxy.reduce((s, r) => s + r.count, 0);
+  const reuseTotal = byReuse.reduce((s, r) => s + r.count, 0);
+  const errorTotal = byError.reduce((s, r) => s + r.count, 0);
+  const topProxy = byProxy[0];
+  const pct = (n: number) => total > 0 ? Math.round((n / total) * 100) : 0;
 
   return (
     <div className="flex-1 p-8 overflow-y-auto custom-scrollbar bg-[#1c1c1c]">
@@ -1622,63 +1640,156 @@ function ProxyStatsDashboard() {
             <Loader2 className="w-8 h-8 animate-spin text-[#3ecf8e] mb-4" />
             <p className="text-sm font-bold tracking-widest uppercase">Loading Analytics...</p>
           </div>
-        ) : stats.length === 0 ? (
+        ) : total === 0 ? (
           <div className="flex flex-col items-center justify-center p-20 opacity-30 border border-dashed border-[#2e2e2e] rounded-xl">
             <BarChart2 className="w-12 h-12 mb-4 text-gray-400" />
-            <p className="text-sm font-bold">No Proxy Data Yet</p>
-            <p className="text-xs mt-2">Run the enrichment pipeline to start tracking proxy usage.</p>
+            <p className="text-sm font-bold">No Enrichment Data Yet</p>
+            <p className="text-xs mt-2">Run the enrichment pipeline to start tracking usage.</p>
           </div>
         ) : (
           <div className="space-y-6">
-            <div className="grid grid-cols-2 gap-6 mb-8">
-              <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-6 shadow-sm">
-                <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Total Successful Scrapes</p>
-                <p className="text-4xl font-bold text-white">{totalSuccesses.toLocaleString()}</p>
+            {/* Headline: total volume + where most of it came from */}
+            <div className="grid grid-cols-4 gap-4 mb-8">
+              <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-5 shadow-sm">
+                <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Total Volume</p>
+                <p className="text-3xl font-bold text-white">{total.toLocaleString()}</p>
+                <p className="text-xs text-gray-600 mt-1">all enrichments in range</p>
               </div>
-              <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-6 shadow-sm">
-                <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Top Performing Proxy</p>
-                <div className="flex items-center gap-3 mt-1">
-                  <p className="text-2xl font-bold text-[#3ecf8e] truncate flex-1">{stats[0]?.proxy_used}</p>
-                  <span className="text-sm font-bold px-2 py-1 bg-[#3ecf8e]/10 text-[#3ecf8e] rounded-md border border-[#3ecf8e]/20">
-                    {Math.round((stats[0]?.success_count / totalSuccesses) * 100)}%
-                  </span>
+              <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-5 shadow-sm">
+                <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Live Scrapes</p>
+                <p className="text-3xl font-bold text-[#3ecf8e]">{liveScrapes.toLocaleString()}</p>
+                <p className="text-xs text-gray-600 mt-1">{pct(liveScrapes)}% of total</p>
+              </div>
+              <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-5 shadow-sm">
+                <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Reuse</p>
+                <p className="text-3xl font-bold text-sky-400">{reuseTotal.toLocaleString()}</p>
+                <p className="text-xs text-gray-600 mt-1">{pct(reuseTotal)}% of total</p>
+              </div>
+              <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-5 shadow-sm">
+                <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Errors</p>
+                <p className="text-3xl font-bold text-rose-400">{errorTotal.toLocaleString()}</p>
+                <p className="text-xs text-gray-600 mt-1">{pct(errorTotal)}% of total</p>
+              </div>
+            </div>
+
+            {topProxy && (
+              <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-5 shadow-sm flex items-center justify-between">
+                <div>
+                  <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Top Performing Proxy</p>
+                  <p className="text-lg font-bold text-[#3ecf8e]">{topProxy.source}</p>
+                </div>
+                <span className="text-sm font-bold px-2 py-1 bg-[#3ecf8e]/10 text-[#3ecf8e] rounded-md border border-[#3ecf8e]/20">
+                  {liveScrapes > 0 ? Math.round((topProxy.count / liveScrapes) * 100) : 0}% of scrapes
+                </span>
+              </div>
+            )}
+
+            {/* Per-proxy leaderboard (live scrapes only) */}
+            {byProxy.length > 0 && (
+              <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl p-6">
+                <h3 className="text-xs font-bold uppercase tracking-widest text-gray-400 border-b border-[#2e2e2e] pb-4 mb-6">
+                  Live Scrapes — Volume Leaderboard
+                </h3>
+                <div className="space-y-5">
+                  {byProxy.map((stat, idx) => {
+                    const percentage = liveScrapes > 0 ? Math.round((stat.count / liveScrapes) * 100) : 0;
+                    const isPremium = stat.source.toLowerCase().includes('premium');
+                    return (
+                      <div key={stat.source} className="group">
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-3">
+                            <span className="text-xs font-bold text-gray-600 w-4">{idx + 1}.</span>
+                            <span className={`text-sm font-bold ${isPremium ? 'text-amber-400' : 'text-gray-200'}`}>
+                              {stat.source}
+                            </span>
+                            {isPremium && <span className="text-[9px] px-1.5 py-0.5 rounded border border-amber-500/20 bg-amber-500/10 text-amber-500 uppercase font-bold tracking-wider">Premium Cost</span>}
+                          </div>
+                          <div className="text-right">
+                            <span className="text-sm font-bold text-white">{stat.count.toLocaleString()}</span>
+                            <span className="text-xs text-gray-500 ml-2 block">scrapes ({percentage}% of live)</span>
+                          </div>
+                        </div>
+                        <div className="w-full h-2 bg-[#2e2e2e] rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all duration-1000 ease-out ${isPremium ? 'bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.3)]' : 'bg-[#3ecf8e] shadow-[0_0_10px_rgba(62,207,142,0.3)]'}`}
+                            style={{ width: `${percentage}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
-            </div>
+            )}
 
-            <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl p-6">
-              <h3 className="text-xs font-bold uppercase tracking-widest text-gray-400 border-b border-[#2e2e2e] pb-4 mb-6">Volume Leaderboard</h3>
-
-              <div className="space-y-5">
-                {stats.map((stat, idx) => {
-                  const percentage = Math.round((stat.success_count / totalSuccesses) * 100);
-                  const isPremium = stat.proxy_used.toLowerCase().includes('premium');
-                  return (
-                    <div key={stat.proxy_used} className="group">
-                      <div className="flex items-center justify-between mb-2">
-                        <div className="flex items-center gap-3">
-                          <span className="text-xs font-bold text-gray-600 w-4">{idx + 1}.</span>
-                          <span className={`text-sm font-bold ${isPremium ? 'text-amber-400' : 'text-gray-200'}`}>
-                            {stat.proxy_used}
-                          </span>
-                          {isPremium && <span className="text-[9px] px-1.5 py-0.5 rounded border border-amber-500/20 bg-amber-500/10 text-amber-500 uppercase font-bold tracking-wider">Premium Cost</span>}
+            {/* Reuse breakdown */}
+            {byReuse.length > 0 && (
+              <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl p-6">
+                <h3 className="text-xs font-bold uppercase tracking-widest text-gray-400 border-b border-[#2e2e2e] pb-4 mb-6">
+                  Reuse — No Scrape Performed
+                </h3>
+                <div className="space-y-5">
+                  {byReuse.map(stat => {
+                    const percentage = pct(stat.count);
+                    return (
+                      <div key={stat.source}>
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm font-bold text-sky-300">{stat.label}</span>
+                          <div className="text-right">
+                            <span className="text-sm font-bold text-white">{stat.count.toLocaleString()}</span>
+                            <span className="text-xs text-gray-500 ml-2 block">{percentage}% of total</span>
+                          </div>
                         </div>
-                        <div className="text-right">
-                          <span className="text-sm font-bold text-white">{stat.success_count.toLocaleString()}</span>
-                          <span className="text-xs text-gray-500 ml-2 block">scrapes ({percentage}%)</span>
+                        <div className="w-full h-2 bg-[#2e2e2e] rounded-full overflow-hidden">
+                          <div
+                            className="h-full rounded-full transition-all duration-1000 ease-out bg-sky-400 shadow-[0_0_10px_rgba(56,189,248,0.3)]"
+                            style={{ width: `${percentage}%` }}
+                          />
                         </div>
                       </div>
-                      <div className="w-full h-2 bg-[#2e2e2e] rounded-full overflow-hidden">
-                        <div
-                          className={`h-full rounded-full transition-all duration-1000 ease-out ${isPremium ? 'bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.3)]' : 'bg-[#3ecf8e] shadow-[0_0_10px_rgba(62,207,142,0.3)]'}`}
-                          style={{ width: `${percentage}%` }}
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
+                    );
+                  })}
+                </div>
               </div>
-            </div>
+            )}
+
+            {/* Error breakdown */}
+            {byError.length > 0 && (
+              <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl p-6">
+                <h3 className="text-xs font-bold uppercase tracking-widest text-gray-400 border-b border-[#2e2e2e] pb-4 mb-6">
+                  Errors
+                </h3>
+                <div className="space-y-5">
+                  {byError.map(stat => {
+                    const percentage = pct(stat.count);
+                    return (
+                      <div key={stat.source}>
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm font-bold text-rose-300">{stat.label}</span>
+                          <div className="text-right">
+                            <span className="text-sm font-bold text-white">{stat.count.toLocaleString()}</span>
+                            <span className="text-xs text-gray-500 ml-2 block">{percentage}% of total</span>
+                          </div>
+                        </div>
+                        <div className="w-full h-2 bg-[#2e2e2e] rounded-full overflow-hidden">
+                          <div
+                            className="h-full rounded-full transition-all duration-1000 ease-out bg-rose-400 shadow-[0_0_10px_rgba(251,113,133,0.3)]"
+                            style={{ width: `${percentage}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Uncategorized (legacy rows from before we added `source`). */}
+            {unknown > 0 && (
+              <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl p-4 text-xs text-gray-500">
+                <span className="font-bold text-gray-400">{unknown.toLocaleString()}</span> rows in this range are uncategorized (enriched before the <code className="text-gray-300">source</code> column was added). They count toward total volume but aren't attributed to a bucket.
+              </div>
+            )}
           </div>
         )}
       </div>

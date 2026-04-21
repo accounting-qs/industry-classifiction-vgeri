@@ -336,17 +336,17 @@ export class JobProcessor {
             const domain = contact.company_website || (contact.email ? contact.email.split('@')[1] : null);
 
             if (!domain) {
-                return this.createResult(jobItem, false, 'failed', 'No domain or email to extract domain from.');
+                return this.createResult(jobItem, false, 'failed', 'No domain or email to extract domain from.', undefined, undefined, 0, 'error:no_domain');
             }
 
             // Issue #9: Skip personal email domains — scraping gmail.com is pointless
             if (PERSONAL_EMAIL_DOMAINS.has(domain.toLowerCase())) {
-                return this.createResult(jobItem, false, 'failed', `Skipped: personal email domain (${domain})`);
+                return this.createResult(jobItem, false, 'failed', `Skipped: personal email domain (${domain})`, undefined, undefined, 0, 'error:personal_email');
             }
 
-            // A. Check Domain Cache (High Confidence)
+            // A. Check Domain Cache (High Confidence) — "Domain Intelligence" reuse
             if (domainCache[domain]) {
-                return this.createResult(jobItem, true, 'completed', '⚡ Reused high-confidence classification', domainCache[domain]);
+                return this.createResult(jobItem, true, 'completed', '⚡ Reused high-confidence classification', domainCache[domain], undefined, 0, 'domain_intelligence');
             }
 
             // B. Check Digest Cache OR Scrape Live
@@ -375,7 +375,7 @@ export class JobProcessor {
                     if (!isTerminal && jobItem.attempt_count < MAX_RETRIES) {
                         return this.createRetry(jobItem, `Scraper error: ${e.message}`);
                     } else {
-                        return this.createResult(jobItem, false, 'failed', `Scrape terminal error: ${e.message}`);
+                        return this.createResult(jobItem, false, 'failed', `Scrape terminal error: ${e.message}`, undefined, undefined, 0, 'error:scrape');
                     }
                 }
             }
@@ -392,7 +392,9 @@ export class JobProcessor {
                 if (aiOutput.status === 'completed' && aiOutput.classification !== 'ERROR') { // Success
                     // Cache it locally so subsequent duplicates in SAME chunk can skip AI
                     domainCache[domain] = aiOutput;
-                    return this.createResult(jobItem, true, 'completed', aiOutput.reasoning, aiOutput, digest, aiOutput.cost);
+                    // proxyUsed is 'Cache' when digest came from digestCache; otherwise it's the winning proxy name.
+                    const source = proxyUsed === 'Cache' ? 'digest_cache' : proxyUsed;
+                    return this.createResult(jobItem, true, 'completed', aiOutput.reasoning, aiOutput, digest, aiOutput.cost, source);
                 } else {
                     // Treat OpenAI 5xx / timeout as transient — don't burn a retry slot as fast.
                     const isTransient = aiOutput.error_category === 'openai_5xx' || aiOutput.error_category === 'openai_timeout';
@@ -400,7 +402,7 @@ export class JobProcessor {
                     if (jobItem.attempt_count < cap) {
                         return this.createRetry(jobItem, `AI error: ${aiOutput.reasoning}`, { transient: isTransient });
                     }
-                    return this.createResult(jobItem, false, 'failed', `AI terminal error: ${aiOutput.reasoning}`);
+                    return this.createResult(jobItem, false, 'failed', `AI terminal error: ${aiOutput.reasoning}`, undefined, undefined, 0, 'error:ai');
                 }
             } catch (aiErr: any) {
                 // Uncaught throw from enrichSingle — treat as transient unless we can prove otherwise.
@@ -409,7 +411,7 @@ export class JobProcessor {
                 if (jobItem.attempt_count < cap) {
                     return this.createRetry(jobItem, `AI exception: ${aiErr.message}`, { transient: isTransient });
                 }
-                return this.createResult(jobItem, false, 'failed', `AI terminal exception: ${aiErr.message}`);
+                return this.createResult(jobItem, false, 'failed', `AI terminal exception: ${aiErr.message}`, undefined, undefined, 0, 'error:ai');
             }
         }));
 
@@ -541,7 +543,11 @@ export class JobProcessor {
     }
 
     // Helpers
-    private static createResult(jobItem: any, isSuccess: boolean, status: 'completed' | 'failed', errorOrReasoning: string, classificationData?: any, digest?: string, cost: number = 0) {
+    //
+    // `source` documents how this enrichment was obtained. See README
+    // ("Enrichment `source` values") for the full taxonomy. The dashboard
+    // aggregates on this column, so every result path must set it.
+    private static createResult(jobItem: any, isSuccess: boolean, status: 'completed' | 'failed', errorOrReasoning: string, classificationData?: any, digest?: string, cost: number = 0, source?: string) {
         const contact = jobItem.contacts;
 
         const enr = {
@@ -552,6 +558,7 @@ export class JobProcessor {
             classification: classificationData?.classification || (isSuccess ? "Unknown" : "Scrape Error"),
             // Fix #2: Removed page_html — already persisted to scraped_data table, storing again wastes ~6KB/item
             cost: cost,
+            source: source,
             processed_at: new Date().toISOString()
         };
 

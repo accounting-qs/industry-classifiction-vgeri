@@ -570,61 +570,62 @@ app.post('/api/resume', async (req, res) => {
     }
 });
 
+// Human-friendly labels for the reuse bucket. Keep in sync with the
+// "Enrichment `source` values" section of README.md.
+const REUSE_LABELS: Record<string, string> = {
+    'domain_intelligence': 'Domain Intelligence',
+    'digest_cache': 'Digest Cache'
+};
+// Human-friendly labels for error:* sources. Any unknown error:* key falls
+// back to a Title-Cased version of whatever follows the colon.
+const ERROR_LABELS: Record<string, string> = {
+    'error:no_domain': 'No Domain',
+    'error:personal_email': 'Personal Email (Skipped)',
+    'error:scrape': 'Scrape Failure',
+    'error:ai': 'AI Failure'
+};
+
 app.get('/api/stats/proxies', async (req, res) => {
     try {
         const startDate = req.query.startDate as string | undefined;
         const endDate = req.query.endDate as string | undefined;
 
-        // Try RPC first (only when no date filters)
-        if (!startDate && !endDate) {
-            const { data, error } = await supabase.rpc('get_proxy_stats');
-            if (!error && data) {
-                return res.json(data);
+        const { data, error } = await supabase.rpc('get_enrichment_source_stats', {
+            start_ts: startDate || null,
+            end_ts: endDate || null
+        });
+
+        if (error) throw error;
+
+        const byProxy: { source: string; count: number }[] = [];
+        const byReuse: { source: string; label: string; count: number }[] = [];
+        const byError: { source: string; label: string; count: number }[] = [];
+        let unknown = 0;
+        let total = 0;
+
+        for (const row of (data || [])) {
+            const src: string = row.source;
+            const n = Number(row.count);
+            total += n;
+
+            if (src === 'unknown' || !src) {
+                unknown += n;
+            } else if (REUSE_LABELS[src]) {
+                byReuse.push({ source: src, label: REUSE_LABELS[src], count: n });
+            } else if (src.startsWith('error:')) {
+                const label = ERROR_LABELS[src] || src.replace(/^error:/, '').replace(/_/g, ' ');
+                byError.push({ source: src, label, count: n });
+            } else {
+                // Proxy name (known or new/unmapped).
+                byProxy.push({ source: src, count: n });
             }
         }
 
-        // Paginate through ALL scraped_data rows using offset-based pagination.
-        // Supabase PostgREST enforces max-rows=1000 per request regardless of .limit(),
-        // so we paginate in 1000-row pages to ensure we fetch everything.
-        const stats: Record<string, number> = {};
-        const PAGE_SIZE = 1000;
-        let page = 0;
+        byProxy.sort((a, b) => b.count - a.count);
+        byError.sort((a, b) => b.count - a.count);
+        byReuse.sort((a, b) => b.count - a.count);
 
-        while (true) {
-            let query: any = supabase
-                .from('scraped_data')
-                .select('proxy_used')
-                .not('proxy_used', 'is', null)
-                .order('created_at', { ascending: true })
-                .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
-
-            // Date range filters
-            if (startDate) {
-                query = query.gte('created_at', startDate);
-            }
-            if (endDate) {
-                query = query.lte('created_at', endDate);
-            }
-
-            const { data: rawData, error: rawError } = await query;
-
-            if (rawError) throw rawError;
-            if (!rawData || rawData.length === 0) break;
-
-            for (const row of rawData) {
-                const proxy = row.proxy_used;
-                if (proxy) stats[proxy] = (stats[proxy] || 0) + 1;
-            }
-
-            if (rawData.length < PAGE_SIZE) break;
-            page++;
-        }
-
-        const formattedStats = Object.keys(stats)
-            .map(key => ({ proxy_used: key, success_count: stats[key] }))
-            .sort((a, b) => b.success_count - a.success_count);
-
-        return res.json(formattedStats);
+        return res.json({ byProxy, byReuse, byError, unknown, total });
     } catch (e: any) {
         res.status(500).json({ error: e.message });
     }
