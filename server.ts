@@ -294,8 +294,13 @@ async function backgroundEnqueue(
         const jobId = jobRaw.id;
         addServerLog(`🆔 Job created: ${jobId} (${totalToEnrich.toLocaleString()} items)`, 'Pipeline', 'info');
 
-        // Step 3: Insert job_items in chunks (with progress updates)
-        const ENQUEUE_CHUNK_SIZE = 5000;
+        // Step 3: Insert job_items in chunks (with progress updates).
+        // Chunks are small (2000) so a single INSERT stays well under Supabase's
+        // 8s statement_timeout even when another job's worker is already running
+        // against job_items. 57014 (statement_timeout) and 40001 (serialization)
+        // are retried with exponential backoff since they're transient under load.
+        const ENQUEUE_CHUNK_SIZE = 2000;
+        const MAX_RETRIES = 4;
         let enqueued = 0;
         for (let i = 0; i < contactIds.length; i += ENQUEUE_CHUNK_SIZE) {
             const chunk = contactIds.slice(i, i + ENQUEUE_CHUNK_SIZE);
@@ -305,8 +310,18 @@ async function backgroundEnqueue(
                 status: 'pending',
                 attempt_count: 0
             }));
-            const { error: errItems } = await supabase.from('job_items').insert(items);
-            if (errItems) throw errItems;
+
+            let attempt = 0;
+            while (true) {
+                const { error: errItems } = await supabase.from('job_items').insert(items);
+                if (!errItems) break;
+                const transient = errItems.code === '57014' || errItems.code === '40001' || errItems.code === '40P01';
+                if (!transient || attempt >= MAX_RETRIES) throw errItems;
+                attempt++;
+                const delay = 500 * Math.pow(2, attempt - 1);
+                addServerLog(`⚠️ Enqueue chunk transient error (${errItems.code}); retry ${attempt}/${MAX_RETRIES} in ${delay}ms`, 'Pipeline', 'warn');
+                await new Promise(r => setTimeout(r, delay));
+            }
 
             enqueued += chunk.length;
             jobStats.queued = enqueued;
@@ -452,6 +467,46 @@ app.post('/api/stop', async (req, res) => {
     await supabase.from('jobs').update({ status: 'cancelled' }).eq('status', 'processing').then();
 
     res.json({ message: 'Pipeline stopping gracefully...' });
+});
+
+// Hard reset: delete every pending/processing/retrying job_item, cancel active
+// jobs, and zero the in-memory stats. Use this when you want to kick off a fresh
+// enrichment without colliding with leftover state from a previously stopped job.
+// Completed/failed job_items and their enrichments are left untouched.
+app.post('/api/reset', async (_req, res) => {
+    addServerLog(`🧹 Reset command received. Clearing queued/processing items...`, 'Pipeline', 'warn');
+    JobProcessor.stop();
+
+    try {
+        const { count: beforeCount } = await supabase
+            .from('job_items')
+            .select('*', { count: 'exact', head: true })
+            .in('status', ['pending', 'processing', 'retrying']);
+
+        const { error: delErr } = await supabase
+            .from('job_items')
+            .delete()
+            .in('status', ['pending', 'processing', 'retrying']);
+        if (delErr) throw delErr;
+
+        const { error: cancelErr } = await supabase
+            .from('jobs')
+            .update({ status: 'cancelled' })
+            .in('status', ['pending', 'processing']);
+        if (cancelErr) throw cancelErr;
+
+        jobStats = { total: 0, completed: 0, failed: 0, isProcessing: false, queueingPhase: false, queued: 0 };
+        currentJobLogs = [];
+        await persistPipelineState();
+
+        const cleared = beforeCount || 0;
+        addServerLog(`✅ Pipeline reset: ${cleared.toLocaleString()} queued items cleared.`, 'Pipeline', 'phase');
+        res.json({ cleared });
+    } catch (err: any) {
+        console.error('Reset error:', err);
+        addServerLog(`❌ Reset failed: ${err.message}`, 'Pipeline', 'error');
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/api/resume', async (req, res) => {

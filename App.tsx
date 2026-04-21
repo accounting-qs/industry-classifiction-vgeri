@@ -269,6 +269,23 @@ export default function App() {
     }
   };
 
+  const resetPipeline = async () => {
+    if (!window.confirm('Clear all queued and in-progress items? Completed enrichments are kept. Running worker will be stopped.')) return;
+    addLog('🧹 Sending reset command to server...');
+    try {
+      const response = await fetch('/api/reset', { method: 'POST' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        addLog(`❌ Reset failed: ${data.error || response.status}`);
+        return;
+      }
+      addLog(`✅ Pipeline reset: ${(data.cleared || 0).toLocaleString()} queued items cleared.`);
+      setStats({ total: 0, completed: 0, failed: 0, isProcessing: false });
+    } catch (err: any) {
+      addLog(`❌ Reset error: ${err.message}`);
+    }
+  };
+
   /**
    * Detached Background Logic (Moved to server.ts)
    */
@@ -450,6 +467,7 @@ export default function App() {
               logs={logs}
               resumePendingQueue={resumePendingQueue}
               stopEnrichment={stopEnrichment}
+              resetPipeline={resetPipeline}
               isStopping={isStopping}
               setLogs={setLogs}
               logContainerRef={logContainerRef}
@@ -510,8 +528,14 @@ export default function App() {
               onSearchQueryChange={setSearchQuery}
               leadListOptions={leadListOptions}
               activeListFilter={activeListFilter}
+              activeListContactCount={importLists.find(l => l.name === activeListFilter)?.contact_count || 0}
               onListFilterChange={setActiveListFilter}
               onOpenListModal={() => setShowListModal(true)}
+              onEnrichActiveList={() => {
+                if (!activeListFilter) return;
+                const list = importLists.find(l => l.name === activeListFilter);
+                enrichList(activeListFilter, list?.contact_count || 0);
+              }}
               isLoadingContacts={contactsLoading}
             />
           ) : (
@@ -794,8 +818,10 @@ function DataTable({
   onSearchQueryChange,
   leadListOptions = [],
   activeListFilter = null,
+  activeListContactCount = 0,
   onListFilterChange,
   onOpenListModal,
+  onEnrichActiveList,
   isLoadingContacts = false
 }: any) {
   const [showPageSizeMenu, setShowPageSizeMenu] = useState(false);
@@ -1066,13 +1092,24 @@ function DataTable({
           <List className="w-3.5 h-3.5" /> Select list
         </button>
         {activeListFilter ? (
-          <div className="flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-bold bg-[#3ecf8e]/10 text-[#3ecf8e] border border-[#3ecf8e]/30">
-            <span className="opacity-60 font-medium">Currently:</span>
-            <span className="truncate max-w-[220px]">{activeListFilter}</span>
-            <button onClick={() => onListFilterChange(null)} className="hover:text-white" title="Clear list filter">
-              <X className="w-3 h-3" />
+          <>
+            <div className="flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-bold bg-[#3ecf8e]/10 text-[#3ecf8e] border border-[#3ecf8e]/30">
+              <span className="opacity-60 font-medium">Currently:</span>
+              <span className="truncate max-w-[220px]">{activeListFilter}</span>
+              <button onClick={() => onListFilterChange(null)} className="hover:text-white" title="Clear list filter">
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+            <button
+              onClick={() => onEnrichActiveList && onEnrichActiveList()}
+              disabled={isProcessing}
+              className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-[11px] font-bold transition-colors ${isProcessing ? 'bg-gray-700 text-gray-400 opacity-50 cursor-not-allowed' : 'bg-[#3ecf8e] text-black hover:bg-[#2fb37a]'}`}
+              title={`Enrich all contacts in ${activeListFilter}`}
+            >
+              <Zap className="w-3.5 h-3.5" />
+              {isProcessing ? 'Pipeline Running...' : `Enrich all ${activeListContactCount ? activeListContactCount.toLocaleString() : ''} in this list`}
             </button>
-          </div>
+          </>
         ) : (
           <span className="text-[11px] text-gray-600 font-medium">All lists</span>
         )}
@@ -1213,6 +1250,7 @@ function PipelineMonitor({
   logs,
   resumePendingQueue,
   stopEnrichment,
+  resetPipeline,
   isStopping,
   setLogs,
   logContainerRef,
@@ -1283,6 +1321,10 @@ function PipelineMonitor({
                 </div>
               )}
             </div>
+
+            <button onClick={resetPipeline} className="flex items-center gap-2 px-3 py-2 text-rose-300 hover:text-white bg-rose-950/30 hover:bg-rose-500 rounded-lg text-xs font-bold border border-rose-500/30 hover:border-rose-500 transition-colors" title="Stop worker and delete all queued/processing items">
+              <Trash2 className="w-3.5 h-3.5" /> Reset Pipeline
+            </button>
 
             <button onClick={() => setLogs([])} className="flex items-center gap-2 px-3 py-2 text-gray-400 hover:text-white hover:bg-[#2e2e2e] rounded-lg text-xs border border-[#2e2e2e] transition-colors">
               <Trash2 className="w-3.5 h-3.5" /> Clear Logs
