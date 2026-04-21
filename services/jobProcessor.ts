@@ -440,9 +440,16 @@ export class JobProcessor {
             if (enrichErr) this.log(`⚠️ enrichments upsert error: ${enrichErr.message}`, 'error');
         }
 
-        // Fix #5: Flush batched scraped_data upserts
+        // Fix #5: Flush batched scraped_data upserts.
+        // Dedupe by domain first — two contacts in the same chunk can share a
+        // company_website, and Postgres rejects the whole batch with
+        // "ON CONFLICT DO UPDATE command cannot affect row a second time"
+        // if the same conflict key appears twice.
         if (pendingDigestUpserts.length > 0) {
-            const { error: digestErr } = await supabase.from('scraped_data').upsert(pendingDigestUpserts, { onConflict: 'domain' });
+            const dedupedByDomain = Array.from(
+                new Map(pendingDigestUpserts.map(u => [u.domain, u])).values()
+            );
+            const { error: digestErr } = await supabase.from('scraped_data').upsert(dedupedByDomain, { onConflict: 'domain' });
             if (digestErr) this.log(`⚠️ scraped_data batch upsert error: ${digestErr.message}`, 'error');
         }
 
