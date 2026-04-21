@@ -21,6 +21,9 @@ const getOpenAIKey = () => {
 
 const INPUT_COST_PER_1M = 0.80;
 const OUTPUT_COST_PER_1M = 3.20;
+// 60s hard timeout on OpenAI fetch. Without it, a degraded OpenAI can hang
+// sockets indefinitely and freeze the entire JobProcessor pollLoop.
+const OPENAI_TIMEOUT_MS = 60000;
 const getPromptId = () => getEnv('VITE_OPENAI_PROMPT_ID');
 
 console.log('🔍 OpenAI Config Check (Module Load):', {
@@ -60,7 +63,8 @@ function normalizeConfidence(val: any): number {
  */
 export async function enrichSingle(item: BatchItem): Promise<any> {
   const html_snippet = (item.digest || "").slice(0, 12000);
-  const key = getOpenAIKey();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
   try {
     const payload = {
       model: "gpt-4.1-mini",
@@ -79,7 +83,8 @@ export async function enrichSingle(item: BatchItem): Promise<any> {
         "Authorization": `Bearer ${getOpenAIKey()}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: controller.signal
     });
 
     if (!response.ok) {
@@ -90,7 +95,9 @@ export async function enrichSingle(item: BatchItem): Promise<any> {
         errorBody = "Could not parse error body";
       }
       console.error(`❌ OpenAI API Error [${response.status}]:`, errorBody);
-      throw new Error(`OpenAI API Error: ${response.status} - ${errorBody.slice(0, 500)}`);
+      const err: any = new Error(`OpenAI API Error: ${response.status} - ${errorBody.slice(0, 500)}`);
+      err.http_status = response.status;
+      throw err;
     }
 
     const data = await response.json();
@@ -137,17 +144,30 @@ export async function enrichSingle(item: BatchItem): Promise<any> {
     };
   } catch (err: any) {
     console.error(`Enrichment failed for ${item.contact_id}:`, err);
+    const isAbort = err?.name === 'AbortError' || /aborted/i.test(err?.message || '');
+    const httpStatus: number | undefined = err?.http_status;
+    let errorCategory: 'openai_5xx' | 'openai_4xx' | 'openai_timeout' | 'parse_error' | 'unknown';
+    if (isAbort) errorCategory = 'openai_timeout';
+    else if (httpStatus && httpStatus >= 500) errorCategory = 'openai_5xx';
+    else if (httpStatus && httpStatus >= 400) errorCategory = 'openai_4xx';
+    else if (/JSON|parse|No model output/i.test(err?.message || '')) errorCategory = 'parse_error';
+    else errorCategory = 'unknown';
+
     return {
       contact_id: item.contact_id,
       classification: "ERROR",
       industry: "ERROR",
       confidence: 1,
-      reasoning: err.message,
+      reasoning: isAbort ? `OpenAI request timed out after ${OPENAI_TIMEOUT_MS}ms` : err.message,
       input_tokens: 0,
       output_tokens: 0,
       cost: 0,
-      status: 'failed'
+      status: 'failed',
+      error_category: errorCategory,
+      http_status: httpStatus
     };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 

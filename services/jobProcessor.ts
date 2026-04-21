@@ -14,6 +14,9 @@ const QUEUE_FETCH_CHUNK_SIZE = parseInt(process.env.QUEUE_FETCH_CHUNK_SIZE || '2
 const CONCURRENCY_SCRAPE = parseInt(process.env.CONCURRENCY_SCRAPE || '15', 10);  // Issue #6: Reduced from 30 to 15
 const CONCURRENCY_AI = parseInt(process.env.CONCURRENCY_AI || '15', 10);
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10);
+// Transient AI errors (5xx / timeout) get many more attempts than terminal
+// ones (4xx / parse). A 5-min OpenAI outage shouldn't permanently fail an item.
+const MAX_RETRIES_TRANSIENT = parseInt(process.env.MAX_RETRIES_TRANSIENT || '10', 10);
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '2000', 10);
 const STALE_PROCESSING_MINUTES = 5; // Issue #7: Auto-reset items stuck processing longer than this
 
@@ -387,14 +390,20 @@ export class JobProcessor {
                     domainCache[domain] = aiOutput;
                     return this.createResult(jobItem, true, 'completed', aiOutput.reasoning, aiOutput, digest, aiOutput.cost);
                 } else {
-                    if (jobItem.attempt_count < MAX_RETRIES) {
-                        return this.createRetry(jobItem, `AI error: ${aiOutput.reasoning}`);
+                    // Treat OpenAI 5xx / timeout as transient — don't burn a retry slot as fast.
+                    const isTransient = aiOutput.error_category === 'openai_5xx' || aiOutput.error_category === 'openai_timeout';
+                    const cap = isTransient ? MAX_RETRIES_TRANSIENT : MAX_RETRIES;
+                    if (jobItem.attempt_count < cap) {
+                        return this.createRetry(jobItem, `AI error: ${aiOutput.reasoning}`, { transient: isTransient });
                     }
                     return this.createResult(jobItem, false, 'failed', `AI terminal error: ${aiOutput.reasoning}`);
                 }
             } catch (aiErr: any) {
-                if (jobItem.attempt_count < MAX_RETRIES) {
-                    return this.createRetry(jobItem, `AI exception: ${aiErr.message}`);
+                // Uncaught throw from enrichSingle — treat as transient unless we can prove otherwise.
+                const isTransient = /timeout|aborted|ECONNRESET|ENOTFOUND|EAI_AGAIN|fetch failed/i.test(aiErr?.message || '');
+                const cap = isTransient ? MAX_RETRIES_TRANSIENT : MAX_RETRIES;
+                if (jobItem.attempt_count < cap) {
+                    return this.createRetry(jobItem, `AI exception: ${aiErr.message}`, { transient: isTransient });
                 }
                 return this.createResult(jobItem, false, 'failed', `AI terminal exception: ${aiErr.message}`);
             }
@@ -422,21 +431,33 @@ export class JobProcessor {
         });
 
         // Issue #4: All bulk writes now have error handling
+        // Dedupe-by-conflict-key helper. A chunk can carry two entries that
+        // share the same conflict target (e.g. two job_items pointing at the
+        // same contact_id, or two enrichments for the same contact) — Postgres
+        // rejects the whole batch with "ON CONFLICT DO UPDATE command cannot
+        // affect row a second time" in that case. Map keeps the last entry per
+        // key, which is the latest state we want to persist.
+        const dedupeBy = <T>(rows: T[], key: keyof T): T[] =>
+            Array.from(new Map(rows.map(r => [r[key] as unknown as string, r])).values());
+
         // 1. Update Job Items (most critical — tracks item state)
         if (itemsToUpsert.length > 0) {
-            const { error: itemErr } = await supabase.from('job_items').upsert(itemsToUpsert, { onConflict: 'id' });
+            const deduped = dedupeBy(itemsToUpsert as any[], 'id');
+            const { error: itemErr } = await supabase.from('job_items').upsert(deduped, { onConflict: 'id' });
             if (itemErr) this.log(`⚠️ job_items upsert error: ${itemErr.message}`, 'error');
         }
 
         // 2. Update Contacts
         if (contactsToUpdate.length > 0) {
-            const { error: contactErr } = await supabase.from('contacts').upsert(contactsToUpdate, { onConflict: 'id' });
+            const deduped = dedupeBy(contactsToUpdate as any[], 'id');
+            const { error: contactErr } = await supabase.from('contacts').upsert(deduped, { onConflict: 'id' });
             if (contactErr) this.log(`⚠️ contacts upsert error: ${contactErr.message}`, 'error');
         }
 
         // 3. Update Enrichments
         if (enrichmentsToUpsert.length > 0) {
-            const { error: enrichErr } = await supabase.from('enrichments').upsert(enrichmentsToUpsert, { onConflict: 'contact_id' });
+            const deduped = dedupeBy(enrichmentsToUpsert as any[], 'contact_id');
+            const { error: enrichErr } = await supabase.from('enrichments').upsert(deduped, { onConflict: 'contact_id' });
             if (enrichErr) this.log(`⚠️ enrichments upsert error: ${enrichErr.message}`, 'error');
         }
 
@@ -551,9 +572,17 @@ export class JobProcessor {
         };
     }
 
-    private static createRetry(jobItem: any, errorMsg: string) {
-        // Exponential backoff
-        const nextRetryMs = Math.pow(2, jobItem.attempt_count) * 2000;
+    private static createRetry(jobItem: any, errorMsg: string, opts?: { transient?: boolean }) {
+        // Exponential backoff with jitter. For transient errors (OpenAI 5xx /
+        // timeout) we start at a higher floor (30s) and cap at 5min so a short
+        // outage doesn't produce a thundering retry storm. For normal errors
+        // keep the previous aggressive schedule (2s, 4s, 8s…) but still cap.
+        const transient = opts?.transient ?? false;
+        const base = Math.pow(2, jobItem.attempt_count) * 2000;
+        const floor = transient ? 30_000 : 0;
+        const ceil = transient ? 300_000 : 60_000;
+        const jitter = Math.floor(Math.random() * 1000);
+        const nextRetryMs = Math.min(ceil, Math.max(floor, base)) + jitter;
 
         return {
             jobId: jobItem.job_id,

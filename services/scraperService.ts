@@ -135,16 +135,19 @@ export async function fetchDigest(
       proxyName
     };
   } catch (err: any) {
-    const errorMsg = `⏳ [Scraper] All free methods failed/timed out for ${start_url}.`;
+    const errorMsg = `⏳ [Scraper] All proxies failed/timed out for ${start_url}.`;
     console.warn(errorMsg);
     if (onProgress) onProgress(errorMsg);
   }
 
   // --- Phase 2: Premium Fallbacks (ZenRows then ScrapingBee) ---
-  const zenKey = getZenRowsKey();
+  // ZenRows is fully disabled per user request (subscription canceled)
+  // const zenKey = getZenRowsKey();
   // ScrapingBee is fully disabled per user request
   // const beeKey = getScrapingBeeKey();
 
+  // disabled
+  /*
   if (zenKey) {
     try {
       const pName = "ZenRows (Premium)";
@@ -160,6 +163,7 @@ export async function fetchDigest(
       if (onProgress) onProgress(errorMsg);
     }
   }
+  */
 
   // disabled
   /*
