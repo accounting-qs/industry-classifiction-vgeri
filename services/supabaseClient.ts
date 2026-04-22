@@ -176,13 +176,13 @@ class SupabaseService {
     if (isMixed) {
       // Query 1: contacts with enrichment status in otherStatuses (INNER JOIN)
       let q1 = this.client.from('contacts')
-        .select('*, enrichments!inner(*)', { count: 'exact' });
+        .select('*, enrichments!inner(*)', { count: 'estimated' });
       q1 = this.applyFilters(q1, nonStatusFilters, enrichmentCols, searchQuery);
       q1 = q1.in('enrichments.status', otherStatuses);
 
       // Query 2: "new" contacts with no enrichment (LEFT JOIN + is null)
       let q2 = this.client.from('contacts')
-        .select('*, enrichments(*)', { count: 'exact' });
+        .select('*, enrichments(*)', { count: 'estimated' });
       q2 = this.applyFilters(q2, nonStatusFilters, enrichmentCols, searchQuery);
       q2 = q2.filter('enrichments', 'is', 'null');
 
@@ -232,7 +232,7 @@ class SupabaseService {
 
     let query = this.client
       .from('contacts')
-      .select(selectStr, { count: 'exact' });
+      .select(selectStr, { count: 'estimated' });
 
     query = this.applyFilters(query, filters, enrichmentCols, searchQuery);
 
