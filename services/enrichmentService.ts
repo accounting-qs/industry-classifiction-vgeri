@@ -70,7 +70,7 @@ export async function enrichSingle(item: BatchItem): Promise<any> {
       model: "gpt-4.1-mini",
       prompt: {
         id: getPromptId(),
-        version: "1",
+        version: "2",
         variables: {
           html: html_snippet
         }

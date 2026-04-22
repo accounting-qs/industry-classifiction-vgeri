@@ -36,6 +36,21 @@ const PERSONAL_EMAIL_DOMAINS = new Set([
 const scrapeLimit = pLimit(CONCURRENCY_SCRAPE);
 const aiLimit = pLimit(CONCURRENCY_AI);
 
+// Postgres text columns reject null bytes and lone UTF-16 surrogates with
+// "unsupported Unicode escape sequence", which kills the whole batch upsert.
+// Scraped HTML occasionally contains these bytes from binary-ish content,
+// broken encodings, or embedded PDF blobs — strip them before persisting.
+function sanitizeForPostgres(s: string): string {
+    if (!s) return s;
+    return s
+        // Null bytes — Postgres can never store these in text/jsonb.
+        .replace(/\u0000/g, '')
+        // Lone high surrogate (no matching low surrogate following).
+        .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
+        // Lone low surrogate (no matching high surrogate preceding).
+        .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
+}
+
 // Hard ceiling on how long a single chunk may take. A chunk that exceeds this
 // is almost certainly waiting on a dead Supabase/OpenAI socket with no TCP
 // reset — the Promise.all never resolves and the pollLoop goes silent for
@@ -532,9 +547,17 @@ export class JobProcessor {
         // company_website, and Postgres rejects the whole batch with
         // "ON CONFLICT DO UPDATE command cannot affect row a second time"
         // if the same conflict key appears twice.
+        //
+        // Also sanitize content: scraped HTML sometimes contains null bytes
+        // (\u0000) or lone UTF-16 surrogates from corrupted-encoding pages or
+        // embedded binary blobs. Postgres text columns reject those with
+        // "unsupported Unicode escape sequence" and the whole batch fails.
         if (pendingDigestUpserts.length > 0) {
             const dedupedByDomain = Array.from(
-                new Map(pendingDigestUpserts.map(u => [u.domain, u])).values()
+                new Map(pendingDigestUpserts.map(u => [u.domain, {
+                    ...u,
+                    content: sanitizeForPostgres(u.content)
+                }])).values()
             );
             const { error: digestErr } = await supabase.from('scraped_data').upsert(dedupedByDomain, { onConflict: 'domain' });
             if (digestErr) this.log(`⚠️ scraped_data batch upsert error: ${digestErr.message}`, 'error');
