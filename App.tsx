@@ -474,6 +474,20 @@ export default function App() {
     }
   };
 
+  const clearExportJob = async (jobId: string) => {
+    try {
+      const res = await fetch(`/api/export-jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        addLog(`❌ Clear export error: ${err.error || res.status}`);
+        return;
+      }
+      setExportJobs(prev => prev.filter(j => j.id !== jobId));
+    } catch (e: any) {
+      addLog(`❌ Clear export error: ${e.message}`);
+    }
+  };
+
   return (
     <div className="flex h-screen bg-[#1c1c1c] overflow-hidden text-[#ededed] font-sans">
       <aside className="w-64 bg-[#1c1c1c] border-r border-[#2e2e2e] flex flex-col shrink-0 z-50">
@@ -695,6 +709,7 @@ export default function App() {
           onOpenList={openList}
           onEnrichList={enrichList}
           onStartExport={startExportList}
+          onClearExport={clearExportJob}
           onGoToImport={() => { setShowListModal(false); setActiveTab(AppTab.IMPORT); }}
         />
       )}
@@ -710,6 +725,7 @@ function ListSelectorModal({
   onOpenList,
   onEnrichList,
   onStartExport,
+  onClearExport,
   onGoToImport,
 }: {
   lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number }[];
@@ -719,6 +735,7 @@ function ListSelectorModal({
   onOpenList: (name: string | null) => void;
   onEnrichList: (name: string, contactCount: number) => void;
   onStartExport: (name: string) => void;
+  onClearExport: (jobId: string) => void;
   onGoToImport: () => void;
 }) {
   // Pick the most recent job per list so the button reflects the current
@@ -821,7 +838,7 @@ function ListSelectorModal({
                           >
                             <Zap className="w-3 h-3" /> Enrich
                           </button>
-                          <ExportButton job={job} listName={l.name} onStart={onStartExport} />
+                          <ExportButton job={job} listName={l.name} onStart={onStartExport} onClear={onClearExport} />
                         </div>
                       </td>
                     </tr>
@@ -845,51 +862,79 @@ function ListSelectorModal({
   );
 }
 
-function ExportButton({ job, listName, onStart }: {
+function ExportButton({ job, listName, onStart, onClear }: {
   job: ExportJob | undefined;
   listName: string;
   onStart: (name: string) => void;
+  onClear: (jobId: string) => void;
 }) {
   if (job?.status === 'ready') {
     return (
-      <a
-        href={`/api/export-list/download?id=${encodeURIComponent(job.id)}`}
-        onClick={e => e.stopPropagation()}
-        className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e]/15 border border-[#3ecf8e]/40 text-[#3ecf8e] hover:bg-[#3ecf8e]/25 transition-colors flex items-center gap-1"
-        title={`${job.rowCount.toLocaleString()} rows · ready`}
-      >
-        <Download className="w-3 h-3" /> Download
-      </a>
+      <div className="inline-flex items-center gap-1">
+        <a
+          href={`/api/export-list/download?id=${encodeURIComponent(job.id)}`}
+          onClick={e => e.stopPropagation()}
+          className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e]/15 border border-[#3ecf8e]/40 text-[#3ecf8e] hover:bg-[#3ecf8e]/25 transition-colors flex items-center gap-1"
+          title={`${job.rowCount.toLocaleString()} rows · ready`}
+        >
+          <Download className="w-3 h-3" /> Download
+        </a>
+        <button
+          onClick={e => { e.stopPropagation(); onClear(job.id); }}
+          className="p-1 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-red-400 hover:border-red-500/40 transition-colors"
+          title="Delete prepared CSV"
+        >
+          <Trash2 className="w-3 h-3" />
+        </button>
+      </div>
     );
   }
   if (job?.status === 'building') {
     const pct = job.totalRows > 0 ? Math.min(100, Math.round((job.rowCount / job.totalRows) * 100)) : 0;
     return (
-      <button
-        disabled
-        onClick={e => e.stopPropagation()}
-        className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-400 flex items-center gap-1 cursor-default"
-        title={`Building CSV: ${job.rowCount.toLocaleString()} rows so far`}
-      >
-        <Loader2 className="w-3 h-3 animate-spin" /> Building… {pct}%
-      </button>
+      <div className="inline-flex items-center gap-1">
+        <button
+          disabled
+          onClick={e => e.stopPropagation()}
+          className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-400 flex items-center gap-1 cursor-default"
+          title={`Building CSV: ${job.rowCount.toLocaleString()} rows so far`}
+        >
+          <Loader2 className="w-3 h-3 animate-spin" /> Building… {pct}%
+        </button>
+        <button
+          onClick={e => { e.stopPropagation(); onClear(job.id); }}
+          className="p-1 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-red-400 hover:border-red-500/40 transition-colors"
+          title="Abandon this export (background writer will finish but be orphaned)"
+        >
+          <Trash2 className="w-3 h-3" />
+        </button>
+      </div>
     );
   }
-  // No job, or last job failed — surface the error via title and let the
-  // user retrigger.
   const failed = job?.status === 'failed';
   return (
-    <button
-      onClick={e => { e.stopPropagation(); onStart(listName); }}
-      className={`px-2 py-1 rounded-md text-[10px] font-bold flex items-center gap-1 transition-colors ${
-        failed
-          ? 'bg-red-500/10 border border-red-500/40 text-red-400 hover:bg-red-500/20'
-          : 'bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white'
-      }`}
-      title={failed ? `Previous export failed: ${job?.error || 'unknown'} — click to retry` : 'Build a CSV on the server; download when ready'}
-    >
-      <Download className="w-3 h-3" /> {failed ? 'Retry export' : 'Export'}
-    </button>
+    <div className="inline-flex items-center gap-1">
+      <button
+        onClick={e => { e.stopPropagation(); onStart(listName); }}
+        className={`px-2 py-1 rounded-md text-[10px] font-bold flex items-center gap-1 transition-colors ${
+          failed
+            ? 'bg-red-500/10 border border-red-500/40 text-red-400 hover:bg-red-500/20'
+            : 'bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white'
+        }`}
+        title={failed ? `Previous export failed: ${job?.error || 'unknown'} — click to retry` : 'Build a CSV on the server; download when ready'}
+      >
+        <Download className="w-3 h-3" /> {failed ? 'Retry export' : 'Export'}
+      </button>
+      {failed && (
+        <button
+          onClick={e => { e.stopPropagation(); onClear(job!.id); }}
+          className="p-1 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-red-400 hover:border-red-500/40 transition-colors"
+          title="Clear failed export"
+        >
+          <Trash2 className="w-3 h-3" />
+        </button>
+      )}
+    </div>
   );
 }
 

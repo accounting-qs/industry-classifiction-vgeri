@@ -995,22 +995,42 @@ async function buildExportCsv(job: ExportJob) {
     try {
         await write(headerCols.join(',') + '\n');
 
-        const PAGE = 1000;
+        // Adaptive paging: start large for throughput, halve on Postgres
+        // statement_timeout (57014) — transient pooler contention can push a
+        // 1000-row page past 8s. Halving usually succeeds on retry; after a
+        // clean page we drift back up toward 1000 so steady-state stays fast.
+        const MAX_PAGE = 1000;
+        const MIN_PAGE = 100;
+        let pageSize = MAX_PAGE;
         let lastId: string | null = null;
-        while (true) {
-            let query: any = supabase
-                .from('contacts')
-                .select(selectStr)
-                .eq('lead_list_name', job.listName)
-                .order('contact_id', { ascending: true })
-                .limit(PAGE);
-            if (lastId) query = query.gt('contact_id', lastId);
 
-            const { data, error } = await query;
-            if (error) throw error;
+        while (true) {
+            let data: any[] | null = null;
+            let attempts = 0;
+            while (true) {
+                let query: any = supabase
+                    .from('contacts')
+                    .select(selectStr)
+                    .eq('lead_list_name', job.listName)
+                    .order('contact_id', { ascending: true })
+                    .limit(pageSize);
+                if (lastId) query = query.gt('contact_id', lastId);
+
+                const { data: pageData, error } = await query;
+                if (!error) { data = pageData; break; }
+
+                const isTimeout = error.code === '57014';
+                attempts++;
+                if (!isTimeout || attempts >= 5 || pageSize <= MIN_PAGE) throw error;
+
+                const nextPage = Math.max(MIN_PAGE, Math.floor(pageSize / 2));
+                console.warn(`[Export] Job ${job.id} page timeout at size=${pageSize}; retrying at size=${nextPage}`);
+                pageSize = nextPage;
+                await new Promise(r => setTimeout(r, 500 * attempts));
+            }
             if (!data || data.length === 0) break;
 
-            for (const row of data as any[]) {
+            for (const row of data) {
                 const enr = Array.isArray(row.enrichments) ? row.enrichments[0] : row.enrichments;
                 const line = headerCols.map(c =>
                     contactCols.includes(c) ? csvEscape(row[c]) : csvEscape(enr ? enr[c] : null)
@@ -1022,7 +1042,11 @@ async function buildExportCsv(job: ExportJob) {
             schedulePersist();
 
             lastId = (data[data.length - 1] as any).contact_id;
-            if (data.length < PAGE) break;
+            if (data.length < pageSize) break;
+
+            // Recover toward MAX_PAGE after a clean fetch so one blip doesn't
+            // trap the rest of the run at a tiny page size.
+            if (pageSize < MAX_PAGE) pageSize = Math.min(MAX_PAGE, pageSize * 2);
         }
 
         await new Promise<void>((resolve, reject) => stream.end((err: any) => err ? reject(err) : resolve()));
@@ -1104,6 +1128,22 @@ app.get('/api/export-list/download', (req, res) => {
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${safeFile}.csv"`);
     fs.createReadStream(filePath).pipe(res);
+});
+
+// Remove a prepared CSV so the next export builds fresh. Used when a job
+// is stuck, stale, or the user just wants to re-run with current data.
+// Deleting a `building` job leaves its background builder running but
+// orphaned — the job record is gone so the file-write will still finish,
+// but nothing references it and the hourly sweep will prune it.
+app.delete('/api/export-jobs/:id', async (req, res) => {
+    const id = req.params.id;
+    const job = exportJobs.get(id);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    exportJobs.delete(id);
+    await fsp.unlink(path.join(EXPORTS_DIR, `${id}.csv`)).catch(() => {});
+    schedulePersist();
+    res.json({ ok: true });
 });
 
 // All other GET requests serve React App
