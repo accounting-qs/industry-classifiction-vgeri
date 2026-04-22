@@ -137,7 +137,7 @@ export default function App() {
   const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
   const [activeListFilter, setActiveListFilter] = useState<string | null>(null);
   const [contactsLoading, setContactsLoading] = useState(false);
-  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number }[]>([]);
+  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[]>([]);
   const [showListModal, setShowListModal] = useState(false);
   const [exportJobs, setExportJobs] = useState<ExportJob[]>([]);
 
@@ -728,7 +728,7 @@ function ListSelectorModal({
   onClearExport,
   onGoToImport,
 }: {
-  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number }[];
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[];
   activeListFilter: string | null;
   exportJobs: ExportJob[];
   onClose: () => void;
@@ -784,7 +784,7 @@ function ListSelectorModal({
                 <tr className="border-b border-[#2e2e2e]">
                   <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider">List Name</th>
                   <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Contacts</th>
-                  <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Enriched</th>
+                  <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider w-[220px]">Enrichment Progress</th>
                   <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Imported</th>
                   <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Actions</th>
                 </tr>
@@ -796,14 +796,12 @@ function ListSelectorModal({
                 >
                   <td className="px-5 py-2.5 font-bold">All lists</td>
                   <td className="px-5 py-2.5 text-right text-gray-500 font-mono">—</td>
-                  <td className="px-5 py-2.5 text-right text-gray-500 font-mono">—</td>
+                  <td className="px-5 py-2.5 text-gray-500">—</td>
                   <td className="px-5 py-2.5 text-right text-gray-500">—</td>
                   <td className="px-5 py-2.5 text-right text-[10px] text-gray-500 italic">Click to view all</td>
                 </tr>
                 {lists.map(l => {
                   const active = activeListFilter === l.name;
-                  const enriched = l.enriched_count || 0;
-                  const pct = l.contact_count > 0 ? Math.min(100, Math.round((enriched / l.contact_count) * 100)) : 0;
                   const job = latestJobByList.get(l.name);
                   return (
                     <tr
@@ -813,12 +811,7 @@ function ListSelectorModal({
                     >
                       <td className={`px-5 py-2.5 font-medium ${active ? 'text-[#3ecf8e]' : 'text-gray-300'}`}>{l.name}</td>
                       <td className="px-5 py-2.5 text-gray-400 text-right font-mono">{l.contact_count.toLocaleString()}</td>
-                      <td className="px-5 py-2.5 text-right font-mono">
-                        <span className={enriched > 0 ? 'text-[#3ecf8e]' : 'text-gray-500'}>
-                          {enriched.toLocaleString()}
-                        </span>
-                        <span className="text-gray-600 ml-1">({pct}%)</span>
-                      </td>
+                      <td className="px-5 py-2.5"><EnrichmentProgress list={l} /></td>
                       <td className="px-5 py-2.5 text-gray-500 text-right">
                         {new Date(l.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                       </td>
@@ -857,6 +850,53 @@ function ListSelectorModal({
             Close
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function EnrichmentProgress({ list }: {
+  list: { contact_count: number; enriched_count?: number; failed_count?: number };
+}) {
+  const total = list.contact_count || 0;
+  const completed = list.enriched_count || 0;
+  const failed = list.failed_count || 0;
+  const pending = Math.max(0, total - completed - failed);
+
+  if (total === 0) return <span className="text-gray-500">—</span>;
+
+  const completedPct = (completed / total) * 100;
+  const failedPct = (failed / total) * 100;
+  const processedPct = Math.min(100, completedPct + failedPct);
+  const isDone = pending === 0 && (completed + failed) > 0;
+
+  return (
+    <div className="flex flex-col gap-1 min-w-[200px]">
+      <div className="flex items-center gap-2">
+        <div className="flex-1 h-1.5 bg-[#1c1c1c] rounded-full overflow-hidden flex">
+          <div
+            className="h-full bg-[#3ecf8e] transition-all"
+            style={{ width: `${completedPct}%` }}
+          />
+          <div
+            className="h-full bg-amber-500/70 transition-all"
+            style={{ width: `${failedPct}%` }}
+          />
+        </div>
+        {isDone ? (
+          <span className="text-[9px] font-bold text-[#3ecf8e] flex items-center gap-0.5 shrink-0">
+            <CheckCircle2 className="w-3 h-3" /> DONE
+          </span>
+        ) : (
+          <span className="text-[9px] font-mono text-gray-400 shrink-0 tabular-nums">
+            {Math.round(processedPct)}%
+          </span>
+        )}
+      </div>
+      <div className="text-[9px] text-gray-500 font-mono flex gap-2">
+        <span className="text-[#3ecf8e]">✓ {completed.toLocaleString()}</span>
+        {failed > 0 && <span className="text-amber-500/90">✕ {failed.toLocaleString()}</span>}
+        {pending > 0 && <span className="text-gray-500">· {pending.toLocaleString()} pending</span>}
       </div>
     </div>
   );

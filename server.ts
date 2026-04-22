@@ -844,19 +844,63 @@ app.get('/api/import-lists', async (_req, res) => {
 
         if (error) return res.status(500).json({ error: error.message });
 
-        // Fetch enriched (status=completed) count per list in parallel.
-        // Uses count=estimated with limit=0 so we only get the header, not rows.
         const lists = data || [];
-        const counts = await Promise.all(lists.map(async (l: any) => {
-            const { count } = await supabase
-                .from('contacts')
-                .select('contact_id, enrichments!inner(status)', { count: 'estimated', head: true })
-                .eq('lead_list_name', l.name)
-                .eq('enrichments.status', 'completed');
-            return count || 0;
-        }));
 
-        const withCounts = lists.map((l: any, i: number) => ({ ...l, enriched_count: counts[i] }));
+        // Preferred path: `get_list_enrichment_stats` RPC returns
+        // completed/failed/total for every list in one aggregate pass.
+        // PostgREST's per-list count=estimated returned 0 unpredictably
+        // (the planner short-circuits), which broke the "done" indicator.
+        const { data: stats, error: rpcErr } = await supabase.rpc('get_list_enrichment_stats');
+        const statsByList = new Map<string, { completed: number; failed: number; total: number }>();
+        if (!rpcErr && Array.isArray(stats)) {
+            for (const row of stats as any[]) {
+                statsByList.set(row.lead_list_name, {
+                    completed: Number(row.completed_count) || 0,
+                    failed: Number(row.failed_count) || 0,
+                    total: Number(row.total_count) || 0,
+                });
+            }
+        } else if (rpcErr) {
+            console.warn('[import-lists] RPC get_list_enrichment_stats unavailable — falling back to per-list estimated counts:', rpcErr.message);
+        }
+
+        // Fallback for environments where the RPC hasn't been applied yet.
+        // Estimated counts can drift or return 0; user will see less
+        // reliable stats until the migration runs.
+        const needFallback = lists.some((l: any) => !statsByList.has(l.name));
+        if (needFallback) {
+            const perList = await Promise.all(lists.map(async (l: any) => {
+                if (statsByList.has(l.name)) return null;
+                const [completed, failed] = await Promise.all([
+                    supabase.from('contacts')
+                        .select('contact_id, enrichments!inner(status)', { count: 'estimated', head: true })
+                        .eq('lead_list_name', l.name).eq('enrichments.status', 'completed'),
+                    supabase.from('contacts')
+                        .select('contact_id, enrichments!inner(status)', { count: 'estimated', head: true })
+                        .eq('lead_list_name', l.name).eq('enrichments.status', 'failed'),
+                ]);
+                statsByList.set(l.name, {
+                    completed: completed.count || 0,
+                    failed: failed.count || 0,
+                    total: l.contact_count || 0,
+                });
+                return null;
+            }));
+            void perList;
+        }
+
+        const withCounts = lists.map((l: any) => {
+            const s = statsByList.get(l.name) || { completed: 0, failed: 0, total: l.contact_count || 0 };
+            return {
+                ...l,
+                enriched_count: s.completed,
+                failed_count: s.failed,
+                // Prefer the live total from the RPC so the bar lines up
+                // with the enrichments actually on disk; fall back to the
+                // import_lists record.
+                contact_count: s.total || l.contact_count || 0,
+            };
+        });
         res.json(withCounts);
     } catch (err: any) {
         res.status(500).json({ error: err.message });
