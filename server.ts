@@ -5,6 +5,9 @@ import express from 'express';
 import cors from 'cors';
 import compression from 'compression';
 import path from 'path';
+import fs from 'fs';
+import fsp from 'fs/promises';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { db } from './services/supabaseClient';
@@ -426,10 +429,18 @@ async function resolveFilteredContactIds(filters: any, searchQuery?: string): Pr
                     case 'starts_with': query = query.ilike(colPath, `${f.value}%`); break;
                     case 'greater_than': query = query.gt(colPath, f.value); break;
                     case 'less_than': query = query.lt(colPath, f.value); break;
-                    case 'in': query = query.in(colPath, Array.isArray(f.value) ? f.value : [f.value]); break;
+                    case 'in': {
+                        // Same PostgREST quirk as services/supabaseClient.ts: `in.("quoted")`
+                        // loses the index. Collapse 1-element `in` → `eq`.
+                        const vals = Array.isArray(f.value) ? f.value : [f.value];
+                        if (vals.length === 1) query = query.eq(colPath, vals[0]);
+                        else query = query.in(colPath, vals);
+                        break;
+                    }
                     case 'not_in': {
                         const vals = Array.isArray(f.value) ? f.value : [f.value];
-                        if (vals.length > 0) query = query.not(colPath, 'in', `(${vals.join(',')})`);
+                        if (vals.length === 1) query = query.neq(colPath, vals[0]);
+                        else if (vals.length > 0) query = query.not(colPath, 'in', `(${vals.join(',')})`);
                         break;
                     }
                 }
@@ -832,7 +843,21 @@ app.get('/api/import-lists', async (_req, res) => {
             .order('created_at', { ascending: false });
 
         if (error) return res.status(500).json({ error: error.message });
-        res.json(data || []);
+
+        // Fetch enriched (status=completed) count per list in parallel.
+        // Uses count=estimated with limit=0 so we only get the header, not rows.
+        const lists = data || [];
+        const counts = await Promise.all(lists.map(async (l: any) => {
+            const { count } = await supabase
+                .from('contacts')
+                .select('contact_id, enrichments!inner(status)', { count: 'estimated', head: true })
+                .eq('lead_list_name', l.name)
+                .eq('enrichments.status', 'completed');
+            return count || 0;
+        }));
+
+        const withCounts = lists.map((l: any, i: number) => ({ ...l, enriched_count: counts[i] }));
+        res.json(withCounts);
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }
@@ -856,83 +881,229 @@ app.post('/api/import-lists', async (req, res) => {
     }
 });
 
-// Stream a full list as CSV. Uses keyset pagination (WHERE contact_id > last_id)
-// so batch cost stays O(log n) regardless of list size, and awaits `drain` so slow
-// clients don't bloat Node's memory with buffered writes.
-// Enrichment columns live on the `enrichments` table — embedded via the PostgREST
-// relationship so one page still == one roundtrip.
-app.get('/api/export-list', async (req, res) => {
-    const name = String(req.query.name || '').trim();
-    if (!name) return res.status(400).json({ error: 'name is required' });
+// ============================================
+// EXPORT JOBS — async CSV builder
+//
+// Problem: large lists (50k+) can take minutes to materialize. Streaming
+// through the HTTP response racing a reverse-proxy idle timeout truncates
+// the file. Instead, we build CSVs on disk in the background and hand the
+// client a "is it ready?" / "download it" handoff so leaving the page is
+// safe.
+//
+// Storage: `./exports/{jobId}.csv` + `./exports/jobs.json` registry.
+// Retention: files older than 7 days are pruned hourly.
+// Restart semantics: any job stuck in `building` at startup is marked
+// `failed` (its partial file is unlinked) — the client can re-trigger.
+// ============================================
 
-    const safeFile = name.replace(/[^a-z0-9-_]+/gi, '_');
+const EXPORT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const EXPORTS_DIR = path.join(__dirname, 'exports');
+const JOBS_REGISTRY_PATH = path.join(EXPORTS_DIR, 'jobs.json');
+
+type ExportJobStatus = 'building' | 'ready' | 'failed';
+interface ExportJob {
+    id: string;
+    listName: string;
+    status: ExportJobStatus;
+    rowCount: number;
+    totalRows: number;
+    createdAt: string;
+    completedAt?: string;
+    error?: string;
+}
+
+const exportJobs = new Map<string, ExportJob>();
+let persistTimer: NodeJS.Timeout | null = null;
+
+const schedulePersist = () => {
+    if (persistTimer) return;
+    persistTimer = setTimeout(async () => {
+        persistTimer = null;
+        try {
+            const payload = JSON.stringify(Array.from(exportJobs.values()), null, 2);
+            await fsp.writeFile(JOBS_REGISTRY_PATH, payload, 'utf-8');
+        } catch (e) {
+            console.error('[Export] Failed to persist jobs registry:', e);
+        }
+    }, 200);
+};
+
+async function loadExportJobs() {
+    await fsp.mkdir(EXPORTS_DIR, { recursive: true });
+    try {
+        const raw = await fsp.readFile(JOBS_REGISTRY_PATH, 'utf-8');
+        const arr: ExportJob[] = JSON.parse(raw);
+        for (const j of arr) exportJobs.set(j.id, j);
+    } catch {
+        // Registry doesn't exist yet — first boot.
+    }
+
+    // Any job still "building" was interrupted by a restart — unlink its
+    // partial file and mark failed so the client can retrigger.
+    for (const j of exportJobs.values()) {
+        if (j.status === 'building') {
+            j.status = 'failed';
+            j.error = 'Server restarted while building';
+            await fsp.unlink(path.join(EXPORTS_DIR, `${j.id}.csv`)).catch(() => {});
+        }
+    }
+    schedulePersist();
+}
+
+async function pruneExpiredExports() {
+    const now = Date.now();
+    let pruned = 0;
+    for (const [id, job] of exportJobs) {
+        const ref = new Date(job.completedAt || job.createdAt).getTime();
+        if (now - ref > EXPORT_RETENTION_MS) {
+            await fsp.unlink(path.join(EXPORTS_DIR, `${id}.csv`)).catch(() => {});
+            exportJobs.delete(id);
+            pruned++;
+        }
+    }
+    if (pruned > 0) {
+        console.log(`[Export] Pruned ${pruned} expired export(s).`);
+        schedulePersist();
+    }
+}
+
+const csvEscape = (v: unknown): string => {
+    if (v === null || v === undefined) return '';
+    const s = String(v).replace(/"/g, '""');
+    return /[",\n\r]/.test(s) ? `"${s}"` : s;
+};
+
+async function buildExportCsv(job: ExportJob) {
     const contactCols = ['contact_id', 'email', 'first_name', 'last_name', 'company_website', 'lead_list_name'];
     const enrichmentCols = ['classification', 'confidence', 'cost', 'status', 'processed_at'];
     const headerCols = [...contactCols, ...enrichmentCols];
     const selectStr = `${contactCols.join(',')},enrichments(${enrichmentCols.join(',')})`;
+    const filePath = path.join(EXPORTS_DIR, `${job.id}.csv`);
 
-    const csvEscape = (v: unknown): string => {
-        if (v === null || v === undefined) return '';
-        const s = String(v).replace(/"/g, '""');
-        return /[",\n\r]/.test(s) ? `"${s}"` : s;
-    };
+    const stream = fs.createWriteStream(filePath, { encoding: 'utf-8' });
+    // Single shared error latch — writes reject against it if the stream
+    // dies mid-flight. Attaching a fresh listener per write leaks handlers.
+    let streamError: Error | null = null;
+    stream.on('error', err => { streamError = err; });
 
-    const write = (chunk: string): Promise<void> => {
-        if (res.write(chunk)) return Promise.resolve();
-        return new Promise(resolve => res.once('drain', () => resolve()));
-    };
-
-    let aborted = false;
-    res.on('close', () => { aborted = true; });
+    const write = (chunk: string): Promise<void> => new Promise((resolve, reject) => {
+        if (streamError) return reject(streamError);
+        if (stream.write(chunk)) resolve();
+        else stream.once('drain', () => streamError ? reject(streamError) : resolve());
+    });
 
     try {
+        await write(headerCols.join(',') + '\n');
+
         const PAGE = 1000;
         let lastId: string | null = null;
-        let firstPage = true;
-        let totalRows = 0;
-        while (!aborted) {
+        while (true) {
             let query: any = supabase
                 .from('contacts')
                 .select(selectStr)
-                .eq('lead_list_name', name)
+                .eq('lead_list_name', job.listName)
                 .order('contact_id', { ascending: true })
                 .limit(PAGE);
             if (lastId) query = query.gt('contact_id', lastId);
 
             const { data, error } = await query;
             if (error) throw error;
-
-            // Defer writing headers until the first successful page so errors can still produce a JSON 500.
-            if (firstPage) {
-                res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-                res.setHeader('Content-Disposition', `attachment; filename="${safeFile}.csv"`);
-                await write(headerCols.join(',') + '\n');
-                firstPage = false;
-            }
-
             if (!data || data.length === 0) break;
 
             for (const row of data as any[]) {
                 const enr = Array.isArray(row.enrichments) ? row.enrichments[0] : row.enrichments;
-                const line = headerCols.map(c => {
-                    if (contactCols.includes(c)) return csvEscape(row[c]);
-                    return csvEscape(enr ? enr[c] : null);
-                }).join(',');
+                const line = headerCols.map(c =>
+                    contactCols.includes(c) ? csvEscape(row[c]) : csvEscape(enr ? enr[c] : null)
+                ).join(',');
                 await write(line + '\n');
-                if (aborted) break;
             }
-            totalRows += data.length;
+
+            job.rowCount += data.length;
+            schedulePersist();
 
             lastId = (data[data.length - 1] as any).contact_id;
             if (data.length < PAGE) break;
         }
-        console.log(`[Export] "${name}": ${totalRows} rows streamed`);
-        res.end();
+
+        await new Promise<void>((resolve, reject) => stream.end((err: any) => err ? reject(err) : resolve()));
+
+        job.status = 'ready';
+        job.completedAt = new Date().toISOString();
+        schedulePersist();
+        console.log(`[Export] Job ${job.id} ready: ${job.rowCount} rows for "${job.listName}"`);
     } catch (err: any) {
-        console.error(`[Export] Error for "${name}":`, err.message);
-        if (!res.headersSent) res.status(500).json({ error: err.message });
-        else res.end();
+        console.error(`[Export] Job ${job.id} failed:`, err.message);
+        job.status = 'failed';
+        job.error = err.message;
+        job.completedAt = new Date().toISOString();
+        stream.destroy();
+        await fsp.unlink(filePath).catch(() => {});
+        schedulePersist();
     }
+}
+
+// Starts a new export job (or returns the existing ready/building one).
+// Client polls /api/export-jobs to discover when it's ready.
+app.post('/api/export-list/start', async (req, res) => {
+    const name = String(req.body?.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'name is required' });
+
+    // Reuse existing non-expired job for the same list, regardless of status:
+    // ready → client downloads, building → client polls, failed → client
+    // sees the error and retries explicitly.
+    const existing = Array.from(exportJobs.values())
+        .filter(j => j.listName === name)
+        .sort((a, b) => (b.completedAt || b.createdAt).localeCompare(a.completedAt || a.createdAt))[0];
+    if (existing && existing.status !== 'failed') {
+        return res.json(existing);
+    }
+
+    // Get total row count for progress reporting.
+    const { count } = await supabase
+        .from('contacts')
+        .select('contact_id', { count: 'estimated', head: true })
+        .eq('lead_list_name', name);
+
+    const job: ExportJob = {
+        id: crypto.randomUUID(),
+        listName: name,
+        status: 'building',
+        rowCount: 0,
+        totalRows: count || 0,
+        createdAt: new Date().toISOString()
+    };
+    exportJobs.set(job.id, job);
+    schedulePersist();
+
+    // Fire-and-forget the build. Errors land on the job record, not the
+    // response — the client already has the job id from this 202.
+    buildExportCsv(job).catch(err => {
+        console.error('[Export] Unexpected build failure:', err);
+    });
+
+    res.status(202).json(job);
+});
+
+// Returns all export jobs so the modal can render button state per list.
+// Clients filter by listName locally.
+app.get('/api/export-jobs', (_req, res) => {
+    res.json(Array.from(exportJobs.values()));
+});
+
+app.get('/api/export-list/download', (req, res) => {
+    const id = String(req.query.id || '');
+    const job = exportJobs.get(id);
+    if (!job || job.status !== 'ready') {
+        return res.status(404).json({ error: 'Export not ready' });
+    }
+    const filePath = path.join(EXPORTS_DIR, `${id}.csv`);
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'Export file missing' });
+    }
+    const safeFile = job.listName.replace(/[^a-z0-9-_]+/gi, '_');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFile}.csv"`);
+    fs.createReadStream(filePath).pipe(res);
 });
 
 // All other GET requests serve React App
@@ -943,6 +1114,9 @@ app.get('*', (req, res) => {
 app.listen(PORT, async () => {
     console.log(`🟢 Job Processor Server running on port ${PORT}`);
     await restorePipelineState();
+    await loadExportJobs();
+    await pruneExpiredExports();
+    setInterval(pruneExpiredExports, 60 * 60 * 1000);
 
     // Resume any stale jobs from previous unexpected crashes
     await JobProcessor.recoverStaleJobs();

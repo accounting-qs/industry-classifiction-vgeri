@@ -88,10 +88,21 @@ class SupabaseService {
           case 'starts_with': query = query.ilike(colPath, `${f.value}%`); break;
           case 'greater_than': query = query.gt(colPath, f.value); break;
           case 'less_than': query = query.lt(colPath, f.value); break;
-          case 'in': query = query.in(colPath, Array.isArray(f.value) ? f.value : [f.value]); break;
+          case 'in': {
+            // Single-value `in.("quoted,with,commas")` defeats the index on
+            // contacts.lead_list_name (PostgREST wraps comma-containing values
+            // in double-quotes and Postgres picks a full-sort plan). Collapse
+            // the 1-element case to `eq`, which uses the index and avoids the
+            // 8s statement_timeout on large lists.
+            const vals = Array.isArray(f.value) ? f.value : [f.value];
+            if (vals.length === 1) query = query.eq(colPath, vals[0]);
+            else query = query.in(colPath, vals);
+            break;
+          }
           case 'not_in': {
             const vals = Array.isArray(f.value) ? f.value : [f.value];
-            if (vals.length > 0) query = query.not(colPath, 'in', `(${vals.join(',')})`);
+            if (vals.length === 1) query = query.neq(colPath, vals[0]);
+            else if (vals.length > 0) query = query.not(colPath, 'in', `(${vals.join(',')})`);
             break;
           }
         }

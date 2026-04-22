@@ -60,6 +60,17 @@ interface LogEntry {
   level: 'info' | 'warn' | 'error' | 'phase';
 }
 
+interface ExportJob {
+  id: string;
+  listName: string;
+  status: 'building' | 'ready' | 'failed';
+  rowCount: number;
+  totalRows: number;
+  createdAt: string;
+  completedAt?: string;
+  error?: string;
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<AppTab>(AppTab.MANAGER);
   const [contacts, setContacts] = useState<MergedContact[]>([]);
@@ -126,8 +137,9 @@ export default function App() {
   const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
   const [activeListFilter, setActiveListFilter] = useState<string | null>(null);
   const [contactsLoading, setContactsLoading] = useState(false);
-  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string }[]>([]);
+  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number }[]>([]);
   const [showListModal, setShowListModal] = useState(false);
+  const [exportJobs, setExportJobs] = useState<ExportJob[]>([]);
 
   const stopRequestedRef = useRef(false);
 
@@ -416,14 +428,50 @@ export default function App() {
     }
   };
 
-  const exportList = (name: string) => {
-    const safe = name.replace(/[^a-z0-9-_]+/gi, '_');
-    const a = document.createElement('a');
-    a.href = `/api/export-list?name=${encodeURIComponent(name)}`;
-    a.download = `${safe}_${new Date().toISOString().slice(0, 10)}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+  const refreshExportJobs = useCallback(async () => {
+    try {
+      const res = await fetch('/api/export-jobs');
+      if (!res.ok) return;
+      const jobs: ExportJob[] = await res.json();
+      setExportJobs(jobs);
+    } catch { /* transient; next poll will retry */ }
+  }, []);
+
+  // Load export jobs when modal opens so the Export/Building/Download state
+  // shows up even if the user left the page mid-build.
+  useEffect(() => {
+    if (showListModal) refreshExportJobs();
+  }, [showListModal, refreshExportJobs]);
+
+  // Poll while any job is building — completion flips the button to Download.
+  useEffect(() => {
+    if (!showListModal) return;
+    const anyBuilding = exportJobs.some(j => j.status === 'building');
+    if (!anyBuilding) return;
+    const t = setInterval(refreshExportJobs, 3000);
+    return () => clearInterval(t);
+  }, [showListModal, exportJobs, refreshExportJobs]);
+
+  const startExportList = async (name: string) => {
+    try {
+      const res = await fetch('/api/export-list/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        addLog(`❌ Export error: ${err.error || res.status}`);
+        return;
+      }
+      const job: ExportJob = await res.json();
+      setExportJobs(prev => {
+        const others = prev.filter(j => j.listName !== name || j.status === 'ready');
+        return [...others, job];
+      });
+    } catch (e: any) {
+      addLog(`❌ Export error: ${e.message}`);
+    }
   };
 
   return (
@@ -642,10 +690,11 @@ export default function App() {
         <ListSelectorModal
           lists={importLists}
           activeListFilter={activeListFilter}
+          exportJobs={exportJobs}
           onClose={() => setShowListModal(false)}
           onOpenList={openList}
           onEnrichList={enrichList}
-          onExportList={exportList}
+          onStartExport={startExportList}
           onGoToImport={() => { setShowListModal(false); setActiveTab(AppTab.IMPORT); }}
         />
       )}
@@ -656,23 +705,36 @@ export default function App() {
 function ListSelectorModal({
   lists,
   activeListFilter,
+  exportJobs,
   onClose,
   onOpenList,
   onEnrichList,
-  onExportList,
+  onStartExport,
   onGoToImport,
 }: {
-  lists: { id: string; name: string; contact_count: number; created_at: string }[];
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number }[];
   activeListFilter: string | null;
+  exportJobs: ExportJob[];
   onClose: () => void;
   onOpenList: (name: string | null) => void;
   onEnrichList: (name: string, contactCount: number) => void;
-  onExportList: (name: string) => void;
+  onStartExport: (name: string) => void;
   onGoToImport: () => void;
 }) {
+  // Pick the most recent job per list so the button reflects the current
+  // attempt (e.g. a fresh build supersedes a stale failed job).
+  const latestJobByList = new Map<string, ExportJob>();
+  for (const j of exportJobs) {
+    const existing = latestJobByList.get(j.listName);
+    const stamp = j.completedAt || j.createdAt;
+    if (!existing || stamp.localeCompare(existing.completedAt || existing.createdAt) > 0) {
+      latestJobByList.set(j.listName, j);
+    }
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
-      <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-4xl max-h-[85vh] flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>
+      <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-5xl max-h-[85vh] flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-[#2e2e2e]">
           <div>
             <h3 className="text-sm font-bold text-white flex items-center gap-2"><List className="w-4 h-4 text-[#3ecf8e]" /> Select list</h3>
@@ -705,6 +767,7 @@ function ListSelectorModal({
                 <tr className="border-b border-[#2e2e2e]">
                   <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider">List Name</th>
                   <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Contacts</th>
+                  <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Enriched</th>
                   <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Imported</th>
                   <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Actions</th>
                 </tr>
@@ -716,11 +779,15 @@ function ListSelectorModal({
                 >
                   <td className="px-5 py-2.5 font-bold">All lists</td>
                   <td className="px-5 py-2.5 text-right text-gray-500 font-mono">—</td>
+                  <td className="px-5 py-2.5 text-right text-gray-500 font-mono">—</td>
                   <td className="px-5 py-2.5 text-right text-gray-500">—</td>
                   <td className="px-5 py-2.5 text-right text-[10px] text-gray-500 italic">Click to view all</td>
                 </tr>
                 {lists.map(l => {
                   const active = activeListFilter === l.name;
+                  const enriched = l.enriched_count || 0;
+                  const pct = l.contact_count > 0 ? Math.min(100, Math.round((enriched / l.contact_count) * 100)) : 0;
+                  const job = latestJobByList.get(l.name);
                   return (
                     <tr
                       key={l.id}
@@ -729,6 +796,12 @@ function ListSelectorModal({
                     >
                       <td className={`px-5 py-2.5 font-medium ${active ? 'text-[#3ecf8e]' : 'text-gray-300'}`}>{l.name}</td>
                       <td className="px-5 py-2.5 text-gray-400 text-right font-mono">{l.contact_count.toLocaleString()}</td>
+                      <td className="px-5 py-2.5 text-right font-mono">
+                        <span className={enriched > 0 ? 'text-[#3ecf8e]' : 'text-gray-500'}>
+                          {enriched.toLocaleString()}
+                        </span>
+                        <span className="text-gray-600 ml-1">({pct}%)</span>
+                      </td>
                       <td className="px-5 py-2.5 text-gray-500 text-right">
                         {new Date(l.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                       </td>
@@ -748,13 +821,7 @@ function ListSelectorModal({
                           >
                             <Zap className="w-3 h-3" /> Enrich
                           </button>
-                          <button
-                            onClick={e => { e.stopPropagation(); onExportList(l.name); }}
-                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white transition-colors flex items-center gap-1"
-                            title="Export list as CSV"
-                          >
-                            <Download className="w-3 h-3" /> Export
-                          </button>
+                          <ExportButton job={job} listName={l.name} onStart={onStartExport} />
                         </div>
                       </td>
                     </tr>
@@ -775,6 +842,54 @@ function ListSelectorModal({
         </div>
       </div>
     </div>
+  );
+}
+
+function ExportButton({ job, listName, onStart }: {
+  job: ExportJob | undefined;
+  listName: string;
+  onStart: (name: string) => void;
+}) {
+  if (job?.status === 'ready') {
+    return (
+      <a
+        href={`/api/export-list/download?id=${encodeURIComponent(job.id)}`}
+        onClick={e => e.stopPropagation()}
+        className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e]/15 border border-[#3ecf8e]/40 text-[#3ecf8e] hover:bg-[#3ecf8e]/25 transition-colors flex items-center gap-1"
+        title={`${job.rowCount.toLocaleString()} rows · ready`}
+      >
+        <Download className="w-3 h-3" /> Download
+      </a>
+    );
+  }
+  if (job?.status === 'building') {
+    const pct = job.totalRows > 0 ? Math.min(100, Math.round((job.rowCount / job.totalRows) * 100)) : 0;
+    return (
+      <button
+        disabled
+        onClick={e => e.stopPropagation()}
+        className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-400 flex items-center gap-1 cursor-default"
+        title={`Building CSV: ${job.rowCount.toLocaleString()} rows so far`}
+      >
+        <Loader2 className="w-3 h-3 animate-spin" /> Building… {pct}%
+      </button>
+    );
+  }
+  // No job, or last job failed — surface the error via title and let the
+  // user retrigger.
+  const failed = job?.status === 'failed';
+  return (
+    <button
+      onClick={e => { e.stopPropagation(); onStart(listName); }}
+      className={`px-2 py-1 rounded-md text-[10px] font-bold flex items-center gap-1 transition-colors ${
+        failed
+          ? 'bg-red-500/10 border border-red-500/40 text-red-400 hover:bg-red-500/20'
+          : 'bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white'
+      }`}
+      title={failed ? `Previous export failed: ${job?.error || 'unknown'} — click to retry` : 'Build a CSV on the server; download when ready'}
+    >
+      <Download className="w-3 h-3" /> {failed ? 'Retry export' : 'Export'}
+    </button>
   );
 }
 
