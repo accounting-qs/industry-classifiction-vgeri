@@ -736,18 +736,28 @@ app.post('/api/import', async (req, res) => {
             .map((c: any) => c.email?.trim()?.toLowerCase())
             .filter(Boolean);
 
-        // 3. Check which emails already exist in the database
+        // 3. Check which emails already exist in the database. Retry
+        // on Postgres statement_timeout (57014) with a smaller batch —
+        // shared-pooler contention can push a 500-email IN query past
+        // the 8s limit even though the column is indexed.
         const existingEmails = new Set<string>();
-        const EMAIL_CHECK_CHUNK = 500;
-        for (let i = 0; i < allEmails.length; i += EMAIL_CHECK_CHUNK) {
-            const emailChunk = allEmails.slice(i, i + EMAIL_CHECK_CHUNK);
-            const { data: existing } = await supabase
+        let emailCheckChunk = 500;
+        for (let i = 0; i < allEmails.length;) {
+            const emailBatch = allEmails.slice(i, i + emailCheckChunk);
+            const { data: existing, error } = await supabase
                 .from('contacts')
                 .select('email')
-                .in('email', emailChunk);
-            if (existing) {
-                existing.forEach((r: any) => existingEmails.add(r.email?.toLowerCase()));
+                .in('email', emailBatch);
+            if (error) {
+                if (error.code === '57014' && emailCheckChunk > 50) {
+                    emailCheckChunk = Math.max(50, Math.floor(emailCheckChunk / 2));
+                    console.warn(`[Import] Email pre-check timeout; retrying at chunk=${emailCheckChunk}`);
+                    continue;
+                }
+                throw error;
             }
+            if (existing) existing.forEach((r: any) => existingEmails.add(r.email?.toLowerCase()));
+            i += emailBatch.length;
         }
 
         // 4. Separate new vs existing contacts
@@ -783,44 +793,64 @@ app.post('/api/import', async (req, res) => {
             newContacts.push(buildRow(c));
         });
 
-        // 5. Insert new contacts + upsert existing (if overwrite enabled)
-        const CHUNK_SIZE = 1000;
+        // 5. Insert new contacts + upsert existing (if overwrite enabled).
+        //
+        // Write helper with adaptive chunking: starts at 1000, halves on
+        // Postgres statement_timeout (57014) or serialization conflicts
+        // (40001/40P01), retries a few times, drifts back up after a
+        // clean write. We use `upsert` with `ignoreDuplicates` instead of
+        // a bare `insert` so the operation is idempotent — a concurrent
+        // import that beat us to an email just makes our row a no-op
+        // instead of blowing up the whole chunk with a unique-violation.
+        const INITIAL_CHUNK = 1000;
+        const MIN_CHUNK = 100;
+        const MAX_RETRIES = 4;
         let inserted = 0;
         let updated = 0;
         let dbFailed = 0;
         const errors: string[] = [];
 
-        // Insert new contacts
-        for (let i = 0; i < newContacts.length; i += CHUNK_SIZE) {
-            const chunk = newContacts.slice(i, i + CHUNK_SIZE);
-            const { error } = await supabase
-                .from('contacts')
-                .insert(chunk);
+        const writeAll = async (
+            rows: any[],
+            kind: 'insert' | 'upsert'
+        ): Promise<number> => {
+            let written = 0;
+            let chunkSize = INITIAL_CHUNK;
+            let i = 0;
+            while (i < rows.length) {
+                const chunk = rows.slice(i, i + chunkSize);
+                let attempts = 0;
+                let success = false;
+                while (true) {
+                    const op = kind === 'insert'
+                        ? supabase.from('contacts').upsert(chunk, { onConflict: 'email', ignoreDuplicates: true })
+                        : supabase.from('contacts').upsert(chunk, { onConflict: 'email' });
+                    const { error } = await op;
+                    if (!error) { success = true; break; }
 
-            if (error) {
-                console.error(`Import chunk error at row ${i}:`, error);
-                errors.push(`Chunk ${i}: ${error.message}`);
-                dbFailed += chunk.length;
-            } else {
-                inserted += chunk.length;
+                    const transient = error.code === '57014' || error.code === '40001' || error.code === '40P01';
+                    attempts++;
+                    if (!transient || attempts >= MAX_RETRIES || chunkSize <= MIN_CHUNK) {
+                        console.error(`${kind} chunk error at row ${i}:`, error);
+                        errors.push(`Chunk ${i}: ${error.message}`);
+                        dbFailed += chunk.length;
+                        break;
+                    }
+                    const nextChunk = Math.max(MIN_CHUNK, Math.floor(chunkSize / 2));
+                    console.warn(`[Import] ${kind} chunk timeout at size=${chunkSize}; retry ${attempts}/${MAX_RETRIES} at size=${nextChunk}`);
+                    chunkSize = nextChunk;
+                    chunk.length = chunkSize; // shrink in place; remainder re-enters on next outer iteration
+                    await new Promise(r => setTimeout(r, 500 * attempts));
+                }
+                if (success) written += chunk.length;
+                i += chunk.length;
+                if (chunkSize < INITIAL_CHUNK) chunkSize = Math.min(INITIAL_CHUNK, chunkSize * 2);
             }
-        }
+            return written;
+        };
 
-        // Update existing contacts (overwrite mode)
-        for (let i = 0; i < updateContacts.length; i += CHUNK_SIZE) {
-            const chunk = updateContacts.slice(i, i + CHUNK_SIZE);
-            const { error } = await supabase
-                .from('contacts')
-                .upsert(chunk, { onConflict: 'email' });
-
-            if (error) {
-                console.error(`Upsert chunk error at row ${i}:`, error);
-                errors.push(`Upsert chunk ${i}: ${error.message}`);
-                dbFailed += chunk.length;
-            } else {
-                updated += chunk.length;
-            }
-        }
+        inserted = await writeAll(newContacts, 'insert');
+        updated = await writeAll(updateContacts, 'upsert');
 
         const totalFailed = failedContacts.length + dbFailed;
         addServerLog(`📥 Import complete: ${inserted} new, ${updated} updated, ${duplicates} duplicates, ${totalFailed} failed (${failedContacts.length} invalid emails).`, 'Sync', 'info');
