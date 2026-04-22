@@ -36,11 +36,27 @@ const PERSONAL_EMAIL_DOMAINS = new Set([
 const scrapeLimit = pLimit(CONCURRENCY_SCRAPE);
 const aiLimit = pLimit(CONCURRENCY_AI);
 
+// Hard ceiling on how long a single chunk may take. A chunk that exceeds this
+// is almost certainly waiting on a dead Supabase/OpenAI socket with no TCP
+// reset — the Promise.all never resolves and the pollLoop goes silent for
+// hours. 10 min is comfortably above a normal chunk (~40s) but well below
+// the "overnight silence" threshold we've actually seen in prod.
+const CHUNK_TIMEOUT_MS = parseInt(process.env.CHUNK_TIMEOUT_MS || '600000', 10);
+// Heartbeat emits a log line at this interval regardless of pipeline state,
+// so a silent pollLoop is immediately visible in Render logs.
+const HEARTBEAT_MS = parseInt(process.env.HEARTBEAT_MS || '60000', 10);
+
 export class JobProcessor {
     private static isRunning = false;
     private static shouldStop = false;
     // Fix #1: Batched log buffer — avoids fire-and-forget promises per log call
     private static pendingLogs: { timestamp: string; instance_id: string; module: string; message: string; level: string }[] = [];
+    private static heartbeatTimer: NodeJS.Timeout | null = null;
+    // Incremented each time the pollLoop makes progress (claims a chunk or
+    // confirms the queue is empty). Heartbeat reads this to report whether
+    // the loop is live and advancing, vs. merely idle.
+    private static loopTick = 0;
+    private static lastTickAt = Date.now();
 
     private static log(msg: string, level: 'info' | 'warn' | 'error' | 'phase' = 'info') {
         console.log(`[JobProcessor] ${msg}`);
@@ -73,8 +89,29 @@ export class JobProcessor {
         this.shouldStop = false;
         this.log(`🚀 JobProcessor started [Chunk: ${QUEUE_FETCH_CHUNK_SIZE}, Scrape: C${CONCURRENCY_SCRAPE}, AI: C${CONCURRENCY_AI}, GC: ${typeof global.gc === 'function' ? 'ENABLED' : 'DISABLED'}]`, 'phase');
 
+        this.startHeartbeat();
+
         // Issue #3: Watchdog wrapper — auto-restarts the loop if it dies unexpectedly
         this.runWithWatchdog();
+    }
+
+    private static startHeartbeat() {
+        if (this.heartbeatTimer) return;
+        this.lastTickAt = Date.now();
+        this.heartbeatTimer = setInterval(() => {
+            const silentSec = Math.round((Date.now() - this.lastTickAt) / 1000);
+            // The whole point of this log: if we see 💓 lines in Render but
+            // the "last tick" keeps growing, the HTTP server is alive but
+            // the pollLoop is stuck.
+            console.log(`[JobProcessor] 💓 heartbeat — tick=${this.loopTick}, last_progress=${silentSec}s ago, shouldStop=${this.shouldStop}`);
+        }, HEARTBEAT_MS);
+    }
+
+    private static stopHeartbeat() {
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
+        }
     }
 
     /**
@@ -106,6 +143,7 @@ export class JobProcessor {
         }
 
         this.isRunning = false;
+        this.stopHeartbeat();
         this.log('🛑 JobProcessor fully stopped.', 'phase');
     }
 
@@ -147,13 +185,35 @@ export class JobProcessor {
         }
     }
 
+    /**
+     * Races an awaitable against a hard deadline. If the deadline fires first,
+     * we throw — the watchdog catches the throw, logs it, and restarts the
+     * loop. Without this, a hung Supabase socket (no TCP reset) stalls the
+     * whole pipeline indefinitely with no signal in the logs.
+     */
+    private static withTimeout<T>(label: string, p: Promise<T>, ms: number): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                reject(new Error(`Timeout after ${ms}ms: ${label}`));
+            }, ms);
+            p.then(v => { clearTimeout(timer); resolve(v); },
+                   e => { clearTimeout(timer); reject(e); });
+        });
+    }
+
     private static async pollLoop() {
         while (!this.shouldStop) {
             try {
                 // Issue #7: Auto-reset items stuck in 'processing' for too long
                 await this.resetStaleProcessingItems();
 
-                const processedCount = await this.processNextChunk();
+                const processedCount = await this.withTimeout(
+                    'processNextChunk',
+                    this.processNextChunk(),
+                    CHUNK_TIMEOUT_MS
+                );
+                this.loopTick++;
+                this.lastTickAt = Date.now();
 
                 // If we processed items, the queue is active, so poll immediately again without waiting.
                 // If 0 items were found, check if the queue is truly empty.
