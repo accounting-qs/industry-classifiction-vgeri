@@ -1,21 +1,30 @@
 -- ============================================
--- MUST DROP the old version first because the return type changed
--- from TABLE(cid UUID) → UUID[]
+-- resolve_enrichment_targets v3
+--
+-- Resolves the set of contact_ids matching (lead_list_names, statuses,
+-- search) in one DB roundtrip and returns them as a UUID[] — bypassing
+-- PostgREST's 1000-row page limit entirely. The caller (server.ts) then
+-- inserts them into job_items in chunks.
+--
+-- v3 change: timeout is now declared as a function attribute
+-- (`SET statement_timeout TO '120s'` on CREATE FUNCTION) instead of
+-- `SET LOCAL` inside the body. The attribute form is applied on
+-- function entry regardless of volatility and is more reliable than
+-- `SET LOCAL`, which on the deployed DB was hitting PostgREST's 8s
+-- default timeout before ever taking effect.
 -- ============================================
-DROP FUNCTION IF EXISTS resolve_enrichment_targets(TEXT[], TEXT[], TEXT);
 
--- ============================================
--- resolve_enrichment_targets v2: Returns UUID[] (single array value)
--- to bypass PostgREST row limits entirely.
--- Runs with 120s statement timeout for large datasets (70K+).
--- ============================================
+DROP FUNCTION IF EXISTS resolve_enrichment_targets(TEXT[], TEXT[], TEXT);
 
 CREATE OR REPLACE FUNCTION resolve_enrichment_targets(
     p_lead_list_names TEXT[] DEFAULT NULL,
     p_statuses TEXT[] DEFAULT NULL,
     p_search TEXT DEFAULT NULL
 )
-RETURNS UUID[] AS $$
+RETURNS UUID[]
+LANGUAGE plpgsql
+SET statement_timeout TO '120s'
+AS $$
 DECLARE
     has_new BOOLEAN := ('new' = ANY(COALESCE(p_statuses, ARRAY[]::TEXT[])));
     other_statuses TEXT[] := ARRAY(
@@ -25,9 +34,6 @@ DECLARE
     status_filter_active BOOLEAN := (p_statuses IS NOT NULL AND array_length(p_statuses, 1) > 0);
     result UUID[];
 BEGIN
-    -- Set generous timeout for large queries (70K+ contacts)
-    SET LOCAL statement_timeout = '120s';
-
     IF status_filter_active AND has_new AND array_length(other_statuses, 1) IS NULL THEN
         -- Status = "new" only: contacts WITHOUT enrichment records
         SELECT array_agg(c.contact_id ORDER BY c.id)
@@ -88,4 +94,9 @@ BEGIN
 
     RETURN COALESCE(result, ARRAY[]::UUID[]);
 END;
-$$ LANGUAGE plpgsql;
+$$;
+
+GRANT EXECUTE ON FUNCTION resolve_enrichment_targets(TEXT[], TEXT[], TEXT)
+    TO anon, authenticated, service_role;
+
+NOTIFY pgrst, 'reload schema';
