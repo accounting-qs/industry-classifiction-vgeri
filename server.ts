@@ -879,9 +879,12 @@ app.get('/api/import-lists', async (_req, res) => {
         // Preferred path: `get_list_enrichment_stats` RPC returns
         // completed/failed/total for every list in one aggregate pass.
         // PostgREST's per-list count=estimated returned 0 unpredictably
-        // (the planner short-circuits), which broke the "done" indicator.
+        // (the planner short-circuits filtered joins), which broke the
+        // "done" indicator and made the same list's count change 30%+
+        // between page refreshes.
         const { data: stats, error: rpcErr } = await supabase.rpc('get_list_enrichment_stats');
         const statsByList = new Map<string, { completed: number; failed: number; total: number }>();
+        let statsSource: 'rpc' | 'fallback' = 'rpc';
         if (!rpcErr && Array.isArray(stats)) {
             for (const row of stats as any[]) {
                 statsByList.set(row.lead_list_name, {
@@ -891,16 +894,18 @@ app.get('/api/import-lists', async (_req, res) => {
                 });
             }
         } else if (rpcErr) {
+            statsSource = 'fallback';
             console.warn('[import-lists] RPC get_list_enrichment_stats unavailable — falling back to per-list estimated counts:', rpcErr.message);
         }
 
         // Fallback for environments where the RPC hasn't been applied yet.
-        // Estimated counts can drift or return 0; user will see less
-        // reliable stats until the migration runs.
+        // These counts are unreliable (count=estimated can drift or return
+        // 0 randomly) — the client surfaces a banner to say so.
         const needFallback = lists.some((l: any) => !statsByList.has(l.name));
         if (needFallback) {
-            const perList = await Promise.all(lists.map(async (l: any) => {
-                if (statsByList.has(l.name)) return null;
+            statsSource = 'fallback';
+            await Promise.all(lists.map(async (l: any) => {
+                if (statsByList.has(l.name)) return;
                 const [completed, failed] = await Promise.all([
                     supabase.from('contacts')
                         .select('contact_id, enrichments!inner(status)', { count: 'estimated', head: true })
@@ -914,9 +919,7 @@ app.get('/api/import-lists', async (_req, res) => {
                     failed: failed.count || 0,
                     total: l.contact_count || 0,
                 });
-                return null;
             }));
-            void perList;
         }
 
         const withCounts = lists.map((l: any) => {
@@ -925,13 +928,13 @@ app.get('/api/import-lists', async (_req, res) => {
                 ...l,
                 enriched_count: s.completed,
                 failed_count: s.failed,
-                // Prefer the live total from the RPC so the bar lines up
-                // with the enrichments actually on disk; fall back to the
-                // import_lists record.
                 contact_count: s.total || l.contact_count || 0,
             };
         });
-        res.json(withCounts);
+        // Object response so we can send metadata (stats_source) alongside
+        // the list — wrapped in a shape the client detects while still
+        // tolerating the older array response during rolling deploys.
+        res.json({ lists: withCounts, stats_source: statsSource });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }

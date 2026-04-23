@@ -138,6 +138,7 @@ export default function App() {
   const [activeListFilter, setActiveListFilter] = useState<string | null>(null);
   const [contactsLoading, setContactsLoading] = useState(false);
   const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[]>([]);
+  const [listStatsSource, setListStatsSource] = useState<'rpc' | 'fallback'>('rpc');
   const [showListModal, setShowListModal] = useState(false);
   const [exportJobs, setExportJobs] = useState<ExportJob[]>([]);
 
@@ -200,7 +201,17 @@ export default function App() {
       .catch(() => { });
     fetch('/api/import-lists')
       .then(res => res.json())
-      .then(data => { if (Array.isArray(data)) setImportLists(data); })
+      .then(data => {
+        // Accept both legacy (bare array) and new ({ lists, stats_source }) shapes
+        // so a rolling deploy doesn't leave the client stranded.
+        if (Array.isArray(data)) {
+          setImportLists(data);
+          setListStatsSource('rpc');
+        } else if (data && Array.isArray(data.lists)) {
+          setImportLists(data.lists);
+          setListStatsSource(data.stats_source === 'fallback' ? 'fallback' : 'rpc');
+        }
+      })
       .catch(() => { });
   }, []);
 
@@ -703,6 +714,7 @@ export default function App() {
       {showListModal && (
         <ListSelectorModal
           lists={importLists}
+          statsSource={listStatsSource}
           activeListFilter={activeListFilter}
           exportJobs={exportJobs}
           onClose={() => setShowListModal(false)}
@@ -719,6 +731,7 @@ export default function App() {
 
 function ListSelectorModal({
   lists,
+  statsSource,
   activeListFilter,
   exportJobs,
   onClose,
@@ -729,6 +742,7 @@ function ListSelectorModal({
   onGoToImport,
 }: {
   lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[];
+  statsSource: 'rpc' | 'fallback';
   activeListFilter: string | null;
   exportJobs: ExportJob[];
   onClose: () => void;
@@ -764,6 +778,15 @@ function ListSelectorModal({
             ×
           </button>
         </div>
+
+        {statsSource === 'fallback' && (
+          <div className="px-6 py-2.5 bg-amber-500/10 border-b border-amber-500/30 text-amber-400 text-[11px] flex items-start gap-2">
+            <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+            <span>
+              <span className="font-bold">Approximate stats.</span> The <code className="bg-black/30 px-1 rounded">get_list_enrichment_stats</code> RPC isn't installed yet — counts can swing or show 0 randomly, and the "failed" slice is invisible. Run <code className="bg-black/30 px-1 rounded">supabase/migrations/20260423_list_enrichment_stats_rpc.sql</code> in the SQL editor for accurate progress.
+            </span>
+          </div>
+        )}
 
         <div className="flex-1 overflow-y-auto custom-scrollbar">
           {lists.length === 0 ? (
