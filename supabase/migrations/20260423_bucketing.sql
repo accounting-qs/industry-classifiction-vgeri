@@ -148,4 +148,12 @@ $$;
 GRANT EXECUTE ON FUNCTION public.get_bucket_assignment_counts(UUID)
     TO anon, authenticated, service_role;
 
+-- Match the project's existing convention: all app tables here run with RLS
+-- disabled (every other table shows "UNRESTRICTED" in the dashboard). Without
+-- this, Supabase auto-enables RLS on CREATE TABLE and the anon key gets
+-- "new row violates row-level security policy" on any insert.
+ALTER TABLE bucketing_runs       DISABLE ROW LEVEL SECURITY;
+ALTER TABLE bucket_industry_map  DISABLE ROW LEVEL SECURITY;
+ALTER TABLE bucket_assignments   DISABLE ROW LEVEL SECURITY;
+
 NOTIFY pgrst, 'reload schema';
