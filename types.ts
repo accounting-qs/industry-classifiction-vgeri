@@ -61,6 +61,7 @@ export interface BucketProposal {
   personalization_angle?: string;
   example_industries: string[];
   estimated_count?: number;
+  parent_bucket?: string;
 }
 
 export interface BucketingRun {

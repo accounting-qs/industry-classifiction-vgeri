@@ -1504,57 +1504,21 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
-        <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest">
-          Proposed buckets
+        <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between">
+          <span>Proposed buckets</span>
+          <span className="text-gray-600 normal-case tracking-normal font-normal">
+            Children below threshold roll up to their parent. Parents still below threshold fall to "Other".
+          </span>
         </div>
-        <div className="divide-y divide-[#2e2e2e]">
-          {sourceBuckets.map(b => {
-            const isKept = kept.has(b.name);
-            const renamed = renames[b.name];
-            const realCount = countByBucket.get(renamed || b.name) ?? countByBucket.get(b.name) ?? 0;
-            const belowThreshold = realCount > 0 && realCount < minVolume;
-            return (
-              <div key={b.name} className={`p-4 ${isKept ? '' : 'opacity-50'}`}>
-                <div className="flex items-start gap-3">
-                  <input
-                    type="checkbox"
-                    checked={isKept}
-                    onChange={() => toggle(b.name)}
-                    className="mt-1 w-3.5 h-3.5"
-                  />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1 flex-wrap">
-                      <input
-                        value={renamed ?? b.name}
-                        onChange={e => setRenames({ ...renames, [b.name]: e.target.value })}
-                        className="bg-[#1c1c1c] border border-[#2e2e2e] rounded px-2 py-1 text-xs font-bold text-white focus:outline-none focus:border-[#3ecf8e]"
-                      />
-                      <span className="text-[10px] font-mono text-gray-400">
-                        {realCount.toLocaleString()} contacts
-                      </span>
-                      {belowThreshold && (
-                        <span className="text-[10px] font-bold text-amber-500 bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded">
-                          Below threshold → Other
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-[11px] text-gray-400">{b.definition}</p>
-                    {b.personalization_angle && (
-                      <p className="text-[10px] text-gray-500 italic mt-1">
-                        Angle: {b.personalization_angle}
-                      </p>
-                    )}
-                    {b.example_industries && b.example_industries.length > 0 && (
-                      <div className="text-[10px] text-gray-600 mt-1.5 truncate">
-                        Industries: {b.example_industries.slice(0, 6).join(', ')}{b.example_industries.length > 6 ? `, +${b.example_industries.length - 6} more` : ''}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
+        <BucketHierarchyList
+          buckets={sourceBuckets}
+          kept={kept}
+          renames={renames}
+          minVolume={minVolume}
+          countByBucket={countByBucket}
+          onToggle={toggle}
+          onRename={(oldName, val) => setRenames({ ...renames, [oldName]: val })}
+        />
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
@@ -1628,6 +1592,145 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
           Apply &amp; Assign
         </button>
       </div>
+    </div>
+  );
+}
+
+// Renders the proposed buckets as a parent → children hierarchy. Shows each
+// child's own count and the parent's *rollup-effective* count (parent's own
+// map rows + sum of child rows that would roll up because they're below
+// threshold). A child flagged "Below threshold → rolls up into {parent}"
+// loses signal to the parent, not to Other.
+function BucketHierarchyList({
+  buckets, kept, renames, minVolume, countByBucket, onToggle, onRename
+}: {
+  buckets: BucketProposal[];
+  kept: Set<string>;
+  renames: Record<string, string>;
+  minVolume: number;
+  countByBucket: Map<string, number>;
+  onToggle: (name: string) => void;
+  onRename: (oldName: string, val: string) => void;
+}) {
+  const displayName = (b: BucketProposal) => renames[b.name] ?? b.name;
+  const currentName = (origName: string) => renames[origName] ?? origName;
+  const baseCountFor = (b: BucketProposal) =>
+    countByBucket.get(displayName(b)) ?? countByBucket.get(b.name) ?? 0;
+
+  // Build a child index by parent name (as the parent currently appears in the
+  // proposal — honoring renames for match).
+  const childrenOf = new Map<string, BucketProposal[]>();
+  const parents: BucketProposal[] = [];
+  const bucketNames = new Set(buckets.map(b => b.name));
+  for (const b of buckets) {
+    if (b.parent_bucket && bucketNames.has(b.parent_bucket)) {
+      const arr = childrenOf.get(b.parent_bucket) || [];
+      arr.push(b);
+      childrenOf.set(b.parent_bucket, arr);
+    } else {
+      parents.push(b);
+    }
+  }
+  // Any bucket whose parent was already dropped from the proposal falls into the top level.
+  for (const b of buckets) {
+    if (b.parent_bucket && !bucketNames.has(b.parent_bucket) && !parents.includes(b)) {
+      parents.push(b);
+    }
+  }
+
+  // Compute effective parent count = own count + sum of children that would
+  // roll up (kept, below threshold).
+  const parentEffectiveCount = (p: BucketProposal): number => {
+    let total = baseCountFor(p);
+    for (const child of childrenOf.get(p.name) || []) {
+      const c = baseCountFor(child);
+      if (kept.has(child.name) && c < minVolume) total += c;
+    }
+    return total;
+  };
+
+  const renderBucket = (b: BucketProposal, isChild: boolean, parent?: BucketProposal) => {
+    const isKept = kept.has(b.name);
+    const base = baseCountFor(b);
+    const parentKept = parent ? kept.has(parent.name) : false;
+    // A child is "rolled up" if it's below threshold AND its parent is kept.
+    const willRollUp = isChild && parentKept && base < minVolume;
+    // A top-level bucket (or parent) falls to Other if its effective count is
+    // still below threshold. For parents we include would-roll-up children.
+    const effective = isChild ? base : parentEffectiveCount(b);
+    const belowThreshold = isKept && effective > 0 && effective < minVolume && !isChild;
+
+    return (
+      <div
+        key={b.name}
+        className={`py-3 ${isChild ? 'pl-10 pr-4 border-l-2 border-[#2e2e2e] ml-6' : 'px-4'} ${isKept ? '' : 'opacity-50'}`}
+      >
+        <div className="flex items-start gap-3">
+          <input
+            type="checkbox"
+            checked={isKept}
+            onChange={() => onToggle(b.name)}
+            className="mt-2 w-3.5 h-3.5 shrink-0"
+          />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+              {!isChild && (
+                <span className="text-[9px] font-bold uppercase tracking-widest text-[#3ecf8e] bg-[#3ecf8e]/10 border border-[#3ecf8e]/30 px-1.5 py-0.5 rounded shrink-0">
+                  Parent
+                </span>
+              )}
+              {isChild && (
+                <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 shrink-0">↳</span>
+              )}
+              <input
+                value={displayName(b)}
+                onChange={e => onRename(b.name, e.target.value)}
+                className="flex-1 min-w-[340px] bg-[#1c1c1c] border border-[#2e2e2e] rounded px-3 py-1.5 text-sm font-bold text-white focus:outline-none focus:border-[#3ecf8e]"
+              />
+            </div>
+            <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+              <span className="text-[10px] font-mono text-gray-400">
+                {base.toLocaleString()} contacts
+                {!isChild && effective !== base && (
+                  <span className="text-[#3ecf8e]"> → {effective.toLocaleString()} after rollup</span>
+                )}
+              </span>
+              {willRollUp && (
+                <span className="text-[10px] font-bold text-blue-400 bg-blue-500/10 border border-blue-500/30 px-2 py-0.5 rounded">
+                  Rolls up → {parent ? currentName(parent.name) : ''}
+                </span>
+              )}
+              {belowThreshold && (
+                <span className="text-[10px] font-bold text-amber-500 bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded">
+                  Below threshold → Other
+                </span>
+              )}
+            </div>
+            <p className="text-[11px] text-gray-400">{b.definition}</p>
+            {b.personalization_angle && (
+              <p className="text-[10px] text-gray-500 italic mt-1">
+                Angle: {b.personalization_angle}
+              </p>
+            )}
+            {b.example_industries && b.example_industries.length > 0 && (
+              <div className="text-[10px] text-gray-600 mt-1.5 truncate">
+                Industries: {b.example_industries.slice(0, 6).join(', ')}{b.example_industries.length > 6 ? `, +${b.example_industries.length - 6} more` : ''}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="divide-y divide-[#2e2e2e]">
+      {parents.map(p => (
+        <div key={p.name} className="py-1">
+          {renderBucket(p, false)}
+          {(childrenOf.get(p.name) || []).map(child => renderBucket(child, true, p))}
+        </div>
+      ))}
     </div>
   );
 }

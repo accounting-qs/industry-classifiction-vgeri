@@ -59,6 +59,10 @@ interface ProposedBucket {
     personalization_angle?: string;
     example_industries: string[];
     estimated_count?: number;
+    // Empty string = top-level parent. Otherwise references another bucket's
+    // `name` in the same taxonomy — used to roll children up when they fall
+    // below the min_volume threshold instead of dumping them to Other.
+    parent_bucket?: string;
 }
 
 interface TaxonomyResponse {
@@ -67,6 +71,34 @@ interface TaxonomyResponse {
 }
 
 const RESERVED_OTHER = 'Other';
+
+// PostgREST caps RPC responses at 1000 rows by default. For lists with long
+// industry tails (common — classifier produces near-unique labels per company)
+// that means `totalContacts` reflects only the top 1000 industries, and the
+// LLM proposes buckets against a biased sample. Paginate explicitly to fetch
+// the full vocabulary up to a generous safety cap.
+const VOCAB_PAGE_SIZE = 1000;
+const VOCAB_MAX_ROWS = 100_000;
+
+async function fetchFullVocabulary(
+    supabase: SupabaseClient,
+    listNames: string[]
+): Promise<VocabRow[]> {
+    const all: VocabRow[] = [];
+    let offset = 0;
+    while (offset < VOCAB_MAX_ROWS) {
+        const { data, error } = await supabase
+            .rpc('get_industry_vocabulary', { p_list_names: listNames })
+            .range(offset, offset + VOCAB_PAGE_SIZE - 1);
+        if (error) throw new Error(`vocabulary fetch failed: ${error.message}`);
+        const page = (data || []) as VocabRow[];
+        if (page.length === 0) break;
+        all.push(...page);
+        if (page.length < VOCAB_PAGE_SIZE) break;
+        offset += VOCAB_PAGE_SIZE;
+    }
+    return all;
+}
 
 // ────────────────────────────────────────────────────────────────────────
 // PHASE 1 — Bucket Determination
@@ -83,12 +115,8 @@ export async function runTaxonomyProposal(
         .from('bucketing_runs').select('*').eq('id', runId).single();
     if (runErr || !run) throw new Error(`Run not found: ${runErr?.message}`);
 
-    // 1) Vocabulary extraction
-    const { data: vocab, error: vErr } = await supabase
-        .rpc('get_industry_vocabulary', { p_list_names: run.list_names });
-    if (vErr) throw new Error(`get_industry_vocabulary failed: ${vErr.message}`);
-
-    const vocabRows = (vocab || []) as VocabRow[];
+    // 1) Vocabulary extraction (paginated — bypasses PostgREST 1000-row cap)
+    const vocabRows = await fetchFullVocabulary(supabase, run.list_names);
     const totalContacts = vocabRows.reduce((s, r) => s + Number(r.n || 0), 0);
     log(`[Bucketing ${runId}] vocabulary: ${vocabRows.length} distinct industries, ${totalContacts} contacts`);
 
@@ -106,17 +134,26 @@ export async function runTaxonomyProposal(
     const { proposal, costUsd } = await callTaxonomyLLM(vocabRows);
     log(`[Bucketing ${runId}] taxonomy LLM call: ${(Date.now() - t0) / 1000}s, $${costUsd.toFixed(4)}, ${proposal.buckets.length} buckets`);
 
-    // Filter out any "Other"-named bucket the model returned (reserved name)
-    const cleanBuckets = proposal.buckets
+    // Filter out any "Other"-named bucket the model returned (reserved name),
+    // normalize names, and validate parent references point at a real bucket.
+    const rawBuckets = proposal.buckets
         .filter(b => b.name && b.name.trim().toLowerCase() !== RESERVED_OTHER.toLowerCase())
         .map(b => ({
             ...b,
             name: b.name.trim(),
             definition: (b.definition || '').trim(),
+            parent_bucket: (b.parent_bucket || '').trim(),
             example_industries: Array.from(
                 new Set((b.example_industries || []).map(s => (s || '').trim()).filter(Boolean))
             )
         }));
+
+    const bucketNames = new Set(rawBuckets.map(b => b.name));
+    const cleanBuckets = rawBuckets.map(b => ({
+        ...b,
+        // If parent reference is broken (model drift), treat as top-level.
+        parent_bucket: b.parent_bucket && bucketNames.has(b.parent_bucket) ? b.parent_bucket : ''
+    }));
 
     // 3) Persist proposal
     await supabase.from('bucketing_runs').update({
@@ -162,13 +199,16 @@ export async function runTaxonomyProposal(
 }
 
 async function callTaxonomyLLM(vocabRows: VocabRow[]): Promise<{ proposal: TaxonomyResponse; costUsd: number }> {
-    // Top 800 covers >99% of contact mass for a typical 100k-contact list.
-    // Tail summary keeps the rest visible without blowing the prompt out.
-    const HEAD_LIMIT = 800;
+    // Classifier tends to produce hyper-specific labels, so lists can have a
+    // very long tail. Send a larger head to the model (~2500 rows ≈ 50k input
+    // tokens, well within gpt-4.1) so the proposed taxonomy reflects the
+    // actual distribution, not just the 800 most-common labels.
+    const HEAD_LIMIT = 2500;
     const head = vocabRows.slice(0, HEAD_LIMIT);
     const tail = vocabRows.slice(HEAD_LIMIT);
     const tailContacts = tail.reduce((s, r) => s + Number(r.n || 0), 0);
-    const tailExamples = tail.slice(0, 20).map(r => r.industry);
+    const headContacts = head.reduce((s, r) => s + Number(r.n || 0), 0);
+    const tailExamples = tail.slice(0, 40).map(r => r.industry);
 
     const vocabularyTable = head.map(r => {
         const samples = (r.sample_companies || []).slice(0, 3).filter(Boolean).join(' | ');
@@ -196,8 +236,13 @@ async function callTaxonomyLLM(vocabRows: VocabRow[]): Promise<{ proposal: Taxon
 
     const systemPrompt = `You are designing outreach segments for cold email campaigns.
 
-Your job: given a vocabulary of narrow industry labels (each label was assigned to companies by a prior classifier), propose 6–15 wider-but-still-specific BUCKETS. Each bucket must:
-- Be specific enough that a single personalized opener works for every company in it.
+Your job: given a vocabulary of narrow industry labels (assigned by a prior classifier), propose a TWO-LEVEL bucket taxonomy:
+
+- 3–6 PARENT buckets: broader categories (e.g. "IT & Cybersecurity Services", "Financial Services", "Legal Services"). These catch children that fall below the user's minimum volume threshold.
+- 8–20 CHILD buckets: more specific segments inside a parent (e.g. under "IT & Cybersecurity Services" → "Managed IT Services for SMBs", "Cybersecurity Consulting & PenTesting", "IT Consulting for Regulated Industries"). A child always references its parent by name.
+
+Every bucket (parent or child) must:
+- Be specific enough that a personalized opener works for every company in it.
 - Avoid generic names ("Professional Services", "Technology", "Software"). Use specific-plus-modifier ("IT Consulting & Managed Services", not "Consulting").
 - Map cleanly to a clear set of the input industry labels.
 - NEVER use the name "Other" — that name is reserved for the catch-all bucket.
@@ -206,16 +251,21 @@ Each bucket needs:
 - name: short, usable as a UI chip, in the same style as these examples: ${exampleBucketStyle.join(', ')}
 - definition: 1–2 sentences describing what kind of company belongs there.
 - personalization_angle: one sentence explaining why grouping these together = same outreach hook.
-- example_industries: an array of 5–20 EXACT strings copied verbatim from the vocabulary you were given. These are what the assignment engine will use as the deterministic mapping.
-- estimated_count: rough total contacts based on the counts in the vocabulary table.
+- example_industries: an array of 5–25 EXACT strings copied verbatim from the vocabulary you were given. These are what the assignment engine will use as the deterministic mapping. Parent buckets may have few or zero example_industries if they're purely a rollup category — their children carry the examples.
+- estimated_count: rough total contacts based on the counts in the vocabulary table (for a parent, sum of its children).
+- parent_bucket: the name of this bucket's PARENT bucket, copied verbatim from another bucket's \`name\` field. Use empty string "" if this bucket IS a parent (top-level).
+
+IMPORTANT: children stay narrow so a tight opener works; parents are the fallback target when a child is too small to survive the user's volume threshold. So children should together cover most of the vocabulary, and each child MUST name a parent that also appears in your \`buckets\` array.
 
 Output strict JSON matching the schema. No prose, no markdown.`;
 
-    const userPrompt = `Vocabulary table (industry | n=count | companies | reasoning), sorted by count descending:
+    const userPrompt = `Vocabulary table (industry | n=count | companies | reasoning), sorted by count descending. The head below covers ${headContacts} contacts across ${head.length} distinct labels:
 
 ${vocabularyTable}${tailSection}
 
-Propose buckets now. Remember: the example_industries array MUST contain only strings that appear in the vocabulary table above, copied verbatim.`;
+Total contacts across all labels: ${headContacts + tailContacts}.
+
+Propose the two-level taxonomy now. Remember: example_industries must be strings copied verbatim from the vocabulary table. Every child's parent_bucket must match another bucket's name in your output.`;
 
     // OpenAI strict JSON schema requires every property in `properties` to
     // appear in `required` — there is no "optional" field when strict=true.
@@ -231,13 +281,14 @@ Propose buckets now. Remember: the example_industries array MUST contain only st
                 items: {
                     type: 'object',
                     additionalProperties: false,
-                    required: ['name', 'definition', 'personalization_angle', 'example_industries', 'estimated_count'],
+                    required: ['name', 'definition', 'personalization_angle', 'example_industries', 'estimated_count', 'parent_bucket'],
                     properties: {
                         name: { type: 'string' },
                         definition: { type: 'string' },
                         personalization_angle: { type: 'string' },
                         example_industries: { type: 'array', items: { type: 'string' } },
-                        estimated_count: { type: 'integer' }
+                        estimated_count: { type: 'integer' },
+                        parent_bucket: { type: 'string' }
                     }
                 }
             },
@@ -310,12 +361,15 @@ export async function applyTaxonomyEdits(
 
     let buckets = [...proposal.buckets];
 
-    // 1) Apply renames
+    // 1) Apply renames — also retarget any child whose parent was renamed.
     if (edits.rename) {
         for (const [oldName, newName] of Object.entries(edits.rename)) {
             const target = newName.trim();
             if (!target || target.toLowerCase() === RESERVED_OTHER.toLowerCase()) continue;
-            buckets = buckets.map(b => b.name === oldName ? { ...b, name: target } : b);
+            buckets = buckets.map(b => {
+                const renamed = b.name === oldName ? { ...b, name: target } : b;
+                return renamed.parent_bucket === oldName ? { ...renamed, parent_bucket: target } : renamed;
+            });
             const { error: upErr } = await supabase.from('bucket_industry_map')
                 .update({ bucket_name: target })
                 .eq('bucketing_run_id', runId)
@@ -324,11 +378,15 @@ export async function applyTaxonomyEdits(
         }
     }
 
-    // 2) Drop unkept buckets
+    // 2) Drop unkept buckets. Children whose parent is dropped become
+    //    top-level (parent_bucket="") so they still survive on their own.
     if (edits.keep) {
         const keepSet = new Set(edits.keep.map(s => s.trim()));
         const dropped = buckets.filter(b => !keepSet.has(b.name)).map(b => b.name);
-        buckets = buckets.filter(b => keepSet.has(b.name));
+        const droppedSet = new Set(dropped);
+        buckets = buckets
+            .filter(b => keepSet.has(b.name))
+            .map(b => droppedSet.has(b.parent_bucket || '') ? { ...b, parent_bucket: '' } : b);
         if (dropped.length > 0) {
             const { error: delErr } = await supabase.from('bucket_industry_map')
                 .delete()
@@ -382,19 +440,71 @@ export async function runAssignment(
 
     await supabase.from('bucketing_runs').update({ status: 'assigning' }).eq('id', runId);
 
-    // Apply min-volume threshold against the deterministic map. This drops
-    // map rows whose bucket would fall under the user's threshold; the
-    // affected contacts then funnel into "Other" via the catch-all sweep.
+    // Apply min-volume threshold with parent rollup. A child below threshold
+    // is rewritten to its parent (keeping its contacts together at a coarser
+    // segment) instead of dumped to Other. Only buckets that are still below
+    // threshold after rollup — or have no surviving parent — are deleted;
+    // those contacts then funnel into "Other" via the catch-all sweep.
     if (run.min_volume && run.min_volume > 0) {
+        const parentOf = new Map<string, string>();
+        for (const b of buckets) {
+            if (b.parent_bucket && allowedNames.has(b.parent_bucket)) {
+                parentOf.set(b.name, b.parent_bucket);
+            }
+        }
+
         const { data: counts } = await supabase
             .rpc('get_bucket_map_counts', { p_run_id: runId });
-        const undersized = (counts || [])
+        const countMap = new Map<string, number>(
+            (counts || []).map((c: any) => [c.bucket_name as string, Number(c.contact_count) || 0])
+        );
+
+        // Rollup order: process by current count ascending so the smallest
+        // children roll up first, giving their parents a chance to cross the
+        // threshold. Walk parent chains up to 4 levels (far more than the
+        // model is asked to produce) to cover nested rollups without looping.
+        const rollupPlan: Array<{ from: string; to: string }> = [];
+        const sortedNames = [...countMap.entries()]
+            .sort((a, b) => a[1] - b[1])
+            .map(([name]) => name);
+
+        for (const name of sortedNames) {
+            if ((countMap.get(name) || 0) >= run.min_volume) continue;
+            let current = name;
+            let target = parentOf.get(current);
+            let hops = 0;
+            while (target && hops < 4 && (countMap.get(target) || 0) < run.min_volume) {
+                current = target;
+                target = parentOf.get(current);
+                hops++;
+            }
+            if (target) {
+                rollupPlan.push({ from: name, to: target });
+                countMap.set(target, (countMap.get(target) || 0) + (countMap.get(name) || 0));
+                countMap.set(name, 0);
+            }
+        }
+
+        for (const r of rollupPlan) {
+            const { error: upErr } = await supabase.from('bucket_industry_map')
+                .update({ bucket_name: r.to })
+                .eq('bucketing_run_id', runId).eq('bucket_name', r.from);
+            if (upErr) throw new Error(`rollup failed: ${upErr.message}`);
+        }
+        if (rollupPlan.length > 0) {
+            log(`[Bucketing ${runId}] rolled up ${rollupPlan.length} sub-bucket(s) into parents below min_volume=${run.min_volume}`);
+        }
+
+        // Anything still below threshold (no parent or parent also undersized) → delete, lands in Other.
+        const { data: freshCounts } = await supabase
+            .rpc('get_bucket_map_counts', { p_run_id: runId });
+        const undersized = (freshCounts || [])
             .filter((c: any) => Number(c.contact_count) < run.min_volume)
             .map((c: any) => c.bucket_name);
         if (undersized.length > 0) {
             await supabase.from('bucket_industry_map').delete()
                 .eq('bucketing_run_id', runId).in('bucket_name', undersized);
-            log(`[Bucketing ${runId}] dropped ${undersized.length} buckets below min_volume=${run.min_volume}`);
+            log(`[Bucketing ${runId}] dropped ${undersized.length} buckets below min_volume=${run.min_volume} (→ Other)`);
         }
     }
 
@@ -820,11 +930,10 @@ async function getResidualIndustries(
 ): Promise<string[]> {
     // Distinct industries in the selected lists that don't yet have a map row.
     // We can't express NOT EXISTS in PostgREST cleanly, so we fetch both sets
-    // and diff client-side. The vocabulary RPC already gives us the distinct
-    // industries — we filter against the existing map.
-    const { data: vocab, error: vErr } = await supabase
-        .rpc('get_industry_vocabulary', { p_list_names: listNames });
-    if (vErr) throw new Error(`vocab fetch failed: ${vErr.message}`);
+    // and diff client-side. Use the paginated vocabulary fetcher so we don't
+    // silently cap at 1000 residuals — on long-tail lists that truncation
+    // would leave tens of thousands of contacts stranded at Phase 2.
+    const vocab = await fetchFullVocabulary(supabase, listNames);
 
     const { data: mapRows, error: mErr } = await supabase
         .from('bucket_industry_map').select('industry_string')
@@ -832,9 +941,7 @@ async function getResidualIndustries(
     if (mErr) throw new Error(`map read failed: ${mErr.message}`);
 
     const mapped = new Set((mapRows || []).map((r: any) => r.industry_string));
-    return ((vocab || []) as VocabRow[])
-        .map(r => r.industry)
-        .filter(ind => !mapped.has(ind));
+    return vocab.map(r => r.industry).filter(ind => !mapped.has(ind));
 }
 
 async function getSamplesForIndustries(
@@ -842,11 +949,10 @@ async function getSamplesForIndustries(
     industries: string[],
     listNames: string[]
 ): Promise<Map<string, VocabRow>> {
-    const { data: vocab } = await supabase
-        .rpc('get_industry_vocabulary', { p_list_names: listNames });
+    const vocab = await fetchFullVocabulary(supabase, listNames);
     const map = new Map<string, VocabRow>();
     const wanted = new Set(industries);
-    for (const r of (vocab || []) as VocabRow[]) {
+    for (const r of vocab) {
         if (wanted.has(r.industry)) map.set(r.industry, r);
     }
     return map;
