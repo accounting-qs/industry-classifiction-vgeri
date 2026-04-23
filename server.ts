@@ -12,6 +12,7 @@ import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { db } from './services/supabaseClient';
 import { JobProcessor } from './services/jobProcessor';
+import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment } from './services/bucketingService';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1221,6 +1222,172 @@ app.delete('/api/export-jobs/:id', async (req, res) => {
     await fsp.unlink(path.join(EXPORTS_DIR, `${id}.csv`)).catch(() => {});
     schedulePersist();
     res.json({ ok: true });
+});
+
+// ============================================
+// BUCKETING — wider campaign-segment assignment
+//
+// Phase 1: review industry classifications across selected lists, propose
+// 6–15 outreach buckets via one LLM call (gpt-4.1).
+// Phase 2: assign exactly one bucket per contact via deterministic SQL JOIN
+// + embedding fallback + residual LLM batch + catch-all "Other" sweep.
+// Each run is its own campaign — same contact can land in different buckets
+// across runs, history is preserved.
+// ============================================
+
+const bucketingLog = (msg: string, level: 'info' | 'warn' | 'error' = 'info') => {
+    addServerLog(msg, 'Bucketing', level === 'info' ? 'info' : level);
+};
+
+// Create a new run + fire taxonomy proposal in the background.
+app.post('/api/bucketing/determine', async (req, res) => {
+    const { name, list_names, min_volume } = req.body || {};
+    if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name is required' });
+    if (!Array.isArray(list_names) || list_names.length === 0) {
+        return res.status(400).json({ error: 'list_names must be a non-empty array' });
+    }
+
+    try {
+        const { data, error } = await supabase.from('bucketing_runs').insert({
+            name: name.trim(),
+            list_names,
+            min_volume: typeof min_volume === 'number' && min_volume >= 0 ? Math.floor(min_volume) : 50,
+            status: 'taxonomy_pending'
+        }).select().single();
+        if (error) return res.status(500).json({ error: error.message });
+
+        // Fire-and-forget taxonomy build. Errors land on the run row, not the
+        // response — the client already has the run id from this 202.
+        runTaxonomyProposal(supabase, data.id, bucketingLog).catch(async (err: any) => {
+            console.error(`[Bucketing] Taxonomy failed for ${data.id}:`, err);
+            await supabase.from('bucketing_runs').update({
+                status: 'failed',
+                error_message: err.message?.slice(0, 1000) || String(err)
+            }).eq('id', data.id);
+        });
+
+        res.status(202).json(data);
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/bucketing/runs', async (_req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('bucketing_runs')
+            .select('id,name,list_names,min_volume,status,total_contacts,assigned_contacts,cost_usd,created_at,taxonomy_completed_at,assignment_completed_at,error_message')
+            .order('created_at', { ascending: false });
+        if (error) return res.status(500).json({ error: error.message });
+        res.json({ runs: data || [] });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/bucketing/runs/:id', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const { data: run, error } = await supabase
+            .from('bucketing_runs').select('*').eq('id', id).single();
+        if (error) return res.status(404).json({ error: error.message });
+
+        // Per-bucket contact counts. For taxonomy_ready: counts come from the
+        // map (predicted size). For completed: counts come from actual
+        // assignments table. Both via RPC for one query each.
+        let bucketCounts: any[] = [];
+        if (run.status === 'completed' || run.status === 'assigning') {
+            const { data: counts } = await supabase
+                .rpc('get_bucket_assignment_counts', { p_run_id: id });
+            bucketCounts = counts || [];
+        } else if (run.status === 'taxonomy_ready') {
+            const { data: counts } = await supabase
+                .rpc('get_bucket_map_counts', { p_run_id: id });
+            bucketCounts = counts || [];
+        }
+
+        res.json({ run, bucket_counts: bucketCounts });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Apply user edits (rename / drop / add / threshold) to the proposed taxonomy.
+app.patch('/api/bucketing/runs/:id/taxonomy', async (req, res) => {
+    const id = req.params.id;
+    const { keep, rename, add, min_volume } = req.body || {};
+    try {
+        await applyTaxonomyEdits(supabase, id, { keep, rename, add, min_volume }, bucketingLog);
+        const { data: run } = await supabase
+            .from('bucketing_runs').select('*').eq('id', id).single();
+        const { data: counts } = await supabase
+            .rpc('get_bucket_map_counts', { p_run_id: id });
+        res.json({ run, bucket_counts: counts || [] });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Kick off Phase 2 in the background.
+app.post('/api/bucketing/runs/:id/assign', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const { data: run, error } = await supabase
+            .from('bucketing_runs').select('*').eq('id', id).single();
+        if (error || !run) return res.status(404).json({ error: error?.message || 'Run not found' });
+        if (run.status === 'assigning') {
+            return res.status(409).json({ error: 'Assignment already in progress' });
+        }
+        if (run.status !== 'taxonomy_ready' && run.status !== 'completed') {
+            return res.status(400).json({ error: `Cannot assign from status: ${run.status}` });
+        }
+
+        runAssignment(supabase, id, bucketingLog).catch(async (err: any) => {
+            console.error(`[Bucketing] Assignment failed for ${id}:`, err);
+            await supabase.from('bucketing_runs').update({
+                status: 'failed',
+                error_message: err.message?.slice(0, 1000) || String(err)
+            }).eq('id', id);
+        });
+
+        res.status(202).json({ ok: true, id });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Paginated assignments for a run, optionally filtered by bucket.
+app.get('/api/bucketing/runs/:id/contacts', async (req, res) => {
+    const id = req.params.id;
+    const bucket = req.query.bucket ? String(req.query.bucket) : null;
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10));
+    const pageSize = Math.min(500, Math.max(10, parseInt(String(req.query.pageSize || '100'), 10)));
+
+    try {
+        let q: any = supabase.from('bucket_assignments')
+            .select('contact_id,bucket_name,source,confidence,assigned_at,contacts!inner(email,first_name,last_name,company_name,company_website,industry,lead_list_name)', { count: 'estimated' })
+            .eq('bucketing_run_id', id);
+        if (bucket) q = q.eq('bucket_name', bucket);
+        q = q.order('assigned_at', { ascending: true })
+            .range((page - 1) * pageSize, page * pageSize - 1);
+        const { data, count, error } = await q;
+        if (error) return res.status(500).json({ error: error.message });
+        res.json({ data: data || [], count: count || 0, page, pageSize });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete a bucketing run (cascades to map + assignments).
+app.delete('/api/bucketing/runs/:id', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const { error } = await supabase.from('bucketing_runs').delete().eq('id', id);
+        if (error) return res.status(500).json({ error: error.message });
+        res.json({ ok: true });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // All other GET requests serve React App

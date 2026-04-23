@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { AppTab, Contact, Enrichment, BatchStats, MergedContact, FilterCondition, FilterOperator } from './types';
+import { AppTab, Contact, Enrichment, BatchStats, MergedContact, FilterCondition, FilterOperator, BucketingRun, BucketProposal, BucketCount, BucketAssignmentCount } from './types';
 import { db } from './services/supabaseClient';
 import { enrichBatch } from './services/enrichmentService';
 import Papa from 'papaparse';
@@ -41,7 +41,8 @@ import {
   AlertCircle,
   FileUp,
   Columns3,
-  Import
+  Import,
+  Layers
 } from 'lucide-react';
 
 /**
@@ -519,6 +520,7 @@ export default function App() {
           <SidebarIconButton active={activeTab === AppTab.MANAGER} onClick={() => setActiveTab(AppTab.MANAGER)} icon={<Users className="w-5 h-5" />} label="Contacts" />
           <SidebarIconButton active={activeTab === AppTab.ENRICHMENT} onClick={() => setActiveTab(AppTab.ENRICHMENT)} icon={<Zap className={`w-5 h-5 ${stats.isProcessing ? 'text-[#3ecf8e] animate-pulse' : ''}`} />} label="Pipeline Monitor" />
           <SidebarIconButton active={activeTab === AppTab.IMPORT} onClick={() => setActiveTab(AppTab.IMPORT)} icon={<Upload className="w-5 h-5" />} label="Import CSV" />
+          <SidebarIconButton active={activeTab === AppTab.BUCKETING} onClick={() => setActiveTab(AppTab.BUCKETING)} icon={<Layers className="w-5 h-5" />} label="Bucketing" />
         </nav>
         <div className="p-2 border-t border-[#2e2e2e]">
           <SidebarIconButton active={activeTab === AppTab.PROXIES} onClick={() => setActiveTab(AppTab.PROXIES)} icon={<BarChart2 className={`w-5 h-5 ${activeTab === AppTab.PROXIES ? 'text-[#3ecf8e]' : ''}`} />} label="Proxy Performance" />
@@ -539,6 +541,8 @@ export default function App() {
         <div className="flex-1 overflow-hidden flex flex-col">
           {activeTab === AppTab.PROXIES ? (
             <ProxyStatsDashboard />
+          ) : activeTab === AppTab.BUCKETING ? (
+            <BucketingTab importLists={importLists} />
           ) : activeTab === AppTab.IMPORT ? (
             <CSVImportWizard onComplete={() => { setActiveTab(AppTab.MANAGER); loadData(); refreshLists(); }} />
           ) : activeTab === AppTab.ENRICHMENT ? (
@@ -1023,6 +1027,732 @@ function SidebarIconButton({ active, onClick, icon, label }: any) {
       <div className="min-w-[20px]">{icon}</div>
       <span className="text-[13px] font-semibold capitalize">{label}</span>
     </button>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// BUCKETING TAB
+//
+// Two phases, four UI views:
+//   1. Index — list of past + current runs (default landing).
+//   2. Setup — pick lists + name + min_volume → POST /api/bucketing/determine.
+//   3. Review — proposed buckets after Phase 1; user keeps / drops / renames /
+//      adds, then triggers Phase 2.
+//   4. Results — actual per-bucket assignment counts after Phase 2.
+// View is driven by `view` state and the active run's `status`.
+// ────────────────────────────────────────────────────────────────────────
+
+type BucketingView = 'index' | 'setup' | 'detail';
+
+function BucketingTab({ importLists }: {
+  importLists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number }[]
+}) {
+  const [view, setView] = useState<BucketingView>('index');
+  const [runs, setRuns] = useState<BucketingRun[]>([]);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [activeRun, setActiveRun] = useState<BucketingRun | null>(null);
+  const [bucketCounts, setBucketCounts] = useState<BucketAssignmentCount[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refreshRuns = useCallback(async () => {
+    try {
+      const res = await fetch('/api/bucketing/runs');
+      const data = await res.json();
+      if (Array.isArray(data.runs)) setRuns(data.runs);
+    } catch (e: any) {
+      setError(e.message);
+    }
+  }, []);
+
+  const fetchActive = useCallback(async () => {
+    if (!activeRunId) return;
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(activeRunId)}`);
+      const data = await res.json();
+      if (data.run) {
+        setActiveRun(data.run);
+        setBucketCounts(Array.isArray(data.bucket_counts) ? data.bucket_counts : []);
+      }
+    } catch (e: any) {
+      setError(e.message);
+    }
+  }, [activeRunId]);
+
+  useEffect(() => { refreshRuns(); }, [refreshRuns]);
+
+  // Poll the active run while it's mid-pipeline.
+  useEffect(() => {
+    if (!activeRunId) return;
+    fetchActive();
+    if (!activeRun || activeRun.status === 'completed' || activeRun.status === 'failed' || activeRun.status === 'taxonomy_ready') {
+      // taxonomy_ready is terminal-for-Phase-1 — no polling needed until user triggers assign.
+      // we still poll once on mount above to pick up status transitions.
+      return;
+    }
+    const t = setInterval(fetchActive, 2500);
+    return () => clearInterval(t);
+  }, [activeRunId, activeRun?.status, fetchActive]);
+
+  // Auto-refresh the runs index occasionally so progress shows on the list.
+  useEffect(() => {
+    if (view !== 'index') return;
+    const hasInflight = runs.some(r => r.status === 'taxonomy_pending' || r.status === 'assigning');
+    if (!hasInflight) return;
+    const t = setInterval(refreshRuns, 4000);
+    return () => clearInterval(t);
+  }, [view, runs, refreshRuns]);
+
+  const openRun = (id: string) => {
+    setActiveRunId(id);
+    setView('detail');
+  };
+
+  const startNew = async (payload: { name: string; list_names: string[]; min_volume: number }) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/bucketing/determine', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+      await refreshRuns();
+      openRun(data.id);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteRun = async (id: string) => {
+    if (!confirm('Delete this bucketing run? Assignments will be removed.')) return;
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Failed (${res.status})`);
+      }
+      if (activeRunId === id) {
+        setActiveRunId(null);
+        setActiveRun(null);
+        setView('index');
+      }
+      await refreshRuns();
+    } catch (e: any) {
+      setError(e.message);
+    }
+  };
+
+  return (
+    <div className="flex-1 overflow-y-auto custom-scrollbar p-6 bg-[#1c1c1c] text-[#ededed]">
+      <div className="max-w-6xl mx-auto">
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h2 className="text-lg font-bold text-white flex items-center gap-2">
+              <Layers className="w-5 h-5 text-[#3ecf8e]" /> Bucketing
+            </h2>
+            <p className="text-xs text-gray-500 mt-1">
+              Group enriched contacts into wider outreach buckets. Phase 1 proposes buckets, Phase 2 assigns one to each contact.
+            </p>
+          </div>
+          <div className="flex gap-2">
+            {view !== 'index' && (
+              <button
+                onClick={() => { setView('index'); setActiveRunId(null); setActiveRun(null); refreshRuns(); }}
+                className="px-3 py-1.5 rounded-md text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e]"
+              >
+                <ArrowLeft className="w-3 h-3 inline mr-1" /> All runs
+              </button>
+            )}
+            {view === 'index' && (
+              <button
+                onClick={() => { setView('setup'); setError(null); }}
+                className="px-3 py-1.5 rounded-md text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] flex items-center gap-1"
+              >
+                <Plus className="w-3 h-3" /> New Bucketing Run
+              </button>
+            )}
+          </div>
+        </div>
+
+        {error && (
+          <div className="mb-4 px-4 py-2.5 bg-red-500/10 border border-red-500/30 rounded text-red-400 text-xs flex items-start gap-2">
+            <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+            <span className="flex-1">{error}</span>
+            <button onClick={() => setError(null)} className="text-red-400 hover:text-white"><X className="w-3 h-3" /></button>
+          </div>
+        )}
+
+        {view === 'index' && (
+          <BucketingIndex runs={runs} onOpen={openRun} onDelete={deleteRun} />
+        )}
+
+        {view === 'setup' && (
+          <BucketingSetup
+            importLists={importLists}
+            onCancel={() => setView('index')}
+            onStart={startNew}
+            loading={loading}
+          />
+        )}
+
+        {view === 'detail' && activeRun && (
+          <BucketingDetail
+            run={activeRun}
+            bucketCounts={bucketCounts}
+            onRefresh={fetchActive}
+            onError={setError}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function BucketingIndex({ runs, onOpen, onDelete }: {
+  runs: BucketingRun[];
+  onOpen: (id: string) => void;
+  onDelete: (id: string) => void;
+}) {
+  if (runs.length === 0) {
+    return (
+      <div className="border border-[#2e2e2e] rounded-xl p-12 text-center bg-[#0e0e0e]">
+        <Layers className="w-10 h-10 text-gray-700 mx-auto mb-3" />
+        <p className="text-sm font-bold text-gray-400">No bucketing runs yet</p>
+        <p className="text-[11px] text-gray-600 mt-1">Click "New Bucketing Run" to create one.</p>
+      </div>
+    );
+  }
+  return (
+    <div className="border border-[#2e2e2e] rounded-xl overflow-hidden bg-[#0e0e0e]">
+      <table className="w-full text-[11px]">
+        <thead className="bg-[#0e0e0e]">
+          <tr className="border-b border-[#2e2e2e] text-[9px] font-bold text-gray-500 uppercase tracking-wider">
+            <th className="px-5 py-3 text-left">Name</th>
+            <th className="px-5 py-3 text-left">Lists</th>
+            <th className="px-5 py-3 text-left">Status</th>
+            <th className="px-5 py-3 text-right">Contacts</th>
+            <th className="px-5 py-3 text-right">Cost</th>
+            <th className="px-5 py-3 text-right">Created</th>
+            <th className="px-5 py-3 text-right"></th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-[#2e2e2e]">
+          {runs.map(r => (
+            <tr key={r.id} className="hover:bg-white/[0.02] cursor-pointer" onClick={() => onOpen(r.id)}>
+              <td className="px-5 py-3 font-medium text-white">{r.name}</td>
+              <td className="px-5 py-3 text-gray-400">{r.list_names.slice(0, 2).join(', ')}{r.list_names.length > 2 ? ` +${r.list_names.length - 2}` : ''}</td>
+              <td className="px-5 py-3"><BucketingStatusBadge status={r.status} /></td>
+              <td className="px-5 py-3 text-right text-gray-300 font-mono">
+                {r.assigned_contacts ? r.assigned_contacts.toLocaleString() : (r.total_contacts?.toLocaleString() || '—')}
+              </td>
+              <td className="px-5 py-3 text-right text-gray-400 font-mono">${(Number(r.cost_usd) || 0).toFixed(3)}</td>
+              <td className="px-5 py-3 text-right text-gray-500">{new Date(r.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</td>
+              <td className="px-5 py-3 text-right">
+                <button
+                  onClick={e => { e.stopPropagation(); onDelete(r.id); }}
+                  className="p-1.5 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-red-400 hover:border-red-500/40"
+                  title="Delete run"
+                >
+                  <Trash2 className="w-3 h-3" />
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function BucketingStatusBadge({ status }: { status: string }) {
+  const styles: Record<string, string> = {
+    'taxonomy_pending': 'bg-blue-500/15 text-blue-400 border-blue-500/30',
+    'taxonomy_ready':   'bg-amber-500/15 text-amber-400 border-amber-500/30',
+    'assigning':        'bg-blue-500/15 text-blue-400 border-blue-500/30 animate-pulse',
+    'completed':        'bg-[#3ecf8e]/15 text-[#3ecf8e] border-[#3ecf8e]/40',
+    'failed':           'bg-red-500/15 text-red-400 border-red-500/30',
+  };
+  const labels: Record<string, string> = {
+    'taxonomy_pending': 'Determining buckets…',
+    'taxonomy_ready':   'Awaiting review',
+    'assigning':        'Assigning…',
+    'completed':        'Completed',
+    'failed':           'Failed',
+  };
+  return (
+    <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${styles[status] || 'bg-gray-500/15 text-gray-400 border-gray-500/30'}`}>
+      {labels[status] || status}
+    </span>
+  );
+}
+
+function BucketingSetup({ importLists, onCancel, onStart, loading }: {
+  importLists: { name: string; contact_count: number; enriched_count?: number }[];
+  onCancel: () => void;
+  onStart: (p: { name: string; list_names: string[]; min_volume: number }) => void;
+  loading: boolean;
+}) {
+  const [name, setName] = useState('');
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [minVolume, setMinVolume] = useState(50);
+
+  const toggle = (n: string) => {
+    const s = new Set(selected);
+    s.has(n) ? s.delete(n) : s.add(n);
+    setSelected(s);
+  };
+
+  const totalSelected = importLists
+    .filter(l => selected.has(l.name))
+    .reduce((s, l) => s + (l.enriched_count || 0), 0);
+  const totalRaw = importLists
+    .filter(l => selected.has(l.name))
+    .reduce((s, l) => s + (l.contact_count || 0), 0);
+
+  const canStart = !!name.trim() && selected.size > 0 && !loading;
+
+  return (
+    <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-6 space-y-5">
+      <div>
+        <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Run Name</label>
+        <input
+          value={name}
+          onChange={e => setName(e.target.value)}
+          placeholder="e.g. Q2 outreach segmentation"
+          className="w-full px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-sm text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e]"
+        />
+      </div>
+
+      <div>
+        <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">
+          Select lists ({selected.size} selected · {totalSelected.toLocaleString()} enriched / {totalRaw.toLocaleString()} total)
+        </label>
+        {importLists.length === 0 ? (
+          <div className="text-xs text-gray-500 italic px-3 py-2 border border-[#2e2e2e] rounded">No lists available — import a CSV first.</div>
+        ) : (
+          <div className="border border-[#2e2e2e] rounded max-h-64 overflow-y-auto custom-scrollbar">
+            {importLists.map(l => {
+              const isSel = selected.has(l.name);
+              return (
+                <button
+                  key={l.name}
+                  onClick={() => toggle(l.name)}
+                  className={`w-full flex items-center justify-between px-3 py-2 text-left text-xs border-b border-[#2e2e2e] last:border-b-0 transition-colors ${isSel ? 'bg-[#3ecf8e]/10 text-[#3ecf8e]' : 'text-gray-300 hover:bg-white/[0.02]'}`}
+                >
+                  <span className="flex items-center gap-2">
+                    <input type="checkbox" checked={isSel} onChange={() => {}} className="w-3 h-3" />
+                    <span className="font-medium">{l.name}</span>
+                  </span>
+                  <span className="font-mono text-[10px] text-gray-500">
+                    {(l.enriched_count || 0).toLocaleString()} enriched / {l.contact_count.toLocaleString()}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div>
+        <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">
+          Minimum bucket volume — buckets below this drop to "Other"
+        </label>
+        <input
+          type="number"
+          min={0}
+          value={minVolume}
+          onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
+          className="w-32 px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-sm text-white focus:outline-none focus:border-[#3ecf8e]"
+        />
+      </div>
+
+      <div className="flex justify-end gap-2 pt-3 border-t border-[#2e2e2e]">
+        <button
+          onClick={onCancel}
+          className="px-4 py-2 rounded text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e]"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={() => onStart({ name: name.trim(), list_names: Array.from(selected), min_volume: minVolume })}
+          disabled={!canStart}
+          className={`px-4 py-2 rounded text-xs font-bold flex items-center gap-1 ${canStart ? 'bg-[#3ecf8e] text-black hover:bg-[#2fb37a]' : 'bg-[#2e2e2e] text-gray-500 cursor-not-allowed'}`}
+        >
+          {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+          Start Bucket Determination
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function BucketingDetail({ run, bucketCounts, onRefresh, onError }: {
+  run: BucketingRun;
+  bucketCounts: BucketAssignmentCount[];
+  onRefresh: () => void;
+  onError: (msg: string | null) => void;
+}) {
+  if (run.status === 'taxonomy_pending') {
+    return (
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-12 text-center">
+        <Loader2 className="w-8 h-8 text-[#3ecf8e] animate-spin mx-auto mb-3" />
+        <p className="text-sm font-bold text-gray-300">Reviewing industry classifications…</p>
+        <p className="text-[11px] text-gray-500 mt-1">One LLM call across the full vocabulary. Usually 20–60s.</p>
+      </div>
+    );
+  }
+
+  if (run.status === 'failed') {
+    return (
+      <div className="border border-red-500/30 rounded-xl bg-red-500/5 p-6">
+        <p className="text-sm font-bold text-red-400 flex items-center gap-2">
+          <AlertCircle className="w-4 h-4" /> Run failed
+        </p>
+        <p className="text-xs text-gray-400 mt-2">{run.error_message || 'Unknown error.'}</p>
+      </div>
+    );
+  }
+
+  if (run.status === 'assigning') {
+    return (
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-12 text-center">
+        <Loader2 className="w-8 h-8 text-[#3ecf8e] animate-spin mx-auto mb-3" />
+        <p className="text-sm font-bold text-gray-300">Assigning contacts to buckets…</p>
+        <p className="text-[11px] text-gray-500 mt-1">SQL fan-out + embedding fallback + residual LLM. Usually under 90s for 100k contacts.</p>
+      </div>
+    );
+  }
+
+  if (run.status === 'taxonomy_ready') {
+    return <BucketingReview run={run} bucketCounts={bucketCounts} onRefresh={onRefresh} onError={onError} />;
+  }
+
+  return <BucketingResults run={run} bucketCounts={bucketCounts} onError={onError} />;
+}
+
+function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
+  run: BucketingRun;
+  bucketCounts: BucketAssignmentCount[];
+  onRefresh: () => void;
+  onError: (msg: string | null) => void;
+}) {
+  // Initialize from taxonomy_final if present, otherwise the proposal.
+  const sourceBuckets = run.taxonomy_final?.buckets || run.taxonomy_proposal?.buckets || [];
+  const [kept, setKept] = useState<Set<string>>(new Set(sourceBuckets.map(b => b.name)));
+  const [renames, setRenames] = useState<Record<string, string>>({});
+  const [adds, setAdds] = useState<{ name: string; definition: string }[]>([]);
+  const [newBucketName, setNewBucketName] = useState('');
+  const [newBucketDef, setNewBucketDef] = useState('');
+  const [minVolume, setMinVolume] = useState<number>(run.min_volume);
+  const [busy, setBusy] = useState<'none' | 'saving' | 'assigning'>('none');
+
+  const countByBucket = new Map(bucketCounts.map(c => [c.bucket_name, Number(c.contact_count) || 0]));
+
+  const toggle = (name: string) => {
+    const s = new Set(kept);
+    s.has(name) ? s.delete(name) : s.add(name);
+    setKept(s);
+  };
+
+  const apply = async (alsoAssign: boolean) => {
+    setBusy(alsoAssign ? 'assigning' : 'saving');
+    onError(null);
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/taxonomy`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          keep: Array.from(kept),
+          rename: renames,
+          add: adds,
+          min_volume: minVolume
+        })
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Failed (${res.status})`);
+      }
+      if (alsoAssign) {
+        const ar = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/assign`, { method: 'POST' });
+        if (!ar.ok) {
+          const data = await ar.json().catch(() => ({}));
+          throw new Error(data.error || `Assign failed (${ar.status})`);
+        }
+      }
+      onRefresh();
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setBusy('none');
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
+        <div className="text-xs text-gray-300">
+          <span className="font-bold text-white">{sourceBuckets.length}</span> proposed buckets across <span className="font-bold text-white">{run.total_contacts?.toLocaleString() || '?'}</span> contacts
+          {run.taxonomy_proposal?.residual_note && (
+            <div className="mt-2 text-[11px] text-gray-500 italic">Note from model: {run.taxonomy_proposal.residual_note}</div>
+          )}
+        </div>
+      </div>
+
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
+        <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest">
+          Proposed buckets
+        </div>
+        <div className="divide-y divide-[#2e2e2e]">
+          {sourceBuckets.map(b => {
+            const isKept = kept.has(b.name);
+            const renamed = renames[b.name];
+            const realCount = countByBucket.get(renamed || b.name) ?? countByBucket.get(b.name) ?? 0;
+            const belowThreshold = realCount > 0 && realCount < minVolume;
+            return (
+              <div key={b.name} className={`p-4 ${isKept ? '' : 'opacity-50'}`}>
+                <div className="flex items-start gap-3">
+                  <input
+                    type="checkbox"
+                    checked={isKept}
+                    onChange={() => toggle(b.name)}
+                    className="mt-1 w-3.5 h-3.5"
+                  />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap">
+                      <input
+                        value={renamed ?? b.name}
+                        onChange={e => setRenames({ ...renames, [b.name]: e.target.value })}
+                        className="bg-[#1c1c1c] border border-[#2e2e2e] rounded px-2 py-1 text-xs font-bold text-white focus:outline-none focus:border-[#3ecf8e]"
+                      />
+                      <span className="text-[10px] font-mono text-gray-400">
+                        {realCount.toLocaleString()} contacts
+                      </span>
+                      {belowThreshold && (
+                        <span className="text-[10px] font-bold text-amber-500 bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded">
+                          Below threshold → Other
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-gray-400">{b.definition}</p>
+                    {b.personalization_angle && (
+                      <p className="text-[10px] text-gray-500 italic mt-1">
+                        Angle: {b.personalization_angle}
+                      </p>
+                    )}
+                    {b.example_industries && b.example_industries.length > 0 && (
+                      <div className="text-[10px] text-gray-600 mt-1.5 truncate">
+                        Industries: {b.example_industries.slice(0, 6).join(', ')}{b.example_industries.length > 6 ? `, +${b.example_industries.length - 6} more` : ''}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
+        <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-3">Add custom bucket</div>
+        <div className="flex flex-col sm:flex-row gap-2">
+          <input
+            value={newBucketName}
+            onChange={e => setNewBucketName(e.target.value)}
+            placeholder="Bucket name"
+            className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e] sm:w-48"
+          />
+          <input
+            value={newBucketDef}
+            onChange={e => setNewBucketDef(e.target.value)}
+            placeholder="Short definition"
+            className="flex-1 px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e]"
+          />
+          <button
+            onClick={() => {
+              if (!newBucketName.trim()) return;
+              setAdds([...adds, { name: newBucketName.trim(), definition: newBucketDef.trim() }]);
+              setNewBucketName('');
+              setNewBucketDef('');
+            }}
+            className="px-3 py-2 rounded text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e]"
+          >
+            <Plus className="w-3 h-3 inline" /> Add
+          </button>
+        </div>
+        {adds.length > 0 && (
+          <div className="mt-3 space-y-1">
+            {adds.map((a, i) => (
+              <div key={i} className="flex items-center justify-between px-3 py-1.5 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-gray-300">
+                <span><span className="font-bold text-white">{a.name}</span> — {a.definition}</span>
+                <button onClick={() => setAdds(adds.filter((_, j) => j !== i))} className="text-gray-500 hover:text-red-400">
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4 flex items-center gap-3">
+        <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Min volume</span>
+        <input
+          type="number"
+          min={0}
+          value={minVolume}
+          onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
+          className="w-24 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
+        />
+        <span className="text-[10px] text-gray-500 italic">Buckets with fewer contacts collapse into "Other".</span>
+      </div>
+
+      <div className="flex justify-end gap-2">
+        <button
+          onClick={() => apply(false)}
+          disabled={busy !== 'none'}
+          className="px-4 py-2 rounded text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e] disabled:opacity-50"
+        >
+          {busy === 'saving' ? <Loader2 className="w-3 h-3 inline animate-spin mr-1" /> : null}
+          Save changes
+        </button>
+        <button
+          onClick={() => apply(true)}
+          disabled={busy !== 'none' || kept.size === 0}
+          className="px-4 py-2 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1"
+        >
+          {busy === 'assigning' ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+          Apply &amp; Assign
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function BucketingResults({ run, bucketCounts, onError }: {
+  run: BucketingRun;
+  bucketCounts: BucketAssignmentCount[];
+  onError: (msg: string | null) => void;
+}) {
+  const [exportingBucket, setExportingBucket] = useState<string | null>(null);
+  const sorted = [...bucketCounts].sort((a, b) => Number(b.contact_count) - Number(a.contact_count));
+  const total = sorted.reduce((s, b) => s + Number(b.contact_count), 0);
+  const max = sorted.length > 0 ? Number(sorted[0].contact_count) : 1;
+  const otherRow = sorted.find(b => b.bucket_name === 'Other');
+
+  const downloadCsv = async (bucket: string) => {
+    setExportingBucket(bucket);
+    onError(null);
+    try {
+      const PAGE = 500;
+      const rows: any[] = [];
+      let page = 1;
+      while (true) {
+        const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/contacts?bucket=${encodeURIComponent(bucket)}&page=${page}&pageSize=${PAGE}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+        rows.push(...(data.data || []));
+        if (!data.data || data.data.length < PAGE) break;
+        page++;
+      }
+      // Flatten { contacts: {...} } from PostgREST join
+      const csvRows = rows.map(r => ({
+        contact_id: r.contact_id,
+        bucket: r.bucket_name,
+        source: r.source,
+        confidence: r.confidence,
+        email: r.contacts?.email,
+        first_name: r.contacts?.first_name,
+        last_name: r.contacts?.last_name,
+        company_name: r.contacts?.company_name,
+        company_website: r.contacts?.company_website,
+        industry: r.contacts?.industry,
+        lead_list_name: r.contacts?.lead_list_name,
+      }));
+      const csv = Papa.unparse(csvRows);
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const safe = bucket.replace(/[^a-z0-9-_]+/gi, '_');
+      a.href = url;
+      a.download = `${run.name.replace(/[^a-z0-9-_]+/gi, '_')}_${safe}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setExportingBucket(null);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <StatCard label="Buckets" value={sorted.length.toString()} color="text-white" />
+        <StatCard label="Contacts assigned" value={total.toLocaleString()} color="text-[#3ecf8e]" />
+        <StatCard label="Total cost" value={`$${(Number(run.cost_usd) || 0).toFixed(3)}`} color="text-white" />
+      </div>
+
+      {otherRow && otherRow.other_sources && (
+        <div className="border border-amber-500/30 bg-amber-500/5 rounded-xl p-4 text-xs text-amber-300">
+          <div className="font-bold mb-1">Other bucket breakdown ({Number(otherRow.contact_count).toLocaleString()} contacts)</div>
+          <div className="text-[11px] text-amber-300/70 font-mono">
+            {Object.entries(otherRow.other_sources).map(([source, count]) => (
+              <span key={source} className="mr-3">{source}: {Number(count).toLocaleString()}</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
+        <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest">
+          Final bucket assignments
+        </div>
+        <div className="divide-y divide-[#2e2e2e]">
+          {sorted.map(b => {
+            const count = Number(b.contact_count);
+            const pct = total > 0 ? (count / total) * 100 : 0;
+            const barWidth = max > 0 ? (count / max) * 100 : 0;
+            const isOther = b.bucket_name === 'Other';
+            return (
+              <div key={b.bucket_name} className="px-4 py-3 hover:bg-white/[0.02]">
+                <div className="flex items-center gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className={`text-xs font-bold ${isOther ? 'text-amber-400' : 'text-white'} truncate`}>
+                        {b.bucket_name}
+                      </span>
+                      <span className="text-[10px] font-mono text-gray-400 shrink-0 ml-2">
+                        {count.toLocaleString()} <span className="text-gray-600">({pct.toFixed(1)}%)</span>
+                      </span>
+                    </div>
+                    <div className="h-1.5 bg-[#1c1c1c] rounded-full overflow-hidden">
+                      <div
+                        className={`h-full transition-all ${isOther ? 'bg-amber-500/70' : 'bg-[#3ecf8e]'}`}
+                        style={{ width: `${barWidth}%` }}
+                      />
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => downloadCsv(b.bucket_name)}
+                    disabled={exportingBucket === b.bucket_name}
+                    className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white flex items-center gap-1 shrink-0"
+                  >
+                    {exportingBucket === b.bucket_name
+                      ? <Loader2 className="w-3 h-3 animate-spin" />
+                      : <Download className="w-3 h-3" />}
+                    CSV
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
   );
 }
 

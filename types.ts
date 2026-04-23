@@ -44,7 +44,59 @@ export enum AppTab {
   MANAGER = 'contacts',
   ENRICHMENT = 'enrichment',
   IMPORT = 'import',
-  PROXIES = 'proxies'
+  PROXIES = 'proxies',
+  BUCKETING = 'bucketing'
+}
+
+export type BucketingRunStatus =
+  | 'taxonomy_pending'
+  | 'taxonomy_ready'
+  | 'assigning'
+  | 'completed'
+  | 'failed';
+
+export interface BucketProposal {
+  name: string;
+  definition: string;
+  personalization_angle?: string;
+  example_industries: string[];
+  estimated_count?: number;
+}
+
+export interface BucketingRun {
+  id: string;
+  name: string;
+  list_names: string[];
+  min_volume: number;
+  status: BucketingRunStatus;
+  taxonomy_model?: string | null;
+  taxonomy_proposal?: { buckets: BucketProposal[]; residual_note?: string } | null;
+  taxonomy_final?: { buckets: BucketProposal[] } | null;
+  total_contacts?: number | null;
+  assigned_contacts?: number | null;
+  cost_usd?: number | null;
+  error_message?: string | null;
+  created_at: string;
+  taxonomy_completed_at?: string | null;
+  assignment_completed_at?: string | null;
+}
+
+export interface BucketAssignmentRow {
+  bucketing_run_id: string;
+  contact_id: string;
+  bucket_name: string;
+  source: 'deterministic' | 'embedding' | 'llm_phase2' | 'other';
+  confidence: number | null;
+  assigned_at: string;
+}
+
+export interface BucketCount {
+  bucket_name: string;
+  contact_count: number;
+}
+
+export interface BucketAssignmentCount extends BucketCount {
+  other_sources?: Record<string, number>;
 }
 
 export interface BatchStats {
