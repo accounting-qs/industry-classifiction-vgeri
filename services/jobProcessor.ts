@@ -73,6 +73,19 @@ export class JobProcessor {
     private static loopTick = 0;
     private static lastTickAt = Date.now();
 
+    // Per-list progress tracker: keyed by lead_list_name. `baseline` is the
+    // completed+failed count at the moment we first saw this list in the
+    // current run (from the RPC), so the log's "1000/100000" reflects the
+    // list's absolute state, not just the run's delta. `lastMilestone` is
+    // the last 1000-multiple we already logged — prevents duplicate lines
+    // when multiple chunks close within the same milestone bucket.
+    private static listProgress: Map<string, {
+        total: number;
+        baselineProcessed: number;
+        processedInRun: number;
+        lastMilestone: number;
+    }> = new Map();
+
     private static log(msg: string, level: 'info' | 'warn' | 'error' | 'phase' = 'info') {
         console.log(`[JobProcessor] ${msg}`);
         this.pendingLogs.push({
@@ -95,6 +108,57 @@ export class JobProcessor {
         }
     }
 
+    // First time we see a list in this run, query the RPC for its current
+    // completed+failed baseline and total. Everything after is maintained
+    // in-memory off that baseline. Failing the RPC call (e.g. migration
+    // not yet applied) falls through to a zero baseline + contact_count
+    // from import_lists — the log is still informative, just less
+    // precise.
+    private static async ensureListBaseline(listName: string): Promise<void> {
+        if (this.listProgress.has(listName)) return;
+        let total = 0;
+        let baseline = 0;
+        try {
+            const { data } = await supabase.rpc('get_list_enrichment_stats');
+            if (Array.isArray(data)) {
+                const row = (data as any[]).find(r => r.lead_list_name === listName);
+                if (row) {
+                    total = Number(row.total_count) || 0;
+                    baseline = (Number(row.completed_count) || 0) + (Number(row.failed_count) || 0);
+                }
+            }
+        } catch { /* fall through to the import_lists fallback */ }
+        if (total === 0) {
+            const { data: il } = await supabase.from('import_lists').select('contact_count').eq('name', listName).maybeSingle();
+            total = il?.contact_count || 0;
+        }
+        // Starting milestone = floor(baseline / 1000) so the first log line
+        // of the run reports the next clean 1000-crossing rather than an
+        // arbitrary mid-milestone number.
+        const lastMilestone = Math.floor(baseline / 1000) * 1000;
+        this.listProgress.set(listName, { total, baselineProcessed: baseline, processedInRun: 0, lastMilestone });
+        const pct = total > 0 ? Math.round((baseline / total) * 100) : 0;
+        this.log(`🏁 Enriching list: "${listName}" — starting at ${baseline.toLocaleString()}/${total.toLocaleString()} (${pct}%)`, 'phase');
+    }
+
+    // Call after each chunk with the number of completed+failed items per
+    // list from that chunk. Emits one log per list that crossed a new
+    // 1000-processed milestone since the last call.
+    private static logListProgress(perListDelta: Record<string, number>) {
+        for (const [listName, delta] of Object.entries(perListDelta)) {
+            const p = this.listProgress.get(listName);
+            if (!p || delta <= 0) continue;
+            p.processedInRun += delta;
+            const liveProcessed = p.baselineProcessed + p.processedInRun;
+            const nextMilestone = Math.floor(liveProcessed / 1000) * 1000;
+            if (nextMilestone > p.lastMilestone) {
+                p.lastMilestone = nextMilestone;
+                const pct = p.total > 0 ? Math.min(100, Math.round((liveProcessed / p.total) * 100)) : 0;
+                this.log(`📈 Progress: "${listName}": ${pct}% (${liveProcessed.toLocaleString()}/${p.total.toLocaleString()})`, 'info');
+            }
+        }
+    }
+
     /**
      * Starts the infinite background polling loop.
      */
@@ -102,6 +166,9 @@ export class JobProcessor {
         if (this.isRunning) return;
         this.isRunning = true;
         this.shouldStop = false;
+        // Fresh run → fresh per-list tallies. Baseline is queried lazily
+        // the first time we see items from each list.
+        this.listProgress.clear();
         this.log(`🚀 JobProcessor started [Chunk: ${QUEUE_FETCH_CHUNK_SIZE}, Scrape: C${CONCURRENCY_SCRAPE}, AI: C${CONCURRENCY_AI}, GC: ${typeof global.gc === 'function' ? 'ENABLED' : 'DISABLED'}]`, 'phase');
 
         this.startHeartbeat();
@@ -496,10 +563,20 @@ export class JobProcessor {
         let enrichmentsToUpsert: any[] = [];
         let contactsToUpdate: any[] = [];
 
+        // Per-list delta for this chunk — drives the progress log.
+        const perListDelta: Record<string, number> = {};
         results.forEach(res => {
             if (!jobsToUpdate[res.jobId]) jobsToUpdate[res.jobId] = { completed: 0, failed: 0 };
             if (res.newStatus === 'completed') jobsToUpdate[res.jobId].completed++;
             if (res.newStatus === 'failed') jobsToUpdate[res.jobId].failed++;
+
+            // Completed + failed both count as "processed" for progress
+            // purposes — a failed scrape is still forward motion, not a
+            // row we'll retry.
+            const listName: string | undefined = (res as any).leadListName;
+            if (listName && (res.newStatus === 'completed' || res.newStatus === 'failed')) {
+                perListDelta[listName] = (perListDelta[listName] || 0) + 1;
+            }
 
             itemsToUpsert.push(res.jobItemUpdate);
 
@@ -510,6 +587,12 @@ export class JobProcessor {
                 contactsToUpdate.push(res.contactUpdate);
             }
         });
+
+        // Ensure we have a baseline for every list we touched in this
+        // chunk (parallel — usually just 1–2 distinct lists), then emit
+        // milestone logs.
+        await Promise.all(Object.keys(perListDelta).map(l => this.ensureListBaseline(l)));
+        this.logListProgress(perListDelta);
 
         // Issue #4: All bulk writes now have error handling
         // Dedupe-by-conflict-key helper. A chunk can carry two entries that
@@ -655,6 +738,7 @@ export class JobProcessor {
         return {
             jobId: jobItem.job_id,
             newStatus: status,
+            leadListName: contact.lead_list_name || null,
             jobItemUpdate: {
                 id: jobItem.id,
                 job_id: jobItem.job_id,
