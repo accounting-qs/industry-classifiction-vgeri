@@ -4,8 +4,12 @@
 -- it can satisfy the query without scanning rows) — an RPC that does
 -- one aggregate pass is both more accurate and cheaper.
 --
--- total_count = every contact on the list regardless of enrichment
--- state, so pending = total - completed - failed on the client.
+-- Uses plpgsql + `SET LOCAL statement_timeout = '60s'` because at
+-- ~600k contacts × ~400k enrichments the LEFT JOIN + GROUP BY runs
+-- past PostgREST's default 8s timeout. Same pattern as
+-- resolve_enrichment_targets. Without this the function returns
+-- 57014 ("canceling statement due to statement timeout") and the
+-- server falls back to its estimated-count path.
 
 CREATE OR REPLACE FUNCTION public.get_list_enrichment_stats()
 RETURNS TABLE(
@@ -14,26 +18,22 @@ RETURNS TABLE(
     failed_count BIGINT,
     total_count BIGINT
 ) AS $$
+BEGIN
+    SET LOCAL statement_timeout = '60s';
+    RETURN QUERY
     SELECT
         c.lead_list_name,
-        COUNT(*) FILTER (WHERE e.status = 'completed') AS completed_count,
-        COUNT(*) FILTER (WHERE e.status = 'failed')    AS failed_count,
-        COUNT(*)                                        AS total_count
+        COUNT(*) FILTER (WHERE e.status = 'completed')::BIGINT AS completed_count,
+        COUNT(*) FILTER (WHERE e.status = 'failed')::BIGINT    AS failed_count,
+        COUNT(*)::BIGINT                                        AS total_count
     FROM contacts c
     LEFT JOIN enrichments e ON e.contact_id = c.contact_id
     WHERE c.lead_list_name IS NOT NULL
     GROUP BY c.lead_list_name;
-$$ LANGUAGE sql STABLE;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
--- Explicit GRANTs so the server's service_role key (and the anon key
--- used by the browser fallback) can invoke the function. Default
--- `CREATE FUNCTION` grants to PUBLIC, but hardened projects sometimes
--- revoke that.
 GRANT EXECUTE ON FUNCTION public.get_list_enrichment_stats()
     TO anon, authenticated, service_role;
 
--- Force PostgREST to refresh its function cache immediately. Supabase's
--- event-trigger auto-reload usually handles this, but it occasionally
--- misses — and when it does the RPC returns `PGRST202 / not found in
--- schema cache` until the next boot.
 NOTIFY pgrst, 'reload schema';

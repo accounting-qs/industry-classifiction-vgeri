@@ -139,6 +139,7 @@ export default function App() {
   const [contactsLoading, setContactsLoading] = useState(false);
   const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[]>([]);
   const [listStatsSource, setListStatsSource] = useState<'rpc' | 'fallback'>('rpc');
+  const [importListsLoading, setImportListsLoading] = useState(true);
   const [showListModal, setShowListModal] = useState(false);
   const [exportJobs, setExportJobs] = useState<ExportJob[]>([]);
 
@@ -199,6 +200,7 @@ export default function App() {
       .then(res => res.json())
       .then(data => { if (Array.isArray(data)) setLeadListOptions(data); })
       .catch(() => { });
+    setImportListsLoading(true);
     fetch('/api/import-lists')
       .then(res => res.json())
       .then(data => {
@@ -212,7 +214,8 @@ export default function App() {
           setListStatsSource(data.stats_source === 'fallback' ? 'fallback' : 'rpc');
         }
       })
-      .catch(() => { });
+      .catch(() => { })
+      .finally(() => setImportListsLoading(false));
   }, []);
 
   useEffect(() => { refreshLists(); }, [refreshLists]);
@@ -448,11 +451,15 @@ export default function App() {
     } catch { /* transient; next poll will retry */ }
   }, []);
 
-  // Load export jobs when modal opens so the Export/Building/Download state
-  // shows up even if the user left the page mid-build.
+  // Load export jobs + refresh lists/stats when modal opens so the
+  // user always sees the latest progress and the Export button state
+  // even if they left the page mid-build.
   useEffect(() => {
-    if (showListModal) refreshExportJobs();
-  }, [showListModal, refreshExportJobs]);
+    if (showListModal) {
+      refreshExportJobs();
+      refreshLists();
+    }
+  }, [showListModal, refreshExportJobs, refreshLists]);
 
   // Poll while any job is building — completion flips the button to Download.
   useEffect(() => {
@@ -714,6 +721,7 @@ export default function App() {
       {showListModal && (
         <ListSelectorModal
           lists={importLists}
+          loading={importListsLoading}
           statsSource={listStatsSource}
           activeListFilter={activeListFilter}
           exportJobs={exportJobs}
@@ -731,6 +739,7 @@ export default function App() {
 
 function ListSelectorModal({
   lists,
+  loading,
   statsSource,
   activeListFilter,
   exportJobs,
@@ -742,6 +751,7 @@ function ListSelectorModal({
   onGoToImport,
 }: {
   lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[];
+  loading: boolean;
   statsSource: 'rpc' | 'fallback';
   activeListFilter: string | null;
   exportJobs: ExportJob[];
@@ -789,7 +799,13 @@ function ListSelectorModal({
         )}
 
         <div className="flex-1 overflow-y-auto custom-scrollbar">
-          {lists.length === 0 ? (
+          {loading && lists.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-20 px-6 text-center">
+              <Loader2 className="w-8 h-8 text-[#3ecf8e] animate-spin mb-3" />
+              <p className="text-sm font-bold text-gray-400">Loading lists…</p>
+              <p className="text-[11px] text-gray-600 mt-1">Aggregating enrichment stats</p>
+            </div>
+          ) : lists.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-20 px-6 text-center">
               <Upload className="w-10 h-10 text-gray-700 mb-3" />
               <p className="text-sm font-bold text-gray-400">No lists yet</p>
