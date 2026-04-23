@@ -300,14 +300,22 @@ export class JobProcessor {
                 // If we processed items, the queue is active, so poll immediately again without waiting.
                 // If 0 items were found, check if the queue is truly empty.
                 if (processedCount === 0) {
-                    // Check if the queue is genuinely drained (no pending/retrying/processing items)
-                    const { count } = await supabase
+                    // Check if the queue is genuinely drained. Critically,
+                    // distinguish "count query errored" from "count is 0" —
+                    // the previous `if (!count || count === 0)` treated both
+                    // as empty, which could auto-stop the processor the
+                    // moment a sanity check timed out and leave thousands
+                    // of pending items orphaned.
+                    const { count, error: countErr } = await supabase
                         .from('job_items')
                         .select('*', { count: 'exact', head: true })
                         .in('status', ['pending', 'retrying', 'processing']);
 
-                    if (!count || count === 0) {
-                        // Queue fully drained — mark active jobs as completed and auto-stop
+                    if (countErr) {
+                        this.log(`⚠️ Queue drain check failed (${countErr.message}); keep polling instead of auto-stopping.`, 'warn');
+                        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                    } else if (count === 0) {
+                        // Confirmed zero pending/retrying/processing — safe to auto-stop.
                         await supabase.from('jobs')
                             .update({ status: 'completed', finished_at: new Date().toISOString() })
                             .eq('status', 'processing');
@@ -319,9 +327,9 @@ export class JobProcessor {
 
                         this.log('✅ All items processed. Queue empty — auto-stopping.', 'phase');
                         break;
+                    } else {
+                        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
                     }
-
-                    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
                 } else {
                     // Micro-sleep to allow event loop to breathe
                     await new Promise(r => setImmediate(r));
@@ -365,17 +373,29 @@ export class JobProcessor {
     }
 
     private static async processNextChunk(): Promise<number> {
-        // 1. Claim N pending/retrying items
+        // 1. Claim N pending/retrying items. Order by id ASC so items from
+        // older jobs drain before items from newer jobs — that way the
+        // oldest in-flight enrich run finishes first instead of two runs
+        // interleaving forever. (job_items.id is bigserial and monotonic
+        // within a job's insert, so ordering by id is equivalent to FIFO
+        // across jobs for practical purposes.)
         const { data: itemIdsToClaim, error: fetchError } = await supabase
             .from('job_items')
             .select('id, job_id')
             .in('status', ['pending', 'retrying'])
             .or('next_retry_at.is.null,next_retry_at.lte.now()')
+            .order('id', { ascending: true })
             .limit(QUEUE_FETCH_CHUNK_SIZE);
 
-        if (fetchError || !itemIdsToClaim || itemIdsToClaim.length === 0) {
-            if (fetchError) this.log('Fetch Claim Error: ' + fetchError.message, 'error');
-            return 0; // Queue empty or error
+        if (fetchError) {
+            // Transient DB error (57014 etc.) — bubble to the caller's
+            // try/catch backoff, don't silently return 0 because returning
+            // 0 would let the outer loop misread this as "queue empty"
+            // and potentially auto-stop the processor mid-run.
+            throw fetchError;
+        }
+        if (!itemIdsToClaim || itemIdsToClaim.length === 0) {
+            return 0;
         }
 
         const ids = itemIdsToClaim.map(row => row.id);
@@ -391,9 +411,14 @@ export class JobProcessor {
             .in('id', ids)
             .select('*');
 
-        if (lockError || !claimedItems || claimedItems.length === 0) {
-            this.log('Lock Error: ' + (lockError?.message || 'Lost race'), 'warn');
-            return 0; // Lost the race or error
+        if (lockError) {
+            // Same reasoning as fetchError above — this is a DB error, not
+            // an empty queue. Must bubble up so auto-stop can't fire.
+            throw lockError;
+        }
+        if (!claimedItems || claimedItems.length === 0) {
+            this.log('Lock Error: Lost race — another worker claimed these rows first', 'warn');
+            return 0;
         }
 
         // 1.5 Manually fetch contacts since we dropped the Foreign Key to fix the UUID mismatch
