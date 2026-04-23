@@ -558,68 +558,14 @@ export async function runAssignment(
 async function deterministicFanOut(
     supabase: SupabaseClient,
     runId: string,
-    listNames: string[]
+    _listNames: string[]
 ): Promise<number> {
-    // Pull the full map for this run into memory (it's bounded by vocabulary
-    // size — typically a few thousand rows max).
-    const { data: mapRows, error: mErr } = await supabase
-        .from('bucket_industry_map')
-        .select('industry_string,bucket_name,source,confidence')
-        .eq('bucketing_run_id', runId);
-    if (mErr) throw new Error(`map fetch failed: ${mErr.message}`);
-
-    const lookup = new Map<string, { bucket_name: string; source: string; confidence: number | null }>();
-    for (const r of (mapRows || [])) {
-        lookup.set(r.industry_string, { bucket_name: r.bucket_name, source: r.source, confidence: r.confidence });
-    }
-    if (lookup.size === 0) return 0;
-
-    // Walk contacts in pages, write assignments in chunks.
-    const PAGE_SIZE = 5000;
-    const UPSERT_CHUNK = 1000;
-    let lastId: string | null = null;
-    let inserted = 0;
-
-    while (true) {
-        let q: any = supabase.from('contacts')
-            .select('contact_id,industry')
-            .in('lead_list_name', listNames)
-            .order('contact_id', { ascending: true })
-            .limit(PAGE_SIZE);
-        if (lastId) q = q.gt('contact_id', lastId);
-
-        const { data: contactPage, error: cErr } = await q;
-        if (cErr) throw new Error(`contacts page failed: ${cErr.message}`);
-        const page = (contactPage || []) as { contact_id: string; industry: string | null }[];
-        if (page.length === 0) break;
-
-        const rows: any[] = [];
-        for (const c of page) {
-            if (!c.industry) continue;
-            const hit = lookup.get(c.industry);
-            if (!hit) continue;
-            rows.push({
-                bucketing_run_id: runId,
-                contact_id: c.contact_id,
-                bucket_name: hit.bucket_name,
-                source: hit.source === 'llm_phase1' || hit.source === 'manual' ? 'deterministic' : hit.source,
-                confidence: hit.confidence ?? 1.0
-            });
-        }
-
-        for (let i = 0; i < rows.length; i += UPSERT_CHUNK) {
-            const chunk = rows.slice(i, i + UPSERT_CHUNK);
-            const { error } = await supabase.from('bucket_assignments')
-                .upsert(chunk, { onConflict: 'bucketing_run_id,contact_id', ignoreDuplicates: true });
-            if (error) throw new Error(`bucket_assignments insert failed: ${error.message}`);
-        }
-        inserted += rows.length;
-
-        lastId = page[page.length - 1].contact_id;
-        if (page.length < PAGE_SIZE) break;
-    }
-
-    return inserted;
+    // Server-side INSERT … SELECT via RPC. Avoids 20+ PostgREST round-trips
+    // and sidesteps the "in.(\"value,with,commas\") + ORDER BY → timeout"
+    // planner bug that struck when list names contain commas.
+    const { data, error } = await supabase.rpc('bucketing_deterministic_fanout', { p_run_id: runId });
+    if (error) throw new Error(`deterministic fanout failed: ${error.message}`);
+    return Number(data || 0);
 }
 
 // ───── Step 2: embedding fallback ─────
@@ -878,47 +824,11 @@ async function classifyResidualBatch(
 async function catchAllOther(
     supabase: SupabaseClient,
     runId: string,
-    listNames: string[]
+    _listNames: string[]
 ): Promise<number> {
-    // Walk contacts in pages, insert any without an existing assignment as
-    // "Other". The unique constraint makes the upsert idempotent.
-    const PAGE_SIZE = 5000;
-    let lastId: string | null = null;
-    let inserted = 0;
-
-    while (true) {
-        let q: any = supabase.from('contacts')
-            .select('contact_id')
-            .in('lead_list_name', listNames)
-            .order('contact_id', { ascending: true })
-            .limit(PAGE_SIZE);
-        if (lastId) q = q.gt('contact_id', lastId);
-
-        const { data: page, error } = await q;
-        if (error) throw new Error(`contacts sweep page failed: ${error.message}`);
-        const rows = (page || []) as { contact_id: string }[];
-        if (rows.length === 0) break;
-
-        const inserts = rows.map(r => ({
-            bucketing_run_id: runId,
-            contact_id: r.contact_id,
-            bucket_name: RESERVED_OTHER,
-            source: 'other',
-            confidence: 0
-        }));
-
-        for (let i = 0; i < inserts.length; i += 1000) {
-            const chunk = inserts.slice(i, i + 1000);
-            const { error: upErr } = await supabase.from('bucket_assignments')
-                .upsert(chunk, { onConflict: 'bucketing_run_id,contact_id', ignoreDuplicates: true });
-            if (upErr) throw new Error(`Other sweep insert failed: ${upErr.message}`);
-        }
-        inserted += inserts.length;
-
-        lastId = rows[rows.length - 1].contact_id;
-        if (rows.length < PAGE_SIZE) break;
-    }
-    return inserted;
+    const { data, error } = await supabase.rpc('bucketing_catchall_other', { p_run_id: runId });
+    if (error) throw new Error(`catchall Other failed: ${error.message}`);
+    return Number(data || 0);
 }
 
 // ───── helpers ─────
