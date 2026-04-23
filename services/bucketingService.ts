@@ -217,17 +217,21 @@ ${vocabularyTable}${tailSection}
 
 Propose buckets now. Remember: the example_industries array MUST contain only strings that appear in the vocabulary table above, copied verbatim.`;
 
+    // OpenAI strict JSON schema requires every property in `properties` to
+    // appear in `required` — there is no "optional" field when strict=true.
+    // The model can still return empty strings / 0 for fields it has nothing
+    // useful to say about.
     const schema = {
         type: 'object',
         additionalProperties: false,
-        required: ['buckets'],
+        required: ['buckets', 'residual_note'],
         properties: {
             buckets: {
                 type: 'array',
                 items: {
                     type: 'object',
                     additionalProperties: false,
-                    required: ['name', 'definition', 'example_industries'],
+                    required: ['name', 'definition', 'personalization_angle', 'example_industries', 'estimated_count'],
                     properties: {
                         name: { type: 'string' },
                         definition: { type: 'string' },
@@ -693,7 +697,8 @@ async function classifyResidualBatch(
                 items: {
                     type: 'object',
                     additionalProperties: false,
-                    required: ['industry', 'bucket_name', 'confidence'],
+                    // strict=true: every property must be in required
+                    required: ['industry', 'bucket_name', 'confidence', 'rationale'],
                     properties: {
                         industry: { type: 'string' },
                         bucket_name: { type: 'string' },
