@@ -73,7 +73,7 @@ interface ExportJob {
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<AppTab>(AppTab.MANAGER);
+  const [activeTab, setActiveTab] = useState<AppTab>(AppTab.IMPORT);
   const [contacts, setContacts] = useState<MergedContact[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [currentPage, setCurrentPage] = useState(() => {
@@ -452,24 +452,24 @@ export default function App() {
     } catch { /* transient; next poll will retry */ }
   }, []);
 
-  // Load export jobs + refresh lists/stats when modal opens so the
-  // user always sees the latest progress and the Export button state
-  // even if they left the page mid-build.
+  // Load export jobs + refresh lists/stats when the modal or the Import tab
+  // opens so the user always sees the latest progress and the Export button
+  // state even if they left the page mid-build.
   useEffect(() => {
-    if (showListModal) {
+    if (showListModal || activeTab === AppTab.IMPORT) {
       refreshExportJobs();
       refreshLists();
     }
-  }, [showListModal, refreshExportJobs, refreshLists]);
+  }, [showListModal, activeTab, refreshExportJobs, refreshLists]);
 
   // Poll while any job is building — completion flips the button to Download.
   useEffect(() => {
-    if (!showListModal) return;
+    if (!showListModal && activeTab !== AppTab.IMPORT) return;
     const anyBuilding = exportJobs.some(j => j.status === 'building');
     if (!anyBuilding) return;
     const t = setInterval(refreshExportJobs, 3000);
     return () => clearInterval(t);
-  }, [showListModal, exportJobs, refreshExportJobs]);
+  }, [showListModal, activeTab, exportJobs, refreshExportJobs]);
 
   const startExportList = async (name: string) => {
     try {
@@ -517,9 +517,9 @@ export default function App() {
           <h1 className="text-sm font-bold text-white">Quantum Scaling</h1>
         </div>
         <nav className="flex-1 px-2 py-4 space-y-1 overflow-hidden">
+          <SidebarIconButton active={activeTab === AppTab.IMPORT} onClick={() => setActiveTab(AppTab.IMPORT)} icon={<Upload className="w-5 h-5" />} label="Import CSV" />
           <SidebarIconButton active={activeTab === AppTab.MANAGER} onClick={() => setActiveTab(AppTab.MANAGER)} icon={<Users className="w-5 h-5" />} label="Contacts" />
           <SidebarIconButton active={activeTab === AppTab.ENRICHMENT} onClick={() => setActiveTab(AppTab.ENRICHMENT)} icon={<Zap className={`w-5 h-5 ${stats.isProcessing ? 'text-[#3ecf8e] animate-pulse' : ''}`} />} label="Pipeline Monitor" />
-          <SidebarIconButton active={activeTab === AppTab.IMPORT} onClick={() => setActiveTab(AppTab.IMPORT)} icon={<Upload className="w-5 h-5" />} label="Import CSV" />
           <SidebarIconButton active={activeTab === AppTab.BUCKETING} onClick={() => setActiveTab(AppTab.BUCKETING)} icon={<Layers className="w-5 h-5" />} label="Bucketing" />
         </nav>
         <div className="p-2 border-t border-[#2e2e2e]">
@@ -544,7 +544,19 @@ export default function App() {
           ) : activeTab === AppTab.BUCKETING ? (
             <BucketingTab importLists={importLists} />
           ) : activeTab === AppTab.IMPORT ? (
-            <CSVImportWizard onComplete={() => { setActiveTab(AppTab.MANAGER); loadData(); refreshLists(); }} />
+            <CSVImportWizard
+              onComplete={() => { setActiveTab(AppTab.MANAGER); loadData(); refreshLists(); }}
+              importLists={importLists}
+              importListsLoading={importListsLoading}
+              listStatsSource={listStatsSource}
+              exportJobs={exportJobs}
+              activeListFilter={activeListFilter}
+              onOpenList={(name) => { setActiveListFilter(name); setActiveTab(AppTab.MANAGER); }}
+              onEnrichList={enrichList}
+              onStartExport={startExportList}
+              onClearExport={clearExportJob}
+              onRefreshLists={refreshLists}
+            />
           ) : activeTab === AppTab.ENRICHMENT ? (
             <PipelineMonitor
               stats={stats}
@@ -741,6 +753,141 @@ export default function App() {
   );
 }
 
+function ImportedListsTable({
+  lists,
+  loading,
+  statsSource,
+  activeListFilter,
+  exportJobs,
+  onOpenList,
+  onEnrichList,
+  onStartExport,
+  onClearExport,
+  onGoToImport,
+  showAllListsRow = true,
+}: {
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[];
+  loading: boolean;
+  statsSource: 'rpc' | 'fallback';
+  activeListFilter: string | null;
+  exportJobs: ExportJob[];
+  onOpenList: (name: string | null) => void;
+  onEnrichList: (name: string, contactCount: number) => void;
+  onStartExport: (name: string) => void;
+  onClearExport: (jobId: string) => void;
+  onGoToImport?: () => void;
+  showAllListsRow?: boolean;
+}) {
+  // Pick the most recent job per list so the button reflects the current
+  // attempt (e.g. a fresh build supersedes a stale failed job).
+  const latestJobByList = new Map<string, ExportJob>();
+  for (const j of exportJobs) {
+    const existing = latestJobByList.get(j.listName);
+    const stamp = j.completedAt || j.createdAt;
+    if (!existing || stamp.localeCompare(existing.completedAt || existing.createdAt) > 0) {
+      latestJobByList.set(j.listName, j);
+    }
+  }
+
+  return (
+    <>
+      {statsSource === 'fallback' && (
+        <div className="px-6 py-2.5 bg-amber-500/10 border-b border-amber-500/30 text-amber-400 text-[11px] flex items-start gap-2">
+          <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+          <span>
+            <span className="font-bold">Approximate stats.</span> The <code className="bg-black/30 px-1 rounded">get_list_enrichment_stats</code> RPC isn't installed yet — counts can swing or show 0 randomly, and the "failed" slice is invisible. Run <code className="bg-black/30 px-1 rounded">supabase/migrations/20260423_list_enrichment_stats_rpc.sql</code> in the SQL editor for accurate progress.
+          </span>
+        </div>
+      )}
+
+      {loading && lists.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-20 px-6 text-center">
+          <Loader2 className="w-8 h-8 text-[#3ecf8e] animate-spin mb-3" />
+          <p className="text-sm font-bold text-gray-400">Loading lists…</p>
+          <p className="text-[11px] text-gray-600 mt-1">Aggregating enrichment stats</p>
+        </div>
+      ) : lists.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-20 px-6 text-center">
+          <Upload className="w-10 h-10 text-gray-700 mb-3" />
+          <p className="text-sm font-bold text-gray-400">No lists yet</p>
+          <p className="text-[11px] text-gray-600 mt-1 mb-5">Import a CSV to get started.</p>
+          {onGoToImport && (
+            <button
+              onClick={onGoToImport}
+              className="px-4 py-2 bg-[#3ecf8e] text-black rounded-lg text-xs font-bold hover:bg-[#2fb37a] transition-colors flex items-center gap-1.5"
+            >
+              <Upload className="w-3.5 h-3.5" /> Import CSV
+            </button>
+          )}
+        </div>
+      ) : (
+        <table className="w-full text-[11px]">
+          <thead className="sticky top-0 bg-[#0e0e0e] z-10">
+            <tr className="border-b border-[#2e2e2e]">
+              <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider">List Name</th>
+              <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Contacts</th>
+              <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider w-[220px]">Enrichment Progress</th>
+              <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Imported</th>
+              <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Actions</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[#2e2e2e]">
+            {showAllListsRow && (
+              <tr
+                onClick={() => onOpenList(null)}
+                className={`cursor-pointer transition-colors ${!activeListFilter ? 'bg-[#3ecf8e]/10 text-[#3ecf8e]' : 'hover:bg-white/[0.02] text-gray-300'}`}
+              >
+                <td className="px-5 py-2.5 font-bold">All lists</td>
+                <td className="px-5 py-2.5 text-right text-gray-500 font-mono">—</td>
+                <td className="px-5 py-2.5 text-gray-500">—</td>
+                <td className="px-5 py-2.5 text-right text-gray-500">—</td>
+                <td className="px-5 py-2.5 text-right text-[10px] text-gray-500 italic">Click to view all</td>
+              </tr>
+            )}
+            {lists.map(l => {
+              const active = activeListFilter === l.name;
+              const job = latestJobByList.get(l.name);
+              return (
+                <tr
+                  key={l.id}
+                  onClick={() => onOpenList(l.name)}
+                  className={`cursor-pointer transition-colors ${active ? 'bg-[#3ecf8e]/10' : 'hover:bg-white/[0.02]'}`}
+                >
+                  <td className={`px-5 py-2.5 font-medium ${active ? 'text-[#3ecf8e]' : 'text-gray-300'}`}>{l.name}</td>
+                  <td className="px-5 py-2.5 text-gray-400 text-right font-mono">{l.contact_count.toLocaleString()}</td>
+                  <td className="px-5 py-2.5"><EnrichmentProgress list={l} /></td>
+                  <td className="px-5 py-2.5 text-gray-500 text-right">
+                    {new Date(l.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                  </td>
+                  <td className="px-5 py-2.5 text-right">
+                    <div className="flex items-center justify-end gap-1.5">
+                      <button
+                        onClick={e => { e.stopPropagation(); onOpenList(l.name); }}
+                        className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white transition-colors flex items-center gap-1"
+                        title="Open contacts"
+                      >
+                        <ExternalLink className="w-3 h-3" /> Open
+                      </button>
+                      <button
+                        onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count); }}
+                        className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] transition-colors flex items-center gap-1"
+                        title="Enrich all contacts in this list"
+                      >
+                        <Zap className="w-3 h-3" /> Enrich
+                      </button>
+                      <ExportButton job={job} listName={l.name} onStart={onStartExport} onClear={onClearExport} />
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </>
+  );
+}
+
 function ListSelectorModal({
   lists,
   loading,
@@ -766,17 +913,6 @@ function ListSelectorModal({
   onClearExport: (jobId: string) => void;
   onGoToImport: () => void;
 }) {
-  // Pick the most recent job per list so the button reflects the current
-  // attempt (e.g. a fresh build supersedes a stale failed job).
-  const latestJobByList = new Map<string, ExportJob>();
-  for (const j of exportJobs) {
-    const existing = latestJobByList.get(j.listName);
-    const stamp = j.completedAt || j.createdAt;
-    if (!existing || stamp.localeCompare(existing.completedAt || existing.createdAt) > 0) {
-      latestJobByList.set(j.listName, j);
-    }
-  }
-
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
       <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-5xl max-h-[85vh] flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>
@@ -793,96 +929,19 @@ function ListSelectorModal({
           </button>
         </div>
 
-        {statsSource === 'fallback' && (
-          <div className="px-6 py-2.5 bg-amber-500/10 border-b border-amber-500/30 text-amber-400 text-[11px] flex items-start gap-2">
-            <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-            <span>
-              <span className="font-bold">Approximate stats.</span> The <code className="bg-black/30 px-1 rounded">get_list_enrichment_stats</code> RPC isn't installed yet — counts can swing or show 0 randomly, and the "failed" slice is invisible. Run <code className="bg-black/30 px-1 rounded">supabase/migrations/20260423_list_enrichment_stats_rpc.sql</code> in the SQL editor for accurate progress.
-            </span>
-          </div>
-        )}
-
         <div className="flex-1 overflow-y-auto custom-scrollbar">
-          {loading && lists.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-20 px-6 text-center">
-              <Loader2 className="w-8 h-8 text-[#3ecf8e] animate-spin mb-3" />
-              <p className="text-sm font-bold text-gray-400">Loading lists…</p>
-              <p className="text-[11px] text-gray-600 mt-1">Aggregating enrichment stats</p>
-            </div>
-          ) : lists.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-20 px-6 text-center">
-              <Upload className="w-10 h-10 text-gray-700 mb-3" />
-              <p className="text-sm font-bold text-gray-400">No lists yet</p>
-              <p className="text-[11px] text-gray-600 mt-1 mb-5">Import a CSV to get started.</p>
-              <button
-                onClick={onGoToImport}
-                className="px-4 py-2 bg-[#3ecf8e] text-black rounded-lg text-xs font-bold hover:bg-[#2fb37a] transition-colors flex items-center gap-1.5"
-              >
-                <Upload className="w-3.5 h-3.5" /> Import CSV
-              </button>
-            </div>
-          ) : (
-            <table className="w-full text-[11px]">
-              <thead className="sticky top-0 bg-[#0e0e0e] z-10">
-                <tr className="border-b border-[#2e2e2e]">
-                  <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider">List Name</th>
-                  <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Contacts</th>
-                  <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider w-[220px]">Enrichment Progress</th>
-                  <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Imported</th>
-                  <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[#2e2e2e]">
-                <tr
-                  onClick={() => onOpenList(null)}
-                  className={`cursor-pointer transition-colors ${!activeListFilter ? 'bg-[#3ecf8e]/10 text-[#3ecf8e]' : 'hover:bg-white/[0.02] text-gray-300'}`}
-                >
-                  <td className="px-5 py-2.5 font-bold">All lists</td>
-                  <td className="px-5 py-2.5 text-right text-gray-500 font-mono">—</td>
-                  <td className="px-5 py-2.5 text-gray-500">—</td>
-                  <td className="px-5 py-2.5 text-right text-gray-500">—</td>
-                  <td className="px-5 py-2.5 text-right text-[10px] text-gray-500 italic">Click to view all</td>
-                </tr>
-                {lists.map(l => {
-                  const active = activeListFilter === l.name;
-                  const job = latestJobByList.get(l.name);
-                  return (
-                    <tr
-                      key={l.id}
-                      onClick={() => onOpenList(l.name)}
-                      className={`cursor-pointer transition-colors ${active ? 'bg-[#3ecf8e]/10' : 'hover:bg-white/[0.02]'}`}
-                    >
-                      <td className={`px-5 py-2.5 font-medium ${active ? 'text-[#3ecf8e]' : 'text-gray-300'}`}>{l.name}</td>
-                      <td className="px-5 py-2.5 text-gray-400 text-right font-mono">{l.contact_count.toLocaleString()}</td>
-                      <td className="px-5 py-2.5"><EnrichmentProgress list={l} /></td>
-                      <td className="px-5 py-2.5 text-gray-500 text-right">
-                        {new Date(l.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
-                      </td>
-                      <td className="px-5 py-2.5 text-right">
-                        <div className="flex items-center justify-end gap-1.5">
-                          <button
-                            onClick={e => { e.stopPropagation(); onOpenList(l.name); }}
-                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white transition-colors flex items-center gap-1"
-                            title="Open contacts"
-                          >
-                            <ExternalLink className="w-3 h-3" /> Open
-                          </button>
-                          <button
-                            onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count); }}
-                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] transition-colors flex items-center gap-1"
-                            title="Enrich all contacts in this list"
-                          >
-                            <Zap className="w-3 h-3" /> Enrich
-                          </button>
-                          <ExportButton job={job} listName={l.name} onStart={onStartExport} onClear={onClearExport} />
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )}
+          <ImportedListsTable
+            lists={lists}
+            loading={loading}
+            statsSource={statsSource}
+            activeListFilter={activeListFilter}
+            exportJobs={exportJobs}
+            onOpenList={onOpenList}
+            onEnrichList={onEnrichList}
+            onStartExport={onStartExport}
+            onClearExport={onClearExport}
+            onGoToImport={onGoToImport}
+          />
         </div>
 
         <div className="px-6 py-3 border-t border-[#2e2e2e] flex justify-end">
@@ -2886,7 +2945,31 @@ const CONTACTS_FIELDS = [
   { key: 'title', label: 'title', description: 'Job title' },
 ];
 
-function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
+function CSVImportWizard({
+  onComplete,
+  importLists,
+  importListsLoading,
+  listStatsSource,
+  exportJobs,
+  activeListFilter,
+  onOpenList,
+  onEnrichList,
+  onStartExport,
+  onClearExport,
+  onRefreshLists,
+}: {
+  onComplete: () => void;
+  importLists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[];
+  importListsLoading: boolean;
+  listStatsSource: 'rpc' | 'fallback';
+  exportJobs: ExportJob[];
+  activeListFilter: string | null;
+  onOpenList: (name: string | null) => void;
+  onEnrichList: (name: string, contactCount: number) => void;
+  onStartExport: (name: string) => void;
+  onClearExport: (jobId: string) => void;
+  onRefreshLists: () => void;
+}) {
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [file, setFile] = useState<File | null>(null);
   const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
@@ -2900,13 +2983,7 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
   const [showFailedModal, setShowFailedModal] = useState(false);
   const [listNameOverride, setListNameOverride] = useState('');
   const [overwriteDuplicates, setOverwriteDuplicates] = useState(false);
-  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string }[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
-
-  // Fetch import history on mount
-  useEffect(() => {
-    fetch('/api/import-lists').then(r => r.json()).then(data => { if (Array.isArray(data)) setImportLists(data); }).catch(() => {});
-  }, []);
 
   // Auto-map CSV headers to contacts fields (case-insensitive, common aliases)
   const autoMap = (headers: string[]) => {
@@ -3099,10 +3176,7 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name: listName, contact_count: totalAffected })
               });
-              // Refresh import lists
-              const res = await fetch('/api/import-lists');
-              const data = await res.json();
-              if (Array.isArray(data)) setImportLists(data);
+              onRefreshLists();
             } catch {}
           }
         });
@@ -3471,36 +3545,30 @@ function CSVImportWizard({ onComplete }: { onComplete: () => void }) {
         )}
       </div>
 
-      {/* Import History */}
-      {importLists.length > 0 && (
-        <div className="max-w-4xl mx-auto mt-8">
-          <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl overflow-hidden">
-            <div className="px-5 py-3 border-b border-[#2e2e2e] flex items-center gap-2">
-              <Clock className="w-4 h-4 text-[#3ecf8e]" />
-              <span className="text-xs font-bold text-gray-300 uppercase tracking-widest">Import History</span>
-              <span className="text-[10px] text-gray-600 ml-auto">{importLists.length} imports</span>
-            </div>
-            <table className="w-full text-[11px]">
-              <thead>
-                <tr className="border-b border-[#2e2e2e]">
-                  <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider">List Name</th>
-                  <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Contacts</th>
-                  <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Imported</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[#2e2e2e]">
-                {importLists.map(il => (
-                  <tr key={il.id} className="hover:bg-white/[0.02]">
-                    <td className="px-5 py-2.5 text-gray-300 font-medium">{il.name}</td>
-                    <td className="px-5 py-2.5 text-gray-400 text-right font-mono">{il.contact_count.toLocaleString()}</td>
-                    <td className="px-5 py-2.5 text-gray-500 text-right">{new Date(il.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      {/* Import History — same list view as the Contacts page */}
+      <div className="max-w-5xl mx-auto mt-8">
+        <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl overflow-hidden">
+          <div className="px-5 py-3 border-b border-[#2e2e2e] flex items-center gap-2">
+            <Clock className="w-4 h-4 text-[#3ecf8e]" />
+            <span className="text-xs font-bold text-gray-300 uppercase tracking-widest">Import History</span>
+            {importLists.length > 0 && (
+              <span className="text-[10px] text-gray-600 ml-auto">{importLists.length} {importLists.length === 1 ? 'list' : 'lists'}</span>
+            )}
           </div>
+          <ImportedListsTable
+            lists={importLists}
+            loading={importListsLoading}
+            statsSource={listStatsSource}
+            activeListFilter={activeListFilter}
+            exportJobs={exportJobs}
+            onOpenList={onOpenList}
+            onEnrichList={onEnrichList}
+            onStartExport={onStartExport}
+            onClearExport={onClearExport}
+            showAllListsRow={false}
+          />
         </div>
-      )}
+      </div>
 
       {/* Failed Contacts Modal */}
       {showFailedModal && (
