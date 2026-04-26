@@ -224,7 +224,28 @@ app.post('/api/enrich', async (req, res) => {
     const { contactIds, filters, searchQuery } = req.body;
 
     if (jobStats.isProcessing || jobStats.queueingPhase) {
-        return res.status(409).json({ error: 'A job is already in progress or queueing' });
+        // Self-heal: in-memory flags can get pinned (e.g. crash mid-queueing,
+        // or queueingPhase=true blocks the /api/status auto-reset at L194).
+        // If the DB has no active items, clear the flags and let the request
+        // through instead of permanently locking out enrichment.
+        const { count } = await supabase
+            .from('job_items')
+            .select('*', { count: 'exact', head: true })
+            .in('status', ['pending', 'processing', 'retrying']);
+
+        if (count && count > 0) {
+            return res.status(409).json({ error: 'A job is already in progress or queueing' });
+        }
+
+        addServerLog(
+            `⚠️ Stale pipeline state cleared (isProcessing=${jobStats.isProcessing}, queueingPhase=${jobStats.queueingPhase}); no active job_items.`,
+            'Pipeline',
+            'warn'
+        );
+        jobStats.isProcessing = false;
+        jobStats.queueingPhase = false;
+        jobStats.queued = 0;
+        await persistPipelineState();
     }
 
     if (!contactIds && !filters) {
