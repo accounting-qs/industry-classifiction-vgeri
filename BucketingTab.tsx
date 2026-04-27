@@ -375,7 +375,7 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
             className="w-32 px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-sm text-white focus:outline-none focus:border-[#3ecf8e]"
           />
           <p className="text-[10px] text-gray-500 italic mt-1">
-            Combos / specializations / identities below this roll up. Below identity → "Generic".
+            Combos / specializations / identities below this roll up. Below identity → "General".
           </p>
         </div>
         <div>
@@ -586,7 +586,7 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
         <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between">
           <span>Discovered specializations (grouped by primary identity)</span>
           <span className="text-gray-600 normal-case tracking-normal font-normal">
-            Phase 1b counts decide the campaign bucket: combo → spec → identity → Generic.
+            Phase 1b counts decide the campaign bucket: combo → spec → identity → General.
           </span>
         </div>
         <BucketChainList
@@ -652,7 +652,7 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
             onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
             className="w-28 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
           />
-          <p className="text-[10px] text-gray-500 italic mt-1">Combos below this fall to spec; specs below to identity; identities below to Generic.</p>
+          <p className="text-[10px] text-gray-500 italic mt-1">Combos below this fall to spec; specs below to identity; identities below to General.</p>
         </div>
         <div>
           <span className="block text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Bucket budget</span>

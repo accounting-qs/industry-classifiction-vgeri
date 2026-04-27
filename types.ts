@@ -133,9 +133,25 @@ export interface BucketAssignmentRow {
   bucketing_run_id: string;
   contact_id: string;
   bucket_name: string;
-  source: 'deterministic' | 'embedding' | 'llm_phase2' | 'other';
+  // 'deterministic'      — fanout copied a map row that came from any source below
+  // 'library_match'      — embedding match against a library bucket (Phase 1a)
+  // 'preview_embedding'  — Phase 1a preview seed (replaced on assignment)
+  // 'embedding'          — Phase 1b sector-aware embedding match
+  // 'llm_phase1b'        — Phase 1b routing LLM
+  // 'catchall'           — bucketing_catchall_other RPC (no map row, contact had no industry)
+  // legacy: 'llm_phase2', 'llm_phase1', 'manual', 'other'
+  source: 'deterministic' | 'library_match' | 'preview_embedding' | 'embedding'
+        | 'llm_phase1b' | 'catchall' | 'llm_phase2' | 'llm_phase1' | 'manual' | 'other';
   confidence: number | null;
   assigned_at: string;
+  bucket_leaf?: string | null;
+  bucket_ancestor?: string | null;
+  bucket_root?: string | null;
+  primary_identity?: string | null;
+  functional_specialization?: string | null;
+  sector_focus?: string | null;
+  is_generic?: boolean | null;
+  is_disqualified?: boolean | null;
 }
 
 export interface BucketCount {

@@ -345,16 +345,58 @@ export async function runTaxonomyProposal(
     if (preferredIds.length > 0) {
         const { data: libRows } = await supabase
             .from('bucket_library').select('*').in('id', preferredIds);
-        preferred = libRows || [];
+        preferred = (libRows || []).filter((b: any) =>
+            (b.functional_specialization || b.bucket_name) && (b.primary_identity || b.direct_ancestor)
+        );
     }
 
+    // Wipe any prior preview map rows for this run (idempotent on re-discover).
+    await supabase.from('bucket_industry_map').delete().eq('bucketing_run_id', runId);
+
+    let totalCost = 0;
+
+    // ── Step A: library-first match BEFORE discovery ──────────────────
+    // High-confidence matches against selected library buckets are written
+    // immediately, and those industries are removed from the vocabulary the
+    // discovery LLM sees. Saves prompt tokens AND prevents the model from
+    // re-inventing buckets we've already saved.
+    const sectorVocabPreview: string[] = []; // populated post-discovery
+    let discoveryVocab: VocabRow[] = vocabRows;
+    let libraryMatchedIndustries = new Set<string>();
+    let libraryUsageByBucketId = new Map<string, number>();
+
+    if (preferred.length > 0) {
+        log(`[Bucketing ${runId}] Phase 1a step 1/3: library-first match against ${preferred.length} preferred buckets`);
+        const libRes = await runLibraryFirstMatch(vocabRows, preferred, [], runId);
+        totalCost += libRes.costUsd;
+
+        if (libRes.autoAssigned.length > 0) {
+            for (let i = 0; i < libRes.autoAssigned.length; i += 1000) {
+                const chunk = libRes.autoAssigned.slice(i, i + 1000);
+                const { error: upErr } = await supabase.from('bucket_industry_map')
+                    .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
+                if (upErr) throw new Error(`library map insert failed: ${upErr.message}`);
+            }
+        }
+        for (const r of libRes.autoAssigned) {
+            libraryMatchedIndustries.add(r.industry_string);
+            const libId: string | undefined = r.reasons?.library_bucket_id;
+            if (libId) libraryUsageByBucketId.set(libId, (libraryUsageByBucketId.get(libId) || 0) + 1);
+        }
+        discoveryVocab = libRes.pending;
+        log(`[Bucketing ${runId}] library-matched ${libRes.autoAssigned.length}/${vocabRows.length}, ${discoveryVocab.length} sent to discovery`);
+    }
+
+    // ── Step B: discovery LLM on residual vocab ───────────────────────
+    log(`[Bucketing ${runId}] Phase 1a step 2/3: discovery LLM on ${discoveryVocab.length} residual industries`);
     const t0 = Date.now();
-    const { discovery, costUsd, modelUsed } = await callDiscoveryLLM(supabase, vocabRows, preferred);
-    log(`[Bucketing ${runId}] discovery LLM (${modelUsed}): ${(Date.now() - t0) / 1000}s, $${costUsd.toFixed(4)}, ${discovery.buckets.length} leaves`);
+    const { discovery, costUsd, modelUsed } = await callDiscoveryLLM(supabase, discoveryVocab, preferred);
+    totalCost += costUsd;
+    log(`[Bucketing ${runId}] discovery LLM (${modelUsed}): ${(Date.now() - t0) / 1000}s, $${costUsd.toFixed(4)}, ${discovery.buckets.length} discovered specs`);
 
     // Normalize primary_identities; drop any reserved names; dedupe.
     const seenIdent = new Set<string>();
-    const primaryIdentities = (discovery.primary_identities || []).filter(p => {
+    let primaryIdentities = (discovery.primary_identities || []).filter(p => {
         const n = (p.name || '').trim();
         if (!n || RESERVED.has(n.toLowerCase())) return false;
         if (seenIdent.has(n)) return false;
@@ -367,9 +409,23 @@ export async function runTaxonomyProposal(
         operator_required: !!p.operator_required
     }));
 
+    // Merge in identities from selected library buckets so they appear in
+    // the Review tree even if the discovery model didn't list them.
+    for (const lib of preferred) {
+        const ident = (lib.primary_identity || lib.direct_ancestor || '').trim();
+        if (!ident || seenIdent.has(ident)) continue;
+        seenIdent.add(ident);
+        primaryIdentities.push({
+            name: ident,
+            description: lib.description || '',
+            identity_type: 'service_provider',
+            operator_required: false
+        });
+    }
+
     // Validate specialization → identity references; drop dangling ones.
     const identitySet = new Set(primaryIdentities.map(p => p.name));
-    const leaves = discovery.buckets.filter(b => {
+    const discoveredLeaves = discovery.buckets.filter(b => {
         const spec = (b.functional_specialization || '').trim();
         const ident = (b.primary_identity || '').trim();
         return spec
@@ -392,77 +448,99 @@ export async function runTaxonomyProposal(
         disqualifying_signals: dedupe(b.disqualifying_signals)
     }));
 
+    // Inject library buckets that had at least one match into the proposal
+    // so the user can review/keep/drop them alongside discovered specs.
+    const lockedFromLibrary: DiscoveredBucket[] = [];
+    for (const lib of preferred) {
+        const spec = (lib.functional_specialization || lib.bucket_name || '').trim();
+        const ident = (lib.primary_identity || lib.direct_ancestor || '').trim();
+        if (!spec || !ident) continue;
+        if (discoveredLeaves.some(l => l.functional_specialization === spec)) continue;
+        lockedFromLibrary.push({
+            functional_specialization: spec,
+            primary_identity: ident,
+            description: lib.description || '',
+            identity_type: 'service_provider',
+            operator_required: false,
+            priority_rank: 3,
+            include: lib.include_terms || [],
+            exclude: lib.exclude_terms || [],
+            example_strings: lib.example_strings || [],
+            strong_identity_signals: [],
+            weak_sector_signals: [],
+            disqualifying_signals: [],
+            library_match_id: lib.id
+        });
+    }
+    const leaves = [...lockedFromLibrary, ...discoveredLeaves];
+    const sectorVocab = discovery.sector_focus_vocabulary || [];
+
     await supabase.from('bucketing_runs').update({
         taxonomy_proposal: {
             observed_patterns: discovery.observed_patterns || [],
-            sector_focus_vocabulary: discovery.sector_focus_vocabulary || [],
+            sector_focus_vocabulary: sectorVocab,
             primary_identities: primaryIdentities,
             buckets: leaves
         },
         taxonomy_model: modelUsed,
-        total_contacts: totalContacts,
-        cost_usd: costUsd,
+        cost_usd: totalCost,
+        total_contacts: totalContacts
+    }).eq('id', runId);
+
+    // ── Step C: embedding preview against ALL proposed specs ──────────
+    // Replaces the old example_strings seed. Embed every still-unmatched
+    // industry against every proposed spec; cosine ≥ EMBED_AUTO_THRESHOLD
+    // and margin ≥ EMBED_MARGIN write a preview map row.
+    const stillPending = vocabRows.filter(r => !libraryMatchedIndustries.has(r.industry));
+    log(`[Bucketing ${runId}] Phase 1a step 3/3: embedding preview against ${leaves.length} specs over ${stillPending.length} pending industries`);
+    const previewRes = await runPreviewEmbedding(stillPending, leaves, sectorVocab, runId);
+    totalCost += previewRes.costUsd;
+    if (previewRes.rows.length > 0) {
+        for (let i = 0; i < previewRes.rows.length; i += 1000) {
+            const chunk = previewRes.rows.slice(i, i + 1000);
+            const { error: upErr } = await supabase.from('bucket_industry_map')
+                .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
+            if (upErr) throw new Error(`preview embedding insert failed: ${upErr.message}`);
+        }
+    }
+    log(`[Bucketing ${runId}] preview embedding wrote ${previewRes.rows.length} map rows`);
+
+    // Final cost + state
+    await supabase.from('bucketing_runs').update({
+        cost_usd: totalCost,
         status: 'taxonomy_ready',
         taxonomy_completed_at: new Date().toISOString()
     }).eq('id', runId);
 
+    // Library link rows + usage counters
     if (preferred.length > 0) {
-        const links = leaves.filter(l => l.library_match_id).map(l => ({
-            bucketing_run_id: runId,
-            library_bucket_id: l.library_match_id!,
-            bucket_name_in_run: l.functional_specialization
-        }));
+        const links: any[] = [];
+        for (const lib of preferred) {
+            const spec = (lib.functional_specialization || lib.bucket_name || '').trim();
+            if (!spec) continue;
+            links.push({
+                bucketing_run_id: runId,
+                library_bucket_id: lib.id,
+                bucket_name_in_run: spec
+            });
+        }
         if (links.length > 0) {
             await supabase.from('bucket_library_run_links').upsert(links, { onConflict: 'bucketing_run_id,library_bucket_id' });
-            for (const id of new Set(links.map(l => l.library_bucket_id))) {
-                const cur = preferred.find((p: any) => p.id === id)?.times_used || 0;
+        }
+        for (const lib of preferred) {
+            const matched = libraryUsageByBucketId.get(lib.id) || 0;
+            if (matched > 0) {
                 await supabase.from('bucket_library')
-                    .update({ times_used: cur + 1, last_used_at: new Date().toISOString() })
-                    .eq('id', id);
+                    .update({
+                        times_used: (lib.times_used || 0) + 1,
+                        last_used_at: new Date().toISOString()
+                    })
+                    .eq('id', lib.id);
             }
         }
     }
 
-    // Seed bucket_industry_map from each spec's example_strings so the
-    // Review screen can show a meaningful per-spec contact-count preview
-    // before Phase 1b runs. Phase 1b clears this map and rewrites it with
-    // the full chain (incl. sector_focus per row), so these seeds are
-    // strictly preview-only.
-    const validIndustries = new Set(vocabRows.map(r => r.industry));
-    const seedRows: any[] = [];
-    const seenSeed = new Set<string>();
-    for (const l of leaves) {
-        for (const ind of (l.example_strings || [])) {
-            if (!validIndustries.has(ind)) continue;     // model hallucinated, skip
-            if (seenSeed.has(ind)) continue;             // first spec wins on conflict
-            seenSeed.add(ind);
-            seedRows.push({
-                bucketing_run_id: runId,
-                industry_string: ind,
-                bucket_name: l.functional_specialization, // pre-rollup placeholder
-                source: 'llm_phase1',
-                confidence: 1.0,
-                bucket_leaf: l.functional_specialization,
-                bucket_ancestor: l.primary_identity,
-                bucket_root: l.primary_identity,
-                primary_identity: l.primary_identity,
-                functional_specialization: l.functional_specialization,
-                sector_focus: '',
-                is_generic: false,
-                is_disqualified: false
-            });
-        }
-    }
-    if (seedRows.length > 0) {
-        for (let i = 0; i < seedRows.length; i += 1000) {
-            const chunk = seedRows.slice(i, i + 1000);
-            const { error: seedErr } = await supabase.from('bucket_industry_map')
-                .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
-            if (seedErr) throw new Error(`Phase 1a seed insert failed: ${seedErr.message}`);
-        }
-    }
-
-    log(`[Bucketing ${runId}] Phase 1a done — ${leaves.length} specs persisted, ${seedRows.length} preview-seed map rows`);
+    log(`[Bucketing ${runId}] Phase 1a done — ${leaves.length} specs (${lockedFromLibrary.length} from library, ${discoveredLeaves.length} discovered), $${totalCost.toFixed(4)}`);
 }
 
 function dedupe(arr: string[] | undefined): string[] {
@@ -849,6 +927,55 @@ export async function applyTaxonomyEdits(
     }
     await supabase.from('bucketing_runs').update(update).eq('id', runId);
     log(`[Bucketing ${runId}] taxonomy edits applied: ${leaves.length} specializations`);
+
+    // Rebuild the preview map so Review counts reflect the edited taxonomy
+    // (renames / drops / new specs all change which industries map where).
+    // Cheap: one batched embedding call against the run's vocab.
+    try {
+        await rebuildPreviewMap(supabase, runId, leaves, proposal.sector_focus_vocabulary || [], run.list_names || [], log);
+    } catch (e: any) {
+        log(`[Bucketing ${runId}] preview rebuild failed (non-fatal): ${e.message}`, 'warn');
+    }
+}
+
+async function rebuildPreviewMap(
+    supabase: SupabaseClient,
+    runId: string,
+    leaves: DiscoveredBucket[],
+    sectorVocab: string[],
+    listNames: string[],
+    log: (msg: string, level?: 'info' | 'warn' | 'error') => void
+): Promise<void> {
+    if (!Array.isArray(listNames) || listNames.length === 0) return;
+    const vocab = await fetchFullVocabulary(supabase, listNames);
+    if (vocab.length === 0) return;
+
+    // Drop only the preview-source rows; keep any library_match rows the
+    // user might want to retain even after editing other specs.
+    await supabase.from('bucket_industry_map')
+        .delete()
+        .eq('bucketing_run_id', runId)
+        .in('source', ['preview_embedding', 'llm_phase1', 'embedding']);
+
+    // Industries still claimed by surviving non-preview rows (e.g. library
+    // matches) shouldn't be re-assigned by the preview pass.
+    const { data: keptRows } = await supabase
+        .from('bucket_industry_map')
+        .select('industry_string')
+        .eq('bucketing_run_id', runId);
+    const keptSet = new Set((keptRows || []).map((r: any) => r.industry_string));
+    const previewVocab = vocab.filter(v => !keptSet.has(v.industry));
+
+    const { rows, costUsd } = await runPreviewEmbedding(previewVocab, leaves, sectorVocab, runId);
+    if (rows.length > 0) {
+        for (let i = 0; i < rows.length; i += 1000) {
+            const chunk = rows.slice(i, i + 1000);
+            const { error } = await supabase.from('bucket_industry_map')
+                .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
+            if (error) throw new Error(error.message);
+        }
+    }
+    log(`[Bucketing ${runId}] preview rebuilt: ${rows.length} rows, $${costUsd.toFixed(4)}`);
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1008,6 +1135,70 @@ function escapeRegExp(s: string): string {
 // industry against them. High-confidence hits short-circuit the LLM and
 // produce a map row using the library's primary_identity +
 // functional_specialization, with sector_focus extracted deterministically.
+// ─── preview embedding pass (post-discovery, pre-review) ───────────
+//
+// Replaces the old "seed from example_strings" behavior. After Phase 1a
+// proposes a taxonomy, we embed every proposed spec and every unmatched
+// industry, then cosine-match. High-confidence pairs become preview map
+// rows so the Review screen shows real per-spec counts before assignment.
+//
+// Returns rows for the caller to upsert + the OpenAI embedding cost.
+// Phase 1b clears and rewrites these rows with the full LLM chain.
+async function runPreviewEmbedding(
+    vocab: VocabRow[],
+    leaves: DiscoveredBucket[],
+    sectorVocab: string[],
+    runId: string
+): Promise<{ rows: any[]; costUsd: number }> {
+    if (vocab.length === 0 || leaves.length === 0) return { rows: [], costUsd: 0 };
+
+    const leafTexts = leaves.map(l => {
+        const sig = (l.strong_identity_signals || []).slice(0, 6).join(', ');
+        const inc = (l.include || []).slice(0, 6).join(', ');
+        const examples = (l.example_strings || []).slice(0, 3).join(' | ');
+        return `${l.functional_specialization} (under ${l.primary_identity}): ${l.description || ''}. Identity: ${l.identity_type}. Strong signals: ${sig}. Include: ${inc}. Examples: ${examples}.`;
+    });
+    const vocabTexts = vocab.map(v => v.industry);
+
+    const { embeddings, costUsd } = await embedBatch([...leafTexts, ...vocabTexts]);
+    const leafVecs = embeddings.slice(0, leaves.length);
+    const vocabVecs = embeddings.slice(leaves.length);
+
+    const rows: any[] = [];
+    for (let i = 0; i < vocab.length; i++) {
+        const sims = leafVecs.map(lv => cosine(vocabVecs[i], lv));
+        const sorted = sims.map((s, j) => ({ s, j })).sort((a, b) => b.s - a.s);
+        const top = sorted[0];
+        const second = sorted[1] || { s: 0 };
+        if (top.s >= EMBED_AUTO_THRESHOLD && (top.s - second.s) >= EMBED_MARGIN) {
+            const leaf = leaves[top.j];
+            // Skip operator_required specs — operator evidence is an LLM
+            // call, not a similarity check.
+            if (leaf.operator_required) continue;
+            const sector = extractSectorFocus(vocab[i].industry, sectorVocab);
+            rows.push({
+                bucketing_run_id: runId,
+                industry_string: vocab[i].industry,
+                bucket_name: leaf.functional_specialization,
+                source: 'preview_embedding',
+                confidence: Number(top.s.toFixed(2)),
+                bucket_leaf: leaf.functional_specialization,
+                bucket_ancestor: leaf.primary_identity,
+                bucket_root: leaf.primary_identity,
+                primary_identity: leaf.primary_identity,
+                functional_specialization: leaf.functional_specialization,
+                sector_focus: sector,
+                leaf_score: Number(top.s.toFixed(2)),
+                ancestor_score: Number(top.s.toFixed(2)),
+                root_score: Number(top.s.toFixed(2)),
+                is_generic: false,
+                is_disqualified: false
+            });
+        }
+    }
+    return { rows, costUsd };
+}
+
 async function runLibraryFirstMatch(
     vocab: VocabRow[],
     libraryBuckets: any[],
