@@ -980,6 +980,63 @@ app.post('/api/import-lists', async (req, res) => {
     }
 });
 
+// Rename an import list and cascade the new name to every contact that
+// references it. contacts.lead_list_name is a plain TEXT column, not a FK,
+// so we have to update both rows ourselves to keep the join consistent.
+app.patch('/api/import-lists/:id', async (req, res) => {
+    const id = String(req.params?.id || '').trim();
+    const newName = String(req.body?.name || '').trim();
+    if (!id) return res.status(400).json({ error: 'id is required' });
+    if (!newName) return res.status(400).json({ error: 'name is required' });
+
+    try {
+        const { data: existing, error: fetchErr } = await supabase
+            .from('import_lists')
+            .select('id, name, contact_count, created_at')
+            .eq('id', id)
+            .single();
+        if (fetchErr || !existing) {
+            return res.status(404).json({ error: fetchErr?.message || 'List not found' });
+        }
+        const oldName = existing.name;
+        if (oldName === newName) return res.json({ ...existing, oldName });
+
+        // Reject collisions — list views/joins group by name, so a
+        // duplicate would silently merge two lists from the user's POV.
+        const { data: clash } = await supabase
+            .from('import_lists')
+            .select('id')
+            .eq('name', newName)
+            .neq('id', id)
+            .maybeSingle();
+        if (clash) return res.status(409).json({ error: `A list named "${newName}" already exists` });
+
+        const { error: updListErr } = await supabase
+            .from('import_lists')
+            .update({ name: newName })
+            .eq('id', id);
+        if (updListErr) return res.status(500).json({ error: updListErr.message });
+
+        const { error: updContactsErr } = await supabase
+            .from('contacts')
+            .update({ lead_list_name: newName })
+            .eq('lead_list_name', oldName);
+        if (updContactsErr) {
+            // Roll back the list rename so the names stay in sync — without
+            // this the list would point to a name no contact carries.
+            await supabase
+                .from('import_lists')
+                .update({ name: oldName })
+                .eq('id', id);
+            return res.status(500).json({ error: updContactsErr.message });
+        }
+
+        res.json({ id, name: newName, oldName, contact_count: existing.contact_count, created_at: existing.created_at });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ============================================
 // EXPORT JOBS — async CSV builder
 //

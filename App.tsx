@@ -42,7 +42,9 @@ import {
   FileUp,
   Columns3,
   Import,
-  Layers
+  Layers,
+  Pencil,
+  Check
 } from 'lucide-react';
 
 /**
@@ -415,6 +417,14 @@ export default function App() {
     setShowListModal(false);
   };
 
+  const renameImportList = useCallback((oldName: string, newName: string) => {
+    // Keep the active pill in sync — the contacts now live under the new
+    // name, so the existing filter would suddenly match nothing.
+    setActiveListFilter(prev => (prev === oldName ? newName : prev));
+    setLeadListOptions(prev => prev.map(n => (n === oldName ? newName : n)));
+    refreshLists();
+  }, [refreshLists]);
+
   const enrichList = async (name: string, contactCount: number) => {
     setShowListModal(false);
     // Use 'in' operator so resolveFilteredContactIds (server.ts) takes the
@@ -556,6 +566,7 @@ export default function App() {
               onStartExport={startExportList}
               onClearExport={clearExportJob}
               onRefreshLists={refreshLists}
+              onRenameList={renameImportList}
             />
           ) : activeTab === AppTab.ENRICHMENT ? (
             <PipelineMonitor
@@ -746,6 +757,7 @@ export default function App() {
           onEnrichList={enrichList}
           onStartExport={startExportList}
           onClearExport={clearExportJob}
+          onRenameList={renameImportList}
           onGoToImport={() => { setShowListModal(false); setActiveTab(AppTab.IMPORT); }}
         />
       )}
@@ -763,6 +775,7 @@ function ImportedListsTable({
   onEnrichList,
   onStartExport,
   onClearExport,
+  onRenameList,
   onGoToImport,
   showAllListsRow = true,
 }: {
@@ -775,6 +788,7 @@ function ImportedListsTable({
   onEnrichList: (name: string, contactCount: number) => void;
   onStartExport: (name: string) => void;
   onClearExport: (jobId: string) => void;
+  onRenameList?: (oldName: string, newName: string) => void;
   onGoToImport?: () => void;
   showAllListsRow?: boolean;
 }) {
@@ -788,6 +802,57 @@ function ImportedListsTable({
       latestJobByList.set(j.listName, j);
     }
   }
+
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingValue, setEditingValue] = useState('');
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  // React batches state updates within an event tick, so editingId can still
+  // read as `l.id` inside the onBlur that fires right after a Save click.
+  // The ref short-circuits the second call without waiting for the re-render.
+  const submitGuardRef = useRef(false);
+
+  const beginRename = (l: { id: string; name: string }) => {
+    setEditingId(l.id);
+    setEditingValue(l.name);
+  };
+
+  const cancelRename = () => {
+    setEditingId(null);
+    setEditingValue('');
+  };
+
+  const submitRename = async (l: { id: string; name: string }) => {
+    if (submitGuardRef.current) return;
+    if (editingId !== l.id) return;
+    submitGuardRef.current = true;
+    const newName = editingValue.trim();
+    setEditingId(null);
+    if (!newName || newName === l.name) {
+      setEditingValue('');
+      submitGuardRef.current = false;
+      return;
+    }
+    setRenamingId(l.id);
+    try {
+      const res = await fetch(`/api/import-lists/${encodeURIComponent(l.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newName }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        window.alert(err.error || `Rename failed (${res.status})`);
+        return;
+      }
+      onRenameList?.(l.name, newName);
+    } catch (e: any) {
+      window.alert(e?.message || 'Rename failed');
+    } finally {
+      setRenamingId(null);
+      setEditingValue('');
+      submitGuardRef.current = false;
+    }
+  };
 
   return (
     <>
@@ -847,13 +912,38 @@ function ImportedListsTable({
             {lists.map(l => {
               const active = activeListFilter === l.name;
               const job = latestJobByList.get(l.name);
+              const isEditing = editingId === l.id;
+              const isRenaming = renamingId === l.id;
               return (
                 <tr
                   key={l.id}
-                  onClick={() => onOpenList(l.name)}
-                  className={`cursor-pointer transition-colors ${active ? 'bg-[#3ecf8e]/10' : 'hover:bg-white/[0.02]'}`}
+                  onClick={() => { if (!isEditing && !isRenaming) onOpenList(l.name); }}
+                  className={`transition-colors ${isEditing || isRenaming ? '' : 'cursor-pointer'} ${active ? 'bg-[#3ecf8e]/10' : 'hover:bg-white/[0.02]'}`}
                 >
-                  <td className={`px-5 py-2.5 font-medium ${active ? 'text-[#3ecf8e]' : 'text-gray-300'}`}>{l.name}</td>
+                  <td className={`px-5 py-2.5 font-medium ${active ? 'text-[#3ecf8e]' : 'text-gray-300'}`}>
+                    {isEditing ? (
+                      <input
+                        autoFocus
+                        value={editingValue}
+                        onChange={e => setEditingValue(e.target.value)}
+                        onClick={e => e.stopPropagation()}
+                        onKeyDown={e => {
+                          e.stopPropagation();
+                          if (e.key === 'Enter') { e.preventDefault(); submitRename(l); }
+                          else if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
+                        }}
+                        onBlur={() => submitRename(l)}
+                        className="w-full bg-[#1c1c1c] border border-[#3ecf8e] rounded px-2 py-1 text-[11px] text-white outline-none"
+                      />
+                    ) : isRenaming ? (
+                      <span className="flex items-center gap-2 text-gray-400">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        Renaming…
+                      </span>
+                    ) : (
+                      l.name
+                    )}
+                  </td>
                   <td className="px-5 py-2.5 text-gray-400 text-right font-mono">{l.contact_count.toLocaleString()}</td>
                   <td className="px-5 py-2.5"><EnrichmentProgress list={l} /></td>
                   <td className="px-5 py-2.5 text-gray-500 text-right">
@@ -861,21 +951,52 @@ function ImportedListsTable({
                   </td>
                   <td className="px-5 py-2.5 text-right">
                     <div className="flex items-center justify-end gap-1.5">
-                      <button
-                        onClick={e => { e.stopPropagation(); onOpenList(l.name); }}
-                        className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white transition-colors flex items-center gap-1"
-                        title="Open contacts"
-                      >
-                        <ExternalLink className="w-3 h-3" /> Open
-                      </button>
-                      <button
-                        onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count); }}
-                        className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] transition-colors flex items-center gap-1"
-                        title="Enrich all contacts in this list"
-                      >
-                        <Zap className="w-3 h-3" /> Enrich
-                      </button>
-                      <ExportButton job={job} listName={l.name} onStart={onStartExport} onClear={onClearExport} />
+                      {isEditing ? (
+                        <>
+                          <button
+                            onMouseDown={e => { e.preventDefault(); e.stopPropagation(); submitRename(l); }}
+                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] transition-colors flex items-center gap-1"
+                            title="Save name (Enter)"
+                          >
+                            <Check className="w-3 h-3" /> Save
+                          </button>
+                          <button
+                            onMouseDown={e => { e.preventDefault(); e.stopPropagation(); cancelRename(); }}
+                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white transition-colors flex items-center gap-1"
+                            title="Cancel (Esc)"
+                          >
+                            <X className="w-3 h-3" /> Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            onClick={e => { e.stopPropagation(); onOpenList(l.name); }}
+                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white transition-colors flex items-center gap-1"
+                            title="Open contacts"
+                          >
+                            <ExternalLink className="w-3 h-3" /> Open
+                          </button>
+                          {onRenameList && (
+                            <button
+                              onClick={e => { e.stopPropagation(); beginRename(l); }}
+                              disabled={isRenaming}
+                              className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white transition-colors flex items-center gap-1 disabled:opacity-50"
+                              title="Rename list"
+                            >
+                              <Pencil className="w-3 h-3" /> Rename
+                            </button>
+                          )}
+                          <button
+                            onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count); }}
+                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] transition-colors flex items-center gap-1"
+                            title="Enrich all contacts in this list"
+                          >
+                            <Zap className="w-3 h-3" /> Enrich
+                          </button>
+                          <ExportButton job={job} listName={l.name} onStart={onStartExport} onClear={onClearExport} />
+                        </>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -899,6 +1020,7 @@ function ListSelectorModal({
   onEnrichList,
   onStartExport,
   onClearExport,
+  onRenameList,
   onGoToImport,
 }: {
   lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[];
@@ -911,6 +1033,7 @@ function ListSelectorModal({
   onEnrichList: (name: string, contactCount: number) => void;
   onStartExport: (name: string) => void;
   onClearExport: (jobId: string) => void;
+  onRenameList?: (oldName: string, newName: string) => void;
   onGoToImport: () => void;
 }) {
   return (
@@ -940,6 +1063,7 @@ function ListSelectorModal({
             onEnrichList={onEnrichList}
             onStartExport={onStartExport}
             onClearExport={onClearExport}
+            onRenameList={onRenameList}
             onGoToImport={onGoToImport}
           />
         </div>
@@ -2957,6 +3081,7 @@ function CSVImportWizard({
   onStartExport,
   onClearExport,
   onRefreshLists,
+  onRenameList,
 }: {
   onComplete: () => void;
   importLists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[];
@@ -2969,6 +3094,7 @@ function CSVImportWizard({
   onStartExport: (name: string) => void;
   onClearExport: (jobId: string) => void;
   onRefreshLists: () => void;
+  onRenameList?: (oldName: string, newName: string) => void;
 }) {
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [file, setFile] = useState<File | null>(null);
@@ -3565,6 +3691,7 @@ function CSVImportWizard({
             onEnrichList={onEnrichList}
             onStartExport={onStartExport}
             onClearExport={onClearExport}
+            onRenameList={onRenameList}
             showAllListsRow={false}
           />
         </div>
