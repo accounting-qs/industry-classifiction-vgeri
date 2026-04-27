@@ -982,7 +982,11 @@ app.post('/api/import-lists', async (req, res) => {
 
 // Rename an import list and cascade the new name to every contact that
 // references it. contacts.lead_list_name is a plain TEXT column, not a FK,
-// so we have to update both rows ourselves to keep the join consistent.
+// so the rename has to touch both tables. Production lists run 50k–250k+
+// rows, which trips PostgREST's 8s statement_timeout when we try to do
+// the cascade through two separate REST UPDATEs — so the real work lives
+// in `rename_import_list` (rename_import_list_rpc.sql), which raises the
+// timeout and runs both updates inside a single transaction.
 app.patch('/api/import-lists/:id', async (req, res) => {
     const id = String(req.params?.id || '').trim();
     const newName = String(req.body?.name || '').trim();
@@ -990,6 +994,41 @@ app.patch('/api/import-lists/:id', async (req, res) => {
     if (!newName) return res.status(400).json({ error: 'name is required' });
 
     try {
+        const { data: rpcData, error: rpcErr } = await supabase.rpc('rename_import_list', {
+            p_id: id,
+            p_new_name: newName,
+        });
+
+        if (!rpcErr) {
+            const row = Array.isArray(rpcData) ? rpcData[0] : rpcData;
+            return res.json({
+                id,
+                name: row?.new_name ?? newName,
+                oldName: row?.old_name ?? null,
+                contacts_updated: Number(row?.contacts_updated) || 0,
+            });
+        }
+
+        // Surface the function's own validation errors with the right HTTP
+        // status before falling back. PostgREST passes RAISE EXCEPTION as
+        // `message` and the SQLSTATE as `code`.
+        const msg = rpcErr.message || '';
+        if (msg.startsWith('duplicate_list_name')) {
+            return res.status(409).json({ error: `A list named "${newName}" already exists` });
+        }
+        if (msg.includes('not found')) {
+            return res.status(404).json({ error: msg });
+        }
+
+        // Fallback for environments where the migration hasn't been applied
+        // yet. This path is unsafe for big lists (statement_timeout) — the
+        // RPC is the supported route. Logged so it's visible in deploys.
+        const isMissingFn = (rpcErr as any).code === 'PGRST202' || /function .*rename_import_list/i.test(msg);
+        if (!isMissingFn) {
+            return res.status(500).json({ error: msg || 'Rename failed' });
+        }
+        console.warn('[import-lists] rename_import_list RPC unavailable — falling back to two-step update. Apply supabase/migrations/20260427_rename_import_list_rpc.sql to lift the timeout.');
+
         const { data: existing, error: fetchErr } = await supabase
             .from('import_lists')
             .select('id, name, contact_count, created_at')
@@ -1001,8 +1040,6 @@ app.patch('/api/import-lists/:id', async (req, res) => {
         const oldName = existing.name;
         if (oldName === newName) return res.json({ ...existing, oldName });
 
-        // Reject collisions — list views/joins group by name, so a
-        // duplicate would silently merge two lists from the user's POV.
         const { data: clash } = await supabase
             .from('import_lists')
             .select('id')
@@ -1022,8 +1059,6 @@ app.patch('/api/import-lists/:id', async (req, res) => {
             .update({ lead_list_name: newName })
             .eq('lead_list_name', oldName);
         if (updContactsErr) {
-            // Roll back the list rename so the names stay in sync — without
-            // this the list would point to a name no contact carries.
             await supabase
                 .from('import_lists')
                 .update({ name: oldName })
