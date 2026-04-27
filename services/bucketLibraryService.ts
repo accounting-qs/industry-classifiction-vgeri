@@ -1,20 +1,26 @@
 /**
- * Bucket Library — reusable bucket definitions across runs.
+ * Bucket Library — reusable specialization definitions across runs.
  *
- * The library lets a user persist proven bucket definitions and seed future
- * Phase 1a runs with them. The discovery LLM is asked to REUSE preferred
- * buckets verbatim when alignment is high (≥ 0.7), avoiding name drift
- * across campaigns and accumulating institutional taxonomy knowledge.
+ * The library persists proven (primary_identity, functional_specialization)
+ * pairs and seeds future runs with them. The discovery LLM is asked to reuse
+ * library specs verbatim at high alignment, AND Phase 1b matches against the
+ * library deterministically before LLM matching, so saved knowledge wins.
+ *
+ * v2.3: rows now carry primary_identity + functional_specialization. The old
+ * bucket_name / direct_ancestor / root_category columns stay for read-side
+ * backward compat; new writes populate both old and new fields.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 export interface LibraryBucket {
     id: string;
-    bucket_name: string;
+    bucket_name: string;                         // == functional_specialization (kept for back-compat)
+    primary_identity: string | null;
+    functional_specialization: string | null;
     description: string | null;
-    direct_ancestor: string | null;
-    root_category: string | null;
+    direct_ancestor: string | null;              // legacy mirror of primary_identity
+    root_category: string | null;                // legacy
     include_terms: string[];
     exclude_terms: string[];
     example_strings: string[];
@@ -27,10 +33,12 @@ export interface LibraryBucket {
 }
 
 export interface LibraryBucketInput {
-    bucket_name: string;
+    primary_identity?: string;                   // preferred
+    functional_specialization?: string;          // preferred
+    bucket_name?: string;                        // legacy alias for functional_specialization
+    direct_ancestor?: string;                    // legacy alias for primary_identity
+    root_category?: string;                      // legacy
     description?: string;
-    direct_ancestor?: string;
-    root_category?: string;
     include_terms?: string[];
     exclude_terms?: string[];
     example_strings?: string[];
@@ -52,14 +60,17 @@ export async function upsertLibraryBucket(
     supabase: SupabaseClient,
     input: LibraryBucketInput
 ): Promise<LibraryBucket> {
-    const name = (input.bucket_name || '').trim();
-    if (!name) throw new Error('bucket_name required');
+    const spec = (input.functional_specialization || input.bucket_name || '').trim();
+    const ident = (input.primary_identity || input.direct_ancestor || '').trim();
+    if (!spec) throw new Error('functional_specialization (or bucket_name) is required');
 
     const payload = {
-        bucket_name: name,
-        description: input.description?.trim() || null,
-        direct_ancestor: input.direct_ancestor?.trim() || null,
+        bucket_name: spec,                       // legacy mirror
+        functional_specialization: spec,
+        primary_identity: ident || null,
+        direct_ancestor: ident || null,          // legacy mirror
         root_category: input.root_category?.trim() || null,
+        description: input.description?.trim() || null,
         include_terms: input.include_terms || [],
         exclude_terms: input.exclude_terms || [],
         example_strings: input.example_strings || [],
@@ -67,7 +78,6 @@ export async function upsertLibraryBucket(
         updated_at: new Date().toISOString()
     };
 
-    // upsert by unique bucket_name
     const { data, error } = await supabase.from('bucket_library')
         .upsert(payload, { onConflict: 'bucket_name' })
         .select()
@@ -96,13 +106,14 @@ export async function deleteLibraryBucket(
 }
 
 /**
- * Save selected buckets from a completed run into the library.
- * For each selected bucket, the run's taxonomy_final entry is the source of truth.
+ * Save selected specializations from a completed run into the library.
+ * Inputs are functional_specialization names (the new shape). Legacy
+ * bucket_name lookup is also accepted for forward-compat.
  */
 export async function saveRunBucketsToLibrary(
     supabase: SupabaseClient,
     runId: string,
-    bucketNames: string[]
+    specNames: string[]
 ): Promise<{ saved: number; skipped: string[] }> {
     const { data: run, error } = await supabase
         .from('bucketing_runs').select('taxonomy_final,taxonomy_proposal').eq('id', runId).single();
@@ -110,17 +121,22 @@ export async function saveRunBucketsToLibrary(
     const final = (run.taxonomy_final || run.taxonomy_proposal) as any;
     if (!final?.buckets) throw new Error('no taxonomy on this run');
 
-    const selected = (final.buckets as any[]).filter(b => bucketNames.includes(b.bucket_name));
-    const skipped: string[] = bucketNames.filter(n => !selected.some(b => b.bucket_name === n));
+    const wanted = new Set(specNames.map(s => s.trim()));
+    const selected = (final.buckets as any[]).filter(b => {
+        const spec = b.functional_specialization || b.bucket_name;
+        return spec && wanted.has(spec);
+    });
+    const matched = new Set(selected.map(b => (b.functional_specialization || b.bucket_name).trim()));
+    const skipped = specNames.filter(n => !matched.has(n.trim()));
+
     let saved = 0;
     for (const b of selected) {
         await upsertLibraryBucket(supabase, {
-            bucket_name: b.bucket_name,
+            functional_specialization: b.functional_specialization || b.bucket_name,
+            primary_identity: b.primary_identity || b.direct_ancestor,
             description: b.description,
-            direct_ancestor: b.direct_ancestor,
-            root_category: b.root_category,
-            include_terms: b.include || [],
-            exclude_terms: b.exclude || [],
+            include_terms: b.include || b.include_terms || [],
+            exclude_terms: b.exclude || b.exclude_terms || [],
             example_strings: b.example_strings || []
         });
         saved++;

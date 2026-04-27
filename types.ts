@@ -112,10 +112,12 @@ export interface BucketingRun {
 
 export interface LibraryBucket {
   id: string;
-  bucket_name: string;
+  bucket_name: string;                         // legacy mirror of functional_specialization
+  primary_identity: string | null;             // v2.3
+  functional_specialization: string | null;    // v2.3
   description: string | null;
-  direct_ancestor: string | null;
-  root_category: string | null;
+  direct_ancestor: string | null;              // legacy mirror of primary_identity
+  root_category: string | null;                // legacy
   include_terms: string[];
   exclude_terms: string[];
   example_strings: string[];

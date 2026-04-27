@@ -20,8 +20,9 @@ import type { BucketingRun, BucketProposal, LibraryBucket } from './types';
 
 type BucketingView = 'index' | 'setup' | 'detail' | 'library';
 
-const RESERVED_GENERIC = 'Generic';
-const RESERVED_DISQUALIFIED = 'Disqualified';
+const RESERVED_GENERAL = 'General';
+// Recognize legacy names too, in case a run was created before v2.3.
+const RESERVED_NAMES = new Set(['general', 'generic', 'disqualified', 'other']);
 
 export function BucketingTab({ importLists }: {
   importLists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number }[]
@@ -418,9 +419,11 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
                   <span className="flex items-start gap-2 flex-1 min-w-0">
                     <input type="checkbox" checked={isSel} onChange={() => {}} className="w-3 h-3 mt-0.5" />
                     <span className="min-w-0">
-                      <span className={`font-medium block ${isSel ? 'text-[#3ecf8e]' : 'text-gray-200'}`}>{b.bucket_name}</span>
+                      <span className={`font-medium block ${isSel ? 'text-[#3ecf8e]' : 'text-gray-200'}`}>
+                        {b.functional_specialization || b.bucket_name}
+                      </span>
                       <span className="text-[10px] text-gray-500 truncate block">
-                        {b.direct_ancestor || '—'} › {b.root_category || '—'} · used {b.times_used}×
+                        under {b.primary_identity || b.direct_ancestor || '—'} · used {b.times_used}×
                       </span>
                     </span>
                   </span>
@@ -937,23 +940,20 @@ function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySave
             const pct = total > 0 ? (count / total) * 100 : 0;
             const barWidth = max > 0 ? (count / max) * 100 : 0;
             const name: string = b.bucket_name;
-            const isGeneric = name === RESERVED_GENERIC;
-            const isDQ = name === RESERVED_DISQUALIFIED;
-            // Bucket level: combo (sector + spec) > spec > identity > generic
-            const isSpec = specNames.has(name);
-            const isIdentity = identityNames.has(name) && !isSpec;
-            const isCombo = !isSpec && !isIdentity && !isGeneric && !isDQ
+            const isGeneral = RESERVED_NAMES.has(name.toLowerCase());
+            // Bucket level: combo (sector + spec) > spec > identity > general
+            const isSpec = !isGeneral && specNames.has(name);
+            const isIdentity = !isGeneral && identityNames.has(name) && !isSpec;
+            const isCombo = !isSpec && !isIdentity && !isGeneral
                 && Array.from(specNames).some(s => name.endsWith(' ' + s));
             const levelLabel = isCombo ? 'sector × specialization'
                 : isSpec ? 'specialization'
                 : isIdentity ? 'identity (rolled up)'
-                : isGeneric ? 'generic'
-                : isDQ ? 'disqualified'
+                : isGeneral ? 'general (catch-all)'
                 : 'rolled up';
             const levelColor = isCombo ? 'text-[#3ecf8e]'
                 : isSpec ? 'text-[#3ecf8e]'
                 : isIdentity ? 'text-blue-400'
-                : isDQ ? 'text-red-400'
                 : 'text-amber-400';
             return (
               <div key={name} className="px-4 py-3 hover:bg-white/[0.02]">
@@ -961,7 +961,7 @@ function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySave
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between mb-1.5">
                       <div className="flex items-center gap-2 min-w-0">
-                        <span className={`text-xs font-bold ${isDQ ? 'text-red-400' : isGeneric ? 'text-amber-400' : 'text-white'} truncate`}>
+                        <span className={`text-xs font-bold ${isGeneral ? 'text-amber-400' : 'text-white'} truncate`}>
                           {name}
                         </span>
                         <span className={`text-[9px] font-bold uppercase tracking-widest ${levelColor} bg-white/[0.03] border border-current/30 px-1.5 py-0.5 rounded shrink-0`}>
@@ -974,7 +974,7 @@ function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySave
                     </div>
                     <div className="h-1.5 bg-[#1c1c1c] rounded-full overflow-hidden">
                       <div
-                        className={`h-full transition-all ${isDQ ? 'bg-red-500/70' : isGeneric ? 'bg-amber-500/70' : isIdentity ? 'bg-blue-500/70' : 'bg-[#3ecf8e]'}`}
+                        className={`h-full transition-all ${isGeneral ? 'bg-amber-500/70' : isIdentity ? 'bg-blue-500/70' : 'bg-[#3ecf8e]'}`}
                         style={{ width: `${barWidth}%` }}
                       />
                     </div>
@@ -1084,9 +1084,8 @@ function BucketingLibrary({ library, onRefresh, onError }: {
           <table className="w-full text-[11px]">
             <thead className="bg-[#0e0e0e]">
               <tr className="border-b border-[#2e2e2e] text-[9px] font-bold text-gray-500 uppercase tracking-wider">
-                <th className="px-5 py-3 text-left">Leaf</th>
-                <th className="px-5 py-3 text-left">Ancestor</th>
-                <th className="px-5 py-3 text-left">Root</th>
+                <th className="px-5 py-3 text-left">Functional specialization</th>
+                <th className="px-5 py-3 text-left">Primary identity</th>
                 <th className="px-5 py-3 text-right">Used</th>
                 <th className="px-5 py-3 text-right">Last used</th>
                 <th className="px-5 py-3 text-right"></th>
@@ -1096,11 +1095,10 @@ function BucketingLibrary({ library, onRefresh, onError }: {
               {library.map(b => (
                 <tr key={b.id} className={`hover:bg-white/[0.02] ${b.archived ? 'opacity-50' : ''}`}>
                   <td className="px-5 py-3">
-                    <div className="font-bold text-white">{b.bucket_name}</div>
+                    <div className="font-bold text-white">{b.functional_specialization || b.bucket_name}</div>
                     {b.description && <div className="text-[10px] text-gray-500 truncate max-w-md">{b.description}</div>}
                   </td>
-                  <td className="px-5 py-3 text-gray-300">{b.direct_ancestor || '—'}</td>
-                  <td className="px-5 py-3 text-gray-300">{b.root_category || '—'}</td>
+                  <td className="px-5 py-3 text-gray-300">{b.primary_identity || b.direct_ancestor || '—'}</td>
                   <td className="px-5 py-3 text-right text-gray-300 font-mono">{b.times_used}×</td>
                   <td className="px-5 py-3 text-right text-gray-500">
                     {b.last_used_at ? new Date(b.last_used_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '—'}
@@ -1134,25 +1132,23 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
   onSaved: () => void;
   onError: (msg: string | null) => void;
 }) {
-  const [name, setName] = useState(existing?.bucket_name || '');
+  const [spec, setSpec] = useState(existing?.functional_specialization || existing?.bucket_name || '');
+  const [identity, setIdentity] = useState(existing?.primary_identity || existing?.direct_ancestor || '');
   const [desc, setDesc] = useState(existing?.description || '');
-  const [ancestor, setAncestor] = useState(existing?.direct_ancestor || '');
-  const [root, setRoot] = useState(existing?.root_category || '');
   const [include, setInclude] = useState((existing?.include_terms || []).join(', '));
   const [exclude, setExclude] = useState((existing?.exclude_terms || []).join(', '));
   const [examples, setExamples] = useState((existing?.example_strings || []).join('\n'));
   const [busy, setBusy] = useState(false);
 
   const save = async () => {
-    if (!name.trim()) return;
+    if (!spec.trim()) return;
     setBusy(true);
     onError(null);
     try {
       const payload = {
-        bucket_name: name.trim(),
+        functional_specialization: spec.trim(),
+        primary_identity: identity.trim(),
         description: desc.trim(),
-        direct_ancestor: ancestor.trim(),
-        root_category: root.trim(),
         include_terms: include.split(',').map(s => s.trim()).filter(Boolean),
         exclude_terms: exclude.split(',').map(s => s.trim()).filter(Boolean),
         example_strings: examples.split('\n').map(s => s.trim()).filter(Boolean)
@@ -1177,13 +1173,11 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
   return (
     <div className="border border-[#3ecf8e]/30 rounded-xl bg-[#0e0e0e] p-4 space-y-3">
       <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{existing ? 'Edit' : 'New'} library bucket</div>
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-        <input value={name} onChange={e => setName(e.target.value)} placeholder="Leaf name (unique)"
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+        <input value={spec} onChange={e => setSpec(e.target.value)} placeholder="Functional specialization (Layer 2, unique)"
           disabled={!!existing}
           className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e] disabled:opacity-60" />
-        <input value={ancestor} onChange={e => setAncestor(e.target.value)} placeholder="Direct ancestor"
-          className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e]" />
-        <input value={root} onChange={e => setRoot(e.target.value)} placeholder="Root category"
+        <input value={identity} onChange={e => setIdentity(e.target.value)} placeholder="Primary identity (Layer 1)"
           className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e]" />
       </div>
       <input value={desc} onChange={e => setDesc(e.target.value)} placeholder="Description"
@@ -1196,7 +1190,7 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
         className="w-full px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e] font-mono" />
       <div className="flex justify-end gap-2">
         <button onClick={onCancel} className="px-3 py-1.5 rounded text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e]">Cancel</button>
-        <button onClick={save} disabled={busy || !name.trim()} className="px-3 py-1.5 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1">
+        <button onClick={save} disabled={busy || !spec.trim()} className="px-3 py-1.5 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1">
           {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
           Save
         </button>

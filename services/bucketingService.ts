@@ -59,9 +59,14 @@ const ANTHROPIC_PRICING: Record<string, { input: number; output: number }> = {
 };
 const EMBEDDING_PRICE_PER_1M = 0.02;
 
-const RESERVED_GENERIC = 'Generic';
-const RESERVED_DISQUALIFIED = 'Disqualified';
-const RESERVED = new Set([RESERVED_GENERIC.toLowerCase(), RESERVED_DISQUALIFIED.toLowerCase(), 'other']);
+// Single catch-all bucket for everything that doesn't earn its own segment:
+// generic, disqualified, sub-threshold rollups, scrape failures.
+// is_disqualified flag is still tracked per row for audit but no longer
+// drives a separate bucket.
+const RESERVED_GENERAL = 'General';
+const RESERVED = new Set([
+    'general', 'generic', 'disqualified', 'other'
+]);
 
 const ANTHROPIC_KEY_NAME = 'ANTHROPIC_API_KEY';
 
@@ -220,7 +225,7 @@ Layer 4 — CAMPAIGN BUCKET (decided downstream, NOT by you)
        leads (e.g. "Real Estate SEO Agency").
      - Else fall back to "{specialization}" (e.g. "SEO Agency").
      - Else fall back to "{primary_identity}" (e.g. "Agency").
-     - Else "Generic".
+     - Else "General" (single catch-all bucket — disqualified rows go here too).
    You DO NOT predict campaign buckets. You produce accurate Layer 1-3
    classifications. The system computes Layer 4 from your output + counts.
 
@@ -288,13 +293,14 @@ Strong ICP (always inviteable): agencies, consulting/advisory, professional
 services (non-local), B2B/enterprise SaaS, financial services & investment
 firms, plausibly scalable high-ticket info products.
 
-Explicit NON-ICP (route to "Generic", still inviteable): ecommerce/DTC
+Explicit NON-ICP (route to "General", still inviteable): ecommerce/DTC
 physical products, local services tied to geography, brick-and-mortar
 retail, low-ticket consumer.
 
-Disqualify ONLY for clear non-ICP operators with no plausible upsell path.
-Disqualification is conservative — false negatives cost more than false
-positives. If ambiguous, prefer Generic.
+Set the disqualified flag (audit only) for clear non-ICP operators with
+no plausible upsell path. Disqualified rows still land in the General
+bucket — there is no separate Disqualified bucket. Disqualification is
+conservative; if ambiguous, prefer the generic flag (also routes to General).
 
 ========================================
 CRITICAL CONSTRAINTS
@@ -417,7 +423,46 @@ export async function runTaxonomyProposal(
         }
     }
 
-    log(`[Bucketing ${runId}] Phase 1a done — ${leaves.length} leaves persisted`);
+    // Seed bucket_industry_map from each spec's example_strings so the
+    // Review screen can show a meaningful per-spec contact-count preview
+    // before Phase 1b runs. Phase 1b clears this map and rewrites it with
+    // the full chain (incl. sector_focus per row), so these seeds are
+    // strictly preview-only.
+    const validIndustries = new Set(vocabRows.map(r => r.industry));
+    const seedRows: any[] = [];
+    const seenSeed = new Set<string>();
+    for (const l of leaves) {
+        for (const ind of (l.example_strings || [])) {
+            if (!validIndustries.has(ind)) continue;     // model hallucinated, skip
+            if (seenSeed.has(ind)) continue;             // first spec wins on conflict
+            seenSeed.add(ind);
+            seedRows.push({
+                bucketing_run_id: runId,
+                industry_string: ind,
+                bucket_name: l.functional_specialization, // pre-rollup placeholder
+                source: 'llm_phase1',
+                confidence: 1.0,
+                bucket_leaf: l.functional_specialization,
+                bucket_ancestor: l.primary_identity,
+                bucket_root: l.primary_identity,
+                primary_identity: l.primary_identity,
+                functional_specialization: l.functional_specialization,
+                sector_focus: '',
+                is_generic: false,
+                is_disqualified: false
+            });
+        }
+    }
+    if (seedRows.length > 0) {
+        for (let i = 0; i < seedRows.length; i += 1000) {
+            const chunk = seedRows.slice(i, i + 1000);
+            const { error: seedErr } = await supabase.from('bucket_industry_map')
+                .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
+            if (seedErr) throw new Error(`Phase 1a seed insert failed: ${seedErr.message}`);
+        }
+    }
+
+    log(`[Bucketing ${runId}] Phase 1a done — ${leaves.length} specs persisted, ${seedRows.length} preview-seed map rows`);
 }
 
 function dedupe(arr: string[] | undefined): string[] {
@@ -825,6 +870,20 @@ export async function runAssignment(
     const leaves = final.buckets;
     const sectorVocab: string[] = (final as any).sector_focus_vocabulary || [];
 
+    // Library buckets the user opted into for this run. We match them first,
+    // deterministically, before LLM matching. They've earned their place
+    // across past runs — no point burning LLM tokens on industries they
+    // already cover.
+    const preferredIds: string[] = Array.isArray(run.preferred_library_ids) ? run.preferred_library_ids : [];
+    let libraryBuckets: any[] = [];
+    if (preferredIds.length > 0) {
+        const { data } = await supabase
+            .from('bucket_library').select('*').in('id', preferredIds);
+        libraryBuckets = (data || []).filter((b: any) =>
+            (b.functional_specialization || b.bucket_name) && (b.primary_identity || b.direct_ancestor)
+        );
+    }
+
     await supabase.from('bucketing_runs').update({ status: 'assigning' }).eq('id', runId);
 
     let totalCost = Number(run.cost_usd || 0);
@@ -838,13 +897,31 @@ export async function runAssignment(
     let assignedRows: any[] = [];
     let pendingIndustries: VocabRow[] = vocab;
 
-    if (EMBED_PREFILTER_ENABLED) {
-        log(`[Bucketing ${runId}] step 3/5: embedding pre-filter`);
-        const embedRes = await runEmbeddingPrefilter(vocab, leaves, runId);
+    // Step 2 (NEW): library-first deterministic match. Embedding cosine
+    // against library bucket definitions; high-confidence hits are written
+    // immediately as map rows with source='library_match'. This puts saved
+    // institutional knowledge in front of fresh LLM discovery.
+    if (libraryBuckets.length > 0) {
+        log(`[Bucketing ${runId}] step 2/5: library-first match against ${libraryBuckets.length} preferred buckets`);
+        const libRes = await runLibraryFirstMatch(vocab, libraryBuckets, sectorVocab, runId);
+        totalCost += libRes.costUsd;
+        assignedRows = libRes.autoAssigned;
+        pendingIndustries = libRes.pending;
+        log(`[Bucketing ${runId}] library matched ${assignedRows.length}/${vocab.length}, ${pendingIndustries.length} pending`);
+    }
+
+    // Step 3: embedding pre-filter against THIS run's discovered specs.
+    // Now sector-aware: we deterministically scan the industry string for
+    // any sector_focus_vocabulary term and tag the resulting row with it,
+    // so combo buckets like "Real Estate SEO Agency" can form even on
+    // embedding-matched rows.
+    if (EMBED_PREFILTER_ENABLED && pendingIndustries.length > 0) {
+        log(`[Bucketing ${runId}] step 3/5: embedding pre-filter (sector-aware)`);
+        const embedRes = await runEmbeddingPrefilter(pendingIndustries, leaves, sectorVocab, runId);
         totalCost += embedRes.costUsd;
-        assignedRows = embedRes.autoAssigned;
+        assignedRows = assignedRows.concat(embedRes.autoAssigned);
         pendingIndustries = embedRes.pending;
-        log(`[Bucketing ${runId}] embedding auto-assigned ${assignedRows.length}/${vocab.length}, ${pendingIndustries.length} pending`);
+        log(`[Bucketing ${runId}] embedding auto-assigned ${embedRes.autoAssigned.length}/${vocab.length}, ${pendingIndustries.length} still pending`);
     }
 
     log(`[Bucketing ${runId}] step 4/5: routing LLM matching`);
@@ -890,10 +967,115 @@ export async function runAssignment(
     log(`[Bucketing ${runId}] DONE — ${assignedCount} contacts assigned, total cost $${totalCost.toFixed(4)}`);
 }
 
-// ─── embedding pre-filter ──────────────────────────────────────────
+// ─── sector_focus extraction (deterministic) ───────────────────────
+//
+// Used by the embedding prefilter and library-first match to populate
+// sector_focus from the raw industry string when no LLM has run on it.
+// Without this, embedding-matched rows would all have sector_focus=''
+// and combo buckets ("Real Estate SEO Agency") could never form.
+//
+// Strategy: case-insensitive substring match against sector_focus_vocabulary,
+// preferring longer matches (so "Real Estate" wins over "Real").
+function extractSectorFocus(industryString: string, sectorVocab: string[]): string {
+    if (!industryString || sectorVocab.length === 0) return '';
+    const lower = industryString.toLowerCase();
+    const hits: { sector: string; len: number }[] = [];
+    for (const sec of sectorVocab) {
+        const s = (sec || '').trim();
+        if (!s) continue;
+        // word-ish match — sector term must appear bordered by start/end or non-letter.
+        const re = new RegExp(`(^|[^a-z0-9])${escapeRegExp(s.toLowerCase())}([^a-z0-9]|$)`);
+        if (re.test(lower)) hits.push({ sector: s, len: s.length });
+    }
+    if (hits.length === 0) return '';
+    // multiple hits → "Multi-industry" (cold-email copy can't pin one sector)
+    if (hits.length > 1) {
+        // unless all hits are the same after normalization (synonym safety)
+        const set = new Set(hits.map(h => h.sector.toLowerCase()));
+        if (set.size > 1) return 'Multi-industry';
+    }
+    // pick the longest match
+    return hits.sort((a, b) => b.len - a.len)[0].sector;
+}
+
+function escapeRegExp(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ─── library-first deterministic match ─────────────────────────────
+//
+// Embeds the user's selected library buckets and matches each vocabulary
+// industry against them. High-confidence hits short-circuit the LLM and
+// produce a map row using the library's primary_identity +
+// functional_specialization, with sector_focus extracted deterministically.
+async function runLibraryFirstMatch(
+    vocab: VocabRow[],
+    libraryBuckets: any[],
+    sectorVocab: string[],
+    runId: string
+): Promise<{ autoAssigned: any[]; pending: VocabRow[]; costUsd: number }> {
+    if (vocab.length === 0 || libraryBuckets.length === 0) {
+        return { autoAssigned: [], pending: vocab, costUsd: 0 };
+    }
+
+    // Library bucket vector representation. Identity signals + include terms
+    // dominate so cosine matches business identity, not sector.
+    const libTexts = libraryBuckets.map(b => {
+        const spec = b.functional_specialization || b.bucket_name || '';
+        const ident = b.primary_identity || b.direct_ancestor || '';
+        const inc = (b.include_terms || []).slice(0, 8).join(', ');
+        const examples = (b.example_strings || []).slice(0, 4).join(' | ');
+        return `${spec} (under ${ident}): ${b.description || ''}. Includes: ${inc}. Examples: ${examples}.`;
+    });
+    const vocabTexts = vocab.map(v => v.industry);
+    const { embeddings, costUsd } = await embedBatch([...libTexts, ...vocabTexts]);
+    const libVecs = embeddings.slice(0, libraryBuckets.length);
+    const vocabVecs = embeddings.slice(libraryBuckets.length);
+
+    const autoAssigned: any[] = [];
+    const pending: VocabRow[] = [];
+
+    for (let i = 0; i < vocab.length; i++) {
+        const sims = libVecs.map(lv => cosine(vocabVecs[i], lv));
+        const sorted = sims.map((s, j) => ({ s, j })).sort((a, b) => b.s - a.s);
+        const top = sorted[0];
+        const second = sorted[1] || { s: 0 };
+        if (top.s >= EMBED_AUTO_THRESHOLD && (top.s - second.s) >= EMBED_MARGIN) {
+            const lib = libraryBuckets[top.j];
+            const spec = lib.functional_specialization || lib.bucket_name || '';
+            const ident = lib.primary_identity || lib.direct_ancestor || '';
+            const sector = extractSectorFocus(vocab[i].industry, sectorVocab);
+            autoAssigned.push({
+                bucketing_run_id: runId,
+                industry_string: vocab[i].industry,
+                bucket_name: spec, // pre-rollup placeholder
+                source: 'library_match',
+                confidence: Number(top.s.toFixed(2)),
+                bucket_leaf: spec,
+                bucket_ancestor: ident,
+                bucket_root: ident,
+                primary_identity: ident,
+                functional_specialization: spec,
+                sector_focus: sector,
+                leaf_score: Number(top.s.toFixed(2)),
+                ancestor_score: Number(top.s.toFixed(2)),
+                root_score: Number(top.s.toFixed(2)),
+                is_generic: false,
+                is_disqualified: false,
+                reasons: { auto: 'library_match', library_bucket_id: lib.id, cosine: top.s }
+            });
+        } else {
+            pending.push(vocab[i]);
+        }
+    }
+    return { autoAssigned, pending, costUsd };
+}
+
+// ─── embedding pre-filter (sector-aware) ───────────────────────────
 async function runEmbeddingPrefilter(
     vocab: VocabRow[],
     leaves: DiscoveredBucket[],
+    sectorVocab: string[],
     runId: string
 ): Promise<{ autoAssigned: any[]; pending: VocabRow[]; costUsd: number }> {
     if (vocab.length === 0 || leaves.length === 0) return { autoAssigned: [], pending: vocab, costUsd: 0 };
@@ -928,6 +1110,10 @@ async function runEmbeddingPrefilter(
                 pending.push(vocab[i]);
                 continue;
             }
+            // Extract sector deterministically from the industry string so
+            // combo campaign buckets ("Real Estate SEO Agency") still form
+            // on embedding-matched rows.
+            const sector = extractSectorFocus(vocab[i].industry, sectorVocab);
             autoAssigned.push({
                 bucketing_run_id: runId,
                 industry_string: vocab[i].industry,
@@ -939,7 +1125,7 @@ async function runEmbeddingPrefilter(
                 bucket_root: leaf.primary_identity,
                 primary_identity: leaf.primary_identity,
                 functional_specialization: leaf.functional_specialization,
-                sector_focus: '',
+                sector_focus: sector,
                 leaf_score: Number(top.s.toFixed(2)),
                 ancestor_score: Number(top.s.toFixed(2)),
                 root_score: Number(top.s.toFixed(2)),
@@ -1060,7 +1246,7 @@ async function runMatchingLLM(
                 industry_string: ind,
                 // Pre-rollup placeholder. The SQL rollup will overwrite this
                 // with the campaign bucket (combo / spec / identity / Generic).
-                bucket_name: specName || (r.disqualified ? RESERVED_DISQUALIFIED : RESERVED_GENERIC),
+                bucket_name: specName || RESERVED_GENERAL,
                 source: 'llm_phase1b',
                 confidence: Number((r.functional_specialization.score || 0).toFixed(2)),
                 bucket_leaf: specName,
