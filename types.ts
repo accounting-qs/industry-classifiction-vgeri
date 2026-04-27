@@ -45,7 +45,8 @@ export enum AppTab {
   ENRICHMENT = 'enrichment',
   IMPORT = 'import',
   PROXIES = 'proxies',
-  BUCKETING = 'bucketing'
+  BUCKETING = 'bucketing',
+  CONNECTORS = 'connectors'
 }
 
 export type BucketingRunStatus =

@@ -2,6 +2,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AppTab, Contact, Enrichment, BatchStats, MergedContact, FilterCondition, FilterOperator, BucketingRun, BucketProposal, BucketCount, BucketAssignmentCount, LibraryBucket } from './types';
 import { BucketingTab } from './BucketingTab';
+import { ConnectorsTab } from './ConnectorsTab';
 import { db } from './services/supabaseClient';
 import { enrichBatch } from './services/enrichmentService';
 import Papa from 'papaparse';
@@ -45,7 +46,8 @@ import {
   Import,
   Layers,
   Pencil,
-  Check
+  Check,
+  KeyRound
 } from 'lucide-react';
 
 /**
@@ -533,7 +535,8 @@ export default function App() {
           <SidebarIconButton active={activeTab === AppTab.ENRICHMENT} onClick={() => setActiveTab(AppTab.ENRICHMENT)} icon={<Zap className={`w-5 h-5 ${stats.isProcessing ? 'text-[#3ecf8e] animate-pulse' : ''}`} />} label="Pipeline Monitor" />
           <SidebarIconButton active={activeTab === AppTab.BUCKETING} onClick={() => setActiveTab(AppTab.BUCKETING)} icon={<Layers className="w-5 h-5" />} label="Bucketing" />
         </nav>
-        <div className="p-2 border-t border-[#2e2e2e]">
+        <div className="p-2 border-t border-[#2e2e2e] space-y-1">
+          <SidebarIconButton active={activeTab === AppTab.CONNECTORS} onClick={() => setActiveTab(AppTab.CONNECTORS)} icon={<KeyRound className="w-5 h-5" />} label="Connectors" />
           <SidebarIconButton active={activeTab === AppTab.PROXIES} onClick={() => setActiveTab(AppTab.PROXIES)} icon={<BarChart2 className={`w-5 h-5 ${activeTab === AppTab.PROXIES ? 'text-[#3ecf8e]' : ''}`} />} label="Proxy Performance" />
         </div>
       </aside>
@@ -552,6 +555,8 @@ export default function App() {
         <div className="flex-1 overflow-hidden flex flex-col">
           {activeTab === AppTab.PROXIES ? (
             <ProxyStatsDashboard />
+          ) : activeTab === AppTab.CONNECTORS ? (
+            <ConnectorsTab />
           ) : activeTab === AppTab.BUCKETING ? (
             <BucketingTab importLists={importLists} />
           ) : activeTab === AppTab.IMPORT ? (

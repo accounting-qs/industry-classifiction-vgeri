@@ -32,6 +32,7 @@ export function BucketingTab({ importLists }: {
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [activeRun, setActiveRun] = useState<BucketingRun | null>(null);
   const [bucketCounts, setBucketCounts] = useState<any[]>([]);
+  const [sectorMix, setSectorMix] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -63,6 +64,7 @@ export function BucketingTab({ importLists }: {
       if (data.run) {
         setActiveRun(data.run);
         setBucketCounts(Array.isArray(data.bucket_counts) ? data.bucket_counts : []);
+        setSectorMix(Array.isArray(data.sector_mix) ? data.sector_mix : []);
       }
     } catch (e: any) {
       setError(e.message);
@@ -195,6 +197,7 @@ export function BucketingTab({ importLists }: {
           <BucketingDetail
             run={activeRun}
             bucketCounts={bucketCounts}
+            sectorMix={sectorMix}
             onRefresh={fetchActive}
             onError={setError}
             onLibrarySaved={refreshLibrary}
@@ -428,9 +431,10 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
 
 // ───── DETAIL ROUTER ──────────────────────────────────────────────
 
-function BucketingDetail({ run, bucketCounts, onRefresh, onError, onLibrarySaved }: {
+function BucketingDetail({ run, bucketCounts, sectorMix, onRefresh, onError, onLibrarySaved }: {
   run: BucketingRun;
   bucketCounts: any[];
+  sectorMix: any[];
   onRefresh: () => void;
   onError: (msg: string | null) => void;
   onLibrarySaved: () => void;
@@ -466,7 +470,7 @@ function BucketingDetail({ run, bucketCounts, onRefresh, onError, onLibrarySaved
   if (run.status === 'taxonomy_ready') {
     return <BucketingReview run={run} bucketCounts={bucketCounts} onRefresh={onRefresh} onError={onError} />;
   }
-  return <BucketingResults run={run} bucketCounts={bucketCounts} onError={onError} onLibrarySaved={onLibrarySaved} />;
+  return <BucketingResults run={run} bucketCounts={bucketCounts} sectorMix={sectorMix} onError={onError} onLibrarySaved={onLibrarySaved} />;
 }
 
 // ───── REVIEW VIEW ──────────────────────────────────────────────
@@ -744,12 +748,15 @@ function BucketChainList({
 
 // ───── RESULTS VIEW ───────────────────────────────────────────────
 
-function BucketingResults({ run, bucketCounts, onError, onLibrarySaved }: {
+function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySaved }: {
   run: BucketingRun;
   bucketCounts: any[];
+  sectorMix: any[];
   onError: (msg: string | null) => void;
   onLibrarySaved: () => void;
 }) {
+  const sectorByBucket = new Map<string, { sector: string; count: number }[]>();
+  for (const row of sectorMix || []) sectorByBucket.set(row.bucket_name, row.sectors || []);
   const [exportingBucket, setExportingBucket] = useState<string | null>(null);
   const [savingLibrary, setSavingLibrary] = useState(false);
   const [librarySelection, setLibrarySelection] = useState<Set<string>>(new Set());
@@ -788,6 +795,7 @@ function BucketingResults({ run, bucketCounts, onError, onLibrarySaved }: {
         bucket_leaf: r.bucket_leaf,
         bucket_ancestor: r.bucket_ancestor,
         bucket_root: r.bucket_root,
+        sector_focus: r.sector_focus,
         is_generic: r.is_generic,
         is_disqualified: r.is_disqualified,
         source: r.source,
@@ -914,6 +922,22 @@ function BucketingResults({ run, bucketCounts, onError, onLibrarySaved }: {
                         style={{ width: `${barWidth}%` }}
                       />
                     </div>
+                    {(() => {
+                      const sectors = sectorByBucket.get(b.bucket_name) || [];
+                      if (sectors.length === 0) return null;
+                      const top = sectors.slice(0, 3);
+                      return (
+                        <div className="mt-1.5 flex flex-wrap gap-1 text-[9px]">
+                          <span className="text-gray-600 uppercase tracking-widest font-bold">Sectors:</span>
+                          {top.map(s => (
+                            <span key={s.sector} className="text-gray-400 font-mono">
+                              {s.sector} <span className="text-gray-600">({s.count.toLocaleString()})</span>
+                            </span>
+                          ))}
+                          {sectors.length > 3 && <span className="text-gray-600">+{sectors.length - 3} more</span>}
+                        </div>
+                      );
+                    })()}
                   </div>
                   <button
                     onClick={() => downloadCsv(b.bucket_name)}

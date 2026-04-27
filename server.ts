@@ -20,6 +20,7 @@ import {
     deleteLibraryBucket,
     saveRunBucketsToLibrary
 } from './services/bucketLibraryService';
+import { getSetting, setSetting, maskSecret } from './services/appSettings';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1417,17 +1418,40 @@ app.get('/api/bucketing/runs/:id', async (req, res) => {
         // map (predicted size). For completed: counts come from actual
         // assignments table. Both via RPC for one query each.
         let bucketCounts: any[] = [];
+        let sectorMix: any[] = [];
         if (run.status === 'completed' || run.status === 'assigning') {
             const { data: counts } = await supabase
                 .rpc('get_bucket_assignment_counts', { p_run_id: id });
             bucketCounts = counts || [];
+
+            // Sector_focus distribution per bucket — drives the "served sectors"
+            // chip on Results so users can see the leaf split (e.g. an "M&A
+            // Advisory" bucket might be 40% Healthcare / 30% Tech / 30% other).
+            const { data: smix } = await supabase
+                .from('bucket_assignments')
+                .select('bucket_name,sector_focus')
+                .eq('bucketing_run_id', id)
+                .not('sector_focus', 'is', null);
+            const tally = new Map<string, Map<string, number>>();
+            for (const row of (smix || []) as any[]) {
+                if (!row.sector_focus) continue;
+                if (!tally.has(row.bucket_name)) tally.set(row.bucket_name, new Map());
+                const inner = tally.get(row.bucket_name)!;
+                inner.set(row.sector_focus, (inner.get(row.sector_focus) || 0) + 1);
+            }
+            sectorMix = Array.from(tally.entries()).map(([bucket_name, secMap]) => ({
+                bucket_name,
+                sectors: Array.from(secMap.entries())
+                    .map(([sector, count]) => ({ sector, count }))
+                    .sort((a, b) => b.count - a.count)
+            }));
         } else if (run.status === 'taxonomy_ready') {
             const { data: counts } = await supabase
                 .rpc('get_bucket_map_counts', { p_run_id: id });
             bucketCounts = counts || [];
         }
 
-        res.json({ run, bucket_counts: bucketCounts });
+        res.json({ run, bucket_counts: bucketCounts, sector_mix: sectorMix });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }
@@ -1486,7 +1510,7 @@ app.get('/api/bucketing/runs/:id/contacts', async (req, res) => {
 
     try {
         let q: any = supabase.from('bucket_assignments')
-            .select('contact_id,bucket_name,source,confidence,assigned_at,contacts!inner(email,first_name,last_name,company_name,company_website,industry,lead_list_name)', { count: 'estimated' })
+            .select('contact_id,bucket_name,bucket_leaf,bucket_ancestor,bucket_root,sector_focus,is_generic,is_disqualified,source,confidence,assigned_at,contacts!inner(email,first_name,last_name,company_name,company_website,industry,lead_list_name)', { count: 'estimated' })
             .eq('bucketing_run_id', id);
         if (bucket) q = q.eq('bucket_name', bucket);
         q = q.order('assigned_at', { ascending: true })
@@ -1562,6 +1586,54 @@ app.post('/api/bucketing/runs/:id/save-to-library', async (req, res) => {
         res.json(result);
     } catch (err: any) {
         res.status(400).json({ error: err.message });
+    }
+});
+
+// ============================================
+// CONNECTORS — UI-managed runtime secrets
+// ============================================
+//
+// Today: Anthropic API key for Phase 1a. Stored in app_settings, masked on
+// reads, never echoed back in full. The bucketing service reads via the
+// cached getSetting() helper.
+
+const ANTHROPIC_KEY_NAME = 'ANTHROPIC_API_KEY';
+
+app.get('/api/settings/anthropic-key', async (_req, res) => {
+    try {
+        const stored = await getSetting(supabase, ANTHROPIC_KEY_NAME);
+        const envFallback = process.env.ANTHROPIC_API_KEY || process.env.VITE_ANTHROPIC_API_KEY || null;
+        const value = stored || envFallback;
+        res.json({
+            configured: !!value,
+            source: stored ? 'app_settings' : (envFallback ? 'env' : 'none'),
+            masked: maskSecret(value)
+        });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/settings/anthropic-key', async (req, res) => {
+    try {
+        const key = (req.body?.key || '').trim();
+        if (!key) return res.status(400).json({ error: 'key is required' });
+        if (!key.startsWith('sk-ant-')) {
+            return res.status(400).json({ error: 'Anthropic keys start with "sk-ant-"' });
+        }
+        await setSetting(supabase, ANTHROPIC_KEY_NAME, key);
+        res.json({ configured: true, source: 'app_settings', masked: maskSecret(key) });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/settings/anthropic-key', async (_req, res) => {
+    try {
+        await setSetting(supabase, ANTHROPIC_KEY_NAME, null);
+        res.json({ configured: false });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
     }
 });
 

@@ -1,55 +1,52 @@
 /**
- * Bucketing Service v2 — discovery + matching with 3-level chain.
+ * Bucketing Service v2.1 — identity-first taxonomy with sector-focus metadata.
  *
- * Phase 1a (DISCOVERY, ONE call):
- *   Pulls full vocabulary, sends to Sonnet (or gpt-4.1 fallback) with the
- *   Project Context + the user's discovery prompt. Model returns:
- *     - 30–60 leaf buckets, each with direct_ancestor + root_category
- *     - 6–15 ancestors, 3–6 roots
- *     - observed_patterns (sanity-check section)
- *   Optionally seeded with PREFERRED_BUCKETS from the bucket_library so the
- *   model reuses them at high alignment instead of inventing duplicates.
+ * Universal routing rule (the foundation of everything below):
+ *   Classify by core business identity FIRST. Sector served SECOND. Never
+ *   reverse the order. A private equity firm focused on healthcare is a PE
+ *   firm — not a healthcare operator. Only operators in a sector belong in
+ *   that sector's bucket.
  *
- * Phase 1b (MATCHING, per distinct industry):
- *   Per-string call to gpt-4.1-mini that returns the full chain
- *   {leaf, ancestor, root, score, reason} + generic/disqualified flags.
- *   Optimizations:
- *     - Embedding pre-filter (text-embedding-3-small) auto-assigns obvious
- *       matches with cosine ≥ 0.85 + ≥ 0.10 margin → no LLM call.
- *     - Remaining strings batched 8 per call.
- *     - Concurrency 40 (configurable).
- *     - Prompt caching: bucket_reference is the prefix, queries are the tail.
+ * Phase 1a (DISCOVERY, ONE call): Sonnet (or gpt-4.1 fallback) reads the
+ * vocabulary and produces:
+ *   - Identity-first leaf taxonomy (30–60 leaves), each tagged with
+ *     identity_type (operator | service_provider | agency | software_vendor |
+ *     investor | advisor | staffing | distributor | media | other), plus
+ *     priority_rank, operator_required, strong_identity_signals,
+ *     weak_sector_signals, disqualifying_signals.
+ *   - A separate sector-focus vocabulary (controlled list of sectors that may
+ *     describe whom a company serves, NEVER what a company is).
  *
- * Volume rollup (no LLM): a SQL RPC walks each row of bucket_industry_map
- * and writes the EFFECTIVE bucket_name based on min_volume thresholds —
- * leaf, then ancestor, then root, then "Generic". Disqualified rows go to
- * "Disqualified" unconditionally.
+ * Phase 1b (MATCHING, per distinct industry): gpt-4.1-mini batched 8/call,
+ * concurrency 40. Returns leaf+ancestor+root chain PLUS sector_focus,
+ * generic/disqualified flags, identity_type. Strict routing rules in the
+ * prompt — strong identity nouns (PE firm, agency, MSP, …) outrank sector
+ * nouns (healthcare, government, …) unless operator evidence is present.
  *
- * Final fan-out: existing bucketing_deterministic_fanout RPC writes one
- * bucket_assignments row per contact, including the full chain.
+ * Volume rollup is unchanged: leaf → ancestor → root → Generic. Disqualified
+ * stays disqualified.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import pLimit from 'p-limit';
 import Anthropic from '@anthropic-ai/sdk';
+import { getSetting } from './appSettings';
 
-// ─── model + concurrency config ──────────────────────────────────────
-const TAXONOMY_PROVIDER = (process.env.BUCKETING_TAXONOMY_PROVIDER || 'anthropic').toLowerCase(); // 'anthropic' | 'openai'
-const TAXONOMY_MODEL_ANTHROPIC = process.env.BUCKETING_TAXONOMY_MODEL_ANTHROPIC || 'claude-sonnet-4-6';
-const TAXONOMY_MODEL_OPENAI = process.env.BUCKETING_TAXONOMY_MODEL_OPENAI || 'gpt-4.1';
-const MATCH_MODEL = process.env.BUCKETING_MATCH_MODEL || 'gpt-4.1-mini';
-const EMBEDDING_MODEL = process.env.BUCKETING_EMBEDDING_MODEL || 'text-embedding-3-small';
-
-const MATCH_BATCH_SIZE = parseInt(process.env.BUCKETING_BATCH_SIZE || '8', 10);
-const MATCH_CONCURRENCY = parseInt(process.env.BUCKETING_CONCURRENCY_AI || '40', 10);
-const EMBED_PREFILTER_ENABLED = (process.env.BUCKETING_EMBED_PREFILTER || 'true').toLowerCase() !== 'false';
-const EMBED_AUTO_THRESHOLD = parseFloat(process.env.BUCKETING_EMBED_AUTO_THRESHOLD || '0.85');
-const EMBED_MARGIN = parseFloat(process.env.BUCKETING_EMBED_MARGIN || '0.10');
-
+// ─── HARD-CODED MODEL + CONCURRENCY CONFIG ─────────────────────────
+// Per user request: no env reliance for non-secret config. Only the
+// Anthropic API key is runtime-configurable (via Connectors UI / app_settings).
+const TAXONOMY_MODEL_ANTHROPIC = 'claude-sonnet-4-6';
+const TAXONOMY_MODEL_OPENAI = 'gpt-4.1';
+const MATCH_MODEL = 'gpt-4.1-mini';
+const EMBEDDING_MODEL = 'text-embedding-3-small';
+const MATCH_BATCH_SIZE = 8;
+const MATCH_CONCURRENCY = 40;
+const EMBED_PREFILTER_ENABLED = true;
+const EMBED_AUTO_THRESHOLD = 0.85;
+const EMBED_MARGIN = 0.10;
 const OPENAI_TIMEOUT_MS = 90_000;
 const TAXONOMY_TIMEOUT_MS = 180_000;
 
-// ─── pricing ─────────────────────────────────────────────────────────
 const OPENAI_PRICING: Record<string, { input: number; output: number; cached_input?: number }> = {
     'gpt-4.1':       { input: 2.00,  output: 8.00,  cached_input: 0.50 },
     'gpt-4.1-mini':  { input: 0.40,  output: 1.60,  cached_input: 0.10 },
@@ -66,27 +63,30 @@ const RESERVED_GENERIC = 'Generic';
 const RESERVED_DISQUALIFIED = 'Disqualified';
 const RESERVED = new Set([RESERVED_GENERIC.toLowerCase(), RESERVED_DISQUALIFIED.toLowerCase(), 'other']);
 
-// ─── env helpers ─────────────────────────────────────────────────────
+const ANTHROPIC_KEY_NAME = 'ANTHROPIC_API_KEY';
+
+// ─── secret access ─────────────────────────────────────────────────
 function getOpenAIKey(): string {
     const key = process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
     if (!key) throw new Error('VITE_OPENAI_API_KEY missing');
     return key.trim();
 }
-function getAnthropicKey(): string | null {
-    const key = process.env.ANTHROPIC_API_KEY || process.env.VITE_ANTHROPIC_API_KEY;
-    return key ? key.trim() : null;
+
+async function getAnthropicKey(supabase: SupabaseClient): Promise<string | null> {
+    // Prefer DB-stored key (Connectors UI). Fall back to env if set.
+    const stored = await getSetting(supabase, ANTHROPIC_KEY_NAME);
+    if (stored) return stored.trim();
+    const envKey = process.env.ANTHROPIC_API_KEY || process.env.VITE_ANTHROPIC_API_KEY;
+    return envKey ? envKey.trim() : null;
 }
 
-let _anthropicClient: Anthropic | null = null;
-function getAnthropic(): Anthropic | null {
-    if (_anthropicClient) return _anthropicClient;
-    const key = getAnthropicKey();
+async function getAnthropic(supabase: SupabaseClient): Promise<Anthropic | null> {
+    const key = await getAnthropicKey(supabase);
     if (!key) return null;
-    _anthropicClient = new Anthropic({ apiKey: key });
-    return _anthropicClient;
+    return new Anthropic({ apiKey: key });
 }
 
-// ─── shared types ────────────────────────────────────────────────────
+// ─── shared types ──────────────────────────────────────────────────
 interface VocabRow {
     industry: string;
     n: number;
@@ -100,9 +100,15 @@ interface DiscoveredBucket {
     description: string;
     direct_ancestor: string;
     root_category: string;
+    identity_type: string;
+    operator_required: boolean;
+    priority_rank: number;
     include?: string[];
     exclude?: string[];
     example_strings?: string[];
+    strong_identity_signals?: string[];
+    weak_sector_signals?: string[];
+    disqualifying_signals?: string[];
     estimated_usage_label?: string;
     rough_volume_estimate?: string;
     library_match_id?: string | null;
@@ -110,6 +116,7 @@ interface DiscoveredBucket {
 
 interface DiscoveryOutput {
     observed_patterns: string[];
+    sector_focus_vocabulary: string[];
     buckets: DiscoveredBucket[];
 }
 
@@ -117,11 +124,13 @@ interface MatchChain {
     bucket_1: { name: string; score: number; reason: string };
     bucket_2: { name: string; score: number; reason: string };
     bucket_3: { name: string; score: number; reason: string };
+    sector_focus: string;
+    identity_type: string;
     generic: boolean;
     disqualified: boolean;
 }
 
-// ─── paginated vocabulary fetch ──────────────────────────────────────
+// ─── paginated vocabulary fetch ────────────────────────────────────
 const VOCAB_PAGE_SIZE = 1000;
 const VOCAB_MAX_ROWS = 100_000;
 
@@ -145,7 +154,7 @@ async function fetchFullVocabulary(
     return all;
 }
 
-// ─── Project Context (system role for both phases) ──────────────────
+// ─── PROJECT CONTEXT (identity-first edition) ─────────────────────
 const PROJECT_CONTEXT = `<<<SYSTEM ROLE AND CONTEXT
 
 You are operating inside a revenue-critical B2B growth system.
@@ -156,81 +165,101 @@ This is NOT an academic taxonomy exercise.
 This is NOT a generic classification task.
 This is NOT about elegance, novelty, or theoretical completeness.
 
-This system exists to solve a very specific operational problem at scale.
+========================================
+UNIVERSAL ROUTING PRINCIPLE (the rule that governs everything)
+========================================
+
+Classify each company by its CORE BUSINESS IDENTITY first.
+Classify SECTOR SERVED second.
+Never reverse that order.
+
+This means:
+- A private equity firm focused on healthcare is still a private equity firm.
+- An IT consultancy serving hospitals is still an IT consultancy.
+- A marketing agency for life sciences is still a marketing agency.
+- A real estate developer focused on senior living is still real estate.
+- "Software for schools" is software, not a school.
+
+Distinguish between:
+- WHAT the company is (its business model / core operation)
+- WHO the company serves (the verticals it targets)
+
+Use the BUCKET for what the company IS.
+Preserve "who it serves" SEPARATELY as sector_focus, never as the primary bucket.
+
+========================================
+OPERATOR vs ENABLER
+========================================
+
+Operators directly operate in an industry: clinics, hospitals, schools,
+universities, banks, city governments, churches, property managers, manufacturing
+plants, retailers, restaurants.
+
+Enablers serve those industries: agencies, consultants, software firms,
+investors, staffing firms, IT providers, advisors.
+
+Enablers are classified by their OWN business model first. Sector references
+in their classification string describe WHO THEY SERVE, not what they are.
+
+Operator buckets (Healthcare, Education, Government, Religious Organizations,
+Real Estate operators) require explicit operator evidence to use as primary
+bucket. Examples of operator evidence: "clinic", "hospital", "university",
+"school district", "city government", "church", "property management company".
+
+If the classification string says only "healthcare technology" or "healthcare
+private equity" or "marketing for hospitals", that is NOT operator evidence.
+Those companies are enablers — bucket them by their own model and put
+"Healthcare" in sector_focus.
 
 ========================================
 BACKGROUND
 ========================================
 
-We run live B2B webinars at very large scale.
-Invitations are sent via Google Calendar to tens or hundreds of thousands of founders.
+We run live B2B webinars at very large scale. Invitations are sent via Google
+Calendar to tens or hundreds of thousands of founders. We can't personalize
+per individual but we CAN personalize per bucket — each bucket supports
+thousands of invitees.
 
-Current state:
-- Invitations are largely generic.
-- Industry personalization is shallow or inaccurate.
-- Lead lists (e.g., from Apollo) have noisy, unreliable industry tags.
-- Attendance rates are lower than they should be.
-
-We cannot personalize per individual.
-However, we CAN personalize per industry bucket,
-where each bucket supports thousands of invitees.
-
-========================================
-CORE GOAL
-========================================
-
-Increase webinar ATTENDANCE RATE (not opens, not clicks)
-by making the invitation feel highly relevant to the recipient's industry context.
-
-Relevance is driven by:
-- Industry specificity
-- Accurate sub-vertical framing
-- Avoiding obvious mismatches
-
-Success is measured downstream by:
-- Attendance rate
-- Show-up quality
-- Call bookings
-- Conversion efficiency
-
-NOT by:
-- Number of buckets
-- Clever naming
-- Taxonomic purity
+Goal: increase ATTENDANCE RATE by making invitations feel highly relevant to
+the recipient's actual business identity. The pressure test: if a recipient
+read outreach written for their bucket, would they say "yes, that sounds
+like my company" — or "no, that sounds like one of my clients"? If it sounds
+like their CLIENTS, the routing is wrong.
 
 ========================================
 IDEAL CLIENT PROFILE (ICP)
 ========================================
 
-The system is designed for B2B, high-ticket businesses.
-
-Strong ICP:
+Strong ICP (always inviteable):
 - Agencies (marketing, performance, CRO, dev, etc.)
 - Consulting / advisory firms
-- Professional services
-- B2B or enterprise SaaS (including sub-verticals)
-- High-ticket info-product businesses (when plausibly scalable)
-- Financial services and investment firms (advisors, M&A, private equity, funds)
+- Professional services (non-local)
+- B2B / enterprise SaaS (sub-verticals matter)
+- High-ticket info products (when plausibly scalable)
+- Financial services & investment firms (advisors, M&A, PE, VC, funds)
 
-Explicitly NON-ICP:
-- Ecommerce / DTC physical products
+Explicit NON-ICP (route to "Generic", do NOT disqualify unless the
+disqualifying-signals list matches; Generic is still inviteable):
+- Ecommerce / DTC physical product sellers
 - Local services tied to geography
 - Brick-and-mortar retail
-- Low-ticket consumer businesses
+- Low-ticket consumer
 
-Disqualification must be CONSERVATIVE.
-False negatives are worse than false positives.
-If ambiguous, do NOT disqualify.
+Disqualify ONLY when the classification clearly indicates a non-ICP operator
+with no plausible upsell path. Disqualification is conservative — false
+negatives cost more than false positives. If ambiguous, prefer Generic.
 
 ========================================
 CRITICAL CONSTRAINTS
 ========================================
 
-1. Accuracy > Coverage. Do not force-fit businesses into buckets.
-2. Specificity > Breadth. Buckets must feel "this is for me".
-3. Reusability > Novelty. Buckets must work across multiple lists and campaigns.
-4. Structure > Guessing. Ancestor relationships must be explicit and logical.
-5. Determinism > Creativity. Predictable behavior at scale.`;
+1. Identity > Sector. The bucket is what the company IS, not whom it serves.
+2. Operator evidence required for operator buckets.
+3. Accuracy > Coverage. Do not force-fit.
+4. Specificity > Breadth. "This is for me" effect.
+5. Reusability > Novelty. Buckets must work across multiple lists.
+6. Structure > Guessing. Ancestor relationships must be explicit and logical.
+7. Determinism > Creativity. Predictable behavior at scale.`;
 
 // ────────────────────────────────────────────────────────────────────
 // PHASE 1A — DISCOVERY
@@ -260,7 +289,6 @@ export async function runTaxonomyProposal(
         throw new Error('Empty vocabulary — none of the selected lists have completed enrichments.');
     }
 
-    // Optional preferred buckets from library (set on the run row at creation time)
     const preferredIds: string[] = Array.isArray(run.preferred_library_ids) ? run.preferred_library_ids : [];
     let preferred: any[] = [];
     if (preferredIds.length > 0) {
@@ -270,10 +298,9 @@ export async function runTaxonomyProposal(
     }
 
     const t0 = Date.now();
-    const { discovery, costUsd, modelUsed } = await callDiscoveryLLM(vocabRows, preferred);
+    const { discovery, costUsd, modelUsed } = await callDiscoveryLLM(supabase, vocabRows, preferred);
     log(`[Bucketing ${runId}] discovery LLM (${modelUsed}): ${(Date.now() - t0) / 1000}s, $${costUsd.toFixed(4)}, ${discovery.buckets.length} leaves`);
 
-    // Validate: every leaf has a non-empty ancestor; reject reserved names.
     const leaves = discovery.buckets.filter(b => {
         const n = (b.bucket_name || '').trim();
         return n && !RESERVED.has(n.toLowerCase());
@@ -283,14 +310,23 @@ export async function runTaxonomyProposal(
         description: (b.description || '').trim(),
         direct_ancestor: (b.direct_ancestor || '').trim(),
         root_category: (b.root_category || '').trim(),
-        include: Array.from(new Set((b.include || []).map(s => (s || '').trim()).filter(Boolean))),
-        exclude: Array.from(new Set((b.exclude || []).map(s => (s || '').trim()).filter(Boolean))),
-        example_strings: Array.from(new Set((b.example_strings || []).map(s => (s || '').trim()).filter(Boolean)))
+        identity_type: (b.identity_type || 'other').trim(),
+        operator_required: !!b.operator_required,
+        priority_rank: typeof b.priority_rank === 'number' ? b.priority_rank : 5,
+        include: dedupe(b.include),
+        exclude: dedupe(b.exclude),
+        example_strings: dedupe(b.example_strings),
+        strong_identity_signals: dedupe(b.strong_identity_signals),
+        weak_sector_signals: dedupe(b.weak_sector_signals),
+        disqualifying_signals: dedupe(b.disqualifying_signals)
     }));
 
-    // Persist discovery output
     await supabase.from('bucketing_runs').update({
-        taxonomy_proposal: { observed_patterns: discovery.observed_patterns || [], buckets: leaves },
+        taxonomy_proposal: {
+            observed_patterns: discovery.observed_patterns || [],
+            sector_focus_vocabulary: discovery.sector_focus_vocabulary || [],
+            buckets: leaves
+        },
         taxonomy_model: modelUsed,
         total_contacts: totalContacts,
         cost_usd: costUsd,
@@ -298,20 +334,18 @@ export async function runTaxonomyProposal(
         taxonomy_completed_at: new Date().toISOString()
     }).eq('id', runId);
 
-    // Library link rows (which library buckets were reused)
     if (preferred.length > 0) {
-        const reusedNames = new Set(leaves.filter(l => l.library_match_id).map(l => l.library_match_id!));
-        if (reusedNames.size > 0) {
-            const links = leaves.filter(l => l.library_match_id).map(l => ({
-                bucketing_run_id: runId,
-                library_bucket_id: l.library_match_id!,
-                bucket_name_in_run: l.bucket_name
-            }));
+        const links = leaves.filter(l => l.library_match_id).map(l => ({
+            bucketing_run_id: runId,
+            library_bucket_id: l.library_match_id!,
+            bucket_name_in_run: l.bucket_name
+        }));
+        if (links.length > 0) {
             await supabase.from('bucket_library_run_links').upsert(links, { onConflict: 'bucketing_run_id,library_bucket_id' });
-            // Bump usage stats
-            for (const id of reusedNames) {
+            for (const id of new Set(links.map(l => l.library_bucket_id))) {
+                const cur = preferred.find((p: any) => p.id === id)?.times_used || 0;
                 await supabase.from('bucket_library')
-                    .update({ times_used: (preferred.find((p: any) => p.id === id)?.times_used || 0) + 1, last_used_at: new Date().toISOString() })
+                    .update({ times_used: cur + 1, last_used_at: new Date().toISOString() })
                     .eq('id', id);
             }
         }
@@ -320,7 +354,12 @@ export async function runTaxonomyProposal(
     log(`[Bucketing ${runId}] Phase 1a done — ${leaves.length} leaves persisted`);
 }
 
+function dedupe(arr: string[] | undefined): string[] {
+    return Array.from(new Set((arr || []).map(s => (s || '').trim()).filter(Boolean)));
+}
+
 async function callDiscoveryLLM(
+    supabase: SupabaseClient,
     vocabRows: VocabRow[],
     preferred: any[]
 ): Promise<{ discovery: DiscoveryOutput; costUsd: number; modelUsed: string }> {
@@ -348,85 +387,117 @@ async function callDiscoveryLLM(
 PREFERRED BUCKETS (from library)
 ========================================
 
-The buckets below were defined in prior runs and have proven useful.
-If a discovered pattern aligns with one of these at score >= 0.7,
-REUSE that exact bucket: copy its bucket_name, description,
-direct_ancestor, and root_category VERBATIM, and set library_match_id
-to the id provided. Do NOT create a near-duplicate with different
-wording. Otherwise, propose new buckets that follow the rules above.
-Treat preferred buckets as anchors.
+These buckets were defined in prior runs and have proven useful. If a
+discovered identity-first pattern aligns with one of these at score >= 0.7,
+REUSE it: copy the bucket_name, description, direct_ancestor, root_category,
+identity_type VERBATIM and set library_match_id to the id provided. Do NOT
+invent a near-duplicate with different wording.
 
 ${preferred.map(p => `id=${p.id} | name="${p.bucket_name}" | ancestor="${p.direct_ancestor}" | root="${p.root_category}" | desc="${p.description || ''}"`).join('\n')}` : '';
 
     const userPrompt = `${PROJECT_CONTEXT}
 
 ========================================
-PHASE 1A — BUCKET DISCOVERY
+PHASE 1A — IDENTITY-FIRST DISCOVERY
 ========================================
 
-Your job is to DISCOVER a set of reusable, meaningful LEAF buckets from the
-dataset of AI-enriched industry classification strings below.
+Discover an identity-first leaf taxonomy from the vocabulary below. The
+critical constraint: a leaf bucket represents WHAT the company IS, not whom
+it serves. Apply the universal routing principle relentlessly.
 
 NO-SHORTCUTS RULES:
-1) Base buckets ONLY on patterns that appear in the provided data.
-2) Do NOT infer industries that are not evidenced in the input strings.
-3) Do NOT use "common sense" priors unless the data shows it.
-4) Do NOT compress the problem by ignoring the dataset.
-5) If a classification is ambiguous, treat it as ambiguous — do not guess.
+1) Base buckets ONLY on patterns that appear in the vocabulary.
+2) Do NOT infer industries that are not evidenced.
+3) Sector words (healthcare, government, education, real estate, finance,
+   legal, manufacturing) MUST NOT be primary leaf buckets unless the
+   vocabulary clearly contains operator companies in that sector AND the
+   bucket carries operator_required=true.
+4) Do NOT compress the problem by ignoring the vocabulary.
 
 ICP BOUNDARIES:
 - Strong ICP: agencies, consulting/advisory, professional services (non-local),
-  B2B/enterprise SaaS, financial services & investment firms, plausibly scalable
-  high-ticket info products.
-- Non-ICP (route to Generic, NOT to ICP buckets): ecommerce/DTC physical products,
-  local services, brick-and-mortar retail, low-ticket consumer.
+  B2B/enterprise SaaS, financial services & investment firms, plausibly
+  scalable high-ticket info products.
+- Non-ICP route to "Generic" (still inviteable). Disqualify only with clear
+  signals — ambiguous → Generic.
 
 BUCKET DESIGN:
-- Output between 30 and 60 LEAF buckets.
-- Specific enough for "this is for me" effect in webinar titles. Not so micro
-  that they apply to a handful of records.
-- Do NOT create near-duplicates that differ only in word order or synonyms.
-- Each leaf MUST have a direct_ancestor (broader, shared roll-up) and a
-  root_category (3–6 family-level categories).
-- Target: 6–15 ancestors total, 3–6 roots total. Many leaves share an ancestor.
-- An ancestor with only 1 leaf under it is invalid.
+- 30–60 leaves total. 6–15 ancestors. 3–6 roots.
+- Each leaf has direct_ancestor (broader, shared) and root_category (family).
+- Many leaves share an ancestor; an ancestor with only one leaf is invalid.
+- No near-duplicates (synonyms, word-order variants).
 
-❌ TOO BROAD (forbidden as leaves; allowed as ancestors/roots only):
-"SaaS", "B2B SaaS", "Marketing Agency", "Consulting Firm", "Financial Services",
-"Professional Services", "Technology Company".
+❌ TOO BROAD (allowed only as ancestors/roots):
+"SaaS", "B2B SaaS", "Marketing Agency", "Consulting Firm",
+"Financial Services", "Professional Services", "Technology Company".
 
-❌ TOO NARROW (forbidden):
+❌ TOO NARROW:
 "AI-powered Stripe reconciliation SaaS for EU neobanks",
 "TikTok ads agency for DTC candle brands",
-"RevOps consulting for Series B HR SaaS companies only",
 "Family office for German real estate developers".
 
 ✅ GOLDILOCKS (target leaves):
-"Payments Infrastructure SaaS", "FinTech SaaS", "Performance Marketing Agency",
-"Conversion Rate Optimization (CRO) Agency", "Revenue Operations Consulting",
-"Fractional CFO Services", "Private Equity Firm", "Venture Capital Fund",
-"M&A Advisory Services", "MarTech SaaS", "Vertical SaaS",
-"B2B Demand Generation Agency", "Branding & Creative Agency".
+Identity-driven labels like "Payments Infrastructure SaaS", "FinTech SaaS",
+"Performance Marketing Agency", "Conversion Rate Optimization Agency",
+"Revenue Operations Consulting", "Fractional CFO Services", "Private Equity
+Firm", "Venture Capital Fund", "M&A Advisory Services", "MarTech SaaS",
+"Vertical SaaS", "B2B Demand Generation Agency", "Branding & Creative
+Agency", "Managed IT Services & Cybersecurity", "Healthcare Operator
+(Clinics/Hospitals)" [operator_required=true], "K-12 School District"
+[operator_required=true].
+
+PER-LEAF ROUTING METADATA — REQUIRED FIELDS:
+- identity_type ∈ {operator, service_provider, agency, software_vendor,
+  investor, advisor, staffing, distributor, media, other}
+- operator_required: boolean. true ONLY for buckets that represent operators
+  in a vertical (Healthcare Operator, K-12 School District, City/Local
+  Government, Religious Organization, Real Estate Operator).
+- priority_rank: integer 1–10. 1 = highest priority (strongest identity nouns
+  that should beat sector words: PE Firm, VC Fund, Law Firm, Accounting Firm,
+  Staffing Firm, Marketing Agency, Software/SaaS, MSP, Consulting Firm).
+  10 = lowest (operator buckets that lose to enabler signals).
+- strong_identity_signals: phrases that PROVE this identity (e.g. "private
+  equity", "venture fund", "law firm", "managed services").
+- weak_sector_signals: sector words that often appear but DON'T determine
+  this bucket (e.g. for a PE Firm: "healthcare", "fintech", "software" —
+  these are likely sector_focus, not the primary bucket).
+- disqualifying_signals: phrases that should ROUTE AWAY from this bucket
+  (e.g. for Healthcare Operator: "healthcare technology", "medical billing
+  software", "healthcare private equity" — these are enablers, not operators).
+
+ALSO PRODUCE A SEPARATE SECTOR-FOCUS VOCABULARY:
+A controlled list of sector terms that appear repeatedly in the vocabulary
+as "served vertical" signals. These NEVER become primary buckets but they
+are valid sector_focus values in Phase 1b. Examples: "Healthcare",
+"Government", "Education", "Real Estate", "Manufacturing", "Legal",
+"Financial Services", "Retail & CPG", "Hospitality", "Energy", "Non-profit".
 ${preferredSection}
 
 REQUIRED PROCESS — DO NOT SKIP:
-A) Identify 10–15 high-frequency patterns observed in the dataset.
-   Each must reference recurring concepts/phrases you actually see in the data.
-B) Use those patterns to justify why your top leaves are ranked highest.
+A) Identify 10–15 high-frequency patterns observed in the vocabulary.
+B) Use those patterns to justify why your top leaves are ranked highest and
+   why they pass the identity-first test.
 
 OUTPUT (strict JSON only, no prose, no markdown fences):
 
 {
   "observed_patterns": [<10–15 strings>],
+  "sector_focus_vocabulary": [<sector terms used as sector_focus, never primary>],
   "buckets": [
     {
       "bucket_name": "<leaf>",
-      "description": "<1 sentence>",
+      "description": "<1 sentence — what the company IS>",
       "direct_ancestor": "<ancestor>",
       "root_category": "<root>",
-      "include": [<string keywords>],
-      "exclude": [<string keywords>],
-      "example_strings": [<6–10 verbatim from vocab below>],
+      "identity_type": "<operator|service_provider|agency|software_vendor|investor|advisor|staffing|distributor|media|other>",
+      "operator_required": <true|false>,
+      "priority_rank": <1..10>,
+      "include": [<keywords>],
+      "exclude": [<keywords>],
+      "example_strings": [<6–10 verbatim from vocab>],
+      "strong_identity_signals": [<phrases>],
+      "weak_sector_signals": [<sector phrases that appear but don't determine this bucket>],
+      "disqualifying_signals": [<phrases that should route AWAY>],
       "estimated_usage_label": "<dominant|very_common|common|moderate|niche_but_meaningful|rare>",
       "rough_volume_estimate": "<e.g. ~8–12% of rows>",
       "library_match_id": "<id from PREFERRED_BUCKETS, or empty string>"
@@ -434,16 +505,16 @@ OUTPUT (strict JSON only, no prose, no markdown fences):
   ]
 }
 
-Rules for output:
-- buckets ordered MOST common → LEAST common.
-- example_strings MUST be verbatim from the vocabulary below.
-- 30–60 leaves total. Every leaf has direct_ancestor and root_category set.
+Rules:
+- Buckets ordered MOST common → LEAST common.
+- example_strings MUST be verbatim from the vocabulary.
+- 30–60 leaves total.
 
 ========================================
 VOCABULARY
 ========================================
 
-The head below covers ${headContacts} contacts across ${head.length} distinct labels.
+Head covers ${headContacts} contacts across ${head.length} distinct labels.
 Format: industry | n=count | companies=[2 samples] | reasoning="…"
 
 ${vocabularyTable}${tailSection}
@@ -452,47 +523,41 @@ Total contacts across all labels: ${headContacts + tailContacts}.
 
 Now produce the JSON.`;
 
-    // Try Anthropic Sonnet first if configured + key present.
-    if (TAXONOMY_PROVIDER === 'anthropic') {
-        const client = getAnthropic();
-        if (client) {
-            try {
-                const t0 = Date.now();
-                const resp = await client.messages.create({
-                    model: TAXONOMY_MODEL_ANTHROPIC,
-                    max_tokens: 16_000,
-                    temperature: 0.2,
-                    system: 'You output strict JSON only. No markdown, no prose, no fences. Just the JSON object.',
-                    messages: [{ role: 'user', content: userPrompt }]
-                }, { timeout: TAXONOMY_TIMEOUT_MS });
-                const text = resp.content
-                    .filter((c: any) => c.type === 'text')
-                    .map((c: any) => c.text).join('');
-                const discovery = parseDiscoveryJson(text);
-                const usage = (resp as any).usage || {};
-                const inTok = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
-                const outTok = usage.output_tokens || 0;
-                const costUsd = computeAnthropicCost(TAXONOMY_MODEL_ANTHROPIC, inTok, outTok);
-                console.log(`[Bucketing] Sonnet discovery: ${(Date.now() - t0) / 1000}s, in=${inTok} out=${outTok}`);
-                return { discovery, costUsd, modelUsed: TAXONOMY_MODEL_ANTHROPIC };
-            } catch (err: any) {
-                console.warn(`[Bucketing] Anthropic discovery failed, falling back to OpenAI: ${err.message}`);
-                // fall through to OpenAI
-            }
+    // Try Anthropic Sonnet first if a key is configured.
+    const anthropic = await getAnthropic(supabase);
+    if (anthropic) {
+        try {
+            const t0 = Date.now();
+            const resp = await anthropic.messages.create({
+                model: TAXONOMY_MODEL_ANTHROPIC,
+                max_tokens: 16_000,
+                temperature: 0.2,
+                system: 'You output strict JSON only. No markdown, no prose, no fences. Just the JSON object.',
+                messages: [{ role: 'user', content: userPrompt }]
+            }, { timeout: TAXONOMY_TIMEOUT_MS });
+            const text = resp.content
+                .filter((c: any) => c.type === 'text')
+                .map((c: any) => c.text).join('');
+            const discovery = parseDiscoveryJson(text);
+            const usage = (resp as any).usage || {};
+            const inTok = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
+            const outTok = usage.output_tokens || 0;
+            const costUsd = computeAnthropicCost(TAXONOMY_MODEL_ANTHROPIC, inTok, outTok);
+            console.log(`[Bucketing] Sonnet discovery: ${(Date.now() - t0) / 1000}s, in=${inTok} out=${outTok}`);
+            return { discovery, costUsd, modelUsed: TAXONOMY_MODEL_ANTHROPIC };
+        } catch (err: any) {
+            console.warn(`[Bucketing] Anthropic discovery failed, falling back to OpenAI: ${err.message}`);
         }
     }
 
-    // OpenAI fallback (or default if provider=openai)
+    // OpenAI fallback
     const schema = buildDiscoverySchema();
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), TAXONOMY_TIMEOUT_MS);
     try {
         const response = await fetch('https://api.openai.com/v1/chat/completions', {
             method: 'POST',
-            headers: {
-                Authorization: `Bearer ${getOpenAIKey()}`,
-                'Content-Type': 'application/json',
-            },
+            headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 model: TAXONOMY_MODEL_OPENAI,
                 messages: [
@@ -529,6 +594,8 @@ function parseDiscoveryJson(text: string): DiscoveryOutput {
     const trimmed = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
     const parsed = JSON.parse(trimmed);
     if (!Array.isArray(parsed.buckets)) throw new Error('Discovery output missing `buckets` array');
+    if (!Array.isArray(parsed.sector_focus_vocabulary)) parsed.sector_focus_vocabulary = [];
+    if (!Array.isArray(parsed.observed_patterns)) parsed.observed_patterns = [];
     return parsed;
 }
 
@@ -536,25 +603,34 @@ function buildDiscoverySchema() {
     return {
         type: 'object',
         additionalProperties: false,
-        required: ['observed_patterns', 'buckets'],
+        required: ['observed_patterns', 'sector_focus_vocabulary', 'buckets'],
         properties: {
             observed_patterns: { type: 'array', items: { type: 'string' } },
+            sector_focus_vocabulary: { type: 'array', items: { type: 'string' } },
             buckets: {
                 type: 'array',
                 items: {
                     type: 'object',
                     additionalProperties: false,
                     required: ['bucket_name', 'description', 'direct_ancestor', 'root_category',
-                               'include', 'exclude', 'example_strings', 'estimated_usage_label',
-                               'rough_volume_estimate', 'library_match_id'],
+                               'identity_type', 'operator_required', 'priority_rank',
+                               'include', 'exclude', 'example_strings',
+                               'strong_identity_signals', 'weak_sector_signals', 'disqualifying_signals',
+                               'estimated_usage_label', 'rough_volume_estimate', 'library_match_id'],
                     properties: {
                         bucket_name: { type: 'string' },
                         description: { type: 'string' },
                         direct_ancestor: { type: 'string' },
                         root_category: { type: 'string' },
+                        identity_type: { type: 'string' },
+                        operator_required: { type: 'boolean' },
+                        priority_rank: { type: 'integer' },
                         include: { type: 'array', items: { type: 'string' } },
                         exclude: { type: 'array', items: { type: 'string' } },
                         example_strings: { type: 'array', items: { type: 'string' } },
+                        strong_identity_signals: { type: 'array', items: { type: 'string' } },
+                        weak_sector_signals: { type: 'array', items: { type: 'string' } },
+                        disqualifying_signals: { type: 'array', items: { type: 'string' } },
                         estimated_usage_label: { type: 'string' },
                         rough_volume_estimate: { type: 'string' },
                         library_match_id: { type: 'string' }
@@ -572,7 +648,7 @@ function buildDiscoverySchema() {
 interface TaxonomyEdits {
     keep?: string[];
     rename?: Record<string, string>;
-    add?: { bucket_name: string; description: string; direct_ancestor: string; root_category: string }[];
+    add?: { bucket_name: string; description: string; direct_ancestor: string; root_category: string; identity_type?: string; operator_required?: boolean }[];
     min_volume?: number;
 }
 
@@ -612,14 +688,22 @@ export async function applyTaxonomyEdits(
                 description: (a.description || '').trim(),
                 direct_ancestor: (a.direct_ancestor || '').trim(),
                 root_category: (a.root_category || '').trim(),
-                include: [],
-                exclude: [],
-                example_strings: []
+                identity_type: a.identity_type || 'other',
+                operator_required: !!a.operator_required,
+                priority_rank: 5,
+                include: [], exclude: [], example_strings: [],
+                strong_identity_signals: [], weak_sector_signals: [], disqualifying_signals: []
             });
         }
     }
 
-    const update: any = { taxonomy_final: { observed_patterns: proposal.observed_patterns || [], buckets: leaves } };
+    const update: any = {
+        taxonomy_final: {
+            observed_patterns: proposal.observed_patterns || [],
+            sector_focus_vocabulary: proposal.sector_focus_vocabulary || [],
+            buckets: leaves
+        }
+    };
     if (typeof edits.min_volume === 'number' && edits.min_volume >= 0) {
         update.min_volume = edits.min_volume;
     }
@@ -628,7 +712,7 @@ export async function applyTaxonomyEdits(
 }
 
 // ────────────────────────────────────────────────────────────────────
-// PHASE 1B — MATCHING + VOLUME ROLLUP + FAN-OUT
+// PHASE 1B — IDENTITY-FIRST MATCHING
 // ────────────────────────────────────────────────────────────────────
 
 export async function runAssignment(
@@ -644,21 +728,18 @@ export async function runAssignment(
         throw new Error('No buckets defined for assignment');
     }
     const leaves = final.buckets;
-    const leafByName = new Map(leaves.map(b => [b.bucket_name, b]));
+    const sectorVocab: string[] = (final as any).sector_focus_vocabulary || [];
 
     await supabase.from('bucketing_runs').update({ status: 'assigning' }).eq('id', runId);
 
     let totalCost = Number(run.cost_usd || 0);
 
-    // Step 1: get distinct industries that need a chain assignment.
     log(`[Bucketing ${runId}] step 1/5: load vocabulary`);
     const vocab = await fetchFullVocabulary(supabase, run.list_names);
     log(`[Bucketing ${runId}] ${vocab.length} distinct industries to match`);
 
-    // Step 2: clear any prior chain rows for this run so re-runs are clean.
     await supabase.from('bucket_industry_map').delete().eq('bucketing_run_id', runId);
 
-    // Step 3: embedding pre-filter — auto-assign obvious matches with cosine.
     let assignedRows: any[] = [];
     let pendingIndustries: VocabRow[] = vocab;
 
@@ -671,14 +752,12 @@ export async function runAssignment(
         log(`[Bucketing ${runId}] embedding auto-assigned ${assignedRows.length}/${vocab.length}, ${pendingIndustries.length} pending`);
     }
 
-    // Step 4: residual LLM matching (batched, concurrent).
-    log(`[Bucketing ${runId}] step 4/5: residual LLM matching`);
-    const llmRes = await runMatchingLLM(pendingIndustries, leaves, runId);
+    log(`[Bucketing ${runId}] step 4/5: routing LLM matching`);
+    const llmRes = await runMatchingLLM(pendingIndustries, leaves, sectorVocab, runId);
     totalCost += llmRes.costUsd;
     assignedRows = assignedRows.concat(llmRes.rows);
     log(`[Bucketing ${runId}] LLM matched ${llmRes.rows.length}, total chain rows ${assignedRows.length}, cost so far $${totalCost.toFixed(4)}`);
 
-    // Insert chain rows into bucket_industry_map (in chunks).
     if (assignedRows.length > 0) {
         for (let i = 0; i < assignedRows.length; i += 1000) {
             const chunk = assignedRows.slice(i, i + 1000);
@@ -688,23 +767,19 @@ export async function runAssignment(
         }
     }
 
-    // Step 5: volume rollup (server-side SQL) → writes effective bucket_name per row.
     log(`[Bucketing ${runId}] step 5/5: volume rollup + fan-out`);
     const { error: rollupErr } = await supabase.rpc('bucketing_apply_volume_rollup', { p_run_id: runId });
     if (rollupErr) throw new Error(`volume rollup failed: ${rollupErr.message}`);
 
-    // Clear prior assignments (idempotent re-run support) then fan out.
     await supabase.from('bucket_assignments').delete().eq('bucketing_run_id', runId);
     const { data: fanoutCount, error: fanErr } = await supabase
         .rpc('bucketing_deterministic_fanout', { p_run_id: runId });
     if (fanErr) throw new Error(`fanout failed: ${fanErr.message}`);
     log(`[Bucketing ${runId}] fan-out wrote ${Number(fanoutCount || 0)} assignments`);
 
-    // Catch-all: contacts with industries we never saw (e.g. NULL industry) → Generic
     const { error: catchErr } = await supabase.rpc('bucketing_catchall_other', { p_run_id: runId });
     if (catchErr) throw new Error(`catch-all failed: ${catchErr.message}`);
 
-    // Final stats
     const { count: assignedCount } = await supabase
         .from('bucket_assignments')
         .select('contact_id', { count: 'exact', head: true })
@@ -728,7 +803,12 @@ async function runEmbeddingPrefilter(
 ): Promise<{ autoAssigned: any[]; pending: VocabRow[]; costUsd: number }> {
     if (vocab.length === 0 || leaves.length === 0) return { autoAssigned: [], pending: vocab, costUsd: 0 };
 
-    const leafTexts = leaves.map(l => `${l.bucket_name}: ${l.description || l.bucket_name}. Includes: ${(l.include || []).join(', ')}.`);
+    // Embedding text leans on identity signals so cosine matches identity, not vertical.
+    const leafTexts = leaves.map(l => {
+        const sig = (l.strong_identity_signals || []).slice(0, 6).join(', ');
+        const inc = (l.include || []).slice(0, 6).join(', ');
+        return `${l.bucket_name}: ${l.description || l.bucket_name}. Identity: ${l.identity_type}. Strong signals: ${sig}. Include: ${inc}.`;
+    });
     const vocabTexts = vocab.map(v => v.industry);
     const allInputs = [...leafTexts, ...vocabTexts];
 
@@ -746,6 +826,12 @@ async function runEmbeddingPrefilter(
         const second = sorted[1] || { s: 0 };
         if (top.s >= EMBED_AUTO_THRESHOLD && (top.s - second.s) >= EMBED_MARGIN) {
             const leaf = leaves[top.j];
+            // Don't auto-assign to operator_required buckets via embedding —
+            // operator evidence has to be an explicit LLM check.
+            if (leaf.operator_required) {
+                pending.push(vocab[i]);
+                continue;
+            }
             autoAssigned.push({
                 bucketing_run_id: runId,
                 industry_string: vocab[i].industry,
@@ -755,12 +841,13 @@ async function runEmbeddingPrefilter(
                 bucket_leaf: leaf.bucket_name,
                 bucket_ancestor: leaf.direct_ancestor || '',
                 bucket_root: leaf.root_category || '',
+                sector_focus: '',
                 leaf_score: Number(top.s.toFixed(2)),
                 ancestor_score: Number(top.s.toFixed(2)),
                 root_score: Number(top.s.toFixed(2)),
                 is_generic: false,
                 is_disqualified: false,
-                reasons: { auto: 'embedding pre-filter', cosine: top.s }
+                reasons: { auto: 'embedding pre-filter', cosine: top.s, identity_type: leaf.identity_type }
             });
         } else {
             pending.push(vocab[i]);
@@ -806,10 +893,11 @@ function cosine(a: number[], b: number[]): number {
     return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
-// ─── residual LLM matching ─────────────────────────────────────────
+// ─── routing LLM (Phase 1b) ────────────────────────────────────────
 async function runMatchingLLM(
     pending: VocabRow[],
     leaves: DiscoveredBucket[],
+    sectorVocab: string[],
     runId: string
 ): Promise<{ rows: any[]; costUsd: number }> {
     if (pending.length === 0) return { rows: [], costUsd: 0 };
@@ -818,14 +906,19 @@ async function runMatchingLLM(
     const ancestorByLeaf = new Map(leaves.map(l => [l.bucket_name, l.direct_ancestor || '']));
     const rootByLeaf = new Map(leaves.map(l => [l.bucket_name, l.root_category || '']));
 
-    // Bucket reference (the cacheable prefix)
     const bucketReferenceJson = JSON.stringify(leaves.map(l => ({
         bucket_name: l.bucket_name,
         description: l.description,
         direct_ancestor: l.direct_ancestor,
         root_category: l.root_category,
-        include: l.include || [],
-        exclude: l.exclude || [],
+        identity_type: l.identity_type,
+        operator_required: l.operator_required,
+        priority_rank: l.priority_rank,
+        strong_identity_signals: (l.strong_identity_signals || []).slice(0, 8),
+        weak_sector_signals: (l.weak_sector_signals || []).slice(0, 6),
+        disqualifying_signals: (l.disqualifying_signals || []).slice(0, 6),
+        include: (l.include || []).slice(0, 6),
+        exclude: (l.exclude || []).slice(0, 6),
         example_strings: (l.example_strings || []).slice(0, 6)
     })));
 
@@ -837,10 +930,9 @@ async function runMatchingLLM(
 
     let totalCost = 0;
     const rows: any[] = [];
-    const rowsLock: any[] = []; // not actually needed since pushes are JS-atomic, but kept for clarity
 
     await Promise.all(batches.map(batch => limit(async () => {
-        const { results, costUsd } = await classifyBatch(batch, bucketReferenceJson, validLeafNames);
+        const { results, costUsd } = await classifyBatch(batch, bucketReferenceJson, sectorVocab, validLeafNames);
         totalCost += costUsd;
         for (let i = 0; i < batch.length; i++) {
             const ind = batch[i].industry;
@@ -852,12 +944,13 @@ async function runMatchingLLM(
             rows.push({
                 bucketing_run_id: runId,
                 industry_string: ind,
-                bucket_name: leafName || (r.disqualified ? RESERVED_DISQUALIFIED : RESERVED_GENERIC), // pre-rollup placeholder
+                bucket_name: leafName || (r.disqualified ? RESERVED_DISQUALIFIED : RESERVED_GENERIC),
                 source: 'llm_phase1b',
                 confidence: Number((r.bucket_1.score || 0).toFixed(2)),
                 bucket_leaf: leafName,
                 bucket_ancestor: ancestor,
                 bucket_root: root,
+                sector_focus: (r.sector_focus || '').trim(),
                 leaf_score: r.bucket_1.score,
                 ancestor_score: r.bucket_2.score,
                 root_score: r.bucket_3.score,
@@ -866,7 +959,8 @@ async function runMatchingLLM(
                 reasons: {
                     leaf: r.bucket_1.reason,
                     ancestor: r.bucket_2.reason,
-                    root: r.bucket_3.reason
+                    root: r.bucket_3.reason,
+                    identity_type: r.identity_type
                 }
             });
         }
@@ -880,6 +974,8 @@ function makeFallbackChain(): MatchChain {
         bucket_1: { name: '', score: 0, reason: 'fallback' },
         bucket_2: { name: '', score: 0, reason: 'fallback' },
         bucket_3: { name: '', score: 0, reason: 'fallback' },
+        sector_focus: '',
+        identity_type: 'other',
         generic: true,
         disqualified: false
     };
@@ -888,29 +984,101 @@ function makeFallbackChain(): MatchChain {
 async function classifyBatch(
     batch: VocabRow[],
     bucketReferenceJson: string,
+    sectorVocab: string[],
     validLeafNames: Set<string>
 ): Promise<{ results: MatchChain[]; costUsd: number }> {
     const systemPrompt = `${PROJECT_CONTEXT}
 
 ========================================
-PHASE 1B — BUCKET MATCHING
+PHASE 1B — IDENTITY-FIRST ROUTING
 ========================================
 
-You are matching company classification strings to an existing industry taxonomy.
-This output measures bucket volumes and enables roll-ups via ancestors.
-NOT a creative writing task.
+You route each company classification string to its IDENTITY-FIRST bucket.
+This is NOT just semantic matching — it is routing.
 
-RULES:
-- Base each decision ONLY on the classification string and the bucket definitions.
-- Do not guess what the company does beyond the text.
-- bucket_1 MUST be a LEAF bucket from the BUCKET_REFERENCE.
-- bucket_2 MUST be the direct_ancestor of bucket_1.
-- bucket_3 MUST be the root_category of bucket_1 (if defined), else "".
-- bucket_2_score <= bucket_1_score.
-- bucket_3_score <= bucket_2_score.
-- If no leaf aligns at >= 0.55, leave bucket_1.name empty and set generic=true.
-- Disqualify ONLY for clear ecommerce/DTC physical products, local services tied to
-  geography, brick-and-mortar retail, or low-ticket consumer. Ambiguous → Generic.
+DECISION SEQUENCE (apply in this order, never skip):
+
+Step 1 — DETERMINE CORE BUSINESS IDENTITY.
+   Ask: is this company primarily an investor? a software vendor? an agency?
+   a consulting firm? a staffing firm? an MSP? a real estate firm? an
+   operator (clinic, school, government entity)?
+
+Step 2 — DETERMINE SECTOR FOCUS.
+   Ask: does it specifically serve healthcare? government? education?
+   finance? real estate? multiple? Sector is what they SERVE, not what
+   they ARE.
+
+Step 3 — ASSIGN BUCKET BY IDENTITY, NOT SECTOR.
+   The bucket is the company's identity. Sector goes in sector_focus.
+
+Step 4 — IF IDENTITY IS UNCLEAR → set generic=true and bucket_1 empty.
+   Never use a sector word as a shortcut bucket.
+
+UNIVERSAL ROUTING RULES (these are HARD rules, not preferences):
+
+Rule 1 — Strong business-model nouns BEAT sector nouns.
+  Identity nouns ("private equity", "venture capital", "law firm",
+  "accounting", "staffing", "agency", "consulting", "managed services",
+  "software platform", "real estate development", "brokerage") OUTRANK
+  sector nouns ("healthcare", "education", "government", "legal",
+  "financial", "real estate", "manufacturing", "home services") UNLESS
+  the text explicitly says the company is an operator in that sector.
+
+Rule 2 — "Serving X" does NOT mean "is X".
+  • software for schools ≠ school
+  • recruiting for hospitals ≠ healthcare provider
+  • private equity focused on HVAC ≠ HVAC company
+  • marketing for law firms ≠ law firm
+  • IT services for government agencies ≠ government entity
+
+Rule 3 — Operator buckets (operator_required=true) require operator
+  evidence. Operator evidence = explicit operator nouns: "clinic",
+  "hospital", "school district", "university", "city government",
+  "church", "property management company", "factory", "mine". Generic
+  sector mentions are NOT operator evidence.
+
+Rule 4 — When BOTH identity and sector appear, use both fields:
+  primary bucket = identity, sector_focus = sector.
+  Example: "Healthcare private equity firm" →
+    bucket_1 = Private Equity Firm, sector_focus = Healthcare.
+
+EXPLICIT EXAMPLES — CORRECT:
+  • "Healthcare private equity investment firm" → Private Equity Firm,
+    sector_focus = Healthcare
+  • "Government IT consulting firm" → IT Consulting / Managed Services,
+    sector_focus = Government
+  • "Marketing agency for dental practices" → Marketing Agency,
+    sector_focus = Healthcare
+  • "Real estate software for hospitals" → PropTech SaaS / Vertical
+    SaaS, sector_focus = Real Estate
+  • "Medical clinic" → Healthcare Operator (Clinics/Hospitals),
+    sector_focus = ""
+  • "Family law firm" → Law Firm, sector_focus = ""
+
+EXPLICIT EXAMPLES — INCORRECT (DO NOT DO THIS):
+  • "Healthcare private equity investment firm" → Healthcare ❌
+  • "Government IT consulting firm" → Government ❌
+  • "Marketing agency for dental practices" → Healthcare ❌
+  • "Real estate software for hospitals" → Healthcare ❌
+  • "Software for schools" → Education ❌
+
+PRESSURE TEST before finalizing each assignment:
+  "If outreach were written FOR THIS BUCKET, would the recipient say
+  'yes, that sounds like my company' — or 'no, that sounds like one of
+  my clients'?" If the answer is "one of my clients", routing is wrong.
+
+OUTPUT FORMAT:
+- bucket_1.name MUST be a leaf bucket from BUCKET_REFERENCE, or empty.
+- bucket_2 MUST be the direct_ancestor of bucket_1 (or empty).
+- bucket_3 MUST be the root_category of bucket_1 (or empty).
+- bucket_2_score <= bucket_1_score, bucket_3_score <= bucket_2_score.
+- If no leaf aligns at >= 0.55: bucket_1.name = "", generic = true.
+- sector_focus: ONE entry from SECTOR_VOCABULARY, or "" if none, or
+  "Multi-industry" if it serves several. NEVER put an identity noun here.
+- identity_type: one of operator | service_provider | agency |
+  software_vendor | investor | advisor | staffing | distributor | media | other.
+- Disqualify ONLY for ecommerce/DTC physical, local geo-tied services,
+  brick-and-mortar retail, low-ticket consumer.
 - Reasons: max 18 words each, must cite a phrase from the classification.
 
 Return strict JSON, no prose, no markdown fences.`;
@@ -918,7 +1086,9 @@ Return strict JSON, no prose, no markdown fences.`;
     const userPrompt = `BUCKET_REFERENCE:
 ${bucketReferenceJson}
 
-COMPANIES_TO_CLASSIFY (array of classification strings, in order):
+SECTOR_VOCABULARY: ${JSON.stringify(sectorVocab)}
+
+COMPANIES_TO_CLASSIFY (in order):
 ${JSON.stringify(batch.map(b => b.industry))}
 
 Return JSON: { "assignments": [<one object per company in the same order>] }
@@ -927,6 +1097,8 @@ Each assignment object:
   "bucket_1": {"name": "<leaf or empty>", "score": 0.00, "reason": ""},
   "bucket_2": {"name": "<ancestor or empty>", "score": 0.00, "reason": ""},
   "bucket_3": {"name": "<root or empty>", "score": 0.00, "reason": ""},
+  "sector_focus": "<from SECTOR_VOCABULARY, or 'Multi-industry', or ''>",
+  "identity_type": "<operator|service_provider|agency|software_vendor|investor|advisor|staffing|distributor|media|other>",
   "generic": false,
   "disqualified": false
 }`;
@@ -941,11 +1113,13 @@ Each assignment object:
                 items: {
                     type: 'object',
                     additionalProperties: false,
-                    required: ['bucket_1', 'bucket_2', 'bucket_3', 'generic', 'disqualified'],
+                    required: ['bucket_1', 'bucket_2', 'bucket_3', 'sector_focus', 'identity_type', 'generic', 'disqualified'],
                     properties: {
                         bucket_1: chainItemSchema(),
                         bucket_2: chainItemSchema(),
                         bucket_3: chainItemSchema(),
+                        sector_focus: { type: 'string' },
+                        identity_type: { type: 'string' },
                         generic: { type: 'boolean' },
                         disqualified: { type: 'boolean' }
                     }
@@ -993,15 +1167,10 @@ Each assignment object:
     };
 
     let result;
-    try {
-        result = await callOnce();
-    } catch (err) {
-        // Retry once on transient failure
-        result = await callOnce();
-    }
+    try { result = await callOnce(); }
+    catch { result = await callOnce(); }
 
     let { assignments, costUsd } = result;
-    // Drift guard: bucket_1.name must be in validLeafNames OR empty
     const drift = assignments.some(a => a.bucket_1.name && !validLeafNames.has(a.bucket_1.name));
     if (drift) {
         try {
@@ -1011,7 +1180,6 @@ Each assignment object:
         } catch { /* keep original */ }
     }
 
-    // Pad/truncate to batch size
     const padded: MatchChain[] = [];
     for (let i = 0; i < batch.length; i++) padded.push(assignments[i] || makeFallbackChain());
     return { results: padded, costUsd };
