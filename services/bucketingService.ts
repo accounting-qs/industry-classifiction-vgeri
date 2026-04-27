@@ -95,11 +95,24 @@ interface VocabRow {
     sample_reasoning: string[] | null;
 }
 
-interface DiscoveredBucket {
-    bucket_name: string;
+// A primary_identity is a Layer-1 high-level business type (Agency,
+// Consulting & Advisory, Software & SaaS, …). Layer-2 functional
+// specializations are nested under it.
+interface PrimaryIdentity {
+    name: string;
     description: string;
-    direct_ancestor: string;
-    root_category: string;
+    identity_type: string;       // operator | service_provider | agency | software_vendor | investor | advisor | staffing | distributor | media | other
+    operator_required: boolean;
+}
+
+// A functional_specialization is the Layer-2 subtype within an identity.
+// This is the "leaf" the LLM matches industry strings to — but the campaign
+// bucket actually used downstream is decided by the rollup (combo > spec >
+// identity > Generic).
+interface DiscoveredBucket {
+    functional_specialization: string;
+    primary_identity: string;        // foreign key to a PrimaryIdentity.name
+    description: string;
     identity_type: string;
     operator_required: boolean;
     priority_rank: number;
@@ -117,13 +130,15 @@ interface DiscoveredBucket {
 interface DiscoveryOutput {
     observed_patterns: string[];
     sector_focus_vocabulary: string[];
-    buckets: DiscoveredBucket[];
+    primary_identities: PrimaryIdentity[];
+    buckets: DiscoveredBucket[];   // Layer-2 specializations
 }
 
+// Phase 1b returns Layer-1 + Layer-2 + Layer-3 per industry string. Layer-4
+// (campaign bucket) is computed by SQL afterwards.
 interface MatchChain {
-    bucket_1: { name: string; score: number; reason: string };
-    bucket_2: { name: string; score: number; reason: string };
-    bucket_3: { name: string; score: number; reason: string };
+    primary_identity: { name: string; score: number; reason: string };
+    functional_specialization: { name: string; score: number; reason: string };
     sector_focus: string;
     identity_type: string;
     generic: boolean;
@@ -154,7 +169,7 @@ async function fetchFullVocabulary(
     return all;
 }
 
-// ─── PROJECT CONTEXT (identity-first edition) ─────────────────────
+// ─── PROJECT CONTEXT (4-layer model, identity-first) ──────────────
 const PROJECT_CONTEXT = `<<<SYSTEM ROLE AND CONTEXT
 
 You are operating inside a revenue-critical B2B growth system.
@@ -163,103 +178,133 @@ how those webinars are positioned, and ultimately revenue outcomes.
 
 This is NOT an academic taxonomy exercise.
 This is NOT a generic classification task.
-This is NOT about elegance, novelty, or theoretical completeness.
 
 ========================================
-UNIVERSAL ROUTING PRINCIPLE (the rule that governs everything)
+THE 4-LAYER CLASSIFICATION MODEL
+========================================
+
+Every company is described along three independent axes. The campaign
+bucket is decided AFTERWARDS by combining counts across those axes.
+
+Layer 1 — PRIMARY IDENTITY (high-level business type, ~6-12 total)
+   What kind of company is this AT ITS CORE?
+   Examples: "Agency", "Consulting & Advisory", "Software & SaaS",
+   "IT Services", "Financial Services", "Real Estate Operator",
+   "Healthcare Operator", "Education Operator", "Staffing & Recruiting",
+   "Legal Services", "Accounting & Tax".
+
+Layer 2 — FUNCTIONAL SPECIALIZATION (subtype within identity)
+   What kind of {identity} is it?
+   Examples (always coupled to a primary identity):
+     Agency → "SEO Agency", "Branding Agency", "Performance Marketing
+              Agency", "B2B Demand Generation Agency"
+     Consulting & Advisory → "IT Consulting", "Management Consulting",
+              "Revenue Operations Consulting", "M&A Advisory"
+     Financial Services → "Private Equity Firm", "Venture Capital Fund",
+              "Growth Equity Firm", "Family Office", "Investment Bank"
+     Software & SaaS → "MarTech SaaS", "FinTech SaaS", "PropTech SaaS",
+              "Vertical SaaS", "HR SaaS", "Data & Analytics SaaS"
+     IT Services → "Managed IT Services", "Cybersecurity Services",
+              "Cloud Migration Services"
+
+Layer 3 — SECTOR FOCUS (optional vertical served, ~10-20 total)
+   Who do they MAINLY serve, if explicitly stated?
+   Examples: "Healthcare", "Real Estate", "Government", "Education",
+   "Manufacturing", "Financial Services", "Hospitality", "Energy",
+   "Non-profit", "Multi-industry", or "" (none).
+
+Layer 4 — CAMPAIGN BUCKET (decided downstream, NOT by you)
+   The actual outreach bucket is computed from the data — not predicted.
+   The routing engine combines volume across the three axes:
+     - Use "{sector_focus} {specialization}" if that combo has enough
+       leads (e.g. "Real Estate SEO Agency").
+     - Else fall back to "{specialization}" (e.g. "SEO Agency").
+     - Else fall back to "{primary_identity}" (e.g. "Agency").
+     - Else "Generic".
+   You DO NOT predict campaign buckets. You produce accurate Layer 1-3
+   classifications. The system computes Layer 4 from your output + counts.
+
+========================================
+UNIVERSAL ROUTING PRINCIPLE
 ========================================
 
 Classify each company by its CORE BUSINESS IDENTITY first.
 Classify SECTOR SERVED second.
 Never reverse that order.
 
-This means:
-- A private equity firm focused on healthcare is still a private equity firm.
-- An IT consultancy serving hospitals is still an IT consultancy.
-- A marketing agency for life sciences is still a marketing agency.
-- A real estate developer focused on senior living is still real estate.
-- "Software for schools" is software, not a school.
+- A private equity firm focused on healthcare is a Private Equity Firm
+  in Financial Services with sector_focus = Healthcare. NOT a healthcare
+  company.
+- An IT consultancy serving hospitals is an IT Consulting firm in
+  Consulting & Advisory with sector_focus = Healthcare.
+- A marketing agency for life sciences is an Agency.
+- "Software for schools" is Software & SaaS, not Education.
 
-Distinguish between:
-- WHAT the company is (its business model / core operation)
-- WHO the company serves (the verticals it targets)
-
-Use the BUCKET for what the company IS.
-Preserve "who it serves" SEPARATELY as sector_focus, never as the primary bucket.
+Distinguish: WHAT the company is vs WHO it serves. Identity decides
+primary_identity + functional_specialization. Sector served decides
+sector_focus.
 
 ========================================
 OPERATOR vs ENABLER
 ========================================
 
-Operators directly operate in an industry: clinics, hospitals, schools,
-universities, banks, city governments, churches, property managers, manufacturing
-plants, retailers, restaurants.
+Operators directly operate in a vertical: clinics, hospitals, schools,
+universities, banks, city governments, churches, property managers,
+manufacturing plants, retailers, restaurants. Their primary_identity
+NAMES the vertical (e.g. "Healthcare Operator", "Education Operator").
 
-Enablers serve those industries: agencies, consultants, software firms,
-investors, staffing firms, IT providers, advisors.
+Enablers serve verticals from outside: agencies, consultants, software
+firms, investors, staffing firms, IT providers, advisors. Their
+primary_identity is the enabler category (Agency, Consulting & Advisory,
+Software & SaaS, …) — the vertical they serve goes in sector_focus.
 
-Enablers are classified by their OWN business model first. Sector references
-in their classification string describe WHO THEY SERVE, not what they are.
-
-Operator buckets (Healthcare, Education, Government, Religious Organizations,
-Real Estate operators) require explicit operator evidence to use as primary
-bucket. Examples of operator evidence: "clinic", "hospital", "university",
-"school district", "city government", "church", "property management company".
-
-If the classification string says only "healthcare technology" or "healthcare
-private equity" or "marketing for hospitals", that is NOT operator evidence.
-Those companies are enablers — bucket them by their own model and put
-"Healthcare" in sector_focus.
+Operator identities (Healthcare Operator, Education Operator, Government,
+Real Estate Operator, Religious Organization) require explicit operator
+evidence: "clinic", "hospital", "school district", "university", "city
+government", "church", "property management company". Generic mentions
+of the sector ("healthcare technology", "marketing for hospitals") are
+NOT operator evidence — those companies are enablers.
 
 ========================================
 BACKGROUND
 ========================================
 
-We run live B2B webinars at very large scale. Invitations are sent via Google
-Calendar to tens or hundreds of thousands of founders. We can't personalize
-per individual but we CAN personalize per bucket — each bucket supports
-thousands of invitees.
+We run live B2B webinars at very large scale. Invitations are sent via
+Google Calendar to tens or hundreds of thousands of founders. We can't
+personalize per individual but we CAN personalize per bucket — each
+bucket supports thousands of invitees.
 
-Goal: increase ATTENDANCE RATE by making invitations feel highly relevant to
-the recipient's actual business identity. The pressure test: if a recipient
+Goal: increase ATTENDANCE RATE by making invitations feel highly relevant
+to the recipient's actual business identity. Pressure test: if a recipient
 read outreach written for their bucket, would they say "yes, that sounds
-like my company" — or "no, that sounds like one of my clients"? If it sounds
-like their CLIENTS, the routing is wrong.
+like my company" — or "no, that sounds like one of my clients"? If it
+sounds like their CLIENTS, the routing is wrong.
 
 ========================================
 IDEAL CLIENT PROFILE (ICP)
 ========================================
 
-Strong ICP (always inviteable):
-- Agencies (marketing, performance, CRO, dev, etc.)
-- Consulting / advisory firms
-- Professional services (non-local)
-- B2B / enterprise SaaS (sub-verticals matter)
-- High-ticket info products (when plausibly scalable)
-- Financial services & investment firms (advisors, M&A, PE, VC, funds)
+Strong ICP (always inviteable): agencies, consulting/advisory, professional
+services (non-local), B2B/enterprise SaaS, financial services & investment
+firms, plausibly scalable high-ticket info products.
 
-Explicit NON-ICP (route to "Generic", do NOT disqualify unless the
-disqualifying-signals list matches; Generic is still inviteable):
-- Ecommerce / DTC physical product sellers
-- Local services tied to geography
-- Brick-and-mortar retail
-- Low-ticket consumer
+Explicit NON-ICP (route to "Generic", still inviteable): ecommerce/DTC
+physical products, local services tied to geography, brick-and-mortar
+retail, low-ticket consumer.
 
-Disqualify ONLY when the classification clearly indicates a non-ICP operator
-with no plausible upsell path. Disqualification is conservative — false
-negatives cost more than false positives. If ambiguous, prefer Generic.
+Disqualify ONLY for clear non-ICP operators with no plausible upsell path.
+Disqualification is conservative — false negatives cost more than false
+positives. If ambiguous, prefer Generic.
 
 ========================================
 CRITICAL CONSTRAINTS
 ========================================
 
-1. Identity > Sector. The bucket is what the company IS, not whom it serves.
-2. Operator evidence required for operator buckets.
+1. Identity > Sector. Bucket the company by what it IS.
+2. Operator evidence required for operator identities.
 3. Accuracy > Coverage. Do not force-fit.
-4. Specificity > Breadth. "This is for me" effect.
-5. Reusability > Novelty. Buckets must work across multiple lists.
-6. Structure > Guessing. Ancestor relationships must be explicit and logical.
-7. Determinism > Creativity. Predictable behavior at scale.`;
+4. Reusability > Novelty. Identities + specializations must be reusable.
+5. Determinism > Creativity. Predictable behavior at scale.`;
 
 // ────────────────────────────────────────────────────────────────────
 // PHASE 1A — DISCOVERY
@@ -301,15 +346,35 @@ export async function runTaxonomyProposal(
     const { discovery, costUsd, modelUsed } = await callDiscoveryLLM(supabase, vocabRows, preferred);
     log(`[Bucketing ${runId}] discovery LLM (${modelUsed}): ${(Date.now() - t0) / 1000}s, $${costUsd.toFixed(4)}, ${discovery.buckets.length} leaves`);
 
+    // Normalize primary_identities; drop any reserved names; dedupe.
+    const seenIdent = new Set<string>();
+    const primaryIdentities = (discovery.primary_identities || []).filter(p => {
+        const n = (p.name || '').trim();
+        if (!n || RESERVED.has(n.toLowerCase())) return false;
+        if (seenIdent.has(n)) return false;
+        seenIdent.add(n);
+        return true;
+    }).map(p => ({
+        name: p.name.trim(),
+        description: (p.description || '').trim(),
+        identity_type: (p.identity_type || 'other').trim(),
+        operator_required: !!p.operator_required
+    }));
+
+    // Validate specialization → identity references; drop dangling ones.
+    const identitySet = new Set(primaryIdentities.map(p => p.name));
     const leaves = discovery.buckets.filter(b => {
-        const n = (b.bucket_name || '').trim();
-        return n && !RESERVED.has(n.toLowerCase());
+        const spec = (b.functional_specialization || '').trim();
+        const ident = (b.primary_identity || '').trim();
+        return spec
+            && !RESERVED.has(spec.toLowerCase())
+            && ident
+            && identitySet.has(ident);
     }).map(b => ({
         ...b,
-        bucket_name: b.bucket_name.trim(),
+        functional_specialization: b.functional_specialization.trim(),
+        primary_identity: b.primary_identity.trim(),
         description: (b.description || '').trim(),
-        direct_ancestor: (b.direct_ancestor || '').trim(),
-        root_category: (b.root_category || '').trim(),
         identity_type: (b.identity_type || 'other').trim(),
         operator_required: !!b.operator_required,
         priority_rank: typeof b.priority_rank === 'number' ? b.priority_rank : 5,
@@ -325,6 +390,7 @@ export async function runTaxonomyProposal(
         taxonomy_proposal: {
             observed_patterns: discovery.observed_patterns || [],
             sector_focus_vocabulary: discovery.sector_focus_vocabulary || [],
+            primary_identities: primaryIdentities,
             buckets: leaves
         },
         taxonomy_model: modelUsed,
@@ -338,7 +404,7 @@ export async function runTaxonomyProposal(
         const links = leaves.filter(l => l.library_match_id).map(l => ({
             bucketing_run_id: runId,
             library_bucket_id: l.library_match_id!,
-            bucket_name_in_run: l.bucket_name
+            bucket_name_in_run: l.functional_specialization
         }));
         if (links.length > 0) {
             await supabase.from('bucket_library_run_links').upsert(links, { onConflict: 'bucketing_run_id,library_bucket_id' });
@@ -384,131 +450,133 @@ async function callDiscoveryLLM(
     const preferredSection = preferred.length > 0 ? `
 
 ========================================
-PREFERRED BUCKETS (from library)
+PREFERRED SPECIALIZATIONS (from library)
 ========================================
 
-These buckets were defined in prior runs and have proven useful. If a
-discovered identity-first pattern aligns with one of these at score >= 0.7,
-REUSE it: copy the bucket_name, description, direct_ancestor, root_category,
-identity_type VERBATIM and set library_match_id to the id provided. Do NOT
-invent a near-duplicate with different wording.
+These specializations were defined in prior runs and have proven useful. If
+a discovered pattern aligns with one of these at score >= 0.7, REUSE it:
+copy functional_specialization, primary_identity, and description VERBATIM
+and set library_match_id. Do NOT invent a near-duplicate with different
+wording.
 
-${preferred.map(p => `id=${p.id} | name="${p.bucket_name}" | ancestor="${p.direct_ancestor}" | root="${p.root_category}" | desc="${p.description || ''}"`).join('\n')}` : '';
+${preferred.map(p => `id=${p.id} | spec="${p.bucket_name}" | identity="${p.direct_ancestor || p.root_category}" | desc="${p.description || ''}"`).join('\n')}` : '';
 
     const userPrompt = `${PROJECT_CONTEXT}
 
 ========================================
-PHASE 1A — IDENTITY-FIRST DISCOVERY
+PHASE 1A — DISCOVER PRIMARY IDENTITIES + FUNCTIONAL SPECIALIZATIONS
 ========================================
 
-Discover an identity-first leaf taxonomy from the vocabulary below. The
-critical constraint: a leaf bucket represents WHAT the company IS, not whom
-it serves. Apply the universal routing principle relentlessly.
+You are NOT predicting campaign buckets. You are producing the catalog
+the routing engine uses. Discover:
+
+A) PRIMARY IDENTITIES (Layer 1): 6–12 high-level identities present in the
+   vocabulary. Examples: "Agency", "Consulting & Advisory", "Software & SaaS",
+   "IT Services", "Financial Services", "Real Estate Operator",
+   "Healthcare Operator", "Education Operator", "Staffing & Recruiting",
+   "Legal Services", "Accounting & Tax", "Media & Publishing".
+   Each identity must be evidenced by multiple companies in the vocabulary.
+
+B) FUNCTIONAL SPECIALIZATIONS (Layer 2): 30–60 specializations across the
+   identities. Each specialization belongs to exactly ONE primary_identity.
+   Examples (always coupled): Agency → "SEO Agency", "Branding Agency",
+   "Performance Marketing Agency", "B2B Demand Generation Agency". Consulting
+   & Advisory → "IT Consulting", "Management Consulting", "Revenue Operations
+   Consulting", "M&A Advisory". Financial Services → "Private Equity Firm",
+   "Venture Capital Fund", "Family Office". Software & SaaS → "MarTech SaaS",
+   "FinTech SaaS", "Vertical SaaS", "PropTech SaaS".
+
+C) SECTOR FOCUS VOCABULARY (Layer 3): a controlled list of sector terms
+   that appear in the data as "served vertical" signals. These NEVER become
+   primary identities or specializations — they are sector_focus values used
+   in Phase 1b. Examples: "Healthcare", "Real Estate", "Government",
+   "Education", "Manufacturing", "Financial Services", "Hospitality",
+   "Energy", "Non-profit", "Legal", "Multi-industry".
 
 NO-SHORTCUTS RULES:
-1) Base buckets ONLY on patterns that appear in the vocabulary.
-2) Do NOT infer industries that are not evidenced.
-3) Sector words (healthcare, government, education, real estate, finance,
-   legal, manufacturing) MUST NOT be primary leaf buckets unless the
-   vocabulary clearly contains operator companies in that sector AND the
-   bucket carries operator_required=true.
-4) Do NOT compress the problem by ignoring the vocabulary.
+1) Base everything ONLY on patterns evidenced in the vocabulary.
+2) Sector words must NOT become a primary_identity unless the vocabulary
+   clearly contains OPERATORS in that sector (clinics, schools, city
+   governments, etc.) AND that identity carries operator_required=true.
+3) No near-duplicates. Specializations differing only by word order or
+   synonym must be merged.
+4) An identity with no specializations is invalid. Every identity must
+   have ≥1 specialization underneath it.
 
-ICP BOUNDARIES:
-- Strong ICP: agencies, consulting/advisory, professional services (non-local),
-  B2B/enterprise SaaS, financial services & investment firms, plausibly
-  scalable high-ticket info products.
-- Non-ICP route to "Generic" (still inviteable). Disqualify only with clear
-  signals — ambiguous → Generic.
+❌ TOO BROAD as a SPECIALIZATION (must be a primary_identity instead):
+"SaaS", "B2B SaaS", "Marketing Agency", "Consulting Firm", "Software".
 
-BUCKET DESIGN:
-- 30–60 leaves total. 6–15 ancestors. 3–6 roots.
-- Each leaf has direct_ancestor (broader, shared) and root_category (family).
-- Many leaves share an ancestor; an ancestor with only one leaf is invalid.
-- No near-duplicates (synonyms, word-order variants).
+❌ TOO NARROW (forbidden):
+"TikTok ads agency for DTC candle brands", "Family office for German
+real estate developers", "RevOps consulting for Series B HR SaaS".
 
-❌ TOO BROAD (allowed only as ancestors/roots):
-"SaaS", "B2B SaaS", "Marketing Agency", "Consulting Firm",
-"Financial Services", "Professional Services", "Technology Company".
+✅ GOLDILOCKS specializations:
+"SEO Agency", "Performance Marketing Agency", "B2B Demand Generation Agency",
+"IT Consulting", "Revenue Operations Consulting", "M&A Advisory",
+"Private Equity Firm", "Venture Capital Fund", "MarTech SaaS",
+"PropTech SaaS", "Managed IT Services", "Cybersecurity Services",
+"Healthcare Clinic / Hospital" [operator_required=true],
+"K-12 School District" [operator_required=true].
 
-❌ TOO NARROW:
-"AI-powered Stripe reconciliation SaaS for EU neobanks",
-"TikTok ads agency for DTC candle brands",
-"Family office for German real estate developers".
-
-✅ GOLDILOCKS (target leaves):
-Identity-driven labels like "Payments Infrastructure SaaS", "FinTech SaaS",
-"Performance Marketing Agency", "Conversion Rate Optimization Agency",
-"Revenue Operations Consulting", "Fractional CFO Services", "Private Equity
-Firm", "Venture Capital Fund", "M&A Advisory Services", "MarTech SaaS",
-"Vertical SaaS", "B2B Demand Generation Agency", "Branding & Creative
-Agency", "Managed IT Services & Cybersecurity", "Healthcare Operator
-(Clinics/Hospitals)" [operator_required=true], "K-12 School District"
-[operator_required=true].
-
-PER-LEAF ROUTING METADATA — REQUIRED FIELDS:
+PER-SPECIALIZATION ROUTING METADATA — REQUIRED FIELDS:
 - identity_type ∈ {operator, service_provider, agency, software_vendor,
   investor, advisor, staffing, distributor, media, other}
-- operator_required: boolean. true ONLY for buckets that represent operators
-  in a vertical (Healthcare Operator, K-12 School District, City/Local
-  Government, Religious Organization, Real Estate Operator).
-- priority_rank: integer 1–10. 1 = highest priority (strongest identity nouns
-  that should beat sector words: PE Firm, VC Fund, Law Firm, Accounting Firm,
-  Staffing Firm, Marketing Agency, Software/SaaS, MSP, Consulting Firm).
-  10 = lowest (operator buckets that lose to enabler signals).
-- strong_identity_signals: phrases that PROVE this identity (e.g. "private
-  equity", "venture fund", "law firm", "managed services").
-- weak_sector_signals: sector words that often appear but DON'T determine
-  this bucket (e.g. for a PE Firm: "healthcare", "fintech", "software" —
-  these are likely sector_focus, not the primary bucket).
-- disqualifying_signals: phrases that should ROUTE AWAY from this bucket
-  (e.g. for Healthcare Operator: "healthcare technology", "medical billing
-  software", "healthcare private equity" — these are enablers, not operators).
-
-ALSO PRODUCE A SEPARATE SECTOR-FOCUS VOCABULARY:
-A controlled list of sector terms that appear repeatedly in the vocabulary
-as "served vertical" signals. These NEVER become primary buckets but they
-are valid sector_focus values in Phase 1b. Examples: "Healthcare",
-"Government", "Education", "Real Estate", "Manufacturing", "Legal",
-"Financial Services", "Retail & CPG", "Hospitality", "Energy", "Non-profit".
+- operator_required: true ONLY for specializations whose identity is an
+  operator identity (Healthcare Operator → "Medical Clinic / Hospital",
+  Education Operator → "K-12 School District").
+- priority_rank: 1–10. 1 = strongest identity nouns (PE Firm, Law Firm,
+  Marketing Agency, MSP). 10 = weakest (operator specializations that
+  lose to enabler signals).
+- strong_identity_signals, weak_sector_signals, disqualifying_signals:
+  same as before — phrases that prove / hint at / route AWAY from this
+  specialization.
 ${preferredSection}
 
 REQUIRED PROCESS — DO NOT SKIP:
-A) Identify 10–15 high-frequency patterns observed in the vocabulary.
-B) Use those patterns to justify why your top leaves are ranked highest and
-   why they pass the identity-first test.
+A) List 10–15 high-frequency patterns observed in the vocabulary.
+B) Use those patterns to justify the top primary_identities and which
+   specializations belong under each.
 
 OUTPUT (strict JSON only, no prose, no markdown fences):
 
 {
   "observed_patterns": [<10–15 strings>],
-  "sector_focus_vocabulary": [<sector terms used as sector_focus, never primary>],
+  "sector_focus_vocabulary": [<sector terms; NEVER appear as identities or specs>],
+  "primary_identities": [
+    {
+      "name": "<identity, Layer 1>",
+      "description": "<1 sentence>",
+      "identity_type": "<operator|service_provider|agency|software_vendor|investor|advisor|staffing|distributor|media|other>",
+      "operator_required": <true|false>
+    }
+  ],
   "buckets": [
     {
-      "bucket_name": "<leaf>",
+      "functional_specialization": "<spec, Layer 2>",
+      "primary_identity": "<MUST exactly match a name in primary_identities above>",
       "description": "<1 sentence — what the company IS>",
-      "direct_ancestor": "<ancestor>",
-      "root_category": "<root>",
-      "identity_type": "<operator|service_provider|agency|software_vendor|investor|advisor|staffing|distributor|media|other>",
+      "identity_type": "<...>",
       "operator_required": <true|false>,
       "priority_rank": <1..10>,
       "include": [<keywords>],
       "exclude": [<keywords>],
       "example_strings": [<6–10 verbatim from vocab>],
       "strong_identity_signals": [<phrases>],
-      "weak_sector_signals": [<sector phrases that appear but don't determine this bucket>],
+      "weak_sector_signals": [<sector phrases that often appear but don't determine this spec>],
       "disqualifying_signals": [<phrases that should route AWAY>],
       "estimated_usage_label": "<dominant|very_common|common|moderate|niche_but_meaningful|rare>",
       "rough_volume_estimate": "<e.g. ~8–12% of rows>",
-      "library_match_id": "<id from PREFERRED_BUCKETS, or empty string>"
+      "library_match_id": "<id from PREFERRED, or empty string>"
     }
   ]
 }
 
 Rules:
-- Buckets ordered MOST common → LEAST common.
+- Specializations ordered MOST common → LEAST common.
 - example_strings MUST be verbatim from the vocabulary.
-- 30–60 leaves total.
+- 6–12 primary_identities, 30–60 specializations total.
+- Every spec's primary_identity field exactly matches a name in the
+  primary_identities array.
 
 ========================================
 VOCABULARY
@@ -594,6 +662,7 @@ function parseDiscoveryJson(text: string): DiscoveryOutput {
     const trimmed = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
     const parsed = JSON.parse(trimmed);
     if (!Array.isArray(parsed.buckets)) throw new Error('Discovery output missing `buckets` array');
+    if (!Array.isArray(parsed.primary_identities)) parsed.primary_identities = [];
     if (!Array.isArray(parsed.sector_focus_vocabulary)) parsed.sector_focus_vocabulary = [];
     if (!Array.isArray(parsed.observed_patterns)) parsed.observed_patterns = [];
     return parsed;
@@ -603,25 +672,38 @@ function buildDiscoverySchema() {
     return {
         type: 'object',
         additionalProperties: false,
-        required: ['observed_patterns', 'sector_focus_vocabulary', 'buckets'],
+        required: ['observed_patterns', 'sector_focus_vocabulary', 'primary_identities', 'buckets'],
         properties: {
             observed_patterns: { type: 'array', items: { type: 'string' } },
             sector_focus_vocabulary: { type: 'array', items: { type: 'string' } },
+            primary_identities: {
+                type: 'array',
+                items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['name', 'description', 'identity_type', 'operator_required'],
+                    properties: {
+                        name: { type: 'string' },
+                        description: { type: 'string' },
+                        identity_type: { type: 'string' },
+                        operator_required: { type: 'boolean' }
+                    }
+                }
+            },
             buckets: {
                 type: 'array',
                 items: {
                     type: 'object',
                     additionalProperties: false,
-                    required: ['bucket_name', 'description', 'direct_ancestor', 'root_category',
+                    required: ['functional_specialization', 'primary_identity', 'description',
                                'identity_type', 'operator_required', 'priority_rank',
                                'include', 'exclude', 'example_strings',
                                'strong_identity_signals', 'weak_sector_signals', 'disqualifying_signals',
                                'estimated_usage_label', 'rough_volume_estimate', 'library_match_id'],
                     properties: {
-                        bucket_name: { type: 'string' },
+                        functional_specialization: { type: 'string' },
+                        primary_identity: { type: 'string' },
                         description: { type: 'string' },
-                        direct_ancestor: { type: 'string' },
-                        root_category: { type: 'string' },
                         identity_type: { type: 'string' },
                         operator_required: { type: 'boolean' },
                         priority_rank: { type: 'integer' },
@@ -646,10 +728,17 @@ function buildDiscoverySchema() {
 // ────────────────────────────────────────────────────────────────────
 
 interface TaxonomyEdits {
-    keep?: string[];
-    rename?: Record<string, string>;
-    add?: { bucket_name: string; description: string; direct_ancestor: string; root_category: string; identity_type?: string; operator_required?: boolean }[];
+    keep?: string[];                              // functional_specialization names
+    rename?: Record<string, string>;              // {old spec name: new spec name}
+    add?: {
+        functional_specialization: string;
+        primary_identity: string;
+        description: string;
+        identity_type?: string;
+        operator_required?: boolean;
+    }[];
     min_volume?: number;
+    bucket_budget?: number;
 }
 
 export async function applyTaxonomyEdits(
@@ -669,25 +758,27 @@ export async function applyTaxonomyEdits(
         for (const [oldName, newName] of Object.entries(edits.rename)) {
             const target = newName.trim();
             if (!target || RESERVED.has(target.toLowerCase())) continue;
-            leaves = leaves.map(b => b.bucket_name === oldName ? { ...b, bucket_name: target } : b);
+            leaves = leaves.map(b => b.functional_specialization === oldName
+                ? { ...b, functional_specialization: target }
+                : b);
         }
     }
 
     if (edits.keep) {
         const keepSet = new Set(edits.keep.map(s => s.trim()));
-        leaves = leaves.filter(b => keepSet.has(b.bucket_name));
+        leaves = leaves.filter(b => keepSet.has(b.functional_specialization));
     }
 
     if (edits.add) {
         for (const a of edits.add) {
-            const name = (a.bucket_name || '').trim();
-            if (!name || RESERVED.has(name.toLowerCase())) continue;
-            if (leaves.some(l => l.bucket_name === name)) continue;
+            const spec = (a.functional_specialization || '').trim();
+            const ident = (a.primary_identity || '').trim();
+            if (!spec || RESERVED.has(spec.toLowerCase()) || !ident) continue;
+            if (leaves.some(l => l.functional_specialization === spec)) continue;
             leaves.push({
-                bucket_name: name,
+                functional_specialization: spec,
+                primary_identity: ident,
                 description: (a.description || '').trim(),
-                direct_ancestor: (a.direct_ancestor || '').trim(),
-                root_category: (a.root_category || '').trim(),
                 identity_type: a.identity_type || 'other',
                 operator_required: !!a.operator_required,
                 priority_rank: 5,
@@ -701,14 +792,18 @@ export async function applyTaxonomyEdits(
         taxonomy_final: {
             observed_patterns: proposal.observed_patterns || [],
             sector_focus_vocabulary: proposal.sector_focus_vocabulary || [],
+            primary_identities: (proposal as any).primary_identities || [],
             buckets: leaves
         }
     };
     if (typeof edits.min_volume === 'number' && edits.min_volume >= 0) {
         update.min_volume = edits.min_volume;
     }
+    if (typeof edits.bucket_budget === 'number' && edits.bucket_budget > 0) {
+        update.bucket_budget = Math.floor(edits.bucket_budget);
+    }
     await supabase.from('bucketing_runs').update(update).eq('id', runId);
-    log(`[Bucketing ${runId}] taxonomy edits applied: ${leaves.length} leaves`);
+    log(`[Bucketing ${runId}] taxonomy edits applied: ${leaves.length} specializations`);
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -803,11 +898,12 @@ async function runEmbeddingPrefilter(
 ): Promise<{ autoAssigned: any[]; pending: VocabRow[]; costUsd: number }> {
     if (vocab.length === 0 || leaves.length === 0) return { autoAssigned: [], pending: vocab, costUsd: 0 };
 
-    // Embedding text leans on identity signals so cosine matches identity, not vertical.
+    // Embedding text leans on identity signals so cosine matches the
+    // specialization, not the vertical the company serves.
     const leafTexts = leaves.map(l => {
         const sig = (l.strong_identity_signals || []).slice(0, 6).join(', ');
         const inc = (l.include || []).slice(0, 6).join(', ');
-        return `${l.bucket_name}: ${l.description || l.bucket_name}. Identity: ${l.identity_type}. Strong signals: ${sig}. Include: ${inc}.`;
+        return `${l.functional_specialization} (under ${l.primary_identity}): ${l.description || ''}. Identity: ${l.identity_type}. Strong signals: ${sig}. Include: ${inc}.`;
     });
     const vocabTexts = vocab.map(v => v.industry);
     const allInputs = [...leafTexts, ...vocabTexts];
@@ -826,7 +922,7 @@ async function runEmbeddingPrefilter(
         const second = sorted[1] || { s: 0 };
         if (top.s >= EMBED_AUTO_THRESHOLD && (top.s - second.s) >= EMBED_MARGIN) {
             const leaf = leaves[top.j];
-            // Don't auto-assign to operator_required buckets via embedding —
+            // Don't auto-assign to operator_required specs via embedding —
             // operator evidence has to be an explicit LLM check.
             if (leaf.operator_required) {
                 pending.push(vocab[i]);
@@ -835,12 +931,14 @@ async function runEmbeddingPrefilter(
             autoAssigned.push({
                 bucketing_run_id: runId,
                 industry_string: vocab[i].industry,
-                bucket_name: leaf.bucket_name,
+                bucket_name: leaf.functional_specialization, // pre-rollup placeholder
                 source: 'embedding',
                 confidence: Number(top.s.toFixed(2)),
-                bucket_leaf: leaf.bucket_name,
-                bucket_ancestor: leaf.direct_ancestor || '',
-                bucket_root: leaf.root_category || '',
+                bucket_leaf: leaf.functional_specialization,
+                bucket_ancestor: leaf.primary_identity,
+                bucket_root: leaf.primary_identity,
+                primary_identity: leaf.primary_identity,
+                functional_specialization: leaf.functional_specialization,
                 sector_focus: '',
                 leaf_score: Number(top.s.toFixed(2)),
                 ancestor_score: Number(top.s.toFixed(2)),
@@ -902,25 +1000,32 @@ async function runMatchingLLM(
 ): Promise<{ rows: any[]; costUsd: number }> {
     if (pending.length === 0) return { rows: [], costUsd: 0 };
 
-    const validLeafNames = new Set(leaves.map(l => l.bucket_name));
-    const ancestorByLeaf = new Map(leaves.map(l => [l.bucket_name, l.direct_ancestor || '']));
-    const rootByLeaf = new Map(leaves.map(l => [l.bucket_name, l.root_category || '']));
+    // Valid Layer-1 + Layer-2 names (the LLM may only return these).
+    const validSpecNames = new Set(leaves.map(l => l.functional_specialization));
+    const validIdentityNames = new Set(leaves.map(l => l.primary_identity));
+    const identityBySpec = new Map(leaves.map(l => [l.functional_specialization, l.primary_identity]));
 
-    const bucketReferenceJson = JSON.stringify(leaves.map(l => ({
-        bucket_name: l.bucket_name,
-        description: l.description,
-        direct_ancestor: l.direct_ancestor,
-        root_category: l.root_category,
-        identity_type: l.identity_type,
-        operator_required: l.operator_required,
-        priority_rank: l.priority_rank,
-        strong_identity_signals: (l.strong_identity_signals || []).slice(0, 8),
-        weak_sector_signals: (l.weak_sector_signals || []).slice(0, 6),
-        disqualifying_signals: (l.disqualifying_signals || []).slice(0, 6),
-        include: (l.include || []).slice(0, 6),
-        exclude: (l.exclude || []).slice(0, 6),
-        example_strings: (l.example_strings || []).slice(0, 6)
-    })));
+    // Bucket reference is the cacheable prompt prefix. Group by primary_identity
+    // so the model sees the hierarchy clearly.
+    const refByIdentity: Record<string, any[]> = {};
+    for (const l of leaves) {
+        const ident = l.primary_identity;
+        if (!refByIdentity[ident]) refByIdentity[ident] = [];
+        refByIdentity[ident].push({
+            functional_specialization: l.functional_specialization,
+            description: l.description,
+            identity_type: l.identity_type,
+            operator_required: l.operator_required,
+            priority_rank: l.priority_rank,
+            strong_identity_signals: (l.strong_identity_signals || []).slice(0, 8),
+            weak_sector_signals: (l.weak_sector_signals || []).slice(0, 6),
+            disqualifying_signals: (l.disqualifying_signals || []).slice(0, 6),
+            include: (l.include || []).slice(0, 6),
+            exclude: (l.exclude || []).slice(0, 6),
+            example_strings: (l.example_strings || []).slice(0, 6)
+        });
+    }
+    const bucketReferenceJson = JSON.stringify(refByIdentity);
 
     const limit = pLimit(MATCH_CONCURRENCY);
     const batches: VocabRow[][] = [];
@@ -932,34 +1037,46 @@ async function runMatchingLLM(
     const rows: any[] = [];
 
     await Promise.all(batches.map(batch => limit(async () => {
-        const { results, costUsd } = await classifyBatch(batch, bucketReferenceJson, sectorVocab, validLeafNames);
+        const { results, costUsd } = await classifyBatch(
+            batch, bucketReferenceJson, sectorVocab, validSpecNames, validIdentityNames
+        );
         totalCost += costUsd;
         for (let i = 0; i < batch.length; i++) {
             const ind = batch[i].industry;
             const r = results[i] || makeFallbackChain();
-            const leafOk = r.bucket_1.name && validLeafNames.has(r.bucket_1.name) && r.bucket_1.score >= 0.55;
-            const leafName = leafOk ? r.bucket_1.name : '';
-            const ancestor = leafOk ? (ancestorByLeaf.get(leafName) || r.bucket_2.name) : (r.bucket_2.name || '');
-            const root = leafOk ? (rootByLeaf.get(leafName) || r.bucket_3.name) : (r.bucket_3.name || '');
+            const specOk = r.functional_specialization.name
+                && validSpecNames.has(r.functional_specialization.name)
+                && r.functional_specialization.score >= 0.55;
+            const specName = specOk ? r.functional_specialization.name : '';
+            // Trust the spec→identity mapping from Phase 1a, not whatever the
+            // LLM returned for primary_identity (drift guard).
+            const identName = specOk
+                ? (identityBySpec.get(specName) || r.primary_identity.name)
+                : (r.primary_identity.name && validIdentityNames.has(r.primary_identity.name)
+                    ? r.primary_identity.name
+                    : '');
             rows.push({
                 bucketing_run_id: runId,
                 industry_string: ind,
-                bucket_name: leafName || (r.disqualified ? RESERVED_DISQUALIFIED : RESERVED_GENERIC),
+                // Pre-rollup placeholder. The SQL rollup will overwrite this
+                // with the campaign bucket (combo / spec / identity / Generic).
+                bucket_name: specName || (r.disqualified ? RESERVED_DISQUALIFIED : RESERVED_GENERIC),
                 source: 'llm_phase1b',
-                confidence: Number((r.bucket_1.score || 0).toFixed(2)),
-                bucket_leaf: leafName,
-                bucket_ancestor: ancestor,
-                bucket_root: root,
+                confidence: Number((r.functional_specialization.score || 0).toFixed(2)),
+                bucket_leaf: specName,
+                bucket_ancestor: identName,
+                bucket_root: identName,
+                primary_identity: identName,
+                functional_specialization: specName,
                 sector_focus: (r.sector_focus || '').trim(),
-                leaf_score: r.bucket_1.score,
-                ancestor_score: r.bucket_2.score,
-                root_score: r.bucket_3.score,
-                is_generic: !!r.generic && !leafOk,
+                leaf_score: r.functional_specialization.score,
+                ancestor_score: r.primary_identity.score,
+                root_score: r.primary_identity.score,
+                is_generic: !!r.generic && !specOk,
                 is_disqualified: !!r.disqualified,
                 reasons: {
-                    leaf: r.bucket_1.reason,
-                    ancestor: r.bucket_2.reason,
-                    root: r.bucket_3.reason,
+                    spec: r.functional_specialization.reason,
+                    identity: r.primary_identity.reason,
                     identity_type: r.identity_type
                 }
             });
@@ -971,9 +1088,8 @@ async function runMatchingLLM(
 
 function makeFallbackChain(): MatchChain {
     return {
-        bucket_1: { name: '', score: 0, reason: 'fallback' },
-        bucket_2: { name: '', score: 0, reason: 'fallback' },
-        bucket_3: { name: '', score: 0, reason: 'fallback' },
+        primary_identity: { name: '', score: 0, reason: 'fallback' },
+        functional_specialization: { name: '', score: 0, reason: 'fallback' },
         sector_focus: '',
         identity_type: 'other',
         generic: true,
@@ -985,44 +1101,49 @@ async function classifyBatch(
     batch: VocabRow[],
     bucketReferenceJson: string,
     sectorVocab: string[],
-    validLeafNames: Set<string>
+    validSpecNames: Set<string>,
+    validIdentityNames: Set<string>
 ): Promise<{ results: MatchChain[]; costUsd: number }> {
     const systemPrompt = `${PROJECT_CONTEXT}
 
 ========================================
-PHASE 1B — IDENTITY-FIRST ROUTING
+PHASE 1B — ROUTE EACH COMPANY TO IDENTITY + SPECIALIZATION + SECTOR
 ========================================
 
-You route each company classification string to its IDENTITY-FIRST bucket.
-This is NOT just semantic matching — it is routing.
+You produce three separate classifications per company:
+  - primary_identity      (Layer 1, MUST be one of the identity keys in BUCKET_REFERENCE)
+  - functional_specialization (Layer 2, MUST be one of the specialization
+                          names listed UNDER that identity in BUCKET_REFERENCE)
+  - sector_focus          (Layer 3, optional — from SECTOR_VOCABULARY only)
 
-DECISION SEQUENCE (apply in this order, never skip):
+You DO NOT produce a campaign bucket. The system computes that from these
+three values + counts.
 
-Step 1 — DETERMINE CORE BUSINESS IDENTITY.
-   Ask: is this company primarily an investor? a software vendor? an agency?
-   a consulting firm? a staffing firm? an MSP? a real estate firm? an
-   operator (clinic, school, government entity)?
+DECISION SEQUENCE (apply in this order):
 
-Step 2 — DETERMINE SECTOR FOCUS.
-   Ask: does it specifically serve healthcare? government? education?
-   finance? real estate? multiple? Sector is what they SERVE, not what
-   they ARE.
+1) Determine PRIMARY IDENTITY (the company's core business model).
+   Investor? Software vendor? Agency? Consulting firm? Staffing firm?
+   MSP? Operator (clinic, school, government entity)?
 
-Step 3 — ASSIGN BUCKET BY IDENTITY, NOT SECTOR.
-   The bucket is the company's identity. Sector goes in sector_focus.
+2) Inside that identity, pick the FUNCTIONAL SPECIALIZATION that best fits.
+   Examples: under "Agency" → "SEO Agency"; under "Financial Services" →
+   "Private Equity Firm"; under "Consulting & Advisory" → "IT Consulting".
 
-Step 4 — IF IDENTITY IS UNCLEAR → set generic=true and bucket_1 empty.
-   Never use a sector word as a shortcut bucket.
+3) Determine SECTOR FOCUS — the vertical the company SERVES if explicitly
+   stated. If multiple, use "Multi-industry". If unspecified, "".
 
-UNIVERSAL ROUTING RULES (these are HARD rules, not preferences):
+4) If neither identity nor specialization fits at >= 0.55 confidence,
+   set generic = true and leave the name fields empty. Never use a sector
+   word as a shortcut bucket.
+
+UNIVERSAL ROUTING RULES:
 
 Rule 1 — Strong business-model nouns BEAT sector nouns.
-  Identity nouns ("private equity", "venture capital", "law firm",
-  "accounting", "staffing", "agency", "consulting", "managed services",
-  "software platform", "real estate development", "brokerage") OUTRANK
-  sector nouns ("healthcare", "education", "government", "legal",
-  "financial", "real estate", "manufacturing", "home services") UNLESS
-  the text explicitly says the company is an operator in that sector.
+  ("private equity", "venture capital", "law firm", "accounting",
+   "staffing", "agency", "consulting", "managed services", "software
+   platform", "brokerage") OUTRANK ("healthcare", "education",
+   "government", "legal", "financial", "real estate", "manufacturing")
+  unless the text explicitly says the company OPERATES in that sector.
 
 Rule 2 — "Serving X" does NOT mean "is X".
   • software for schools ≠ school
@@ -1031,59 +1152,69 @@ Rule 2 — "Serving X" does NOT mean "is X".
   • marketing for law firms ≠ law firm
   • IT services for government agencies ≠ government entity
 
-Rule 3 — Operator buckets (operator_required=true) require operator
-  evidence. Operator evidence = explicit operator nouns: "clinic",
-  "hospital", "school district", "university", "city government",
-  "church", "property management company", "factory", "mine". Generic
-  sector mentions are NOT operator evidence.
+Rule 3 — Operator specializations (operator_required=true) require
+  EXPLICIT operator evidence: "clinic", "hospital", "school district",
+  "university", "city government", "church", "property management
+  company", "factory". Generic sector mentions are NOT evidence.
 
-Rule 4 — When BOTH identity and sector appear, use both fields:
-  primary bucket = identity, sector_focus = sector.
+Rule 4 — When BOTH identity and sector appear, fill BOTH fields.
   Example: "Healthcare private equity firm" →
-    bucket_1 = Private Equity Firm, sector_focus = Healthcare.
+    primary_identity = "Financial Services",
+    functional_specialization = "Private Equity Firm",
+    sector_focus = "Healthcare".
 
 EXPLICIT EXAMPLES — CORRECT:
-  • "Healthcare private equity investment firm" → Private Equity Firm,
-    sector_focus = Healthcare
-  • "Government IT consulting firm" → IT Consulting / Managed Services,
-    sector_focus = Government
-  • "Marketing agency for dental practices" → Marketing Agency,
-    sector_focus = Healthcare
-  • "Real estate software for hospitals" → PropTech SaaS / Vertical
-    SaaS, sector_focus = Real Estate
-  • "Medical clinic" → Healthcare Operator (Clinics/Hospitals),
-    sector_focus = ""
-  • "Family law firm" → Law Firm, sector_focus = ""
+  • "Healthcare private equity investment firm" →
+      primary_identity = Financial Services
+      functional_specialization = Private Equity Firm
+      sector_focus = Healthcare
+  • "Government IT consulting firm" →
+      primary_identity = Consulting & Advisory  (or IT Services depending
+        on which identity contains "IT Consulting" in BUCKET_REFERENCE)
+      functional_specialization = IT Consulting
+      sector_focus = Government
+  • "Marketing agency for dental practices" →
+      primary_identity = Agency
+      functional_specialization = Performance Marketing Agency  (or
+        Branding Agency, etc — pick the closest spec from BUCKET_REFERENCE)
+      sector_focus = Healthcare
+  • "Real estate software for hospitals" →
+      primary_identity = Software & SaaS
+      functional_specialization = PropTech SaaS  (or Vertical SaaS)
+      sector_focus = Real Estate     ← yes, real estate is the OWN model
+  • "Medical clinic" →
+      primary_identity = Healthcare Operator
+      functional_specialization = Medical Clinic / Hospital
+      sector_focus = ""
 
-EXPLICIT EXAMPLES — INCORRECT (DO NOT DO THIS):
-  • "Healthcare private equity investment firm" → Healthcare ❌
-  • "Government IT consulting firm" → Government ❌
-  • "Marketing agency for dental practices" → Healthcare ❌
-  • "Real estate software for hospitals" → Healthcare ❌
-  • "Software for schools" → Education ❌
+EXPLICIT EXAMPLES — INCORRECT:
+  • "Healthcare private equity investment firm" → primary_identity = Healthcare ❌
+  • "Government IT consulting firm" → primary_identity = Government ❌
+  • "Marketing agency for dental practices" → primary_identity = Healthcare ❌
+  • "Real estate software for hospitals" → primary_identity = Healthcare ❌
+  • "Software for schools" → primary_identity = Education ❌
 
-PRESSURE TEST before finalizing each assignment:
-  "If outreach were written FOR THIS BUCKET, would the recipient say
-  'yes, that sounds like my company' — or 'no, that sounds like one of
-  my clients'?" If the answer is "one of my clients", routing is wrong.
+PRESSURE TEST: "If outreach were written for this primary_identity +
+specialization, would the recipient say 'yes that's me' or 'no that's
+my client'?" If 'my client' → routing is wrong.
 
-OUTPUT FORMAT:
-- bucket_1.name MUST be a leaf bucket from BUCKET_REFERENCE, or empty.
-- bucket_2 MUST be the direct_ancestor of bucket_1 (or empty).
-- bucket_3 MUST be the root_category of bucket_1 (or empty).
-- bucket_2_score <= bucket_1_score, bucket_3_score <= bucket_2_score.
-- If no leaf aligns at >= 0.55: bucket_1.name = "", generic = true.
-- sector_focus: ONE entry from SECTOR_VOCABULARY, or "" if none, or
-  "Multi-industry" if it serves several. NEVER put an identity noun here.
-- identity_type: one of operator | service_provider | agency |
-  software_vendor | investor | advisor | staffing | distributor | media | other.
-- Disqualify ONLY for ecommerce/DTC physical, local geo-tied services,
+OUTPUT CONSTRAINTS:
+- primary_identity.name MUST be one of the identity keys in BUCKET_REFERENCE,
+  or "" if generic / disqualified.
+- functional_specialization.name MUST be a spec listed under that exact
+  identity, or "" if generic / disqualified.
+- functional_specialization.score must be <= primary_identity.score.
+- sector_focus MUST be from SECTOR_VOCABULARY, "Multi-industry", or "".
+  NEVER put an identity noun in sector_focus.
+- identity_type ∈ operator | service_provider | agency | software_vendor |
+  investor | advisor | staffing | distributor | media | other.
+- Disqualify ONLY clear ecommerce/DTC physical, local geo-tied services,
   brick-and-mortar retail, low-ticket consumer.
 - Reasons: max 18 words each, must cite a phrase from the classification.
 
 Return strict JSON, no prose, no markdown fences.`;
 
-    const userPrompt = `BUCKET_REFERENCE:
+    const userPrompt = `BUCKET_REFERENCE (grouped by primary_identity):
 ${bucketReferenceJson}
 
 SECTOR_VOCABULARY: ${JSON.stringify(sectorVocab)}
@@ -1094,10 +1225,9 @@ ${JSON.stringify(batch.map(b => b.industry))}
 Return JSON: { "assignments": [<one object per company in the same order>] }
 Each assignment object:
 {
-  "bucket_1": {"name": "<leaf or empty>", "score": 0.00, "reason": ""},
-  "bucket_2": {"name": "<ancestor or empty>", "score": 0.00, "reason": ""},
-  "bucket_3": {"name": "<root or empty>", "score": 0.00, "reason": ""},
-  "sector_focus": "<from SECTOR_VOCABULARY, or 'Multi-industry', or ''>",
+  "primary_identity": {"name": "<identity key from BUCKET_REFERENCE or empty>", "score": 0.00, "reason": ""},
+  "functional_specialization": {"name": "<spec under that identity, or empty>", "score": 0.00, "reason": ""},
+  "sector_focus": "<from SECTOR_VOCABULARY, 'Multi-industry', or ''>",
   "identity_type": "<operator|service_provider|agency|software_vendor|investor|advisor|staffing|distributor|media|other>",
   "generic": false,
   "disqualified": false
@@ -1113,11 +1243,11 @@ Each assignment object:
                 items: {
                     type: 'object',
                     additionalProperties: false,
-                    required: ['bucket_1', 'bucket_2', 'bucket_3', 'sector_focus', 'identity_type', 'generic', 'disqualified'],
+                    required: ['primary_identity', 'functional_specialization',
+                               'sector_focus', 'identity_type', 'generic', 'disqualified'],
                     properties: {
-                        bucket_1: chainItemSchema(),
-                        bucket_2: chainItemSchema(),
-                        bucket_3: chainItemSchema(),
+                        primary_identity: chainItemSchema(),
+                        functional_specialization: chainItemSchema(),
                         sector_focus: { type: 'string' },
                         identity_type: { type: 'string' },
                         generic: { type: 'boolean' },
@@ -1171,7 +1301,10 @@ Each assignment object:
     catch { result = await callOnce(); }
 
     let { assignments, costUsd } = result;
-    const drift = assignments.some(a => a.bucket_1.name && !validLeafNames.has(a.bucket_1.name));
+    const drift = assignments.some(a =>
+        (a.functional_specialization.name && !validSpecNames.has(a.functional_specialization.name)) ||
+        (a.primary_identity.name && !validIdentityNames.has(a.primary_identity.name))
+    );
     if (drift) {
         try {
             const retried = await callOnce();

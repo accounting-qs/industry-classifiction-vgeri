@@ -1362,7 +1362,7 @@ const bucketingLog = (msg: string, level: 'info' | 'warn' | 'error' = 'info') =>
 
 // Create a new run + fire taxonomy proposal in the background.
 app.post('/api/bucketing/determine', async (req, res) => {
-    const { name, list_names, min_volume, preferred_library_ids } = req.body || {};
+    const { name, list_names, min_volume, bucket_budget, preferred_library_ids } = req.body || {};
     if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name is required' });
     if (!Array.isArray(list_names) || list_names.length === 0) {
         return res.status(400).json({ error: 'list_names must be a non-empty array' });
@@ -1373,6 +1373,7 @@ app.post('/api/bucketing/determine', async (req, res) => {
             name: name.trim(),
             list_names,
             min_volume: typeof min_volume === 'number' && min_volume >= 0 ? Math.floor(min_volume) : 50,
+            bucket_budget: typeof bucket_budget === 'number' && bucket_budget > 0 ? Math.floor(bucket_budget) : 30,
             preferred_library_ids: Array.isArray(preferred_library_ids) ? preferred_library_ids : [],
             status: 'taxonomy_pending'
         }).select().single();
@@ -1457,12 +1458,12 @@ app.get('/api/bucketing/runs/:id', async (req, res) => {
     }
 });
 
-// Apply user edits (rename / drop / add / threshold) to the proposed taxonomy.
+// Apply user edits (rename / drop / add / threshold / bucket_budget) to the proposed taxonomy.
 app.patch('/api/bucketing/runs/:id/taxonomy', async (req, res) => {
     const id = req.params.id;
-    const { keep, rename, add, min_volume } = req.body || {};
+    const { keep, rename, add, min_volume, bucket_budget } = req.body || {};
     try {
-        await applyTaxonomyEdits(supabase, id, { keep, rename, add, min_volume }, bucketingLog);
+        await applyTaxonomyEdits(supabase, id, { keep, rename, add, min_volume, bucket_budget }, bucketingLog);
         const { data: run } = await supabase
             .from('bucketing_runs').select('*').eq('id', id).single();
         const { data: counts } = await supabase

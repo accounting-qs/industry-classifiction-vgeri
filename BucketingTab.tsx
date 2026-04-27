@@ -1,13 +1,13 @@
 /**
- * Bucketing UI v2 — discovery + matching with leaf → ancestor → root chain.
+ * Bucketing UI v2.2 — 4-layer model (identity → specialization → sector → campaign bucket).
  *
  * Five views:
  *   - Index    : past runs + library shortcut
- *   - Setup    : pick lists, name, min_volume, optional preferred library buckets
- *   - Review   : Phase 1a proposal — observed patterns + tree of leaves grouped
- *                by ancestor → root, keep/drop/rename/add, threshold preview
- *   - Results  : Phase 1b assignments grouped leaf → ancestor → root, save-to-library
- *   - Library  : CRUD for reusable buckets across runs
+ *   - Setup    : pick lists, name, min_volume, bucket_budget, optional library
+ *   - Review   : Phase 1a proposal — observed patterns + specializations grouped
+ *                under primary identities, keep/drop/rename/add, threshold preview
+ *   - Results  : Phase 1b assignments rolled up to campaign buckets, save-to-library
+ *   - Library  : CRUD for reusable specializations across runs
  */
 
 import React, { useState, useEffect, useCallback } from 'react';
@@ -92,7 +92,7 @@ export function BucketingTab({ importLists }: {
 
   const openRun = (id: string) => { setActiveRunId(id); setView('detail'); };
 
-  const startNew = async (payload: { name: string; list_names: string[]; min_volume: number; preferred_library_ids: string[] }) => {
+  const startNew = async (payload: { name: string; list_names: string[]; min_volume: number; bucket_budget: number; preferred_library_ids: string[] }) => {
     setLoading(true);
     setError(null);
     try {
@@ -136,7 +136,7 @@ export function BucketingTab({ importLists }: {
               <Layers className="w-5 h-5 text-[#3ecf8e]" /> Bucketing
             </h2>
             <p className="text-xs text-gray-500 mt-1">
-              Phase 1a discovers a leaf → ancestor → root taxonomy. Phase 1b matches every contact via the chain. Volume rollup keeps small buckets useful.
+              Phase 1a discovers identities + specializations. Phase 1b matches every contact (identity + specialization + sector). Volume rollup combines into campaign buckets within your bucket budget.
             </p>
           </div>
           <div className="flex gap-2">
@@ -294,12 +294,13 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
   importLists: { name: string; contact_count: number; enriched_count?: number }[];
   library: LibraryBucket[];
   onCancel: () => void;
-  onStart: (p: { name: string; list_names: string[]; min_volume: number; preferred_library_ids: string[] }) => void;
+  onStart: (p: { name: string; list_names: string[]; min_volume: number; bucket_budget: number; preferred_library_ids: string[] }) => void;
   loading: boolean;
 }) {
   const [name, setName] = useState('');
   const [selectedLists, setSelectedLists] = useState<Set<string>>(new Set());
   const [minVolume, setMinVolume] = useState(1000);
+  const [bucketBudget, setBucketBudget] = useState(30);
   const [selectedLib, setSelectedLib] = useState<Set<string>>(new Set());
   const [showLib, setShowLib] = useState(false);
 
@@ -360,17 +361,38 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
         )}
       </div>
 
-      <div>
-        <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">
-          Minimum bucket volume — buckets below this roll up to ancestor → root → "Generic"
-        </label>
-        <input
-          type="number"
-          min={0}
-          value={minVolume}
-          onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
-          className="w-32 px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-sm text-white focus:outline-none focus:border-[#3ecf8e]"
-        />
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">
+            Minimum bucket volume
+          </label>
+          <input
+            type="number"
+            min={0}
+            value={minVolume}
+            onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
+            className="w-32 px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-sm text-white focus:outline-none focus:border-[#3ecf8e]"
+          />
+          <p className="text-[10px] text-gray-500 italic mt-1">
+            Combos / specializations / identities below this roll up. Below identity → "Generic".
+          </p>
+        </div>
+        <div>
+          <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">
+            Bucket budget (max campaign buckets)
+          </label>
+          <input
+            type="number"
+            min={5}
+            max={100}
+            value={bucketBudget}
+            onChange={e => setBucketBudget(Math.max(5, Math.min(100, parseInt(e.target.value || '30', 10))))}
+            className="w-32 px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-sm text-white focus:outline-none focus:border-[#3ecf8e]"
+          />
+          <p className="text-[10px] text-gray-500 italic mt-1">
+            If more campaign buckets clear the threshold, the smallest are rolled up further until this cap is met. Typical: 25–35.
+          </p>
+        </div>
       </div>
 
       <div>
@@ -416,6 +438,7 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
             name: name.trim(),
             list_names: Array.from(selectedLists),
             min_volume: minVolume,
+            bucket_budget: bucketBudget,
             preferred_library_ids: Array.from(selectedLib)
           })}
           disabled={!canStart}
@@ -482,15 +505,16 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
   onError: (msg: string | null) => void;
 }) {
   const sourceBuckets = run.taxonomy_final?.buckets || run.taxonomy_proposal?.buckets || [];
+  const primaryIdentities = (run.taxonomy_final?.primary_identities || run.taxonomy_proposal?.primary_identities) || [];
   const observedPatterns = (run.taxonomy_final?.observed_patterns || run.taxonomy_proposal?.observed_patterns) || [];
-  const [kept, setKept] = useState<Set<string>>(new Set(sourceBuckets.map(b => b.bucket_name)));
+  const [kept, setKept] = useState<Set<string>>(new Set(sourceBuckets.map(b => b.functional_specialization)));
   const [renames, setRenames] = useState<Record<string, string>>({});
-  const [adds, setAdds] = useState<{ bucket_name: string; description: string; direct_ancestor: string; root_category: string }[]>([]);
-  const [newName, setNewName] = useState('');
+  const [adds, setAdds] = useState<{ functional_specialization: string; primary_identity: string; description: string }[]>([]);
+  const [newSpec, setNewSpec] = useState('');
   const [newDesc, setNewDesc] = useState('');
-  const [newAncestor, setNewAncestor] = useState('');
-  const [newRoot, setNewRoot] = useState('');
+  const [newIdentity, setNewIdentity] = useState('');
   const [minVolume, setMinVolume] = useState<number>(run.min_volume);
+  const [bucketBudget, setBucketBudget] = useState<number>(run.bucket_budget || 30);
   const [busy, setBusy] = useState<'none' | 'saving' | 'assigning'>('none');
   const [showPatterns, setShowPatterns] = useState(false);
 
@@ -507,7 +531,13 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
       const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/taxonomy`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keep: Array.from(kept), rename: renames, add: adds, min_volume: minVolume })
+        body: JSON.stringify({
+            keep: Array.from(kept),
+            rename: renames,
+            add: adds,
+            min_volume: minVolume,
+            bucket_budget: bucketBudget
+        })
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -532,7 +562,7 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
     <div className="space-y-4">
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
         <div className="text-xs text-gray-300">
-          <span className="font-bold text-white">{sourceBuckets.length}</span> leaf buckets discovered across <span className="font-bold text-white">{run.total_contacts?.toLocaleString() || '?'}</span> contacts
+          <span className="font-bold text-white">{primaryIdentities.length}</span> primary identities · <span className="font-bold text-white">{sourceBuckets.length}</span> functional specializations · <span className="font-bold text-white">{run.total_contacts?.toLocaleString() || '?'}</span> contacts
           {run.taxonomy_model && <span className="text-gray-500"> · model: {run.taxonomy_model}</span>}
         </div>
         {observedPatterns.length > 0 && (
@@ -551,13 +581,14 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
         <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between">
-          <span>Discovered buckets (leaf → ancestor → root)</span>
+          <span>Discovered specializations (grouped by primary identity)</span>
           <span className="text-gray-600 normal-case tracking-normal font-normal">
-            Counts shown after Phase 1b will determine rollup. Below threshold = roll into ancestor → root → Generic.
+            Phase 1b counts decide the campaign bucket: combo → spec → identity → Generic.
           </span>
         </div>
         <BucketChainList
           buckets={sourceBuckets}
+          identities={primaryIdentities}
           kept={kept}
           renames={renames}
           countByBucket={new Map(bucketCounts.map(c => [c.bucket_name, Number(c.contact_count) || 0]))}
@@ -568,27 +599,27 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
-        <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-3">Add custom leaf bucket</div>
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
-          <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Leaf name"
+        <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-3">Add custom specialization</div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+          <input value={newSpec} onChange={e => setNewSpec(e.target.value)} placeholder="Functional specialization (Layer 2)"
             className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e]" />
-          <input value={newAncestor} onChange={e => setNewAncestor(e.target.value)} placeholder="Direct ancestor"
-            className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e]" />
-          <input value={newRoot} onChange={e => setNewRoot(e.target.value)} placeholder="Root category"
-            className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e]" />
+          <select value={newIdentity} onChange={e => setNewIdentity(e.target.value)}
+            className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]">
+            <option value="">Pick a primary identity (Layer 1)…</option>
+            {primaryIdentities.map(p => <option key={p.name} value={p.name}>{p.name}</option>)}
+          </select>
           <input value={newDesc} onChange={e => setNewDesc(e.target.value)} placeholder="One-sentence description"
             className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e]" />
         </div>
         <button
           onClick={() => {
-            if (!newName.trim() || !newAncestor.trim()) return;
+            if (!newSpec.trim() || !newIdentity.trim()) return;
             setAdds([...adds, {
-              bucket_name: newName.trim(),
-              description: newDesc.trim(),
-              direct_ancestor: newAncestor.trim(),
-              root_category: newRoot.trim()
+              functional_specialization: newSpec.trim(),
+              primary_identity: newIdentity.trim(),
+              description: newDesc.trim()
             }]);
-            setNewName(''); setNewDesc(''); setNewAncestor(''); setNewRoot('');
+            setNewSpec(''); setNewDesc(''); setNewIdentity('');
           }}
           className="mt-2 px-3 py-1.5 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e] flex items-center gap-1"
         >
@@ -598,7 +629,7 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
           <div className="mt-3 space-y-1">
             {adds.map((a, i) => (
               <div key={i} className="flex items-center justify-between px-3 py-1.5 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-gray-300">
-                <span><span className="font-bold text-white">{a.bucket_name}</span> · {a.direct_ancestor} › {a.root_category} — {a.description}</span>
+                <span><span className="font-bold text-white">{a.functional_specialization}</span> · under {a.primary_identity} — {a.description}</span>
                 <button onClick={() => setAdds(adds.filter((_, j) => j !== i))} className="text-gray-500 hover:text-red-400">
                   <X className="w-3 h-3" />
                 </button>
@@ -608,16 +639,30 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
         )}
       </div>
 
-      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4 flex items-center gap-3">
-        <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Min volume</span>
-        <input
-          type="number"
-          min={0}
-          value={minVolume}
-          onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
-          className="w-24 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
-        />
-        <span className="text-[10px] text-gray-500 italic">Leaves below this roll up to ancestor → root → "Generic" after Phase 1b matching.</span>
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <span className="block text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Min volume</span>
+          <input
+            type="number"
+            min={0}
+            value={minVolume}
+            onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
+            className="w-28 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
+          />
+          <p className="text-[10px] text-gray-500 italic mt-1">Combos below this fall to spec; specs below to identity; identities below to Generic.</p>
+        </div>
+        <div>
+          <span className="block text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Bucket budget</span>
+          <input
+            type="number"
+            min={5}
+            max={100}
+            value={bucketBudget}
+            onChange={e => setBucketBudget(Math.max(5, Math.min(100, parseInt(e.target.value || '30', 10))))}
+            className="w-28 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
+          />
+          <p className="text-[10px] text-gray-500 italic mt-1">Cap on total campaign buckets. Smallest are rolled up further until the count fits.</p>
+        </div>
       </div>
 
       <div className="flex justify-end gap-2">
@@ -642,12 +687,13 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
   );
 }
 
-// ───── CHAIN TREE ─────────────────────────────────────────────────
+// ───── IDENTITY → SPECIALIZATION TREE ─────────────────────────────
 
 function BucketChainList({
-  buckets, kept, renames, countByBucket, minVolume, onToggle, onRename
+  buckets, identities, kept, renames, countByBucket, minVolume, onToggle, onRename
 }: {
   buckets: BucketProposal[];
+  identities: { name: string; description?: string; identity_type?: string; operator_required?: boolean }[];
   kept: Set<string>;
   renames: Record<string, string>;
   countByBucket: Map<string, number>;
@@ -655,85 +701,79 @@ function BucketChainList({
   onToggle: (name: string) => void;
   onRename: (oldName: string, val: string) => void;
 }) {
-  const displayName = (b: BucketProposal) => renames[b.bucket_name] ?? b.bucket_name;
+  const displayName = (b: BucketProposal) => renames[b.functional_specialization] ?? b.functional_specialization;
   const baseCountFor = (b: BucketProposal) =>
-    countByBucket.get(displayName(b)) ?? countByBucket.get(b.bucket_name) ?? 0;
+    countByBucket.get(displayName(b)) ?? countByBucket.get(b.functional_specialization) ?? 0;
 
-  // Group by root → ancestor → leaves
-  const byRoot = new Map<string, Map<string, BucketProposal[]>>();
+  // Group specializations by primary_identity. Use the order of `identities`
+  // when available, then any leftover identities in the proposal.
+  const byIdent = new Map<string, BucketProposal[]>();
   for (const b of buckets) {
-    const root = b.root_category || '(no root)';
-    const anc = b.direct_ancestor || '(no ancestor)';
-    if (!byRoot.has(root)) byRoot.set(root, new Map());
-    const ancMap = byRoot.get(root)!;
-    if (!ancMap.has(anc)) ancMap.set(anc, []);
-    ancMap.get(anc)!.push(b);
+    const ident = b.primary_identity || '(unassigned)';
+    if (!byIdent.has(ident)) byIdent.set(ident, []);
+    byIdent.get(ident)!.push(b);
   }
+  const orderedIdents = [
+    ...identities.filter(p => byIdent.has(p.name)).map(p => p.name),
+    ...Array.from(byIdent.keys()).filter(n => !identities.some(p => p.name === n))
+  ];
 
   return (
     <div className="divide-y divide-[#2e2e2e]">
-      {Array.from(byRoot.entries()).map(([root, ancMap]) => {
-        const rootCount = Array.from(ancMap.values()).flat().reduce((s, l) => s + (kept.has(l.bucket_name) ? baseCountFor(l) : 0), 0);
+      {orderedIdents.map(identName => {
+        const specs = byIdent.get(identName) || [];
+        const meta = identities.find(p => p.name === identName);
+        const identCount = specs.reduce((s, l) => s + (kept.has(l.functional_specialization) ? baseCountFor(l) : 0), 0);
         return (
-          <div key={root} className="py-2">
-            <div className="px-4 py-2 flex items-center gap-2">
-              <span className="text-[9px] font-bold uppercase tracking-widest text-purple-400 bg-purple-500/10 border border-purple-500/30 px-1.5 py-0.5 rounded">Root</span>
-              <span className="text-sm font-bold text-white">{root}</span>
-              <span className="text-[10px] font-mono text-gray-500">{rootCount.toLocaleString()} contacts</span>
+          <div key={identName} className="py-3">
+            <div className="px-4 pb-2 flex items-center gap-2 flex-wrap">
+              <span className="text-[9px] font-bold uppercase tracking-widest text-purple-400 bg-purple-500/10 border border-purple-500/30 px-1.5 py-0.5 rounded">Primary Identity</span>
+              <span className="text-sm font-bold text-white">{identName}</span>
+              {meta?.operator_required && (
+                <span className="text-[9px] font-bold uppercase text-amber-400 bg-amber-500/10 border border-amber-500/30 px-1.5 py-0.5 rounded">Operator</span>
+              )}
+              <span className="text-[10px] font-mono text-gray-500">{identCount.toLocaleString()} contacts</span>
+              {meta?.description && <span className="text-[10px] text-gray-500 italic ml-1">— {meta.description}</span>}
             </div>
-            <div className="pl-4">
-              {Array.from(ancMap.entries()).map(([anc, leaves]) => {
-                const ancCount = leaves.reduce((s, l) => s + (kept.has(l.bucket_name) ? baseCountFor(l) : 0), 0);
+            <div className="pl-4 border-l-2 border-[#2e2e2e] ml-4 divide-y divide-[#2e2e2e]/40">
+              {specs.map(b => {
+                const isKept = kept.has(b.functional_specialization);
+                const count = baseCountFor(b);
+                const willRollUp = isKept && count > 0 && count < minVolume;
                 return (
-                  <div key={anc} className="border-l-2 border-[#2e2e2e] pl-3 py-1">
-                    <div className="px-2 py-1.5 flex items-center gap-2">
-                      <span className="text-[9px] font-bold uppercase tracking-widest text-[#3ecf8e] bg-[#3ecf8e]/10 border border-[#3ecf8e]/30 px-1.5 py-0.5 rounded">Ancestor</span>
-                      <span className="text-xs font-bold text-gray-200">{anc}</span>
-                      <span className="text-[10px] font-mono text-gray-500">{ancCount.toLocaleString()} contacts</span>
-                    </div>
-                    <div className="divide-y divide-[#2e2e2e]/40">
-                      {leaves.map(b => {
-                        const isKept = kept.has(b.bucket_name);
-                        const count = baseCountFor(b);
-                        const willRollUp = isKept && count > 0 && count < minVolume;
-                        return (
-                          <div key={b.bucket_name} className={`py-2 pl-4 pr-3 ${isKept ? '' : 'opacity-50'}`}>
-                            <div className="flex items-start gap-2">
-                              <input type="checkbox" checked={isKept} onChange={() => onToggle(b.bucket_name)} className="mt-1.5 w-3.5 h-3.5 shrink-0" />
-                              <div className="flex-1 min-w-0">
-                                <div className="flex items-center gap-2 mb-1 flex-wrap">
-                                  <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 shrink-0">↳ Leaf</span>
-                                  <input
-                                    value={displayName(b)}
-                                    onChange={e => onRename(b.bucket_name, e.target.value)}
-                                    className="flex-1 min-w-[300px] bg-[#1c1c1c] border border-[#2e2e2e] rounded px-3 py-1.5 text-sm font-bold text-white focus:outline-none focus:border-[#3ecf8e]"
-                                  />
-                                  {b.library_match_id && (
-                                    <span className="text-[9px] font-bold text-blue-400 bg-blue-500/10 border border-blue-500/30 px-1.5 py-0.5 rounded shrink-0">📚 from library</span>
-                                  )}
-                                </div>
-                                <div className="flex items-center gap-2 mb-1.5 flex-wrap">
-                                  <span className="text-[10px] font-mono text-gray-400">{count.toLocaleString()} contacts (pre-rollup)</span>
-                                  {willRollUp && (
-                                    <span className="text-[10px] font-bold text-blue-400 bg-blue-500/10 border border-blue-500/30 px-2 py-0.5 rounded">
-                                      Below threshold → ancestor "{anc}"
-                                    </span>
-                                  )}
-                                  {b.estimated_usage_label && (
-                                    <span className="text-[9px] text-gray-600 italic">{b.estimated_usage_label}</span>
-                                  )}
-                                </div>
-                                <p className="text-[11px] text-gray-400">{b.description}</p>
-                                {b.example_strings && b.example_strings.length > 0 && (
-                                  <div className="text-[10px] text-gray-600 mt-1.5 truncate">
-                                    Examples: {b.example_strings.slice(0, 5).join(' · ')}{b.example_strings.length > 5 ? ` · +${b.example_strings.length - 5}` : ''}
-                                  </div>
-                                )}
-                              </div>
-                            </div>
+                  <div key={b.functional_specialization} className={`py-2 pl-4 pr-3 ${isKept ? '' : 'opacity-50'}`}>
+                    <div className="flex items-start gap-2">
+                      <input type="checkbox" checked={isKept} onChange={() => onToggle(b.functional_specialization)} className="mt-1.5 w-3.5 h-3.5 shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1 flex-wrap">
+                          <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 shrink-0">↳ Specialization</span>
+                          <input
+                            value={displayName(b)}
+                            onChange={e => onRename(b.functional_specialization, e.target.value)}
+                            className="flex-1 min-w-[300px] bg-[#1c1c1c] border border-[#2e2e2e] rounded px-3 py-1.5 text-sm font-bold text-white focus:outline-none focus:border-[#3ecf8e]"
+                          />
+                          {b.library_match_id && (
+                            <span className="text-[9px] font-bold text-blue-400 bg-blue-500/10 border border-blue-500/30 px-1.5 py-0.5 rounded shrink-0">📚 from library</span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                          <span className="text-[10px] font-mono text-gray-400">{count.toLocaleString()} contacts (pre-rollup)</span>
+                          {willRollUp && (
+                            <span className="text-[10px] font-bold text-blue-400 bg-blue-500/10 border border-blue-500/30 px-2 py-0.5 rounded">
+                              Below threshold → identity "{identName}"
+                            </span>
+                          )}
+                          {b.estimated_usage_label && (
+                            <span className="text-[9px] text-gray-600 italic">{b.estimated_usage_label}</span>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-gray-400">{b.description}</p>
+                        {b.example_strings && b.example_strings.length > 0 && (
+                          <div className="text-[10px] text-gray-600 mt-1.5 truncate">
+                            Examples: {b.example_strings.slice(0, 5).join(' · ')}{b.example_strings.length > 5 ? ` · +${b.example_strings.length - 5}` : ''}
                           </div>
-                        );
-                      })}
+                        )}
+                      </div>
                     </div>
                   </div>
                 );
@@ -766,7 +806,8 @@ function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySave
   const max = sorted.length > 0 ? Number(sorted[0].contact_count) : 1;
 
   const bucketsInRun = (run.taxonomy_final?.buckets || run.taxonomy_proposal?.buckets || []) as BucketProposal[];
-  const proposalNames = new Set(bucketsInRun.map(b => b.bucket_name));
+  const identityNames = new Set(((run.taxonomy_final?.primary_identities || run.taxonomy_proposal?.primary_identities) || []).map(p => p.name));
+  const specNames = new Set(bucketsInRun.map(b => b.functional_specialization));
 
   const toggleLibSel = (name: string) => {
     const s = new Set(librarySelection);
@@ -791,10 +832,9 @@ function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySave
       }
       const csvRows = rows.map(r => ({
         contact_id: r.contact_id,
-        bucket: r.bucket_name,
-        bucket_leaf: r.bucket_leaf,
-        bucket_ancestor: r.bucket_ancestor,
-        bucket_root: r.bucket_root,
+        campaign_bucket: r.bucket_name,
+        primary_identity: r.primary_identity || r.bucket_ancestor,
+        functional_specialization: r.functional_specialization || r.bucket_leaf,
         sector_focus: r.sector_focus,
         is_generic: r.is_generic,
         is_disqualified: r.is_disqualified,
@@ -858,7 +898,7 @@ function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySave
         <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
           <div className="flex items-center justify-between mb-3">
             <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">
-              Save proven buckets to library ({librarySelection.size} selected)
+              Save proven specializations to library ({librarySelection.size} selected)
             </span>
             <button
               onClick={saveSelectedToLibrary}
@@ -871,14 +911,15 @@ function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySave
           </div>
           <div className="flex flex-wrap gap-1.5">
             {bucketsInRun.map(b => {
-              const sel = librarySelection.has(b.bucket_name);
+              const sel = librarySelection.has(b.functional_specialization);
               return (
                 <button
-                  key={b.bucket_name}
-                  onClick={() => toggleLibSel(b.bucket_name)}
+                  key={b.functional_specialization}
+                  onClick={() => toggleLibSel(b.functional_specialization)}
                   className={`px-2 py-1 rounded text-[10px] font-bold border transition-colors ${sel ? 'bg-[#3ecf8e]/15 text-[#3ecf8e] border-[#3ecf8e]/40' : 'bg-[#1c1c1c] text-gray-300 border-[#2e2e2e] hover:border-gray-500'}`}
+                  title={`under ${b.primary_identity}`}
                 >
-                  {b.bucket_name}
+                  {b.functional_specialization}
                 </button>
               );
             })}
@@ -888,29 +929,44 @@ function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySave
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
         <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest">
-          Final bucket assignments (effective bucket after volume rollup)
+          Campaign buckets (after combo + threshold + bucket-budget rollup)
         </div>
         <div className="divide-y divide-[#2e2e2e]">
           {sorted.map(b => {
             const count = Number(b.contact_count);
             const pct = total > 0 ? (count / total) * 100 : 0;
             const barWidth = max > 0 ? (count / max) * 100 : 0;
-            const isGeneric = b.bucket_name === RESERVED_GENERIC;
-            const isDQ = b.bucket_name === RESERVED_DISQUALIFIED;
-            const isFromProposal = proposalNames.has(b.bucket_name);
-            const isAncestor = !isFromProposal && !isGeneric && !isDQ;
+            const name: string = b.bucket_name;
+            const isGeneric = name === RESERVED_GENERIC;
+            const isDQ = name === RESERVED_DISQUALIFIED;
+            // Bucket level: combo (sector + spec) > spec > identity > generic
+            const isSpec = specNames.has(name);
+            const isIdentity = identityNames.has(name) && !isSpec;
+            const isCombo = !isSpec && !isIdentity && !isGeneric && !isDQ
+                && Array.from(specNames).some(s => name.endsWith(' ' + s));
+            const levelLabel = isCombo ? 'sector × specialization'
+                : isSpec ? 'specialization'
+                : isIdentity ? 'identity (rolled up)'
+                : isGeneric ? 'generic'
+                : isDQ ? 'disqualified'
+                : 'rolled up';
+            const levelColor = isCombo ? 'text-[#3ecf8e]'
+                : isSpec ? 'text-[#3ecf8e]'
+                : isIdentity ? 'text-blue-400'
+                : isDQ ? 'text-red-400'
+                : 'text-amber-400';
             return (
-              <div key={b.bucket_name} className="px-4 py-3 hover:bg-white/[0.02]">
+              <div key={name} className="px-4 py-3 hover:bg-white/[0.02]">
                 <div className="flex items-center gap-3">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between mb-1.5">
                       <div className="flex items-center gap-2 min-w-0">
                         <span className={`text-xs font-bold ${isDQ ? 'text-red-400' : isGeneric ? 'text-amber-400' : 'text-white'} truncate`}>
-                          {b.bucket_name}
+                          {name}
                         </span>
-                        {isAncestor && (
-                          <span className="text-[9px] font-bold text-blue-400 bg-blue-500/10 border border-blue-500/30 px-1.5 py-0.5 rounded shrink-0">rolled up</span>
-                        )}
+                        <span className={`text-[9px] font-bold uppercase tracking-widest ${levelColor} bg-white/[0.03] border border-current/30 px-1.5 py-0.5 rounded shrink-0`}>
+                          {levelLabel}
+                        </span>
                       </div>
                       <span className="text-[10px] font-mono text-gray-400 shrink-0 ml-2">
                         {count.toLocaleString()} <span className="text-gray-600">({pct.toFixed(1)}%)</span>
@@ -918,7 +974,7 @@ function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySave
                     </div>
                     <div className="h-1.5 bg-[#1c1c1c] rounded-full overflow-hidden">
                       <div
-                        className={`h-full transition-all ${isDQ ? 'bg-red-500/70' : isGeneric ? 'bg-amber-500/70' : isAncestor ? 'bg-blue-500/70' : 'bg-[#3ecf8e]'}`}
+                        className={`h-full transition-all ${isDQ ? 'bg-red-500/70' : isGeneric ? 'bg-amber-500/70' : isIdentity ? 'bg-blue-500/70' : 'bg-[#3ecf8e]'}`}
                         style={{ width: `${barWidth}%` }}
                       />
                     </div>

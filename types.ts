@@ -56,18 +56,38 @@ export type BucketingRunStatus =
   | 'completed'
   | 'failed';
 
-// v2: leaf bucket from Phase 1a, with ancestor chain.
-export interface BucketProposal {
-  bucket_name: string;
+// v2.2: Layer-1 primary identity + Layer-2 functional specialization.
+// Layer-3 sector_focus and Layer-4 campaign bucket are computed elsewhere.
+export interface PrimaryIdentity {
+  name: string;
   description: string;
-  direct_ancestor: string;
-  root_category: string;
+  identity_type: string;
+  operator_required: boolean;
+}
+
+export interface BucketProposal {
+  functional_specialization: string;
+  primary_identity: string;
+  description: string;
+  identity_type?: string;
+  operator_required?: boolean;
+  priority_rank?: number;
   include?: string[];
   exclude?: string[];
   example_strings?: string[];
+  strong_identity_signals?: string[];
+  weak_sector_signals?: string[];
+  disqualifying_signals?: string[];
   estimated_usage_label?: string;
   rough_volume_estimate?: string;
   library_match_id?: string | null;
+}
+
+export interface TaxonomyDoc {
+  observed_patterns?: string[];
+  sector_focus_vocabulary?: string[];
+  primary_identities?: PrimaryIdentity[];
+  buckets: BucketProposal[];
 }
 
 export interface BucketingRun {
@@ -75,10 +95,11 @@ export interface BucketingRun {
   name: string;
   list_names: string[];
   min_volume: number;
+  bucket_budget?: number;
   status: BucketingRunStatus;
   taxonomy_model?: string | null;
-  taxonomy_proposal?: { observed_patterns?: string[]; buckets: BucketProposal[] } | null;
-  taxonomy_final?: { observed_patterns?: string[]; buckets: BucketProposal[] } | null;
+  taxonomy_proposal?: TaxonomyDoc | null;
+  taxonomy_final?: TaxonomyDoc | null;
   preferred_library_ids?: string[] | null;
   total_contacts?: number | null;
   assigned_contacts?: number | null;
