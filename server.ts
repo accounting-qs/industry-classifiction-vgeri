@@ -13,6 +13,13 @@ import { createClient } from '@supabase/supabase-js';
 import { db } from './services/supabaseClient';
 import { JobProcessor } from './services/jobProcessor';
 import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment } from './services/bucketingService';
+import {
+    listLibrary,
+    upsertLibraryBucket,
+    archiveLibraryBucket,
+    deleteLibraryBucket,
+    saveRunBucketsToLibrary
+} from './services/bucketLibraryService';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1354,7 +1361,7 @@ const bucketingLog = (msg: string, level: 'info' | 'warn' | 'error' = 'info') =>
 
 // Create a new run + fire taxonomy proposal in the background.
 app.post('/api/bucketing/determine', async (req, res) => {
-    const { name, list_names, min_volume } = req.body || {};
+    const { name, list_names, min_volume, preferred_library_ids } = req.body || {};
     if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name is required' });
     if (!Array.isArray(list_names) || list_names.length === 0) {
         return res.status(400).json({ error: 'list_names must be a non-empty array' });
@@ -1365,6 +1372,7 @@ app.post('/api/bucketing/determine', async (req, res) => {
             name: name.trim(),
             list_names,
             min_volume: typeof min_volume === 'number' && min_volume >= 0 ? Math.floor(min_volume) : 50,
+            preferred_library_ids: Array.isArray(preferred_library_ids) ? preferred_library_ids : [],
             status: 'taxonomy_pending'
         }).select().single();
         if (error) return res.status(500).json({ error: error.message });
@@ -1500,6 +1508,60 @@ app.delete('/api/bucketing/runs/:id', async (req, res) => {
         res.json({ ok: true });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// ============================================
+// BUCKET LIBRARY — reusable buckets across runs
+// ============================================
+
+app.get('/api/bucketing/library', async (req, res) => {
+    try {
+        const includeArchived = String(req.query.include_archived || '').toLowerCase() === 'true';
+        const buckets = await listLibrary(supabase, { includeArchived });
+        res.json({ buckets });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/bucketing/library', async (req, res) => {
+    try {
+        const bucket = await upsertLibraryBucket(supabase, req.body || {});
+        res.json(bucket);
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+app.patch('/api/bucketing/library/:id/archive', async (req, res) => {
+    try {
+        const archived = !!(req.body || {}).archived;
+        await archiveLibraryBucket(supabase, req.params.id, archived);
+        res.json({ ok: true, archived });
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+app.delete('/api/bucketing/library/:id', async (req, res) => {
+    try {
+        await deleteLibraryBucket(supabase, req.params.id);
+        res.json({ ok: true });
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+// Save selected buckets from a completed run into the library.
+app.post('/api/bucketing/runs/:id/save-to-library', async (req, res) => {
+    try {
+        const bucketNames: string[] = Array.isArray((req.body || {}).bucket_names) ? req.body.bucket_names : [];
+        if (bucketNames.length === 0) return res.status(400).json({ error: 'bucket_names array required' });
+        const result = await saveRunBucketsToLibrary(supabase, req.params.id, bucketNames);
+        res.json(result);
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
     }
 });
 

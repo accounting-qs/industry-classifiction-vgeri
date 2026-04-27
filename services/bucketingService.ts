@@ -1,50 +1,92 @@
 /**
- * Bucketing Service — Phase 1 (taxonomy proposal) + Phase 2 (assignment).
+ * Bucketing Service v2 — discovery + matching with 3-level chain.
  *
- * Core insight: the unit of work is the *distinct industry string*, not the
- * contact. 100k contacts share only ~500–2000 unique industries. Both phases
- * reason at vocabulary scale; per-contact fan-out is a single SQL JOIN.
+ * Phase 1a (DISCOVERY, ONE call):
+ *   Pulls full vocabulary, sends to Sonnet (or gpt-4.1 fallback) with the
+ *   Project Context + the user's discovery prompt. Model returns:
+ *     - 30–60 leaf buckets, each with direct_ancestor + root_category
+ *     - 6–15 ancestors, 3–6 roots
+ *     - observed_patterns (sanity-check section)
+ *   Optionally seeded with PREFERRED_BUCKETS from the bucket_library so the
+ *   model reuses them at high alignment instead of inventing duplicates.
  *
- * Phase 1 (one LLM call):
- *   1. Pull vocabulary via get_industry_vocabulary RPC
- *   2. Send to gpt-4.1 with strict JSON schema → propose 6–15 buckets
- *   3. Persist proposal + Phase 1 industry→bucket map rows
+ * Phase 1b (MATCHING, per distinct industry):
+ *   Per-string call to gpt-4.1-mini that returns the full chain
+ *   {leaf, ancestor, root, score, reason} + generic/disqualified flags.
+ *   Optimizations:
+ *     - Embedding pre-filter (text-embedding-3-small) auto-assigns obvious
+ *       matches with cosine ≥ 0.85 + ≥ 0.10 margin → no LLM call.
+ *     - Remaining strings batched 8 per call.
+ *     - Concurrency 40 (configurable).
+ *     - Prompt caching: bucket_reference is the prefix, queries are the tail.
  *
- * Phase 2 (~70s end-to-end for 100k):
- *   1. Deterministic SQL JOIN: contacts.industry = map.industry_string → 90–95% covered
- *   2. Embed residual industries + bucket definitions (text-embedding-3-small)
- *   3. Auto-assign labels with cosine top1 ≥ 0.72 AND margin ≥ 0.08
- *   4. Batched LLM call (gpt-4.1-mini, 50 labels per request) for the rest
- *   5. Catch-all "Other" sweep — every contact in the lists ends up assigned
+ * Volume rollup (no LLM): a SQL RPC walks each row of bucket_industry_map
+ * and writes the EFFECTIVE bucket_name based on min_volume thresholds —
+ * leaf, then ancestor, then root, then "Generic". Disqualified rows go to
+ * "Disqualified" unconditionally.
+ *
+ * Final fan-out: existing bucketing_deterministic_fanout RPC writes one
+ * bucket_assignments row per contact, including the full chain.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import pLimit from 'p-limit';
+import Anthropic from '@anthropic-ai/sdk';
 
-const TAXONOMY_MODEL = process.env.BUCKETING_TAXONOMY_MODEL || 'gpt-4.1';
-const RESIDUAL_MODEL = process.env.BUCKETING_RESIDUAL_MODEL || 'gpt-4.1-mini';
+// ─── model + concurrency config ──────────────────────────────────────
+const TAXONOMY_PROVIDER = (process.env.BUCKETING_TAXONOMY_PROVIDER || 'anthropic').toLowerCase(); // 'anthropic' | 'openai'
+const TAXONOMY_MODEL_ANTHROPIC = process.env.BUCKETING_TAXONOMY_MODEL_ANTHROPIC || 'claude-sonnet-4-6';
+const TAXONOMY_MODEL_OPENAI = process.env.BUCKETING_TAXONOMY_MODEL_OPENAI || 'gpt-4.1';
+const MATCH_MODEL = process.env.BUCKETING_MATCH_MODEL || 'gpt-4.1-mini';
 const EMBEDDING_MODEL = process.env.BUCKETING_EMBEDDING_MODEL || 'text-embedding-3-small';
-const RESIDUAL_BATCH_SIZE = parseInt(process.env.BUCKETING_BATCH_SIZE || '50', 10);
-const EMBED_AUTO_THRESHOLD = parseFloat(process.env.BUCKETING_EMBED_AUTO_THRESHOLD || '0.72');
-const EMBED_MARGIN = parseFloat(process.env.BUCKETING_EMBED_MARGIN || '0.08');
-const CONCURRENCY_AI = parseInt(process.env.CONCURRENCY_AI || '15', 10);
+
+const MATCH_BATCH_SIZE = parseInt(process.env.BUCKETING_BATCH_SIZE || '8', 10);
+const MATCH_CONCURRENCY = parseInt(process.env.BUCKETING_CONCURRENCY_AI || '40', 10);
+const EMBED_PREFILTER_ENABLED = (process.env.BUCKETING_EMBED_PREFILTER || 'true').toLowerCase() !== 'false';
+const EMBED_AUTO_THRESHOLD = parseFloat(process.env.BUCKETING_EMBED_AUTO_THRESHOLD || '0.85');
+const EMBED_MARGIN = parseFloat(process.env.BUCKETING_EMBED_MARGIN || '0.10');
+
 const OPENAI_TIMEOUT_MS = 90_000;
-const TAXONOMY_TIMEOUT_MS = 120_000;
+const TAXONOMY_TIMEOUT_MS = 180_000;
 
-// gpt-4.1 family pricing per 1M tokens
-const PRICING: Record<string, { input: number; output: number }> = {
-    'gpt-4.1':       { input: 2.00,  output: 8.00 },
-    'gpt-4.1-mini':  { input: 0.40,  output: 1.60 },
-    'gpt-4.1-nano':  { input: 0.10,  output: 0.40 },
+// ─── pricing ─────────────────────────────────────────────────────────
+const OPENAI_PRICING: Record<string, { input: number; output: number; cached_input?: number }> = {
+    'gpt-4.1':       { input: 2.00,  output: 8.00,  cached_input: 0.50 },
+    'gpt-4.1-mini':  { input: 0.40,  output: 1.60,  cached_input: 0.10 },
+    'gpt-4.1-nano':  { input: 0.10,  output: 0.40,  cached_input: 0.025 },
 };
-const EMBEDDING_PRICE_PER_1M = 0.02; // text-embedding-3-small
+const ANTHROPIC_PRICING: Record<string, { input: number; output: number }> = {
+    'claude-sonnet-4-6': { input: 3.00, output: 15.00 },
+    'claude-opus-4-7':   { input: 15.00, output: 75.00 },
+    'claude-haiku-4-5':  { input: 1.00, output: 5.00 },
+};
+const EMBEDDING_PRICE_PER_1M = 0.02;
 
+const RESERVED_GENERIC = 'Generic';
+const RESERVED_DISQUALIFIED = 'Disqualified';
+const RESERVED = new Set([RESERVED_GENERIC.toLowerCase(), RESERVED_DISQUALIFIED.toLowerCase(), 'other']);
+
+// ─── env helpers ─────────────────────────────────────────────────────
 function getOpenAIKey(): string {
     const key = process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
     if (!key) throw new Error('VITE_OPENAI_API_KEY missing');
     return key.trim();
 }
+function getAnthropicKey(): string | null {
+    const key = process.env.ANTHROPIC_API_KEY || process.env.VITE_ANTHROPIC_API_KEY;
+    return key ? key.trim() : null;
+}
 
+let _anthropicClient: Anthropic | null = null;
+function getAnthropic(): Anthropic | null {
+    if (_anthropicClient) return _anthropicClient;
+    const key = getAnthropicKey();
+    if (!key) return null;
+    _anthropicClient = new Anthropic({ apiKey: key });
+    return _anthropicClient;
+}
+
+// ─── shared types ────────────────────────────────────────────────────
 interface VocabRow {
     industry: string;
     n: number;
@@ -53,30 +95,33 @@ interface VocabRow {
     sample_reasoning: string[] | null;
 }
 
-interface ProposedBucket {
-    name: string;
-    definition: string;
-    personalization_angle?: string;
-    example_industries: string[];
-    estimated_count?: number;
-    // Empty string = top-level parent. Otherwise references another bucket's
-    // `name` in the same taxonomy — used to roll children up when they fall
-    // below the min_volume threshold instead of dumping them to Other.
-    parent_bucket?: string;
+interface DiscoveredBucket {
+    bucket_name: string;
+    description: string;
+    direct_ancestor: string;
+    root_category: string;
+    include?: string[];
+    exclude?: string[];
+    example_strings?: string[];
+    estimated_usage_label?: string;
+    rough_volume_estimate?: string;
+    library_match_id?: string | null;
 }
 
-interface TaxonomyResponse {
-    buckets: ProposedBucket[];
-    residual_note?: string;
+interface DiscoveryOutput {
+    observed_patterns: string[];
+    buckets: DiscoveredBucket[];
 }
 
-const RESERVED_OTHER = 'Other';
+interface MatchChain {
+    bucket_1: { name: string; score: number; reason: string };
+    bucket_2: { name: string; score: number; reason: string };
+    bucket_3: { name: string; score: number; reason: string };
+    generic: boolean;
+    disqualified: boolean;
+}
 
-// PostgREST caps RPC responses at 1000 rows by default. For lists with long
-// industry tails (common — classifier produces near-unique labels per company)
-// that means `totalContacts` reflects only the top 1000 industries, and the
-// LLM proposes buckets against a biased sample. Paginate explicitly to fetch
-// the full vocabulary up to a generous safety cap.
+// ─── paginated vocabulary fetch ──────────────────────────────────────
 const VOCAB_PAGE_SIZE = 1000;
 const VOCAB_MAX_ROWS = 100_000;
 
@@ -100,22 +145,108 @@ async function fetchFullVocabulary(
     return all;
 }
 
-// ────────────────────────────────────────────────────────────────────────
-// PHASE 1 — Bucket Determination
-// ────────────────────────────────────────────────────────────────────────
+// ─── Project Context (system role for both phases) ──────────────────
+const PROJECT_CONTEXT = `<<<SYSTEM ROLE AND CONTEXT
+
+You are operating inside a revenue-critical B2B growth system.
+Your outputs directly influence who is invited to high-volume webinars,
+how those webinars are positioned, and ultimately revenue outcomes.
+
+This is NOT an academic taxonomy exercise.
+This is NOT a generic classification task.
+This is NOT about elegance, novelty, or theoretical completeness.
+
+This system exists to solve a very specific operational problem at scale.
+
+========================================
+BACKGROUND
+========================================
+
+We run live B2B webinars at very large scale.
+Invitations are sent via Google Calendar to tens or hundreds of thousands of founders.
+
+Current state:
+- Invitations are largely generic.
+- Industry personalization is shallow or inaccurate.
+- Lead lists (e.g., from Apollo) have noisy, unreliable industry tags.
+- Attendance rates are lower than they should be.
+
+We cannot personalize per individual.
+However, we CAN personalize per industry bucket,
+where each bucket supports thousands of invitees.
+
+========================================
+CORE GOAL
+========================================
+
+Increase webinar ATTENDANCE RATE (not opens, not clicks)
+by making the invitation feel highly relevant to the recipient's industry context.
+
+Relevance is driven by:
+- Industry specificity
+- Accurate sub-vertical framing
+- Avoiding obvious mismatches
+
+Success is measured downstream by:
+- Attendance rate
+- Show-up quality
+- Call bookings
+- Conversion efficiency
+
+NOT by:
+- Number of buckets
+- Clever naming
+- Taxonomic purity
+
+========================================
+IDEAL CLIENT PROFILE (ICP)
+========================================
+
+The system is designed for B2B, high-ticket businesses.
+
+Strong ICP:
+- Agencies (marketing, performance, CRO, dev, etc.)
+- Consulting / advisory firms
+- Professional services
+- B2B or enterprise SaaS (including sub-verticals)
+- High-ticket info-product businesses (when plausibly scalable)
+- Financial services and investment firms (advisors, M&A, private equity, funds)
+
+Explicitly NON-ICP:
+- Ecommerce / DTC physical products
+- Local services tied to geography
+- Brick-and-mortar retail
+- Low-ticket consumer businesses
+
+Disqualification must be CONSERVATIVE.
+False negatives are worse than false positives.
+If ambiguous, do NOT disqualify.
+
+========================================
+CRITICAL CONSTRAINTS
+========================================
+
+1. Accuracy > Coverage. Do not force-fit businesses into buckets.
+2. Specificity > Breadth. Buckets must feel "this is for me".
+3. Reusability > Novelty. Buckets must work across multiple lists and campaigns.
+4. Structure > Guessing. Ancestor relationships must be explicit and logical.
+5. Determinism > Creativity. Predictable behavior at scale.`;
+
+// ────────────────────────────────────────────────────────────────────
+// PHASE 1A — DISCOVERY
+// ────────────────────────────────────────────────────────────────────
 
 export async function runTaxonomyProposal(
     supabase: SupabaseClient,
     runId: string,
     log: (msg: string, level?: 'info' | 'warn' | 'error') => void
 ): Promise<void> {
-    log(`[Bucketing ${runId}] Phase 1: starting taxonomy proposal`);
+    log(`[Bucketing ${runId}] Phase 1a: starting discovery`);
 
     const { data: run, error: runErr } = await supabase
         .from('bucketing_runs').select('*').eq('id', runId).single();
     if (runErr || !run) throw new Error(`Run not found: ${runErr?.message}`);
 
-    // 1) Vocabulary extraction (paginated — bypasses PostgREST 1000-row cap)
     const vocabRows = await fetchFullVocabulary(supabase, run.list_names);
     const totalContacts = vocabRows.reduce((s, r) => s + Number(r.n || 0), 0);
     log(`[Bucketing ${runId}] vocabulary: ${vocabRows.length} distinct industries, ${totalContacts} contacts`);
@@ -129,91 +260,81 @@ export async function runTaxonomyProposal(
         throw new Error('Empty vocabulary — none of the selected lists have completed enrichments.');
     }
 
-    // 2) LLM taxonomy call
+    // Optional preferred buckets from library (set on the run row at creation time)
+    const preferredIds: string[] = Array.isArray(run.preferred_library_ids) ? run.preferred_library_ids : [];
+    let preferred: any[] = [];
+    if (preferredIds.length > 0) {
+        const { data: libRows } = await supabase
+            .from('bucket_library').select('*').in('id', preferredIds);
+        preferred = libRows || [];
+    }
+
     const t0 = Date.now();
-    const { proposal, costUsd } = await callTaxonomyLLM(vocabRows);
-    log(`[Bucketing ${runId}] taxonomy LLM call: ${(Date.now() - t0) / 1000}s, $${costUsd.toFixed(4)}, ${proposal.buckets.length} buckets`);
+    const { discovery, costUsd, modelUsed } = await callDiscoveryLLM(vocabRows, preferred);
+    log(`[Bucketing ${runId}] discovery LLM (${modelUsed}): ${(Date.now() - t0) / 1000}s, $${costUsd.toFixed(4)}, ${discovery.buckets.length} leaves`);
 
-    // Filter out any "Other"-named bucket the model returned (reserved name),
-    // normalize names, and validate parent references point at a real bucket.
-    const rawBuckets = proposal.buckets
-        .filter(b => b.name && b.name.trim().toLowerCase() !== RESERVED_OTHER.toLowerCase())
-        .map(b => ({
-            ...b,
-            name: b.name.trim(),
-            definition: (b.definition || '').trim(),
-            parent_bucket: (b.parent_bucket || '').trim(),
-            example_industries: Array.from(
-                new Set((b.example_industries || []).map(s => (s || '').trim()).filter(Boolean))
-            )
-        }));
-
-    const bucketNames = new Set(rawBuckets.map(b => b.name));
-    const cleanBuckets = rawBuckets.map(b => ({
+    // Validate: every leaf has a non-empty ancestor; reject reserved names.
+    const leaves = discovery.buckets.filter(b => {
+        const n = (b.bucket_name || '').trim();
+        return n && !RESERVED.has(n.toLowerCase());
+    }).map(b => ({
         ...b,
-        // If parent reference is broken (model drift), treat as top-level.
-        parent_bucket: b.parent_bucket && bucketNames.has(b.parent_bucket) ? b.parent_bucket : ''
+        bucket_name: b.bucket_name.trim(),
+        description: (b.description || '').trim(),
+        direct_ancestor: (b.direct_ancestor || '').trim(),
+        root_category: (b.root_category || '').trim(),
+        include: Array.from(new Set((b.include || []).map(s => (s || '').trim()).filter(Boolean))),
+        exclude: Array.from(new Set((b.exclude || []).map(s => (s || '').trim()).filter(Boolean))),
+        example_strings: Array.from(new Set((b.example_strings || []).map(s => (s || '').trim()).filter(Boolean)))
     }));
 
-    // 3) Persist proposal
+    // Persist discovery output
     await supabase.from('bucketing_runs').update({
-        taxonomy_proposal: { buckets: cleanBuckets, residual_note: proposal.residual_note },
-        taxonomy_model: TAXONOMY_MODEL,
+        taxonomy_proposal: { observed_patterns: discovery.observed_patterns || [], buckets: leaves },
+        taxonomy_model: modelUsed,
         total_contacts: totalContacts,
         cost_usd: costUsd,
         status: 'taxonomy_ready',
         taxonomy_completed_at: new Date().toISOString()
     }).eq('id', runId);
 
-    // Insert Phase 1 map rows. The vocabulary set bounds what's valid — drop
-    // any LLM-hallucinated industry strings the model invented that aren't in
-    // the actual data.
-    const validIndustries = new Set(vocabRows.map(r => r.industry));
-    const mapRows: { bucketing_run_id: string; industry_string: string; bucket_name: string; source: string; confidence: number }[] = [];
-    const seen = new Set<string>();
-    for (const b of cleanBuckets) {
-        for (const ind of b.example_industries) {
-            if (!validIndustries.has(ind)) continue;
-            if (seen.has(ind)) continue; // first bucket wins on conflict — model rarely conflicts
-            seen.add(ind);
-            mapRows.push({
+    // Library link rows (which library buckets were reused)
+    if (preferred.length > 0) {
+        const reusedNames = new Set(leaves.filter(l => l.library_match_id).map(l => l.library_match_id!));
+        if (reusedNames.size > 0) {
+            const links = leaves.filter(l => l.library_match_id).map(l => ({
                 bucketing_run_id: runId,
-                industry_string: ind,
-                bucket_name: b.name,
-                source: 'llm_phase1',
-                confidence: 1.0
-            });
+                library_bucket_id: l.library_match_id!,
+                bucket_name_in_run: l.bucket_name
+            }));
+            await supabase.from('bucket_library_run_links').upsert(links, { onConflict: 'bucketing_run_id,library_bucket_id' });
+            // Bump usage stats
+            for (const id of reusedNames) {
+                await supabase.from('bucket_library')
+                    .update({ times_used: (preferred.find((p: any) => p.id === id)?.times_used || 0) + 1, last_used_at: new Date().toISOString() })
+                    .eq('id', id);
+            }
         }
     }
 
-    if (mapRows.length > 0) {
-        // chunked upsert; 1000-row batches stay under PostgREST payload limits
-        for (let i = 0; i < mapRows.length; i += 1000) {
-            const chunk = mapRows.slice(i, i + 1000);
-            const { error } = await supabase.from('bucket_industry_map')
-                .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
-            if (error) throw new Error(`bucket_industry_map insert failed: ${error.message}`);
-        }
-    }
-    log(`[Bucketing ${runId}] Phase 1 done: ${mapRows.length} initial industry mappings`);
+    log(`[Bucketing ${runId}] Phase 1a done — ${leaves.length} leaves persisted`);
 }
 
-async function callTaxonomyLLM(vocabRows: VocabRow[]): Promise<{ proposal: TaxonomyResponse; costUsd: number }> {
-    // Classifier tends to produce hyper-specific labels, so lists can have a
-    // very long tail. Send a larger head to the model (~2500 rows ≈ 50k input
-    // tokens, well within gpt-4.1) so the proposed taxonomy reflects the
-    // actual distribution, not just the 800 most-common labels.
+async function callDiscoveryLLM(
+    vocabRows: VocabRow[],
+    preferred: any[]
+): Promise<{ discovery: DiscoveryOutput; costUsd: number; modelUsed: string }> {
     const HEAD_LIMIT = 2500;
     const head = vocabRows.slice(0, HEAD_LIMIT);
     const tail = vocabRows.slice(HEAD_LIMIT);
     const tailContacts = tail.reduce((s, r) => s + Number(r.n || 0), 0);
     const headContacts = head.reduce((s, r) => s + Number(r.n || 0), 0);
-    const tailExamples = tail.slice(0, 40).map(r => r.industry);
+    const tailExamples = tail.slice(0, 50).map(r => r.industry);
 
     const vocabularyTable = head.map(r => {
-        const samples = (r.sample_companies || []).slice(0, 3).filter(Boolean).join(' | ');
+        const samples = (r.sample_companies || []).slice(0, 2).filter(Boolean).join(' | ');
         const reason = (r.sample_reasoning || [])[0] || '';
-        const trimmedReason = reason.length > 160 ? reason.slice(0, 160) + '…' : reason;
+        const trimmedReason = reason.length > 120 ? reason.slice(0, 120) + '…' : reason;
         return `${r.industry} | n=${r.n} | companies=[${samples}] | reasoning="${trimmedReason}"`;
     }).join('\n');
 
@@ -221,81 +342,148 @@ async function callTaxonomyLLM(vocabRows: VocabRow[]): Promise<{ proposal: Taxon
         ? `\n\nTail (${tail.length} more labels covering ${tailContacts} contacts). Examples: ${tailExamples.join(', ')}.`
         : '';
 
-    const exampleBucketStyle = [
-        'FinTech & Financial Services SaaS',
-        'IT Consulting & Managed Services',
-        'Accounting Firms USA',
-        'Architecture, Engineering & Construction',
-        'Accounting, Audit & Tax Services',
-        'Venture Capital Firm',
-        'Data, Analytics & AI SaaS',
-        'Insurance Services & Brokerage',
-        'Branding, Creative & PR Agency',
-        'Digital Marketing & SEO Agency'
-    ];
+    const preferredSection = preferred.length > 0 ? `
 
-    const systemPrompt = `You are designing outreach segments for cold email campaigns.
+========================================
+PREFERRED BUCKETS (from library)
+========================================
 
-Your job: given a vocabulary of narrow industry labels (assigned by a prior classifier), propose a TWO-LEVEL bucket taxonomy:
+The buckets below were defined in prior runs and have proven useful.
+If a discovered pattern aligns with one of these at score >= 0.7,
+REUSE that exact bucket: copy its bucket_name, description,
+direct_ancestor, and root_category VERBATIM, and set library_match_id
+to the id provided. Do NOT create a near-duplicate with different
+wording. Otherwise, propose new buckets that follow the rules above.
+Treat preferred buckets as anchors.
 
-- 3–6 PARENT buckets: broader categories (e.g. "IT & Cybersecurity Services", "Financial Services", "Legal Services"). These catch children that fall below the user's minimum volume threshold.
-- 8–20 CHILD buckets: more specific segments inside a parent (e.g. under "IT & Cybersecurity Services" → "Managed IT Services for SMBs", "Cybersecurity Consulting & PenTesting", "IT Consulting for Regulated Industries"). A child always references its parent by name.
+${preferred.map(p => `id=${p.id} | name="${p.bucket_name}" | ancestor="${p.direct_ancestor}" | root="${p.root_category}" | desc="${p.description || ''}"`).join('\n')}` : '';
 
-Every bucket (parent or child) must:
-- Be specific enough that a personalized opener works for every company in it.
-- Avoid generic names ("Professional Services", "Technology", "Software"). Use specific-plus-modifier ("IT Consulting & Managed Services", not "Consulting").
-- Map cleanly to a clear set of the input industry labels.
-- NEVER use the name "Other" — that name is reserved for the catch-all bucket.
+    const userPrompt = `${PROJECT_CONTEXT}
 
-Each bucket needs:
-- name: short, usable as a UI chip, in the same style as these examples: ${exampleBucketStyle.join(', ')}
-- definition: 1–2 sentences describing what kind of company belongs there.
-- personalization_angle: one sentence explaining why grouping these together = same outreach hook.
-- example_industries: an array of 5–25 EXACT strings copied verbatim from the vocabulary you were given. These are what the assignment engine will use as the deterministic mapping. Parent buckets may have few or zero example_industries if they're purely a rollup category — their children carry the examples.
-- estimated_count: rough total contacts based on the counts in the vocabulary table (for a parent, sum of its children).
-- parent_bucket: the name of this bucket's PARENT bucket, copied verbatim from another bucket's \`name\` field. Use empty string "" if this bucket IS a parent (top-level).
+========================================
+PHASE 1A — BUCKET DISCOVERY
+========================================
 
-IMPORTANT: children stay narrow so a tight opener works; parents are the fallback target when a child is too small to survive the user's volume threshold. So children should together cover most of the vocabulary, and each child MUST name a parent that also appears in your \`buckets\` array.
+Your job is to DISCOVER a set of reusable, meaningful LEAF buckets from the
+dataset of AI-enriched industry classification strings below.
 
-Output strict JSON matching the schema. No prose, no markdown.`;
+NO-SHORTCUTS RULES:
+1) Base buckets ONLY on patterns that appear in the provided data.
+2) Do NOT infer industries that are not evidenced in the input strings.
+3) Do NOT use "common sense" priors unless the data shows it.
+4) Do NOT compress the problem by ignoring the dataset.
+5) If a classification is ambiguous, treat it as ambiguous — do not guess.
 
-    const userPrompt = `Vocabulary table (industry | n=count | companies | reasoning), sorted by count descending. The head below covers ${headContacts} contacts across ${head.length} distinct labels:
+ICP BOUNDARIES:
+- Strong ICP: agencies, consulting/advisory, professional services (non-local),
+  B2B/enterprise SaaS, financial services & investment firms, plausibly scalable
+  high-ticket info products.
+- Non-ICP (route to Generic, NOT to ICP buckets): ecommerce/DTC physical products,
+  local services, brick-and-mortar retail, low-ticket consumer.
+
+BUCKET DESIGN:
+- Output between 30 and 60 LEAF buckets.
+- Specific enough for "this is for me" effect in webinar titles. Not so micro
+  that they apply to a handful of records.
+- Do NOT create near-duplicates that differ only in word order or synonyms.
+- Each leaf MUST have a direct_ancestor (broader, shared roll-up) and a
+  root_category (3–6 family-level categories).
+- Target: 6–15 ancestors total, 3–6 roots total. Many leaves share an ancestor.
+- An ancestor with only 1 leaf under it is invalid.
+
+❌ TOO BROAD (forbidden as leaves; allowed as ancestors/roots only):
+"SaaS", "B2B SaaS", "Marketing Agency", "Consulting Firm", "Financial Services",
+"Professional Services", "Technology Company".
+
+❌ TOO NARROW (forbidden):
+"AI-powered Stripe reconciliation SaaS for EU neobanks",
+"TikTok ads agency for DTC candle brands",
+"RevOps consulting for Series B HR SaaS companies only",
+"Family office for German real estate developers".
+
+✅ GOLDILOCKS (target leaves):
+"Payments Infrastructure SaaS", "FinTech SaaS", "Performance Marketing Agency",
+"Conversion Rate Optimization (CRO) Agency", "Revenue Operations Consulting",
+"Fractional CFO Services", "Private Equity Firm", "Venture Capital Fund",
+"M&A Advisory Services", "MarTech SaaS", "Vertical SaaS",
+"B2B Demand Generation Agency", "Branding & Creative Agency".
+${preferredSection}
+
+REQUIRED PROCESS — DO NOT SKIP:
+A) Identify 10–15 high-frequency patterns observed in the dataset.
+   Each must reference recurring concepts/phrases you actually see in the data.
+B) Use those patterns to justify why your top leaves are ranked highest.
+
+OUTPUT (strict JSON only, no prose, no markdown fences):
+
+{
+  "observed_patterns": [<10–15 strings>],
+  "buckets": [
+    {
+      "bucket_name": "<leaf>",
+      "description": "<1 sentence>",
+      "direct_ancestor": "<ancestor>",
+      "root_category": "<root>",
+      "include": [<string keywords>],
+      "exclude": [<string keywords>],
+      "example_strings": [<6–10 verbatim from vocab below>],
+      "estimated_usage_label": "<dominant|very_common|common|moderate|niche_but_meaningful|rare>",
+      "rough_volume_estimate": "<e.g. ~8–12% of rows>",
+      "library_match_id": "<id from PREFERRED_BUCKETS, or empty string>"
+    }
+  ]
+}
+
+Rules for output:
+- buckets ordered MOST common → LEAST common.
+- example_strings MUST be verbatim from the vocabulary below.
+- 30–60 leaves total. Every leaf has direct_ancestor and root_category set.
+
+========================================
+VOCABULARY
+========================================
+
+The head below covers ${headContacts} contacts across ${head.length} distinct labels.
+Format: industry | n=count | companies=[2 samples] | reasoning="…"
 
 ${vocabularyTable}${tailSection}
 
 Total contacts across all labels: ${headContacts + tailContacts}.
 
-Propose the two-level taxonomy now. Remember: example_industries must be strings copied verbatim from the vocabulary table. Every child's parent_bucket must match another bucket's name in your output.`;
+Now produce the JSON.`;
 
-    // OpenAI strict JSON schema requires every property in `properties` to
-    // appear in `required` — there is no "optional" field when strict=true.
-    // The model can still return empty strings / 0 for fields it has nothing
-    // useful to say about.
-    const schema = {
-        type: 'object',
-        additionalProperties: false,
-        required: ['buckets', 'residual_note'],
-        properties: {
-            buckets: {
-                type: 'array',
-                items: {
-                    type: 'object',
-                    additionalProperties: false,
-                    required: ['name', 'definition', 'personalization_angle', 'example_industries', 'estimated_count', 'parent_bucket'],
-                    properties: {
-                        name: { type: 'string' },
-                        definition: { type: 'string' },
-                        personalization_angle: { type: 'string' },
-                        example_industries: { type: 'array', items: { type: 'string' } },
-                        estimated_count: { type: 'integer' },
-                        parent_bucket: { type: 'string' }
-                    }
-                }
-            },
-            residual_note: { type: 'string' }
+    // Try Anthropic Sonnet first if configured + key present.
+    if (TAXONOMY_PROVIDER === 'anthropic') {
+        const client = getAnthropic();
+        if (client) {
+            try {
+                const t0 = Date.now();
+                const resp = await client.messages.create({
+                    model: TAXONOMY_MODEL_ANTHROPIC,
+                    max_tokens: 16_000,
+                    temperature: 0.2,
+                    system: 'You output strict JSON only. No markdown, no prose, no fences. Just the JSON object.',
+                    messages: [{ role: 'user', content: userPrompt }]
+                }, { timeout: TAXONOMY_TIMEOUT_MS });
+                const text = resp.content
+                    .filter((c: any) => c.type === 'text')
+                    .map((c: any) => c.text).join('');
+                const discovery = parseDiscoveryJson(text);
+                const usage = (resp as any).usage || {};
+                const inTok = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
+                const outTok = usage.output_tokens || 0;
+                const costUsd = computeAnthropicCost(TAXONOMY_MODEL_ANTHROPIC, inTok, outTok);
+                console.log(`[Bucketing] Sonnet discovery: ${(Date.now() - t0) / 1000}s, in=${inTok} out=${outTok}`);
+                return { discovery, costUsd, modelUsed: TAXONOMY_MODEL_ANTHROPIC };
+            } catch (err: any) {
+                console.warn(`[Bucketing] Anthropic discovery failed, falling back to OpenAI: ${err.message}`);
+                // fall through to OpenAI
+            }
         }
-    };
+    }
 
+    // OpenAI fallback (or default if provider=openai)
+    const schema = buildDiscoverySchema();
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), TAXONOMY_TIMEOUT_MS);
     try {
@@ -306,45 +494,85 @@ Propose the two-level taxonomy now. Remember: example_industries must be strings
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-                model: TAXONOMY_MODEL,
+                model: TAXONOMY_MODEL_OPENAI,
                 messages: [
-                    { role: 'system', content: systemPrompt },
+                    { role: 'system', content: 'You output strict JSON only. No markdown, no prose, no fences.' },
                     { role: 'user', content: userPrompt }
                 ],
                 response_format: {
                     type: 'json_schema',
-                    json_schema: { name: 'bucket_taxonomy', strict: true, schema }
+                    json_schema: { name: 'bucket_discovery', strict: true, schema }
                 },
                 temperature: 0.2
             }),
             signal: controller.signal
         });
-
         if (!response.ok) {
             const errBody = await response.text().catch(() => '');
-            throw new Error(`Taxonomy LLM error ${response.status}: ${errBody.slice(0, 500)}`);
+            throw new Error(`Discovery LLM error ${response.status}: ${errBody.slice(0, 500)}`);
         }
         const data = await response.json();
         const text = data.choices?.[0]?.message?.content;
-        if (!text) throw new Error('Empty taxonomy response');
-        const proposal = JSON.parse(text) as TaxonomyResponse;
-
+        if (!text) throw new Error('Empty discovery response');
+        const discovery = parseDiscoveryJson(text);
         const usage = data.usage || {};
-        const costUsd = computeCost(TAXONOMY_MODEL, usage.prompt_tokens || 0, usage.completion_tokens || 0);
-        return { proposal, costUsd };
+        const cached = usage.prompt_tokens_details?.cached_tokens || 0;
+        const uncached = (usage.prompt_tokens || 0) - cached;
+        const costUsd = computeOpenAICost(TAXONOMY_MODEL_OPENAI, uncached, cached, usage.completion_tokens || 0);
+        return { discovery, costUsd, modelUsed: TAXONOMY_MODEL_OPENAI };
     } finally {
         clearTimeout(timeoutId);
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────
-// USER EDIT APPLICATION (between Phase 1 and Phase 2)
-// ────────────────────────────────────────────────────────────────────────
+function parseDiscoveryJson(text: string): DiscoveryOutput {
+    const trimmed = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+    const parsed = JSON.parse(trimmed);
+    if (!Array.isArray(parsed.buckets)) throw new Error('Discovery output missing `buckets` array');
+    return parsed;
+}
+
+function buildDiscoverySchema() {
+    return {
+        type: 'object',
+        additionalProperties: false,
+        required: ['observed_patterns', 'buckets'],
+        properties: {
+            observed_patterns: { type: 'array', items: { type: 'string' } },
+            buckets: {
+                type: 'array',
+                items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['bucket_name', 'description', 'direct_ancestor', 'root_category',
+                               'include', 'exclude', 'example_strings', 'estimated_usage_label',
+                               'rough_volume_estimate', 'library_match_id'],
+                    properties: {
+                        bucket_name: { type: 'string' },
+                        description: { type: 'string' },
+                        direct_ancestor: { type: 'string' },
+                        root_category: { type: 'string' },
+                        include: { type: 'array', items: { type: 'string' } },
+                        exclude: { type: 'array', items: { type: 'string' } },
+                        example_strings: { type: 'array', items: { type: 'string' } },
+                        estimated_usage_label: { type: 'string' },
+                        rough_volume_estimate: { type: 'string' },
+                        library_match_id: { type: 'string' }
+                    }
+                }
+            }
+        }
+    };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// EDIT APPLICATION
+// ────────────────────────────────────────────────────────────────────
 
 interface TaxonomyEdits {
-    keep?: string[];                          // bucket names to keep
-    rename?: Record<string, string>;          // {old: new}
-    add?: { name: string; definition: string }[];
+    keep?: string[];
+    rename?: Record<string, string>;
+    add?: { bucket_name: string; description: string; direct_ancestor: string; root_category: string }[];
     min_volume?: number;
 }
 
@@ -356,72 +584,52 @@ export async function applyTaxonomyEdits(
 ): Promise<void> {
     const { data: run, error } = await supabase.from('bucketing_runs').select('*').eq('id', runId).single();
     if (error || !run) throw new Error(`Run not found: ${error?.message}`);
-    const proposal: TaxonomyResponse | null = run.taxonomy_proposal;
-    if (!proposal) throw new Error('Taxonomy proposal missing — run Phase 1 first');
+    const proposal = run.taxonomy_proposal as DiscoveryOutput | null;
+    if (!proposal?.buckets) throw new Error('Taxonomy proposal missing — run Phase 1a first');
 
-    let buckets = [...proposal.buckets];
+    let leaves = proposal.buckets.map(b => ({ ...b }));
 
-    // 1) Apply renames — also retarget any child whose parent was renamed.
     if (edits.rename) {
         for (const [oldName, newName] of Object.entries(edits.rename)) {
             const target = newName.trim();
-            if (!target || target.toLowerCase() === RESERVED_OTHER.toLowerCase()) continue;
-            buckets = buckets.map(b => {
-                const renamed = b.name === oldName ? { ...b, name: target } : b;
-                return renamed.parent_bucket === oldName ? { ...renamed, parent_bucket: target } : renamed;
-            });
-            const { error: upErr } = await supabase.from('bucket_industry_map')
-                .update({ bucket_name: target })
-                .eq('bucketing_run_id', runId)
-                .eq('bucket_name', oldName);
-            if (upErr) throw new Error(`Rename failed: ${upErr.message}`);
+            if (!target || RESERVED.has(target.toLowerCase())) continue;
+            leaves = leaves.map(b => b.bucket_name === oldName ? { ...b, bucket_name: target } : b);
         }
     }
 
-    // 2) Drop unkept buckets. Children whose parent is dropped become
-    //    top-level (parent_bucket="") so they still survive on their own.
     if (edits.keep) {
         const keepSet = new Set(edits.keep.map(s => s.trim()));
-        const dropped = buckets.filter(b => !keepSet.has(b.name)).map(b => b.name);
-        const droppedSet = new Set(dropped);
-        buckets = buckets
-            .filter(b => keepSet.has(b.name))
-            .map(b => droppedSet.has(b.parent_bucket || '') ? { ...b, parent_bucket: '' } : b);
-        if (dropped.length > 0) {
-            const { error: delErr } = await supabase.from('bucket_industry_map')
-                .delete()
-                .eq('bucketing_run_id', runId)
-                .in('bucket_name', dropped);
-            if (delErr) throw new Error(`Drop failed: ${delErr.message}`);
-        }
+        leaves = leaves.filter(b => keepSet.has(b.bucket_name));
     }
 
-    // 3) Add manual buckets (no map rows yet — Phase 2 embedding/LLM populates)
     if (edits.add) {
         for (const a of edits.add) {
-            const name = (a.name || '').trim();
-            if (!name || name.toLowerCase() === RESERVED_OTHER.toLowerCase()) continue;
-            if (buckets.some(b => b.name === name)) continue;
-            buckets.push({
-                name,
-                definition: (a.definition || '').trim(),
-                example_industries: []
+            const name = (a.bucket_name || '').trim();
+            if (!name || RESERVED.has(name.toLowerCase())) continue;
+            if (leaves.some(l => l.bucket_name === name)) continue;
+            leaves.push({
+                bucket_name: name,
+                description: (a.description || '').trim(),
+                direct_ancestor: (a.direct_ancestor || '').trim(),
+                root_category: (a.root_category || '').trim(),
+                include: [],
+                exclude: [],
+                example_strings: []
             });
         }
     }
 
-    const update: any = { taxonomy_final: { buckets } };
+    const update: any = { taxonomy_final: { observed_patterns: proposal.observed_patterns || [], buckets: leaves } };
     if (typeof edits.min_volume === 'number' && edits.min_volume >= 0) {
         update.min_volume = edits.min_volume;
     }
-    const { error: upRunErr } = await supabase.from('bucketing_runs').update(update).eq('id', runId);
-    if (upRunErr) throw new Error(`Run update failed: ${upRunErr.message}`);
-    log(`[Bucketing ${runId}] taxonomy edits applied: ${buckets.length} buckets`);
+    await supabase.from('bucketing_runs').update(update).eq('id', runId);
+    log(`[Bucketing ${runId}] taxonomy edits applied: ${leaves.length} leaves`);
 }
 
-// ────────────────────────────────────────────────────────────────────────
-// PHASE 2 — Bucket Assignment
-// ────────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────────
+// PHASE 1B — MATCHING + VOLUME ROLLUP + FAN-OUT
+// ────────────────────────────────────────────────────────────────────
 
 export async function runAssignment(
     supabase: SupabaseClient,
@@ -431,112 +639,70 @@ export async function runAssignment(
     const { data: run, error } = await supabase.from('bucketing_runs').select('*').eq('id', runId).single();
     if (error || !run) throw new Error(`Run not found: ${error?.message}`);
 
-    const final = run.taxonomy_final || run.taxonomy_proposal;
+    const final = (run.taxonomy_final || run.taxonomy_proposal) as DiscoveryOutput | null;
     if (!final?.buckets || final.buckets.length === 0) {
         throw new Error('No buckets defined for assignment');
     }
-    const buckets = final.buckets as ProposedBucket[];
-    const allowedNames = new Set(buckets.map(b => b.name));
+    const leaves = final.buckets;
+    const leafByName = new Map(leaves.map(b => [b.bucket_name, b]));
 
     await supabase.from('bucketing_runs').update({ status: 'assigning' }).eq('id', runId);
 
-    // Apply min-volume threshold with parent rollup. A child below threshold
-    // is rewritten to its parent (keeping its contacts together at a coarser
-    // segment) instead of dumped to Other. Only buckets that are still below
-    // threshold after rollup — or have no surviving parent — are deleted;
-    // those contacts then funnel into "Other" via the catch-all sweep.
-    if (run.min_volume && run.min_volume > 0) {
-        const parentOf = new Map<string, string>();
-        for (const b of buckets) {
-            if (b.parent_bucket && allowedNames.has(b.parent_bucket)) {
-                parentOf.set(b.name, b.parent_bucket);
-            }
-        }
+    let totalCost = Number(run.cost_usd || 0);
 
-        const { data: counts } = await supabase
-            .rpc('get_bucket_map_counts', { p_run_id: runId });
-        const countMap = new Map<string, number>(
-            (counts || []).map((c: any) => [c.bucket_name as string, Number(c.contact_count) || 0])
-        );
+    // Step 1: get distinct industries that need a chain assignment.
+    log(`[Bucketing ${runId}] step 1/5: load vocabulary`);
+    const vocab = await fetchFullVocabulary(supabase, run.list_names);
+    log(`[Bucketing ${runId}] ${vocab.length} distinct industries to match`);
 
-        // Rollup order: process by current count ascending so the smallest
-        // children roll up first, giving their parents a chance to cross the
-        // threshold. Walk parent chains up to 4 levels (far more than the
-        // model is asked to produce) to cover nested rollups without looping.
-        const rollupPlan: Array<{ from: string; to: string }> = [];
-        const sortedNames = [...countMap.entries()]
-            .sort((a, b) => a[1] - b[1])
-            .map(([name]) => name);
+    // Step 2: clear any prior chain rows for this run so re-runs are clean.
+    await supabase.from('bucket_industry_map').delete().eq('bucketing_run_id', runId);
 
-        for (const name of sortedNames) {
-            if ((countMap.get(name) || 0) >= run.min_volume) continue;
-            let current = name;
-            let target = parentOf.get(current);
-            let hops = 0;
-            while (target && hops < 4 && (countMap.get(target) || 0) < run.min_volume) {
-                current = target;
-                target = parentOf.get(current);
-                hops++;
-            }
-            if (target) {
-                rollupPlan.push({ from: name, to: target });
-                countMap.set(target, (countMap.get(target) || 0) + (countMap.get(name) || 0));
-                countMap.set(name, 0);
-            }
-        }
+    // Step 3: embedding pre-filter — auto-assign obvious matches with cosine.
+    let assignedRows: any[] = [];
+    let pendingIndustries: VocabRow[] = vocab;
 
-        for (const r of rollupPlan) {
+    if (EMBED_PREFILTER_ENABLED) {
+        log(`[Bucketing ${runId}] step 3/5: embedding pre-filter`);
+        const embedRes = await runEmbeddingPrefilter(vocab, leaves, runId);
+        totalCost += embedRes.costUsd;
+        assignedRows = embedRes.autoAssigned;
+        pendingIndustries = embedRes.pending;
+        log(`[Bucketing ${runId}] embedding auto-assigned ${assignedRows.length}/${vocab.length}, ${pendingIndustries.length} pending`);
+    }
+
+    // Step 4: residual LLM matching (batched, concurrent).
+    log(`[Bucketing ${runId}] step 4/5: residual LLM matching`);
+    const llmRes = await runMatchingLLM(pendingIndustries, leaves, runId);
+    totalCost += llmRes.costUsd;
+    assignedRows = assignedRows.concat(llmRes.rows);
+    log(`[Bucketing ${runId}] LLM matched ${llmRes.rows.length}, total chain rows ${assignedRows.length}, cost so far $${totalCost.toFixed(4)}`);
+
+    // Insert chain rows into bucket_industry_map (in chunks).
+    if (assignedRows.length > 0) {
+        for (let i = 0; i < assignedRows.length; i += 1000) {
+            const chunk = assignedRows.slice(i, i + 1000);
             const { error: upErr } = await supabase.from('bucket_industry_map')
-                .update({ bucket_name: r.to })
-                .eq('bucketing_run_id', runId).eq('bucket_name', r.from);
-            if (upErr) throw new Error(`rollup failed: ${upErr.message}`);
-        }
-        if (rollupPlan.length > 0) {
-            log(`[Bucketing ${runId}] rolled up ${rollupPlan.length} sub-bucket(s) into parents below min_volume=${run.min_volume}`);
-        }
-
-        // Anything still below threshold (no parent or parent also undersized) → delete, lands in Other.
-        const { data: freshCounts } = await supabase
-            .rpc('get_bucket_map_counts', { p_run_id: runId });
-        const undersized = (freshCounts || [])
-            .filter((c: any) => Number(c.contact_count) < run.min_volume)
-            .map((c: any) => c.bucket_name);
-        if (undersized.length > 0) {
-            await supabase.from('bucket_industry_map').delete()
-                .eq('bucketing_run_id', runId).in('bucket_name', undersized);
-            log(`[Bucketing ${runId}] dropped ${undersized.length} buckets below min_volume=${run.min_volume} (→ Other)`);
+                .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
+            if (upErr) throw new Error(`map insert failed: ${upErr.message}`);
         }
     }
 
-    let totalCost = Number(run.cost_usd || 0);
+    // Step 5: volume rollup (server-side SQL) → writes effective bucket_name per row.
+    log(`[Bucketing ${runId}] step 5/5: volume rollup + fan-out`);
+    const { error: rollupErr } = await supabase.rpc('bucketing_apply_volume_rollup', { p_run_id: runId });
+    if (rollupErr) throw new Error(`volume rollup failed: ${rollupErr.message}`);
 
-    // Step 1 — deterministic SQL fan-out (chunked client-side since PostgREST
-    // doesn't expose INSERT … SELECT). We pull industry → bucket map then walk
-    // contacts in pages, joining client-side. For ~100k this is ~10–20s.
-    log(`[Bucketing ${runId}] step 1/4: deterministic fan-out`);
-    const determCount = await deterministicFanOut(supabase, runId, run.list_names);
-    log(`[Bucketing ${runId}] deterministic assigned: ${determCount}`);
+    // Clear prior assignments (idempotent re-run support) then fan out.
+    await supabase.from('bucket_assignments').delete().eq('bucketing_run_id', runId);
+    const { data: fanoutCount, error: fanErr } = await supabase
+        .rpc('bucketing_deterministic_fanout', { p_run_id: runId });
+    if (fanErr) throw new Error(`fanout failed: ${fanErr.message}`);
+    log(`[Bucketing ${runId}] fan-out wrote ${Number(fanoutCount || 0)} assignments`);
 
-    // Step 2 — embedding fallback
-    log(`[Bucketing ${runId}] step 2/4: embedding fallback`);
-    const embedCost = await embeddingFallback(supabase, runId, run.list_names, buckets);
-    totalCost += embedCost;
-
-    // Step 3 — residual LLM batch
-    log(`[Bucketing ${runId}] step 3/4: residual LLM batch classification`);
-    const llmCost = await residualLLMClassification(supabase, runId, run.list_names, buckets, allowedNames);
-    totalCost += llmCost;
-
-    // Re-run fan-out to pick up newly added map rows from steps 2 and 3
-    await deterministicFanOut(supabase, runId, run.list_names);
-
-    // Step 4 — catch-all "Other" sweep. Every remaining contact in the
-    // selected lists lands here — scrape failures, no enrichment, low
-    // confidence, no fit, dropped-bucket orphans. ON CONFLICT keeps existing
-    // assignments untouched.
-    log(`[Bucketing ${runId}] step 4/4: catch-all Other sweep`);
-    const otherCount = await catchAllOther(supabase, runId, run.list_names);
-    log(`[Bucketing ${runId}] Other bucket received ${otherCount} contacts`);
+    // Catch-all: contacts with industries we never saw (e.g. NULL industry) → Generic
+    const { error: catchErr } = await supabase.rpc('bucketing_catchall_other', { p_run_id: runId });
+    if (catchErr) throw new Error(`catch-all failed: ${catchErr.message}`);
 
     // Final stats
     const { count: assignedCount } = await supabase
@@ -554,70 +720,53 @@ export async function runAssignment(
     log(`[Bucketing ${runId}] DONE — ${assignedCount} contacts assigned, total cost $${totalCost.toFixed(4)}`);
 }
 
-// ───── Step 1: deterministic fan-out ─────
-async function deterministicFanOut(
-    supabase: SupabaseClient,
-    runId: string,
-    _listNames: string[]
-): Promise<number> {
-    // Server-side INSERT … SELECT via RPC. Avoids 20+ PostgREST round-trips
-    // and sidesteps the "in.(\"value,with,commas\") + ORDER BY → timeout"
-    // planner bug that struck when list names contain commas.
-    const { data, error } = await supabase.rpc('bucketing_deterministic_fanout', { p_run_id: runId });
-    if (error) throw new Error(`deterministic fanout failed: ${error.message}`);
-    return Number(data || 0);
-}
+// ─── embedding pre-filter ──────────────────────────────────────────
+async function runEmbeddingPrefilter(
+    vocab: VocabRow[],
+    leaves: DiscoveredBucket[],
+    runId: string
+): Promise<{ autoAssigned: any[]; pending: VocabRow[]; costUsd: number }> {
+    if (vocab.length === 0 || leaves.length === 0) return { autoAssigned: [], pending: vocab, costUsd: 0 };
 
-// ───── Step 2: embedding fallback ─────
-async function embeddingFallback(
-    supabase: SupabaseClient,
-    runId: string,
-    listNames: string[],
-    buckets: ProposedBucket[]
-): Promise<number> {
-    // Find residual industries: distinct industry strings in the lists that
-    // don't yet have a map row for this run.
-    const residuals = await getResidualIndustries(supabase, runId, listNames);
-    if (residuals.length === 0) return 0;
+    const leafTexts = leaves.map(l => `${l.bucket_name}: ${l.description || l.bucket_name}. Includes: ${(l.include || []).join(', ')}.`);
+    const vocabTexts = vocab.map(v => v.industry);
+    const allInputs = [...leafTexts, ...vocabTexts];
 
-    // Embed bucket definitions + all residual industries in one batch.
-    // OpenAI embeddings API accepts an array of inputs (limit 2048 per call).
-    const bucketTexts = buckets.map(b => `${b.name}: ${b.definition || b.name}`);
-    const allInputs = [...bucketTexts, ...residuals];
     const { embeddings, costUsd } = await embedBatch(allInputs);
-    if (embeddings.length !== allInputs.length) {
-        throw new Error(`embedding count mismatch: got ${embeddings.length}, expected ${allInputs.length}`);
-    }
-    const bucketVecs = embeddings.slice(0, buckets.length);
-    const residualVecs = embeddings.slice(buckets.length);
+    const leafVecs = embeddings.slice(0, leaves.length);
+    const vocabVecs = embeddings.slice(leaves.length);
 
-    const inserts: any[] = [];
-    for (let i = 0; i < residuals.length; i++) {
-        const ind = residuals[i];
-        const sims = bucketVecs.map(bv => cosine(residualVecs[i], bv));
+    const autoAssigned: any[] = [];
+    const pending: VocabRow[] = [];
+
+    for (let i = 0; i < vocab.length; i++) {
+        const sims = leafVecs.map(lv => cosine(vocabVecs[i], lv));
         const sorted = sims.map((s, j) => ({ s, j })).sort((a, b) => b.s - a.s);
         const top = sorted[0];
         const second = sorted[1] || { s: 0 };
         if (top.s >= EMBED_AUTO_THRESHOLD && (top.s - second.s) >= EMBED_MARGIN) {
-            inserts.push({
+            const leaf = leaves[top.j];
+            autoAssigned.push({
                 bucketing_run_id: runId,
-                industry_string: ind,
-                bucket_name: buckets[top.j].name,
+                industry_string: vocab[i].industry,
+                bucket_name: leaf.bucket_name,
                 source: 'embedding',
-                confidence: Number(top.s.toFixed(2))
+                confidence: Number(top.s.toFixed(2)),
+                bucket_leaf: leaf.bucket_name,
+                bucket_ancestor: leaf.direct_ancestor || '',
+                bucket_root: leaf.root_category || '',
+                leaf_score: Number(top.s.toFixed(2)),
+                ancestor_score: Number(top.s.toFixed(2)),
+                root_score: Number(top.s.toFixed(2)),
+                is_generic: false,
+                is_disqualified: false,
+                reasons: { auto: 'embedding pre-filter', cosine: top.s }
             });
+        } else {
+            pending.push(vocab[i]);
         }
     }
-
-    if (inserts.length > 0) {
-        for (let i = 0; i < inserts.length; i += 1000) {
-            const chunk = inserts.slice(i, i + 1000);
-            const { error } = await supabase.from('bucket_industry_map')
-                .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
-            if (error) throw new Error(`embedding map insert failed: ${error.message}`);
-        }
-    }
-    return costUsd;
+    return { autoAssigned, pending, costUsd };
 }
 
 async function embedBatch(inputs: string[]): Promise<{ embeddings: number[][]; costUsd: number }> {
@@ -631,10 +780,7 @@ async function embedBatch(inputs: string[]): Promise<{ embeddings: number[][]; c
         try {
             const res = await fetch('https://api.openai.com/v1/embeddings', {
                 method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${getOpenAIKey()}`,
-                    'Content-Type': 'application/json'
-                },
+                headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ model: EMBEDDING_MODEL, input: slice }),
                 signal: controller.signal
             });
@@ -660,88 +806,130 @@ function cosine(a: number[], b: number[]): number {
     return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
-// ───── Step 3: residual LLM batch ─────
-async function residualLLMClassification(
-    supabase: SupabaseClient,
-    runId: string,
-    listNames: string[],
-    buckets: ProposedBucket[],
-    allowedNames: Set<string>
-): Promise<number> {
-    // Residuals after embedding pass: distinct industries with no map row yet.
-    const residuals = await getResidualIndustries(supabase, runId, listNames);
-    if (residuals.length === 0) return 0;
+// ─── residual LLM matching ─────────────────────────────────────────
+async function runMatchingLLM(
+    pending: VocabRow[],
+    leaves: DiscoveredBucket[],
+    runId: string
+): Promise<{ rows: any[]; costUsd: number }> {
+    if (pending.length === 0) return { rows: [], costUsd: 0 };
 
-    // Pull sample context for each residual industry — counts + sample
-    // companies/reasoning to give the LLM enough signal to bucket well.
-    const samplesByIndustry = await getSamplesForIndustries(supabase, residuals, listNames);
+    const validLeafNames = new Set(leaves.map(l => l.bucket_name));
+    const ancestorByLeaf = new Map(leaves.map(l => [l.bucket_name, l.direct_ancestor || '']));
+    const rootByLeaf = new Map(leaves.map(l => [l.bucket_name, l.root_category || '']));
 
-    const bucketsForPrompt = buckets.map(b => ({ name: b.name, definition: b.definition || b.name }));
-    const limit = pLimit(CONCURRENCY_AI);
+    // Bucket reference (the cacheable prefix)
+    const bucketReferenceJson = JSON.stringify(leaves.map(l => ({
+        bucket_name: l.bucket_name,
+        description: l.description,
+        direct_ancestor: l.direct_ancestor,
+        root_category: l.root_category,
+        include: l.include || [],
+        exclude: l.exclude || [],
+        example_strings: (l.example_strings || []).slice(0, 6)
+    })));
 
-    const batches: string[][] = [];
-    for (let i = 0; i < residuals.length; i += RESIDUAL_BATCH_SIZE) {
-        batches.push(residuals.slice(i, i + RESIDUAL_BATCH_SIZE));
+    const limit = pLimit(MATCH_CONCURRENCY);
+    const batches: VocabRow[][] = [];
+    for (let i = 0; i < pending.length; i += MATCH_BATCH_SIZE) {
+        batches.push(pending.slice(i, i + MATCH_BATCH_SIZE));
     }
 
     let totalCost = 0;
-    const allInserts: any[] = [];
+    const rows: any[] = [];
+    const rowsLock: any[] = []; // not actually needed since pushes are JS-atomic, but kept for clarity
 
     await Promise.all(batches.map(batch => limit(async () => {
-        const labelPayload = batch.map(ind => {
-            const s = samplesByIndustry.get(ind);
-            return {
-                industry: ind,
-                count: s?.n ?? 0,
-                sample_companies: s?.sample_companies?.slice(0, 3) || [],
-                sample_reasoning: (s?.sample_reasoning?.[0] || '').slice(0, 200)
-            };
-        });
-
-        const { results, costUsd } = await classifyResidualBatch(labelPayload, bucketsForPrompt, allowedNames);
+        const { results, costUsd } = await classifyBatch(batch, bucketReferenceJson, validLeafNames);
         totalCost += costUsd;
-
-        for (const r of results) {
-            // Validate: if confidence < 6 or unknown bucket, route to "Other"
-            // by inserting an industry→Other mapping. The deterministic
-            // fan-out re-run picks it up.
-            const isValid = allowedNames.has(r.bucket_name) && (r.confidence ?? 0) >= 6;
-            allInserts.push({
+        for (let i = 0; i < batch.length; i++) {
+            const ind = batch[i].industry;
+            const r = results[i] || makeFallbackChain();
+            const leafOk = r.bucket_1.name && validLeafNames.has(r.bucket_1.name) && r.bucket_1.score >= 0.55;
+            const leafName = leafOk ? r.bucket_1.name : '';
+            const ancestor = leafOk ? (ancestorByLeaf.get(leafName) || r.bucket_2.name) : (r.bucket_2.name || '');
+            const root = leafOk ? (rootByLeaf.get(leafName) || r.bucket_3.name) : (r.bucket_3.name || '');
+            rows.push({
                 bucketing_run_id: runId,
-                industry_string: r.industry,
-                bucket_name: isValid ? r.bucket_name : RESERVED_OTHER,
-                source: 'llm_phase2',
-                confidence: Number(((r.confidence ?? 0) / 10).toFixed(2))
+                industry_string: ind,
+                bucket_name: leafName || (r.disqualified ? RESERVED_DISQUALIFIED : RESERVED_GENERIC), // pre-rollup placeholder
+                source: 'llm_phase1b',
+                confidence: Number((r.bucket_1.score || 0).toFixed(2)),
+                bucket_leaf: leafName,
+                bucket_ancestor: ancestor,
+                bucket_root: root,
+                leaf_score: r.bucket_1.score,
+                ancestor_score: r.bucket_2.score,
+                root_score: r.bucket_3.score,
+                is_generic: !!r.generic && !leafOk,
+                is_disqualified: !!r.disqualified,
+                reasons: {
+                    leaf: r.bucket_1.reason,
+                    ancestor: r.bucket_2.reason,
+                    root: r.bucket_3.reason
+                }
             });
         }
     })));
 
-    if (allInserts.length > 0) {
-        for (let i = 0; i < allInserts.length; i += 1000) {
-            const chunk = allInserts.slice(i, i + 1000);
-            const { error } = await supabase.from('bucket_industry_map')
-                .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
-            if (error) throw new Error(`llm phase2 map insert failed: ${error.message}`);
-        }
-    }
-    return totalCost;
+    return { rows, costUsd: totalCost };
 }
 
-interface BatchClassifyResult {
-    industry: string;
-    bucket_name: string;
-    confidence: number;
-    rationale?: string;
+function makeFallbackChain(): MatchChain {
+    return {
+        bucket_1: { name: '', score: 0, reason: 'fallback' },
+        bucket_2: { name: '', score: 0, reason: 'fallback' },
+        bucket_3: { name: '', score: 0, reason: 'fallback' },
+        generic: true,
+        disqualified: false
+    };
 }
 
-async function classifyResidualBatch(
-    labels: { industry: string; count: number; sample_companies: string[]; sample_reasoning: string }[],
-    buckets: { name: string; definition: string }[],
-    allowedNames: Set<string>
-): Promise<{ results: BatchClassifyResult[]; costUsd: number }> {
-    const systemPrompt = `Assign each industry label to exactly one bucket from the provided list. Use confidence 1–10. If no bucket fits with confidence >= 6, use "Other". Do not invent bucket names. Return strict JSON.`;
+async function classifyBatch(
+    batch: VocabRow[],
+    bucketReferenceJson: string,
+    validLeafNames: Set<string>
+): Promise<{ results: MatchChain[]; costUsd: number }> {
+    const systemPrompt = `${PROJECT_CONTEXT}
 
-    const userPrompt = `Allowed buckets:\n${buckets.map(b => `- ${b.name}: ${b.definition}`).join('\n')}\n\nIndustries to assign:\n${JSON.stringify(labels, null, 2)}\n\nReturn an "assignments" array with one object per industry: {industry, bucket_name, confidence, rationale}. The bucket_name MUST be one of the allowed bucket names listed above (or "Other").`;
+========================================
+PHASE 1B — BUCKET MATCHING
+========================================
+
+You are matching company classification strings to an existing industry taxonomy.
+This output measures bucket volumes and enables roll-ups via ancestors.
+NOT a creative writing task.
+
+RULES:
+- Base each decision ONLY on the classification string and the bucket definitions.
+- Do not guess what the company does beyond the text.
+- bucket_1 MUST be a LEAF bucket from the BUCKET_REFERENCE.
+- bucket_2 MUST be the direct_ancestor of bucket_1.
+- bucket_3 MUST be the root_category of bucket_1 (if defined), else "".
+- bucket_2_score <= bucket_1_score.
+- bucket_3_score <= bucket_2_score.
+- If no leaf aligns at >= 0.55, leave bucket_1.name empty and set generic=true.
+- Disqualify ONLY for clear ecommerce/DTC physical products, local services tied to
+  geography, brick-and-mortar retail, or low-ticket consumer. Ambiguous → Generic.
+- Reasons: max 18 words each, must cite a phrase from the classification.
+
+Return strict JSON, no prose, no markdown fences.`;
+
+    const userPrompt = `BUCKET_REFERENCE:
+${bucketReferenceJson}
+
+COMPANIES_TO_CLASSIFY (array of classification strings, in order):
+${JSON.stringify(batch.map(b => b.industry))}
+
+Return JSON: { "assignments": [<one object per company in the same order>] }
+Each assignment object:
+{
+  "bucket_1": {"name": "<leaf or empty>", "score": 0.00, "reason": ""},
+  "bucket_2": {"name": "<ancestor or empty>", "score": 0.00, "reason": ""},
+  "bucket_3": {"name": "<root or empty>", "score": 0.00, "reason": ""},
+  "generic": false,
+  "disqualified": false
+}`;
 
     const schema = {
         type: 'object',
@@ -753,13 +941,13 @@ async function classifyResidualBatch(
                 items: {
                     type: 'object',
                     additionalProperties: false,
-                    // strict=true: every property must be in required
-                    required: ['industry', 'bucket_name', 'confidence', 'rationale'],
+                    required: ['bucket_1', 'bucket_2', 'bucket_3', 'generic', 'disqualified'],
                     properties: {
-                        industry: { type: 'string' },
-                        bucket_name: { type: 'string' },
-                        confidence: { type: 'number' },
-                        rationale: { type: 'string' }
+                        bucket_1: chainItemSchema(),
+                        bucket_2: chainItemSchema(),
+                        bucket_3: chainItemSchema(),
+                        generic: { type: 'boolean' },
+                        disqualified: { type: 'boolean' }
                     }
                 }
             }
@@ -772,19 +960,16 @@ async function classifyResidualBatch(
         try {
             const res = await fetch('https://api.openai.com/v1/chat/completions', {
                 method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${getOpenAIKey()}`,
-                    'Content-Type': 'application/json'
-                },
+                headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    model: RESIDUAL_MODEL,
+                    model: MATCH_MODEL,
                     messages: [
                         { role: 'system', content: systemPrompt },
                         { role: 'user', content: userPrompt }
                     ],
                     response_format: {
                         type: 'json_schema',
-                        json_schema: { name: 'residual_assignments', strict: true, schema }
+                        json_schema: { name: 'phase1b_match', strict: true, schema }
                     },
                     temperature: 0.1
                 }),
@@ -792,83 +977,69 @@ async function classifyResidualBatch(
             });
             if (!res.ok) {
                 const body = await res.text().catch(() => '');
-                throw new Error(`residual classify ${res.status}: ${body.slice(0, 300)}`);
+                throw new Error(`match ${res.status}: ${body.slice(0, 300)}`);
             }
             const data = await res.json();
             const text = data.choices?.[0]?.message?.content;
             const parsed = JSON.parse(text);
             const usage = data.usage || {};
-            const costUsd = computeCost(RESIDUAL_MODEL, usage.prompt_tokens || 0, usage.completion_tokens || 0);
-            return { assignments: parsed.assignments as BatchClassifyResult[], costUsd };
+            const cached = usage.prompt_tokens_details?.cached_tokens || 0;
+            const uncached = (usage.prompt_tokens || 0) - cached;
+            const costUsd = computeOpenAICost(MATCH_MODEL, uncached, cached, usage.completion_tokens || 0);
+            return { assignments: parsed.assignments as MatchChain[], costUsd };
         } finally {
             clearTimeout(t);
         }
     };
 
-    let { assignments, costUsd } = await callOnce();
-
-    // Drift guard: if any returned bucket isn't in the allowed set, retry once
-    // with the same prompt — usually corrects on retry. Else those rows fall
-    // through to the "<6 confidence" check downstream and route to Other.
-    const bad = assignments.filter(a => a.bucket_name !== RESERVED_OTHER && !allowedNames.has(a.bucket_name));
-    if (bad.length > 0) {
-        const retried = await callOnce();
-        assignments = retried.assignments;
-        costUsd += retried.costUsd;
+    let result;
+    try {
+        result = await callOnce();
+    } catch (err) {
+        // Retry once on transient failure
+        result = await callOnce();
     }
 
-    return { results: assignments, costUsd };
-}
-
-// ───── Step 4: catch-all Other sweep ─────
-async function catchAllOther(
-    supabase: SupabaseClient,
-    runId: string,
-    _listNames: string[]
-): Promise<number> {
-    const { data, error } = await supabase.rpc('bucketing_catchall_other', { p_run_id: runId });
-    if (error) throw new Error(`catchall Other failed: ${error.message}`);
-    return Number(data || 0);
-}
-
-// ───── helpers ─────
-
-async function getResidualIndustries(
-    supabase: SupabaseClient,
-    runId: string,
-    listNames: string[]
-): Promise<string[]> {
-    // Distinct industries in the selected lists that don't yet have a map row.
-    // We can't express NOT EXISTS in PostgREST cleanly, so we fetch both sets
-    // and diff client-side. Use the paginated vocabulary fetcher so we don't
-    // silently cap at 1000 residuals — on long-tail lists that truncation
-    // would leave tens of thousands of contacts stranded at Phase 2.
-    const vocab = await fetchFullVocabulary(supabase, listNames);
-
-    const { data: mapRows, error: mErr } = await supabase
-        .from('bucket_industry_map').select('industry_string')
-        .eq('bucketing_run_id', runId);
-    if (mErr) throw new Error(`map read failed: ${mErr.message}`);
-
-    const mapped = new Set((mapRows || []).map((r: any) => r.industry_string));
-    return vocab.map(r => r.industry).filter(ind => !mapped.has(ind));
-}
-
-async function getSamplesForIndustries(
-    supabase: SupabaseClient,
-    industries: string[],
-    listNames: string[]
-): Promise<Map<string, VocabRow>> {
-    const vocab = await fetchFullVocabulary(supabase, listNames);
-    const map = new Map<string, VocabRow>();
-    const wanted = new Set(industries);
-    for (const r of vocab) {
-        if (wanted.has(r.industry)) map.set(r.industry, r);
+    let { assignments, costUsd } = result;
+    // Drift guard: bucket_1.name must be in validLeafNames OR empty
+    const drift = assignments.some(a => a.bucket_1.name && !validLeafNames.has(a.bucket_1.name));
+    if (drift) {
+        try {
+            const retried = await callOnce();
+            assignments = retried.assignments;
+            costUsd += retried.costUsd;
+        } catch { /* keep original */ }
     }
-    return map;
+
+    // Pad/truncate to batch size
+    const padded: MatchChain[] = [];
+    for (let i = 0; i < batch.length; i++) padded.push(assignments[i] || makeFallbackChain());
+    return { results: padded, costUsd };
 }
 
-function computeCost(model: string, promptTokens: number, completionTokens: number): number {
-    const p = PRICING[model] || PRICING['gpt-4.1-mini'];
-    return (promptTokens / 1_000_000) * p.input + (completionTokens / 1_000_000) * p.output;
+function chainItemSchema() {
+    return {
+        type: 'object',
+        additionalProperties: false,
+        required: ['name', 'score', 'reason'],
+        properties: {
+            name: { type: 'string' },
+            score: { type: 'number' },
+            reason: { type: 'string' }
+        }
+    };
+}
+
+// ─── pricing helpers ───────────────────────────────────────────────
+function computeOpenAICost(model: string, uncachedInput: number, cachedInput: number, output: number): number {
+    const p = OPENAI_PRICING[model] || OPENAI_PRICING['gpt-4.1-mini'];
+    const cachedCost = (cachedInput / 1_000_000) * (p.cached_input ?? p.input);
+    const uncachedCost = (uncachedInput / 1_000_000) * p.input;
+    const outCost = (output / 1_000_000) * p.output;
+    return cachedCost + uncachedCost + outCost;
+}
+
+function computeAnthropicCost(model: string, input: number, output: number): number {
+    const p = ANTHROPIC_PRICING[model] || ANTHROPIC_PRICING['claude-sonnet-4-6'];
+    return (input / 1_000_000) * p.input + (output / 1_000_000) * p.output;
 }

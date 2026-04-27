@@ -55,13 +55,18 @@ export type BucketingRunStatus =
   | 'completed'
   | 'failed';
 
+// v2: leaf bucket from Phase 1a, with ancestor chain.
 export interface BucketProposal {
-  name: string;
-  definition: string;
-  personalization_angle?: string;
-  example_industries: string[];
-  estimated_count?: number;
-  parent_bucket?: string;
+  bucket_name: string;
+  description: string;
+  direct_ancestor: string;
+  root_category: string;
+  include?: string[];
+  exclude?: string[];
+  example_strings?: string[];
+  estimated_usage_label?: string;
+  rough_volume_estimate?: string;
+  library_match_id?: string | null;
 }
 
 export interface BucketingRun {
@@ -71,8 +76,9 @@ export interface BucketingRun {
   min_volume: number;
   status: BucketingRunStatus;
   taxonomy_model?: string | null;
-  taxonomy_proposal?: { buckets: BucketProposal[]; residual_note?: string } | null;
-  taxonomy_final?: { buckets: BucketProposal[] } | null;
+  taxonomy_proposal?: { observed_patterns?: string[]; buckets: BucketProposal[] } | null;
+  taxonomy_final?: { observed_patterns?: string[]; buckets: BucketProposal[] } | null;
+  preferred_library_ids?: string[] | null;
   total_contacts?: number | null;
   assigned_contacts?: number | null;
   cost_usd?: number | null;
@@ -80,6 +86,23 @@ export interface BucketingRun {
   created_at: string;
   taxonomy_completed_at?: string | null;
   assignment_completed_at?: string | null;
+}
+
+export interface LibraryBucket {
+  id: string;
+  bucket_name: string;
+  description: string | null;
+  direct_ancestor: string | null;
+  root_category: string | null;
+  include_terms: string[];
+  exclude_terms: string[];
+  example_strings: string[];
+  notes: string | null;
+  times_used: number;
+  last_used_at: string | null;
+  archived: boolean;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface BucketAssignmentRow {
