@@ -10,7 +10,7 @@
  *   - Library  : CRUD for reusable specializations across runs
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Layers, Loader2, AlertCircle, ArrowLeft, Plus, X, Trash2, Download,
   Play, BookMarked, CheckCircle2, Edit3, Archive
@@ -79,7 +79,7 @@ export function BucketingTab({ importLists }: {
     fetchActive();
     if (!activeRun) return;
     if (activeRun.status === 'completed' || activeRun.status === 'failed' || activeRun.status === 'taxonomy_ready') return;
-    const t = setInterval(fetchActive, 2500);
+    const t = setInterval(fetchActive, 1500);
     return () => clearInterval(t);
   }, [activeRunId, activeRun?.status, fetchActive]);
 
@@ -457,6 +457,120 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
 
 // ───── DETAIL ROUTER ──────────────────────────────────────────────
 
+// ───── LIVE PROGRESS PANEL ────────────────────────────────────────
+// Renders the current step, % bar, ETA, and an auto-scrolling tail of
+// log lines. Polls /runs/:id/logs every ~1.5s for new entries.
+
+function BucketingProgressPanel({ run, title }: { run: BucketingRun; title: string }) {
+  const [logs, setLogs] = useState<{ id: number; timestamp: string; level: string; message: string }[]>([]);
+  const [sinceId, setSinceId] = useState(0);
+  const logBoxRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/logs?since=${sinceId}`);
+        const data = await res.json();
+        if (!cancelled && Array.isArray(data.logs) && data.logs.length > 0) {
+          setLogs(prev => [...prev, ...data.logs].slice(-500));
+          setSinceId(data.logs[data.logs.length - 1].id);
+        }
+      } catch { /* swallow polling errors */ }
+    };
+    tick();
+    const t = setInterval(tick, 1500);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [run.id, sinceId]);
+
+  // Auto-scroll on new logs
+  useEffect(() => {
+    if (logBoxRef.current) logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
+  }, [logs]);
+
+  const p = run.progress;
+  const pct = (p && typeof p.pct === 'number') ? p.pct : null;
+  const note = p?.note || 'Working…';
+  const etaTxt = (p && typeof p.eta_seconds === 'number')
+    ? formatDuration(p.eta_seconds)
+    : null;
+  const elapsedTxt = (p && typeof p.elapsed_seconds === 'number')
+    ? formatDuration(p.elapsed_seconds)
+    : null;
+
+  return (
+    <div className="space-y-3">
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-5">
+        <div className="flex items-center gap-3 mb-3">
+          <Loader2 className="w-5 h-5 text-[#3ecf8e] animate-spin" />
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-bold text-white">{title}</div>
+            <div className="text-[11px] text-gray-500 truncate">{note}</div>
+          </div>
+          <div className="text-right shrink-0">
+            <div className="text-2xl font-bold font-mono text-[#3ecf8e]">
+              {pct !== null ? `${pct}%` : '—'}
+            </div>
+            <div className="text-[10px] text-gray-500 uppercase tracking-widest">
+              {etaTxt ? `ETA ${etaTxt}` : (elapsedTxt ? `${elapsedTxt} elapsed` : 'estimating…')}
+            </div>
+          </div>
+        </div>
+        <div className="h-2 bg-[#1c1c1c] rounded-full overflow-hidden">
+          <div
+            className="h-full bg-[#3ecf8e] transition-all duration-300"
+            style={{ width: pct !== null ? `${pct}%` : '0%' }}
+          />
+        </div>
+        {p && (typeof p.current === 'number' || typeof p.total === 'number') && (
+          <div className="text-[10px] font-mono text-gray-500 mt-1.5">
+            step: <span className="text-gray-300">{p.step}</span>
+            {typeof p.current === 'number' && typeof p.total === 'number'
+              ? <> · {p.current.toLocaleString()} / {p.total.toLocaleString()}</>
+              : null}
+            {elapsedTxt && <> · elapsed {elapsedTxt}</>}
+          </div>
+        )}
+      </div>
+
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] overflow-hidden">
+        <div className="px-4 py-2 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between">
+          <span>Live log stream</span>
+          <span className="text-gray-600 normal-case font-normal">{logs.length} lines</span>
+        </div>
+        <div
+          ref={logBoxRef}
+          className="h-72 overflow-y-auto custom-scrollbar font-mono text-[11px] leading-relaxed px-4 py-2 bg-black/30"
+        >
+          {logs.length === 0 ? (
+            <div className="text-gray-600 italic">Waiting for first log line…</div>
+          ) : logs.map(l => {
+            const colour = l.level === 'error' ? 'text-red-400'
+              : l.level === 'warn' ? 'text-amber-400'
+              : l.level === 'phase' ? 'text-[#3ecf8e]'
+              : 'text-gray-300';
+            const time = new Date(l.timestamp).toLocaleTimeString('en-US', { hour12: false });
+            return (
+              <div key={l.id} className={colour}>
+                <span className="text-gray-600">{time}</span> {l.message}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${Math.max(0, seconds)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
 function BucketingDetail({ run, bucketCounts, sectorMix, onRefresh, onError, onLibrarySaved }: {
   run: BucketingRun;
   bucketCounts: any[];
@@ -466,13 +580,7 @@ function BucketingDetail({ run, bucketCounts, sectorMix, onRefresh, onError, onL
   onLibrarySaved: () => void;
 }) {
   if (run.status === 'taxonomy_pending') {
-    return (
-      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-12 text-center">
-        <Loader2 className="w-8 h-8 text-[#3ecf8e] animate-spin mx-auto mb-3" />
-        <p className="text-sm font-bold text-gray-300">Discovering bucket taxonomy…</p>
-        <p className="text-[11px] text-gray-500 mt-1">Phase 1a — one LLM call across the full vocabulary.</p>
-      </div>
-    );
+    return <BucketingProgressPanel run={run} title="Phase 1a — Discovering taxonomy" />;
   }
   if (run.status === 'failed') {
     return (
@@ -485,13 +593,7 @@ function BucketingDetail({ run, bucketCounts, sectorMix, onRefresh, onError, onL
     );
   }
   if (run.status === 'assigning') {
-    return (
-      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-12 text-center">
-        <Loader2 className="w-8 h-8 text-[#3ecf8e] animate-spin mx-auto mb-3" />
-        <p className="text-sm font-bold text-gray-300">Matching contacts to buckets…</p>
-        <p className="text-[11px] text-gray-500 mt-1">Phase 1b — embedding pre-filter + batched LLM matching + volume rollup.</p>
-      </div>
-    );
+    return <BucketingProgressPanel run={run} title="Phase 1b — Matching contacts to buckets" />;
   }
   if (run.status === 'taxonomy_ready') {
     return <BucketingReview run={run} bucketCounts={bucketCounts} onRefresh={onRefresh} onError={onError} />;

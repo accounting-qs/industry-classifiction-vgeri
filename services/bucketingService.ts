@@ -64,6 +64,24 @@ const EMBEDDING_PRICE_PER_1M = 0.02;
 // is_disqualified flag is still tracked per row for audit but no longer
 // drives a separate bucket.
 const RESERVED_GENERAL = 'General';
+
+// Live progress + log surface used by the Bucketing UI. Server.ts builds
+// one of these per run and passes it through the entry points; every step
+// in Phase 1a / Phase 1b reports to it. log() persists to bucketing_run_logs;
+// progress() debounces writes to bucketing_runs.progress so we don't hammer
+// the DB on tight inner loops.
+export interface BucketingCtx {
+    log(msg: string, level?: 'info' | 'warn' | 'error' | 'phase'): void;
+    progress(p: ProgressUpdate): void;
+}
+
+export interface ProgressUpdate {
+    phase: 'phase1a' | 'phase1b' | 'edit_preview';
+    step: string;                 // human-readable, e.g. "library_match"
+    current?: number;             // optional progress counter
+    total?: number;               // optional total for the counter
+    note?: string;                // optional one-line caption
+}
 const RESERVED = new Set([
     'general', 'generic', 'disqualified', 'other'
 ]);
@@ -319,9 +337,10 @@ CRITICAL CONSTRAINTS
 export async function runTaxonomyProposal(
     supabase: SupabaseClient,
     runId: string,
-    log: (msg: string, level?: 'info' | 'warn' | 'error') => void
+    ctx: BucketingCtx
 ): Promise<void> {
-    log(`[Bucketing ${runId}] Phase 1a: starting discovery`);
+    ctx.log(`[Bucketing ${runId}] Phase 1a: starting discovery`, 'phase');
+    ctx.progress({ phase: 'phase1a', step: 'load_vocabulary', note: 'Loading vocabulary from selected lists…' });
 
     const { data: run, error: runErr } = await supabase
         .from('bucketing_runs').select('*').eq('id', runId).single();
@@ -329,7 +348,8 @@ export async function runTaxonomyProposal(
 
     const vocabRows = await fetchFullVocabulary(supabase, run.list_names);
     const totalContacts = vocabRows.reduce((s, r) => s + Number(r.n || 0), 0);
-    log(`[Bucketing ${runId}] vocabulary: ${vocabRows.length} distinct industries, ${totalContacts} contacts`);
+    ctx.log(`[Bucketing ${runId}] vocabulary: ${vocabRows.length} distinct industries, ${totalContacts} contacts`);
+    ctx.progress({ phase: 'phase1a', step: 'vocabulary_loaded', current: vocabRows.length, total: vocabRows.length, note: `${vocabRows.length} distinct industries, ${totalContacts.toLocaleString()} contacts` });
 
     if (vocabRows.length === 0) {
         await supabase.from('bucketing_runs').update({
@@ -366,7 +386,8 @@ export async function runTaxonomyProposal(
     let libraryUsageByBucketId = new Map<string, number>();
 
     if (preferred.length > 0) {
-        log(`[Bucketing ${runId}] Phase 1a step 1/3: library-first match against ${preferred.length} preferred buckets`);
+        ctx.log(`[Bucketing ${runId}] Phase 1a step 1/3: library-first match against ${preferred.length} preferred buckets`, 'phase');
+        ctx.progress({ phase: 'phase1a', step: 'library_match', note: `Matching against ${preferred.length} library buckets…` });
         const libRes = await runLibraryFirstMatch(vocabRows, preferred, [], runId);
         totalCost += libRes.costUsd;
 
@@ -384,15 +405,16 @@ export async function runTaxonomyProposal(
             if (libId) libraryUsageByBucketId.set(libId, (libraryUsageByBucketId.get(libId) || 0) + 1);
         }
         discoveryVocab = libRes.pending;
-        log(`[Bucketing ${runId}] library-matched ${libRes.autoAssigned.length}/${vocabRows.length}, ${discoveryVocab.length} sent to discovery`);
+        ctx.log(`[Bucketing ${runId}] library-matched ${libRes.autoAssigned.length}/${vocabRows.length}, ${discoveryVocab.length} sent to discovery`);
     }
 
     // ── Step B: discovery LLM on residual vocab ───────────────────────
-    log(`[Bucketing ${runId}] Phase 1a step 2/3: discovery LLM on ${discoveryVocab.length} residual industries`);
+    ctx.log(`[Bucketing ${runId}] Phase 1a step 2/3: discovery LLM on ${discoveryVocab.length} residual industries`, 'phase');
+    ctx.progress({ phase: 'phase1a', step: 'discovery_llm', note: `Running discovery LLM (${discoveryVocab.length} residual industries)…` });
     const t0 = Date.now();
     const { discovery, costUsd, modelUsed } = await callDiscoveryLLM(supabase, discoveryVocab, preferred);
     totalCost += costUsd;
-    log(`[Bucketing ${runId}] discovery LLM (${modelUsed}): ${(Date.now() - t0) / 1000}s, $${costUsd.toFixed(4)}, ${discovery.buckets.length} discovered specs`);
+    ctx.log(`[Bucketing ${runId}] discovery LLM (${modelUsed}): ${(Date.now() - t0) / 1000}s, $${costUsd.toFixed(4)}, ${discovery.buckets.length} discovered specs`);
 
     // Normalize primary_identities; drop any reserved names; dedupe.
     const seenIdent = new Set<string>();
@@ -492,7 +514,8 @@ export async function runTaxonomyProposal(
     // industry against every proposed spec; cosine ≥ EMBED_AUTO_THRESHOLD
     // and margin ≥ EMBED_MARGIN write a preview map row.
     const stillPending = vocabRows.filter(r => !libraryMatchedIndustries.has(r.industry));
-    log(`[Bucketing ${runId}] Phase 1a step 3/3: embedding preview against ${leaves.length} specs over ${stillPending.length} pending industries`);
+    ctx.log(`[Bucketing ${runId}] Phase 1a step 3/3: embedding preview against ${leaves.length} specs over ${stillPending.length} pending industries`, 'phase');
+    ctx.progress({ phase: 'phase1a', step: 'preview_embedding', current: 0, total: stillPending.length, note: 'Computing per-spec preview counts via embedding…' });
     const previewRes = await runPreviewEmbedding(stillPending, leaves, sectorVocab, runId);
     totalCost += previewRes.costUsd;
     if (previewRes.rows.length > 0) {
@@ -503,7 +526,7 @@ export async function runTaxonomyProposal(
             if (upErr) throw new Error(`preview embedding insert failed: ${upErr.message}`);
         }
     }
-    log(`[Bucketing ${runId}] preview embedding wrote ${previewRes.rows.length} map rows`);
+    ctx.log(`[Bucketing ${runId}] preview embedding wrote ${previewRes.rows.length} map rows`);
 
     // Final cost + state
     await supabase.from('bucketing_runs').update({
@@ -540,7 +563,8 @@ export async function runTaxonomyProposal(
         }
     }
 
-    log(`[Bucketing ${runId}] Phase 1a done — ${leaves.length} specs (${lockedFromLibrary.length} from library, ${discoveredLeaves.length} discovered), $${totalCost.toFixed(4)}`);
+    ctx.log(`[Bucketing ${runId}] Phase 1a done — ${leaves.length} specs (${lockedFromLibrary.length} from library, ${discoveredLeaves.length} discovered), $${totalCost.toFixed(4)}`, 'phase');
+    ctx.progress({ phase: 'phase1a', step: 'done', current: 1, total: 1, note: `Discovery complete — ${leaves.length} specializations ready for review` });
 }
 
 function dedupe(arr: string[] | undefined): string[] {
@@ -868,7 +892,7 @@ export async function applyTaxonomyEdits(
     supabase: SupabaseClient,
     runId: string,
     edits: TaxonomyEdits,
-    log: (msg: string, level?: 'info' | 'warn' | 'error') => void
+    ctx: BucketingCtx
 ): Promise<void> {
     const { data: run, error } = await supabase.from('bucketing_runs').select('*').eq('id', runId).single();
     if (error || !run) throw new Error(`Run not found: ${error?.message}`);
@@ -926,15 +950,15 @@ export async function applyTaxonomyEdits(
         update.bucket_budget = Math.floor(edits.bucket_budget);
     }
     await supabase.from('bucketing_runs').update(update).eq('id', runId);
-    log(`[Bucketing ${runId}] taxonomy edits applied: ${leaves.length} specializations`);
+    ctx.log(`[Bucketing ${runId}] taxonomy edits applied: ${leaves.length} specializations`);
 
     // Rebuild the preview map so Review counts reflect the edited taxonomy
     // (renames / drops / new specs all change which industries map where).
     // Cheap: one batched embedding call against the run's vocab.
     try {
-        await rebuildPreviewMap(supabase, runId, leaves, proposal.sector_focus_vocabulary || [], run.list_names || [], log);
+        await rebuildPreviewMap(supabase, runId, leaves, proposal.sector_focus_vocabulary || [], run.list_names || [], ctx);
     } catch (e: any) {
-        log(`[Bucketing ${runId}] preview rebuild failed (non-fatal): ${e.message}`, 'warn');
+        ctx.log(`[Bucketing ${runId}] preview rebuild failed (non-fatal): ${e.message}`, 'warn');
     }
 }
 
@@ -944,7 +968,7 @@ async function rebuildPreviewMap(
     leaves: DiscoveredBucket[],
     sectorVocab: string[],
     listNames: string[],
-    log: (msg: string, level?: 'info' | 'warn' | 'error') => void
+    ctx: BucketingCtx
 ): Promise<void> {
     if (!Array.isArray(listNames) || listNames.length === 0) return;
     const vocab = await fetchFullVocabulary(supabase, listNames);
@@ -975,7 +999,7 @@ async function rebuildPreviewMap(
             if (error) throw new Error(error.message);
         }
     }
-    log(`[Bucketing ${runId}] preview rebuilt: ${rows.length} rows, $${costUsd.toFixed(4)}`);
+    ctx.log(`[Bucketing ${runId}] preview rebuilt: ${rows.length} rows, $${costUsd.toFixed(4)}`);
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -985,7 +1009,7 @@ async function rebuildPreviewMap(
 export async function runAssignment(
     supabase: SupabaseClient,
     runId: string,
-    log: (msg: string, level?: 'info' | 'warn' | 'error') => void
+    ctx: BucketingCtx
 ): Promise<void> {
     const { data: run, error } = await supabase.from('bucketing_runs').select('*').eq('id', runId).single();
     if (error || !run) throw new Error(`Run not found: ${error?.message}`);
@@ -1015,47 +1039,48 @@ export async function runAssignment(
 
     let totalCost = Number(run.cost_usd || 0);
 
-    log(`[Bucketing ${runId}] step 1/5: load vocabulary`);
+    ctx.log(`[Bucketing ${runId}] step 1/5: load vocabulary`, 'phase');
+    ctx.progress({ phase: 'phase1b', step: 'load_vocabulary', note: 'Loading vocabulary…' });
     const vocab = await fetchFullVocabulary(supabase, run.list_names);
-    log(`[Bucketing ${runId}] ${vocab.length} distinct industries to match`);
+    ctx.log(`[Bucketing ${runId}] ${vocab.length} distinct industries to match`);
+    ctx.progress({ phase: 'phase1b', step: 'vocabulary_loaded', current: vocab.length, total: vocab.length, note: `${vocab.length} distinct industries to match` });
 
     await supabase.from('bucket_industry_map').delete().eq('bucketing_run_id', runId);
 
     let assignedRows: any[] = [];
     let pendingIndustries: VocabRow[] = vocab;
 
-    // Step 2 (NEW): library-first deterministic match. Embedding cosine
-    // against library bucket definitions; high-confidence hits are written
-    // immediately as map rows with source='library_match'. This puts saved
-    // institutional knowledge in front of fresh LLM discovery.
+    // Step 2 (NEW): library-first deterministic match.
     if (libraryBuckets.length > 0) {
-        log(`[Bucketing ${runId}] step 2/5: library-first match against ${libraryBuckets.length} preferred buckets`);
+        ctx.log(`[Bucketing ${runId}] step 2/5: library-first match against ${libraryBuckets.length} preferred buckets`, 'phase');
+        ctx.progress({ phase: 'phase1b', step: 'library_match', note: `Matching against ${libraryBuckets.length} library buckets…` });
         const libRes = await runLibraryFirstMatch(vocab, libraryBuckets, sectorVocab, runId);
         totalCost += libRes.costUsd;
         assignedRows = libRes.autoAssigned;
         pendingIndustries = libRes.pending;
-        log(`[Bucketing ${runId}] library matched ${assignedRows.length}/${vocab.length}, ${pendingIndustries.length} pending`);
+        ctx.log(`[Bucketing ${runId}] library matched ${assignedRows.length}/${vocab.length}, ${pendingIndustries.length} pending`);
+        ctx.progress({ phase: 'phase1b', step: 'library_match_done', current: assignedRows.length, total: vocab.length, note: `${assignedRows.length} matched via library, ${pendingIndustries.length} pending` });
     }
 
-    // Step 3: embedding pre-filter against THIS run's discovered specs.
-    // Now sector-aware: we deterministically scan the industry string for
-    // any sector_focus_vocabulary term and tag the resulting row with it,
-    // so combo buckets like "Real Estate SEO Agency" can form even on
-    // embedding-matched rows.
+    // Step 3: sector-aware embedding pre-filter.
     if (EMBED_PREFILTER_ENABLED && pendingIndustries.length > 0) {
-        log(`[Bucketing ${runId}] step 3/5: embedding pre-filter (sector-aware)`);
+        ctx.log(`[Bucketing ${runId}] step 3/5: embedding pre-filter (sector-aware)`, 'phase');
+        ctx.progress({ phase: 'phase1b', step: 'embedding_prefilter', note: `Embedding pre-filter on ${pendingIndustries.length} industries…` });
         const embedRes = await runEmbeddingPrefilter(pendingIndustries, leaves, sectorVocab, runId);
         totalCost += embedRes.costUsd;
         assignedRows = assignedRows.concat(embedRes.autoAssigned);
         pendingIndustries = embedRes.pending;
-        log(`[Bucketing ${runId}] embedding auto-assigned ${embedRes.autoAssigned.length}/${vocab.length}, ${pendingIndustries.length} still pending`);
+        ctx.log(`[Bucketing ${runId}] embedding auto-assigned ${embedRes.autoAssigned.length}/${vocab.length}, ${pendingIndustries.length} still pending`);
+        ctx.progress({ phase: 'phase1b', step: 'embedding_prefilter_done', current: vocab.length - pendingIndustries.length, total: vocab.length, note: `${embedRes.autoAssigned.length} matched via embedding, ${pendingIndustries.length} still pending LLM` });
     }
 
-    log(`[Bucketing ${runId}] step 4/5: routing LLM matching`);
-    const llmRes = await runMatchingLLM(pendingIndustries, leaves, sectorVocab, runId);
+    ctx.log(`[Bucketing ${runId}] step 4/5: routing LLM matching`, 'phase');
+    ctx.progress({ phase: 'phase1b', step: 'llm_routing', current: 0, total: pendingIndustries.length, note: `LLM routing on ${pendingIndustries.length} industries…` });
+    const llmRes = await runMatchingLLM(pendingIndustries, leaves, sectorVocab, runId, ctx);
     totalCost += llmRes.costUsd;
     assignedRows = assignedRows.concat(llmRes.rows);
-    log(`[Bucketing ${runId}] LLM matched ${llmRes.rows.length}, total chain rows ${assignedRows.length}, cost so far $${totalCost.toFixed(4)}`);
+    ctx.log(`[Bucketing ${runId}] LLM matched ${llmRes.rows.length}, total chain rows ${assignedRows.length}, cost so far $${totalCost.toFixed(4)}`);
+    ctx.progress({ phase: 'phase1b', step: 'llm_routing_done', current: vocab.length, total: vocab.length, note: `LLM matched ${llmRes.rows.length} industries, $${totalCost.toFixed(4)} spent` });
 
     if (assignedRows.length > 0) {
         for (let i = 0; i < assignedRows.length; i += 1000) {
@@ -1066,7 +1091,8 @@ export async function runAssignment(
         }
     }
 
-    log(`[Bucketing ${runId}] step 5/5: volume rollup + fan-out`);
+    ctx.log(`[Bucketing ${runId}] step 5/5: volume rollup + fan-out`, 'phase');
+    ctx.progress({ phase: 'phase1b', step: 'rollup_fanout', note: 'Computing campaign buckets and writing per-contact assignments…' });
     const { error: rollupErr } = await supabase.rpc('bucketing_apply_volume_rollup', { p_run_id: runId });
     if (rollupErr) throw new Error(`volume rollup failed: ${rollupErr.message}`);
 
@@ -1074,7 +1100,7 @@ export async function runAssignment(
     const { data: fanoutCount, error: fanErr } = await supabase
         .rpc('bucketing_deterministic_fanout', { p_run_id: runId });
     if (fanErr) throw new Error(`fanout failed: ${fanErr.message}`);
-    log(`[Bucketing ${runId}] fan-out wrote ${Number(fanoutCount || 0)} assignments`);
+    ctx.log(`[Bucketing ${runId}] fan-out wrote ${Number(fanoutCount || 0)} assignments`);
 
     const { error: catchErr } = await supabase.rpc('bucketing_catchall_other', { p_run_id: runId });
     if (catchErr) throw new Error(`catch-all failed: ${catchErr.message}`);
@@ -1091,7 +1117,8 @@ export async function runAssignment(
         assignment_completed_at: new Date().toISOString()
     }).eq('id', runId);
 
-    log(`[Bucketing ${runId}] DONE — ${assignedCount} contacts assigned, total cost $${totalCost.toFixed(4)}`);
+    ctx.log(`[Bucketing ${runId}] DONE — ${assignedCount} contacts assigned, total cost $${totalCost.toFixed(4)}`, 'phase');
+    ctx.progress({ phase: 'phase1b', step: 'done', current: 1, total: 1, note: `Assigned ${assignedCount?.toLocaleString()} contacts — total cost $${totalCost.toFixed(4)}` });
 }
 
 // ─── sector_focus extraction (deterministic) ───────────────────────
@@ -1373,7 +1400,8 @@ async function runMatchingLLM(
     pending: VocabRow[],
     leaves: DiscoveredBucket[],
     sectorVocab: string[],
-    runId: string
+    runId: string,
+    ctx?: BucketingCtx
 ): Promise<{ rows: any[]; costUsd: number }> {
     if (pending.length === 0) return { rows: [], costUsd: 0 };
 
@@ -1411,13 +1439,26 @@ async function runMatchingLLM(
     }
 
     let totalCost = 0;
+    let completedBatches = 0;
     const rows: any[] = [];
+    const totalBatches = batches.length;
 
     await Promise.all(batches.map(batch => limit(async () => {
         const { results, costUsd } = await classifyBatch(
             batch, bucketReferenceJson, sectorVocab, validSpecNames, validIdentityNames
         );
         totalCost += costUsd;
+        completedBatches++;
+        if (ctx) {
+            const completedItems = Math.min(pending.length, completedBatches * MATCH_BATCH_SIZE);
+            ctx.progress({
+                phase: 'phase1b',
+                step: 'llm_routing',
+                current: completedItems,
+                total: pending.length,
+                note: `LLM batch ${completedBatches}/${totalBatches} done (${completedItems}/${pending.length} industries)`
+            });
+        }
         for (let i = 0; i < batch.length; i++) {
             const ind = batch[i].industry;
             const r = results[i] || makeFallbackChain();

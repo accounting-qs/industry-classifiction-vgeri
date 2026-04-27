@@ -1360,6 +1360,58 @@ const bucketingLog = (msg: string, level: 'info' | 'warn' | 'error' = 'info') =>
     addServerLog(msg, 'Bucketing', level === 'info' ? 'info' : level);
 };
 
+// Build a per-run BucketingCtx that the bucketing service uses to emit
+// live logs and progress. Logs are persisted to bucketing_run_logs and
+// also relayed to the global pipeline_logs stream. Progress writes are
+// throttled (one DB write per ~700ms) so tight loops don't spam Supabase.
+function buildBucketingCtx(runId: string) {
+    let lastWrite = 0;
+    let pending: any = null;
+    const startTime = Date.now();
+    const phaseStartedAt = new Map<string, number>();
+
+    const flush = async () => {
+        if (!pending) return;
+        const snap = pending; pending = null;
+        const elapsed = (Date.now() - (phaseStartedAt.get(snap.phase) || startTime)) / 1000;
+        const pct = (typeof snap.total === 'number' && snap.total > 0 && typeof snap.current === 'number')
+            ? Math.min(100, Math.round((snap.current / snap.total) * 100))
+            : null;
+        const eta = (typeof snap.current === 'number' && snap.current > 0
+                && typeof snap.total === 'number' && snap.total > snap.current
+                && elapsed > 1)
+            ? Math.round((elapsed / snap.current) * (snap.total - snap.current))
+            : null;
+        try {
+            await supabase.from('bucketing_runs').update({
+                progress: { ...snap, pct, eta_seconds: eta, elapsed_seconds: Math.round(elapsed), updated_at: new Date().toISOString() }
+            }).eq('id', runId);
+        } catch (e) { /* swallow — progress is best-effort */ }
+    };
+
+    return {
+        log: (msg: string, level: 'info' | 'warn' | 'error' | 'phase' = 'info') => {
+            bucketingLog(msg, level === 'phase' ? 'info' : level);
+            // Append to per-run log stream — fire-and-forget.
+            supabase.from('bucketing_run_logs').insert({
+                bucketing_run_id: runId,
+                level,
+                message: msg
+            }).then(({ error }) => {
+                if (error) console.warn('[bucketing_run_logs] write failed:', error.message);
+            });
+        },
+        progress: (p: any) => {
+            if (!phaseStartedAt.has(p.phase)) phaseStartedAt.set(p.phase, Date.now());
+            pending = { ...(pending || {}), ...p };
+            const now = Date.now();
+            if (now - lastWrite < 700) return;
+            lastWrite = now;
+            flush();
+        }
+    };
+}
+
 // Create a new run + fire taxonomy proposal in the background.
 app.post('/api/bucketing/determine', async (req, res) => {
     const { name, list_names, min_volume, bucket_budget, preferred_library_ids } = req.body || {};
@@ -1381,7 +1433,7 @@ app.post('/api/bucketing/determine', async (req, res) => {
 
         // Fire-and-forget taxonomy build. Errors land on the run row, not the
         // response — the client already has the run id from this 202.
-        runTaxonomyProposal(supabase, data.id, bucketingLog).catch(async (err: any) => {
+        runTaxonomyProposal(supabase, data.id, buildBucketingCtx(data.id)).catch(async (err: any) => {
             console.error(`[Bucketing] Taxonomy failed for ${data.id}:`, err);
             await supabase.from('bucketing_runs').update({
                 status: 'failed',
@@ -1463,7 +1515,7 @@ app.patch('/api/bucketing/runs/:id/taxonomy', async (req, res) => {
     const id = req.params.id;
     const { keep, rename, add, min_volume, bucket_budget } = req.body || {};
     try {
-        await applyTaxonomyEdits(supabase, id, { keep, rename, add, min_volume, bucket_budget }, bucketingLog);
+        await applyTaxonomyEdits(supabase, id, { keep, rename, add, min_volume, bucket_budget }, buildBucketingCtx(id));
         const { data: run } = await supabase
             .from('bucketing_runs').select('*').eq('id', id).single();
         const { data: counts } = await supabase
@@ -1488,7 +1540,7 @@ app.post('/api/bucketing/runs/:id/assign', async (req, res) => {
             return res.status(400).json({ error: `Cannot assign from status: ${run.status}` });
         }
 
-        runAssignment(supabase, id, bucketingLog).catch(async (err: any) => {
+        runAssignment(supabase, id, buildBucketingCtx(id)).catch(async (err: any) => {
             console.error(`[Bucketing] Assignment failed for ${id}:`, err);
             await supabase.from('bucketing_runs').update({
                 status: 'failed',
@@ -1497,6 +1549,27 @@ app.post('/api/bucketing/runs/:id/assign', async (req, res) => {
         });
 
         res.status(202).json({ ok: true, id });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Live log stream for a run. UI passes ?since=<last_id> to get only new
+// rows since the previous poll. Returns up to 500 entries per call.
+app.get('/api/bucketing/runs/:id/logs', async (req, res) => {
+    const id = req.params.id;
+    const sinceParam = req.query.since ? Number(req.query.since) : 0;
+    const since = Number.isFinite(sinceParam) ? sinceParam : 0;
+    try {
+        const { data, error } = await supabase
+            .from('bucketing_run_logs')
+            .select('id,timestamp,level,message')
+            .eq('bucketing_run_id', id)
+            .gt('id', since)
+            .order('id', { ascending: true })
+            .limit(500);
+        if (error) return res.status(500).json({ error: error.message });
+        res.json({ logs: data || [] });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }

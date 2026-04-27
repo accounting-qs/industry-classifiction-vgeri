@@ -90,6 +90,18 @@ export interface TaxonomyDoc {
   buckets: BucketProposal[];
 }
 
+export interface BucketingProgress {
+  phase: 'phase1a' | 'phase1b' | 'edit_preview';
+  step: string;
+  current?: number | null;
+  total?: number | null;
+  pct?: number | null;
+  eta_seconds?: number | null;
+  elapsed_seconds?: number | null;
+  note?: string | null;
+  updated_at?: string | null;
+}
+
 export interface BucketingRun {
   id: string;
   name: string;
@@ -104,10 +116,18 @@ export interface BucketingRun {
   total_contacts?: number | null;
   assigned_contacts?: number | null;
   cost_usd?: number | null;
+  progress?: BucketingProgress | null;
   error_message?: string | null;
   created_at: string;
   taxonomy_completed_at?: string | null;
   assignment_completed_at?: string | null;
+}
+
+export interface BucketingLogEntry {
+  id: number;
+  timestamp: string;
+  level: 'info' | 'warn' | 'error' | 'phase';
+  message: string;
 }
 
 export interface LibraryBucket {
