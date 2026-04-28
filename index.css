@@ -1,0 +1,152 @@
+/* Theme variables and the light-mode override shim.
+ *
+ * Why a shim instead of dark: variants or tokens-on-every-class:
+ * Tailwind here is loaded from the CDN at runtime, so there is no build
+ * step that could compile dark: variants, and the JSX already carries
+ * ~600 hardcoded arbitrary-color tokens (`bg-[#0e0e0e]`, `text-gray-300`,
+ * etc.) across three files. Each token compiles to a stable selector, so
+ * we can flip the whole app to light by attaching one override per
+ * distinct token, scoped to `:root[data-theme="light"]`. Brand green and
+ * status colors (amber, red) are intentionally untouched — they read on
+ * both backgrounds.
+ *
+ * Adding a new neutral hex to the JSX? Add a matching override here.
+ */
+
+:root {
+  --bg-deepest: #0e0e0e;
+  --bg-surface: #1c1c1c;
+  --bg-deep: #161616;
+  --bg-elevated: #2e2e2e;
+  --bg-elevated-2: #3e3e3e;
+  --bg-elevated-3: #242424;
+  --bg-variant: #222;
+  --bg-variant-2: #1e1e1e;
+  --bg-darkest: #111;
+  --border: #2e2e2e;
+  --border-strong: #333;
+  --border-elevated: #3e3e3e;
+  --text-primary: #ededed;
+  --text-on-surface: #ffffff;
+  --text-secondary: #d1d5db;
+  --text-tertiary: #9ca3af;
+  --text-muted: #6b7280;
+  --text-faint: #4b5563;
+  --text-faintest: #374151;
+  --placeholder: #4b5563;
+  --hover-overlay: rgba(255, 255, 255, 0.05);
+  --hover-overlay-strong: rgba(255, 255, 255, 0.1);
+  --body-bg: #1c1c1c;
+  --scrollbar-track: #1e293b;
+  --scrollbar-thumb: #475569;
+}
+
+:root[data-theme="light"] {
+  --bg-deepest: #ffffff;
+  --bg-surface: #f8fafc;
+  --bg-deep: #f1f5f9;
+  --bg-elevated: #e5e7eb;
+  --bg-elevated-2: #d1d5db;
+  --bg-elevated-3: #e2e8f0;
+  --bg-variant: #f1f5f9;
+  --bg-variant-2: #f8fafc;
+  --bg-darkest: #ffffff;
+  --border: #e5e7eb;
+  --border-strong: #d1d5db;
+  --border-elevated: #cbd5e1;
+  --text-primary: #0f172a;
+  --text-on-surface: #0f172a;
+  --text-secondary: #1f2937;
+  --text-tertiary: #374151;
+  --text-muted: #4b5563;
+  --text-faint: #6b7280;
+  --text-faintest: #94a3b8;
+  --placeholder: #94a3b8;
+  --hover-overlay: rgba(15, 23, 42, 0.05);
+  --hover-overlay-strong: rgba(15, 23, 42, 0.1);
+  --body-bg: #f8fafc;
+  --scrollbar-track: #e5e7eb;
+  --scrollbar-thumb: #94a3b8;
+}
+
+body {
+  background-color: var(--body-bg);
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * Light-theme override shim. Each rule maps a Tailwind arbitrary-color
+ * class to its light-mode CSS variable so existing JSX picks up the new
+ * theme without edits.
+ * ───────────────────────────────────────────────────────────────── */
+
+/* Surfaces */
+:root[data-theme="light"] .bg-\[\#0e0e0e\] { background-color: var(--bg-deepest) !important; }
+:root[data-theme="light"] .bg-\[\#1c1c1c\] { background-color: var(--bg-surface) !important; }
+:root[data-theme="light"] .bg-\[\#161616\] { background-color: var(--bg-deep) !important; }
+:root[data-theme="light"] .bg-\[\#2e2e2e\] { background-color: var(--bg-elevated) !important; }
+:root[data-theme="light"] .bg-\[\#1e1e1e\] { background-color: var(--bg-variant-2) !important; }
+:root[data-theme="light"] .bg-\[\#222\]    { background-color: var(--bg-variant) !important; }
+:root[data-theme="light"] .bg-\[\#111\]    { background-color: var(--bg-darkest) !important; }
+
+/* Hover surfaces */
+:root[data-theme="light"] .hover\:bg-\[\#2e2e2e\]:hover { background-color: var(--bg-elevated) !important; }
+:root[data-theme="light"] .hover\:bg-\[\#3e3e3e\]:hover { background-color: var(--bg-elevated-2) !important; }
+:root[data-theme="light"] .hover\:bg-\[\#0e0e0e\]:hover { background-color: var(--bg-deepest) !important; }
+:root[data-theme="light"] .hover\:bg-\[\#242424\]:hover { background-color: var(--bg-elevated-3) !important; }
+
+/* White-tint hover overlays read as "lighten" on dark; on light we need
+ * "darken" or they vanish. Map every observed alpha to a dark equivalent. */
+:root[data-theme="light"] .hover\:bg-white\/\[0\.02\]:hover { background-color: rgba(15, 23, 42, 0.04) !important; }
+:root[data-theme="light"] .hover\:bg-white\/5:hover         { background-color: rgba(15, 23, 42, 0.05) !important; }
+:root[data-theme="light"] .hover\:bg-white\/10:hover        { background-color: rgba(15, 23, 42, 0.07) !important; }
+:root[data-theme="light"] .bg-white\/\[0\.02\]              { background-color: rgba(15, 23, 42, 0.04) !important; }
+
+/* Borders */
+:root[data-theme="light"] .border-\[\#2e2e2e\] { border-color: var(--border) !important; }
+:root[data-theme="light"] .border-\[\#3e3e3e\] { border-color: var(--border-elevated) !important; }
+:root[data-theme="light"] .border-\[\#333\]    { border-color: var(--border-strong) !important; }
+:root[data-theme="light"] .divide-\[\#2e2e2e\] > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--border) !important;
+}
+
+/* Text — fixed-color whites/named grays flip to dark text on light. */
+:root[data-theme="light"] .text-white       { color: var(--text-primary) !important; }
+:root[data-theme="light"] .text-\[\#ededed\] { color: var(--text-primary) !important; }
+:root[data-theme="light"] .hover\:text-white:hover { color: var(--text-primary) !important; }
+
+:root[data-theme="light"] .text-gray-200 { color: var(--text-secondary) !important; }
+:root[data-theme="light"] .text-gray-300 { color: var(--text-secondary) !important; }
+:root[data-theme="light"] .text-gray-400 { color: var(--text-tertiary) !important; }
+:root[data-theme="light"] .text-gray-500 { color: var(--text-muted) !important; }
+:root[data-theme="light"] .text-gray-600 { color: var(--text-faint) !important; }
+:root[data-theme="light"] .text-gray-700 { color: var(--text-faintest) !important; }
+
+:root[data-theme="light"] .hover\:text-gray-300:hover { color: var(--text-secondary) !important; }
+:root[data-theme="light"] .hover\:text-gray-400:hover { color: var(--text-tertiary) !important; }
+:root[data-theme="light"] .hover\:text-gray-500:hover { color: var(--text-muted) !important; }
+
+/* Borders/backgrounds in the gray scale */
+:root[data-theme="light"] .border-gray-400 { border-color: var(--text-tertiary) !important; }
+:root[data-theme="light"] .border-gray-500 { border-color: var(--text-muted) !important; }
+:root[data-theme="light"] .border-gray-600 { border-color: var(--text-faint) !important; }
+:root[data-theme="light"] .hover\:border-gray-400:hover { border-color: var(--text-tertiary) !important; }
+:root[data-theme="light"] .hover\:border-gray-500:hover { border-color: var(--text-muted) !important; }
+:root[data-theme="light"] .hover\:border-gray-600:hover { border-color: var(--text-faint) !important; }
+
+/* Placeholders */
+:root[data-theme="light"] .placeholder-gray-600::placeholder,
+:root[data-theme="light"] .placeholder-gray-600::-webkit-input-placeholder {
+  color: var(--placeholder) !important;
+}
+:root[data-theme="light"] .placeholder-gray-700::placeholder,
+:root[data-theme="light"] .placeholder-gray-700::-webkit-input-placeholder {
+  color: var(--placeholder) !important;
+}

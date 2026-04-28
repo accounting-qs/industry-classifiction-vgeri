@@ -47,7 +47,10 @@ import {
   Layers,
   Pencil,
   Check,
-  KeyRound
+  KeyRound,
+  Sun,
+  Moon,
+  Monitor
 } from 'lucide-react';
 
 /**
@@ -65,6 +68,8 @@ interface LogEntry {
   message: string;
   level: 'info' | 'warn' | 'error' | 'phase';
 }
+
+type ThemeChoice = 'light' | 'dark' | 'system';
 
 interface ExportJob {
   id: string;
@@ -93,6 +98,11 @@ export default function App() {
   const [activeFilters, setActiveFilters] = useState<FilterCondition[]>(() => {
     const saved = localStorage.getItem('active_filters_v3');
     return saved ? JSON.parse(saved) : [];
+  });
+
+  const [theme, setTheme] = useState<ThemeChoice>(() => {
+    const saved = localStorage.getItem('qs_theme');
+    return saved === 'light' || saved === 'dark' || saved === 'system' ? saved : 'system';
   });
 
   const [stats, setStats] = useState<BatchStats>({ total: 0, completed: 0, failed: 0, isProcessing: false });
@@ -175,6 +185,20 @@ export default function App() {
     localStorage.setItem('qs_current_page', currentPage.toString());
     localStorage.setItem('qs_page_size', pageSize.toString());
   }, [currentPage, pageSize]);
+
+  useEffect(() => {
+    localStorage.setItem('qs_theme', theme);
+    const mql = window.matchMedia('(prefers-color-scheme: light)');
+    const apply = () => {
+      const resolved = theme === 'system' ? (mql.matches ? 'light' : 'dark') : theme;
+      document.documentElement.dataset.theme = resolved;
+    };
+    apply();
+    if (theme !== 'system') return;
+    // Live-follow OS changes only while in system mode.
+    mql.addEventListener('change', apply);
+    return () => mql.removeEventListener('change', apply);
+  }, [theme]);
 
   const loadData = useCallback(async () => {
     setContactsLoading(true);
@@ -547,8 +571,9 @@ export default function App() {
             <Database className="w-4 h-4" />
             <span>/</span> <span className="text-white font-semibold capitalize">{activeTab}</span>
           </div>
-          <div className="flex items-center gap-3 text-[10px] text-gray-500 font-mono uppercase">
-            gpt-4.1-mini / Background Mode
+          <div className="flex items-center gap-3">
+            <span className="text-[10px] text-gray-500 font-mono uppercase">gpt-4.1-mini / Background Mode</span>
+            <ThemeToggle theme={theme} onChange={setTheme} />
           </div>
         </header>
 
@@ -766,6 +791,59 @@ export default function App() {
           onRenameList={renameImportList}
           onGoToImport={() => { setShowListModal(false); setActiveTab(AppTab.IMPORT); }}
         />
+      )}
+    </div>
+  );
+}
+
+function ThemeToggle({ theme, onChange }: { theme: ThemeChoice; onChange: (t: ThemeChoice) => void }) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, [open]);
+
+  const ActiveIcon = theme === 'light' ? Sun : theme === 'dark' ? Moon : Monitor;
+  const items: { value: ThemeChoice; label: string; Icon: React.ComponentType<{ className?: string }> }[] = [
+    { value: 'light', label: 'Light', Icon: Sun },
+    { value: 'dark', label: 'Dark', Icon: Moon },
+    { value: 'system', label: 'System', Icon: Monitor },
+  ];
+
+  return (
+    <div className="relative" ref={menuRef}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="flex items-center gap-1.5 px-2 py-1 text-gray-300 hover:text-white bg-[#222] hover:bg-[#2e2e2e] rounded-md text-[11px] border border-[#333] transition-colors"
+        title="Theme"
+      >
+        <ActiveIcon className="w-3.5 h-3.5" />
+        <ChevronDown className={`w-3 h-3 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-2 w-36 bg-[#1e1e1e] border border-[#333] rounded-lg shadow-2xl py-1 z-50">
+          {items.map(({ value, label, Icon }) => (
+            <button
+              key={value}
+              onClick={() => { onChange(value); setOpen(false); }}
+              className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-[11px] transition-colors ${
+                theme === value
+                  ? 'bg-[#3ecf8e]/10 text-[#3ecf8e] font-bold'
+                  : 'text-gray-300 hover:bg-[#2e2e2e] hover:text-white'
+              }`}
+            >
+              <Icon className="w-3.5 h-3.5" />
+              <span className="flex-1 text-left">{label}</span>
+              {theme === value && <Check className="w-3 h-3" />}
+            </button>
+          ))}
+        </div>
       )}
     </div>
   );
