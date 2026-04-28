@@ -553,9 +553,33 @@ export async function runTaxonomyProposal(
     // Only `completed` rows go to the LLM. Everything else (scrape_error,
     // unenriched, failed, pending) is a known-bad row and routes straight
     // to the Disqualified bucket without spending a token.
-    const completedVocab = vocabRows.filter(r => (r.enrichment_status || 'completed') === 'completed');
-    const dqVocab = vocabRows.filter(r => (r.enrichment_status || 'completed') !== 'completed');
-    ctx.log(`[Bucketing ${runId}] partition: ${completedVocab.length} taggable, ${dqVocab.length} → Disqualified (failed/missing/scrape_error)`);
+    //
+    // The vocab RPC groups by (industry, enrichment_status), so the same
+    // industry text can appear in two rows if some contacts enriched and
+    // others didn't (e.g. "Wealth Management Services" with 100 completed
+    // + 3 scrape_errors). bucket_industry_map's PK is (run_id, industry),
+    // so we MUST collapse to one row per industry before inserting —
+    // otherwise the upsert hits "ON CONFLICT DO UPDATE command cannot
+    // affect row a second time". A 'completed' row beats anything else
+    // because the LLM tagger has the best signal there; everything else
+    // collapses into a single Disqualified passthrough row.
+    const byIndustry = new Map<string, VocabRow>();
+    for (const v of vocabRows) {
+        const cur = byIndustry.get(v.industry);
+        if (!cur) { byIndustry.set(v.industry, v); continue; }
+        const curIsCompleted = (cur.enrichment_status || 'completed') === 'completed';
+        const newIsCompleted = (v.enrichment_status || 'completed') === 'completed';
+        if (newIsCompleted && !curIsCompleted) {
+            byIndustry.set(v.industry, { ...v, n: Number(cur.n || 0) + Number(v.n || 0) });
+        } else {
+            // Same precedence — accumulate counts so totals stay correct.
+            cur.n = Number(cur.n || 0) + Number(v.n || 0);
+        }
+    }
+    const dedupedVocab = Array.from(byIndustry.values());
+    const completedVocab = dedupedVocab.filter(r => (r.enrichment_status || 'completed') === 'completed');
+    const dqVocab = dedupedVocab.filter(r => (r.enrichment_status || 'completed') !== 'completed');
+    ctx.log(`[Bucketing ${runId}] partition: ${completedVocab.length} taggable, ${dqVocab.length} → Disqualified (failed/missing/scrape_error)${vocabRows.length !== dedupedVocab.length ? ` — ${vocabRows.length - dedupedVocab.length} duplicate (industry, status) rows collapsed` : ''}`);
 
     let totalCost = 0;
     const preMapRows: any[] = [];
@@ -668,13 +692,23 @@ export async function runTaxonomyProposal(
     }
 
     // ── Bulk insert all map rows ─────────────────────────────────────
-    for (let i = 0; i < preMapRows.length; i += 1000) {
-        const chunk = preMapRows.slice(i, i + 1000);
+    // Final dedupe pass — the (run_id, industry_string) PK rejects any
+    // accidental duplicate. Keep the last write (LLM tagging beats
+    // disqualified passthrough since the tagger appends after the DQ
+    // passthrough loop).
+    const dedupedMap = new Map<string, any>();
+    for (const r of preMapRows) dedupedMap.set(r.industry_string, r);
+    const finalRows = Array.from(dedupedMap.values());
+    if (finalRows.length !== preMapRows.length) {
+        ctx.log(`[Bucketing ${runId}] dedupe: ${preMapRows.length} → ${finalRows.length} rows (collapsed ${preMapRows.length - finalRows.length} dup industry strings)`, 'warn');
+    }
+    for (let i = 0; i < finalRows.length; i += 1000) {
+        const chunk = finalRows.slice(i, i + 1000);
         const { error: upErr } = await supabase.from('bucket_industry_map')
             .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
         if (upErr) throw new Error(`bucket_industry_map insert failed: ${upErr.message}`);
     }
-    ctx.log(`[Bucketing ${runId}] wrote ${preMapRows.length} map rows`);
+    ctx.log(`[Bucketing ${runId}] wrote ${finalRows.length} map rows`);
 
     // ── Build a synthetic taxonomy_proposal for the existing UI ──────
     // The Review screen reads taxonomy_proposal.{primary_identities, buckets}
@@ -684,7 +718,7 @@ export async function runTaxonomyProposal(
     const usedIdentitySet = new Set<string>();
     const usedCharByKey = new Map<string, { spec: string; identity: string; description: string }>();
     const usedSectors = new Set<string>();
-    for (const r of preMapRows) {
+    for (const r of finalRows) {
         if (r.identity) usedIdentitySet.add(r.identity);
         if (r.characteristic && r.identity) {
             const key = `${r.identity}::${r.characteristic}`;
@@ -740,7 +774,7 @@ export async function runTaxonomyProposal(
         taxonomy_completed_at: new Date().toISOString()
     }).eq('id', runId);
 
-    ctx.log(`[Bucketing ${runId}] Phase 1a done — tagged ${preMapRows.length} industries (${dqVocab.length} DQ, ${completedVocab.length} via LLM), $${totalCost.toFixed(4)}`, 'phase');
+    ctx.log(`[Bucketing ${runId}] Phase 1a done — tagged ${finalRows.length} industries (${dqVocab.length} DQ, ${completedVocab.length} via LLM), $${totalCost.toFixed(4)}`, 'phase');
     ctx.progress({
         phase: 'phase1a', step: 'done', current: 1, total: 1,
         note: `Tagging complete — ${primaryIdentities.length} identities, ${buckets.length} characteristics, ${usedSectors.size} sectors used`
