@@ -385,15 +385,36 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
           <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">
             Minimum bucket volume
           </label>
-          <input
-            type="number"
-            min={0}
-            value={minVolume}
-            onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
-            className="w-32 px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-sm text-white focus:outline-none focus:border-[#3ecf8e]"
-          />
+          <div className="flex flex-wrap items-center gap-2 mb-2">
+            {[
+              { label: 'Loose', value: 200 },
+              { label: 'Balanced', value: 500 },
+              { label: 'Strict', value: 1000 }
+            ].map(p => (
+              <button
+                key={p.value}
+                type="button"
+                onClick={() => setMinVolume(p.value)}
+                className={`px-3 py-1.5 rounded-md text-xs font-bold border transition ${
+                  minVolume === p.value
+                    ? 'bg-[#3ecf8e] text-black border-[#3ecf8e]'
+                    : 'bg-[#1c1c1c] text-gray-300 border-[#2e2e2e] hover:bg-[#2e2e2e]'
+                }`}
+              >
+                {p.label} ({p.value})
+              </button>
+            ))}
+            <span className="text-[10px] text-gray-500 italic ml-1">or custom:</span>
+            <input
+              type="number"
+              min={0}
+              value={minVolume}
+              onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
+              className="w-24 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
+            />
+          </div>
           <p className="text-[10px] text-gray-500 italic mt-1">
-            Combos / specializations / identities below this roll up. Below identity → "General".
+            Combos / specializations / identities below this roll up. 5 fallback levels: combo → sector_core+spec → spec → functional_core → identity → General.
           </p>
         </div>
         <div>
@@ -1044,24 +1065,31 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
       }
       const csvRows = rows.map(r => ({
         contact_id: r.contact_id,
-        campaign_bucket: r.bucket_name,
-        primary_identity: r.primary_identity || r.bucket_ancestor,
-        functional_specialization: r.functional_specialization || r.bucket_leaf,
-        sector_focus: r.sector_focus,
-        is_generic: r.is_generic,
-        is_disqualified: r.is_disqualified,
-        pre_rollup_bucket: r.pre_rollup_bucket_name,
-        rollup_level: r.rollup_level,
-        general_reason: r.general_reason,
-        source: r.source,
-        confidence: r.confidence,
         email: r.contacts?.email,
         first_name: r.contacts?.first_name,
         last_name: r.contacts?.last_name,
         company_name: r.contacts?.company_name,
         company_website: r.contacts?.company_website,
-        industry: r.contacts?.industry,
         lead_list_name: r.contacts?.lead_list_name,
+        classification_text: r.contacts?.industry,
+        // 5-layer truth schema
+        primary_identity: r.primary_identity || r.bucket_ancestor || '',
+        functional_core: r.functional_core || '',
+        functional_specialization: r.functional_specialization || r.bucket_leaf || '',
+        sector_core: r.sector_core || '',
+        sector_focus: r.sector_focus || '',
+        canonical_classification: r.canonical_classification || '',
+        // Routing decision
+        final_campaign_bucket: r.bucket_name,
+        fallback_level_used: r.rollup_level,
+        pre_rollup_bucket: r.pre_rollup_bucket_name,
+        bucket_reason: r.bucket_reason || r.general_reason || '',
+        classification_reason: r.reasons?.classification_reason || r.reasons?.llm_reason || '',
+        // Status flags
+        generic: r.is_generic,
+        disqualified: r.is_disqualified,
+        confidence_score: r.confidence,
+        source: r.source,
       }));
       const csv = Papa.unparse(csvRows);
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
@@ -1115,6 +1143,37 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
           <ul className="space-y-1 text-xs text-amber-100/80">
             {run.quality_warnings.map((w, i) => <li key={i}>{w}</li>)}
           </ul>
+        </div>
+      )}
+
+      {(run as any).generic_audit && (
+        <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
+          <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-2">Generic Audit</div>
+          {(() => {
+            const audit = (run as any).generic_audit;
+            const reclaimed = Number(audit.reclaimed || 0);
+            const targets: { bucket: string; count: number; from: string }[] = audit.targets || [];
+            return (
+              <div>
+                <div className="text-xs text-gray-300">
+                  {reclaimed > 0
+                    ? <>Reclaimed <span className="font-bold text-[#3ecf8e]">{reclaimed.toLocaleString()}</span> rows from General into <span className="font-bold text-white">{targets.length}</span> bucket{targets.length === 1 ? '' : 's'}.</>
+                    : <span className="text-gray-500">No rows needed reclaiming — General was already minimal.</span>
+                  }
+                </div>
+                {targets.length > 0 && (
+                  <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                    {targets.slice(0, 12).map((t, i) => (
+                      <div key={i} className="px-3 py-2 rounded border border-[#2e2e2e] bg-[#1c1c1c]">
+                        <div className="text-xs font-bold text-white truncate" title={t.bucket}>{t.bucket}</div>
+                        <div className="text-[10px] text-gray-400">+{Number(t.count).toLocaleString()} <span className="text-gray-600">via {t.from}</span></div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
       )}
 
@@ -1656,7 +1715,7 @@ function Phase1aQAQueuePanel({ runId, onError }: { runId: string; onError: (m: s
         className="w-full px-4 py-3 flex items-center justify-between text-left hover:bg-white/[0.02]"
       >
         <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">
-          Low-confidence QA queue ({queue.length})
+          Low-confidence Sonnet decisions ({queue.length}) — inspection only, all rows still bucketed via fallback
         </span>
         <span className="text-[11px] text-gray-500">{open ? 'Hide' : 'Review'}</span>
       </button>

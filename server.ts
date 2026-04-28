@@ -1672,7 +1672,7 @@ app.get('/api/bucketing/runs/:id/contacts', async (req, res) => {
         // PostgREST's embed syntax. Fetch the assignment page first, then
         // hydrate contact fields via a second IN-list query.
         let q: any = supabase.from('bucket_assignments')
-            .select('contact_id,bucket_name,bucket_leaf,bucket_ancestor,bucket_root,primary_identity,functional_specialization,sector_focus,pre_rollup_bucket_name,rollup_level,general_reason,reasons,is_generic,is_disqualified,source,confidence,assigned_at', { count: 'estimated' })
+            .select('contact_id,bucket_name,bucket_leaf,bucket_ancestor,bucket_root,primary_identity,functional_core,functional_specialization,sector_core,sector_focus,canonical_classification,bucket_reason,pre_rollup_bucket_name,rollup_level,general_reason,reasons,is_generic,is_disqualified,source,confidence,assigned_at', { count: 'estimated' })
             .eq('bucketing_run_id', id);
         if (bucket) q = q.eq('bucket_name', bucket);
         q = q.order('assigned_at', { ascending: true })

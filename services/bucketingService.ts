@@ -147,6 +147,8 @@ interface TaxonomyEntry {
     name: string;
     description?: string | null;
     parent_identity?: string | null;     // characteristics only
+    functional_core?: string | null;     // characteristics only — the broad function family
+    sector_core?: string | null;         // sectors only — the broad served-market family
     is_disqualified?: boolean;           // identities only
     synonyms?: string | null;            // sectors only
     created_by?: string;
@@ -164,8 +166,12 @@ interface IndustryTagging {
     industry: string;
     identity: string | null;
     is_new_identity: boolean;
+    functional_core: string | null;
+    is_new_functional_core: boolean;
     characteristic: string | null;
     is_new_characteristic: boolean;
+    sector_core: string | null;
+    is_new_sector_core: boolean;
     sector: string | null;
     is_new_sector: boolean;
     is_disqualified: boolean;
@@ -248,11 +254,15 @@ interface ContactMapRow {
     contact_id: string;
     industry_string: string;
     primary_identity: string;
+    functional_core: string;
     functional_specialization: string;
+    sector_core: string;
     sector_focus: string;
+    canonical_classification: string;
+    bucket_reason: string;
     pre_rollup_bucket_name: string;
     bucket_name: string;
-    rollup_level: 'combo' | 'specialization' | 'identity' | 'general';
+    rollup_level: 'combo' | 'sector_core_specialization' | 'specialization' | 'functional_core' | 'identity' | 'general';
     source: string;
     confidence: number;
     leaf_score: number;
@@ -595,14 +605,19 @@ export async function runTaxonomyProposal(
             source: 'disqualified_passthrough',
             confidence: 0,
             identity: null,
+            functional_core: null,
             characteristic: null,
+            sector_core: null,
             sector: null,
             is_new_identity: false,
+            is_new_functional_core: false,
             is_new_characteristic: false,
+            is_new_sector_core: false,
             is_new_sector: false,
             is_disqualified: true,
             is_generic: false,
             needs_qa: false,
+            canonical_classification: 'Disqualified',
             llm_reason: `enrichment_status=${reason}`,
             // Mirror trigger fills primary_identity/etc; leave nulls so they
             // survive as nulls in the legacy columns too.
@@ -635,14 +650,27 @@ export async function runTaxonomyProposal(
         const identitySet = new Set(snapshot.identities.map(i => i.name));
         const charSet = new Set(snapshot.characteristics.map(c => c.name));
         const sectorSet = new Set(snapshot.sectors.map(s => s.name));
+        const fcSet = new Set<string>();
+        for (const c of snapshot.characteristics) if (c.functional_core) fcSet.add(c.functional_core);
+        const scSet = new Set<string>();
+        for (const sec of snapshot.sectors) if (sec.sector_core) scSet.add(sec.sector_core);
         const dqIdentities = new Set(snapshot.identities.filter(i => i.is_disqualified).map(i => i.name));
+        const charByName = new Map(snapshot.characteristics.map(c => [c.name, c]));
 
         for (const t of tagResult.taggings) {
-            const v = completedVocab.find(c => c.industry === t.industry);
             const conf01 = Math.max(0, Math.min(1, (t.confidence || 0) / 10));
             const lowConf = (t.confidence || 0) < PHASE1A_QA_FLOOR;
             const identityIsDq = !!(t.identity && dqIdentities.has(t.identity));
             const isDisqualified = t.is_disqualified || identityIsDq;
+
+            // Backfill functional_core from the library if the LLM didn't provide
+            // it but we know the mapping for this characteristic. This way the
+            // 5-level rollup always has a core layer to fall back to even when
+            // the model is sloppy.
+            let functionalCore = t.functional_core;
+            if (!functionalCore && t.characteristic) {
+                functionalCore = charByName.get(t.characteristic)?.functional_core || null;
+            }
 
             // Pre-rollup name: characteristic preferred → identity → fallback.
             // The actual final bucket_name is rewritten by the volume rollup
@@ -660,6 +688,13 @@ export async function runTaxonomyProposal(
                 preBucket = RESERVED_GENERAL;
             }
 
+            // Canonical classification: concise truth statement combining the
+            // narrowest available fields. Used for the CSV export.
+            const canonical = isDisqualified
+                ? 'Disqualified'
+                : (t.sector && t.characteristic ? `${t.sector} ${t.characteristic}`
+                    : (t.characteristic || t.identity || 'Generic'));
+
             preMapRows.push({
                 bucketing_run_id: runId,
                 industry_string: t.industry,
@@ -668,14 +703,19 @@ export async function runTaxonomyProposal(
                 source: 'llm_phase1a',
                 confidence: Number(conf01.toFixed(2)),
                 identity: t.identity,
+                functional_core: functionalCore,
                 characteristic: t.characteristic,
+                sector_core: t.sector_core,
                 sector: t.sector,
                 is_new_identity: t.is_new_identity && !identitySet.has(t.identity || ''),
+                is_new_functional_core: t.is_new_functional_core && !fcSet.has(functionalCore || ''),
                 is_new_characteristic: t.is_new_characteristic && !charSet.has(t.characteristic || ''),
+                is_new_sector_core: t.is_new_sector_core && !scSet.has(t.sector_core || ''),
                 is_new_sector: t.is_new_sector && !sectorSet.has(t.sector || ''),
                 is_disqualified: isDisqualified,
                 is_generic: false,
                 needs_qa: lowConf,
+                canonical_classification: canonical,
                 llm_reason: t.reason
             });
 
@@ -862,8 +902,12 @@ async function tagIndustriesWithSonnet(
                     industry: v.industry,
                     identity: null,
                     is_new_identity: false,
+                    functional_core: null,
+                    is_new_functional_core: false,
                     characteristic: null,
                     is_new_characteristic: false,
+                    sector_core: null,
+                    is_new_sector_core: false,
                     sector: null,
                     is_new_sector: false,
                     is_disqualified: false,
@@ -894,26 +938,40 @@ function buildTaggingSystemPrompt(s: TaxonomySnapshot): string {
         `  - ${i.name}${i.is_disqualified ? ' [DQ]' : ''}: ${i.description || ''}`
     ).join('\n');
     const chLines = s.characteristics.map(c =>
-        `  - ${c.name} (under ${c.parent_identity}): ${c.description || ''}`
+        `  - ${c.name} (under ${c.parent_identity}${c.functional_core ? `, core=${c.functional_core}` : ''}): ${c.description || ''}`
     ).join('\n');
     const secLines = s.sectors.map(sec =>
-        `  - ${sec.name}: ${sec.synonyms || sec.description || ''}`
+        `  - ${sec.name}${sec.sector_core ? ` (core=${sec.sector_core})` : ''}: ${sec.synonyms || sec.description || ''}`
     ).join('\n');
+
+    // Build the unique functional_core / sector_core lists for the prompt
+    // so the LLM has a concrete enum to pick from.
+    const fcSet = new Set<string>();
+    for (const c of s.characteristics) if (c.functional_core) fcSet.add(c.functional_core);
+    const scSet = new Set<string>();
+    for (const sec of s.sectors) if (sec.sector_core) scSet.add(sec.sector_core);
+    const fcLines = Array.from(fcSet).sort().map(n => `  - ${n}`).join('\n');
+    const scLines = Array.from(scSet).sort().map(n => `  - ${n}`).join('\n');
 
     return `You are tagging B2B contact industries for outreach segmentation.
 
-For each industry text the user provides, return three independent tags:
+For each industry text the user provides, return five independent tags. The five tags form a layered truth model: identity is broadest, sector is narrowest, with two intermediate "core" layers used as rollup fallbacks.
 
-1. **Identity** (REQUIRED) — what kind of company is it? Pick from the IDENTITY library below. If nothing fits well (you have less than ~6/10 confidence), propose a new identity name and set is_new_identity=true. Identities marked [DQ] mean the company is disqualified for outreach.
+1. **Identity** (REQUIRED) — what kind of company is it at its core? Pick from the IDENTITY library below. If nothing fits well (less than ~6/10 confidence), propose a new identity name and set is_new_identity=true. Identities marked [DQ] mean the company is disqualified for outreach.
 
-2. **Characteristic** (optional) — the more specific subtype within the identity. Pick from the CHARACTERISTICS library below; the parent_identity must match the identity you chose. If nothing fits well, propose a new one and set is_new_characteristic=true. If no characteristic applies, return null.
+2. **Functional core** (REQUIRED when identity is set) — the broad function family this company performs. Pick from the FUNCTIONAL_CORE library below. Each library characteristic shows its core — use that mapping. If you genuinely think a new core is needed, set is_new_functional_core=true. functional_core is broader than characteristic, narrower than identity (e.g. Identity=Agency, functional_core=Marketing Services, characteristic=SEO Agency).
 
-3. **Sector** (optional) — what *vertical* does the company serve? Pick from the SECTOR library below. Sector is independent of identity (a "Marketing Agency serving Healthcare" has identity=Agency, characteristic=Specialty Marketing Agency, sector=Healthcare / Medical). If the company doesn't have a clear served sector (it's a generic service / cross-vertical), return null. If nothing fits, propose new and set is_new_sector=true.
+3. **Characteristic** (optional) — the specific subtype inside the identity. Pick from the CHARACTERISTICS library below; the parent_identity must match the identity you chose. If nothing fits well, propose a new one and set is_new_characteristic=true. If no characteristic applies, return null.
+
+4. **Sector core** (optional) — the broad served-market family. Pick from the SECTOR_CORE library below. sector_core is broader than sector_focus (e.g. sector_core=Healthcare, sector_focus=Healthcare / Medical or Life Sciences & Biotech). Return null if the company has no clear served sector.
+
+5. **Sector** (optional) — the specific vertical the company serves. Pick from the SECTOR library below. Sector is independent of identity (a "Marketing Agency serving Healthcare" has identity=Agency, sector_core=Healthcare, sector=Healthcare / Medical). If the company doesn't have a clear served sector, return null. If nothing fits, propose new and set is_new_sector=true.
 
 CLASSIFICATION RULES (critical):
-- Classify by core business identity FIRST, sector served SECOND. A PE firm focused on healthcare is identity=Financial Services (PE), NOT Healthcare.
-- Operators in a vertical (a hospital, a SaaS company) belong to that identity. Service providers TO that vertical (an agency that markets healthcare, a consultant to insurers) belong to the service identity, with the vertical going into sector.
+- Classify by core business identity FIRST, sector served SECOND. A PE firm focused on healthcare is identity=Financial Services, NOT Healthcare.
+- Operators in a vertical (a hospital, a SaaS company) belong to that identity. Service providers TO that vertical (an agency that markets healthcare, a consultant to insurers) belong to the service identity, with the vertical going into sector_core+sector.
 - If the identity is marked [DQ] in the library OR the company's core business is consumer-facing retail/hospitality/DTC, set is_disqualified=true.
+- functional_core must be consistent with identity. sector_core must be consistent with sector when both are set.
 - confidence is 1-10. <6 means you weren't able to find a confident match.
 
 OUTPUT FORMAT — return ONLY valid JSON, no prose:
@@ -923,8 +981,12 @@ OUTPUT FORMAT — return ONLY valid JSON, no prose:
       "id": <integer matching input id>,
       "identity": "<library name or new>" | null,
       "is_new_identity": <bool>,
+      "functional_core": "<library name or new>" | null,
+      "is_new_functional_core": <bool>,
       "characteristic": "<library name or new>" | null,
       "is_new_characteristic": <bool>,
+      "sector_core": "<library name or new>" | null,
+      "is_new_sector_core": <bool>,
       "sector": "<library name or new>" | null,
       "is_new_sector": <bool>,
       "is_disqualified": <bool>,
@@ -937,8 +999,14 @@ OUTPUT FORMAT — return ONLY valid JSON, no prose:
 == IDENTITY LIBRARY ==
 ${idLines}
 
+== FUNCTIONAL_CORE LIBRARY ==
+${fcLines}
+
 == CHARACTERISTICS LIBRARY ==
 ${chLines}
+
+== SECTOR_CORE LIBRARY ==
+${scLines}
 
 == SECTOR LIBRARY ==
 ${secLines}`;
@@ -963,8 +1031,12 @@ function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
             industry: v.industry,
             identity: nz(item.identity),
             is_new_identity: !!item.is_new_identity,
+            functional_core: nz(item.functional_core),
+            is_new_functional_core: !!item.is_new_functional_core,
             characteristic: nz(item.characteristic),
             is_new_characteristic: !!item.is_new_characteristic,
+            sector_core: nz(item.sector_core),
+            is_new_sector_core: !!item.is_new_sector_core,
             sector: nz(item.sector),
             is_new_sector: !!item.is_new_sector,
             is_disqualified: !!item.is_disqualified,
@@ -1532,7 +1604,38 @@ export async function runAssignment(
     await ctx.checkCancel();
     ctx.log(`[Bucketing ${runId}] step 5/5: contact-level volume rollup + write`, 'phase');
     ctx.progress({ phase: 'phase1b', step: 'rollup_write', note: 'Computing contact-level campaign buckets…' });
-    const rolledRows = computeContactRollup(assignedRows, Number(run.min_volume || 0), Number(run.bucket_budget || 30));
+
+    // Hydrate functional_core + sector_core from the taxonomy library so
+    // the 5-level rollup has the intermediate layers to fall back to.
+    // Phase 1b matchers only carry identity + specialization + sector_focus
+    // — we look up the cores by name here.
+    const hydrateSnapshot = await loadTaxonomySnapshot(supabase);
+    const fcByChar = new Map<string, string>();
+    for (const c of hydrateSnapshot.characteristics) {
+        if (c.functional_core) fcByChar.set(c.name, c.functional_core);
+    }
+    const scBySector = new Map<string, string>();
+    for (const s of hydrateSnapshot.sectors) {
+        if (s.sector_core) scBySector.set(s.name, s.sector_core);
+    }
+    for (const r of assignedRows) {
+        if (!r.functional_core && r.functional_specialization) {
+            r.functional_core = fcByChar.get(r.functional_specialization) || '';
+        }
+        if (!r.sector_core && r.sector_focus) {
+            r.sector_core = scBySector.get(r.sector_focus) || '';
+        }
+    }
+
+    let rolledRows = computeContactRollup(assignedRows, Number(run.min_volume || 0), Number(run.bucket_budget || 30));
+
+    // Generic Audit — always runs after rollup. Pattern-recovers rows
+    // from General by re-routing groups of ≥ min_volume/4 rows up the
+    // chain to functional_core or identity buckets that already exist.
+    const auditRes = runGenericAudit(rolledRows, Number(run.min_volume || 0));
+    rolledRows = auditRes.rows;
+    ctx.log(`[Bucketing ${runId}] Generic Audit: reclaimed ${auditRes.reclaimed} rows from General into ${auditRes.targets.length} target bucket(s)${auditRes.targets.length > 0 ? ` (${auditRes.targets.slice(0, 3).map(t => `${t.bucket}+${t.count}`).join(', ')}${auditRes.targets.length > 3 ? '…' : ''})` : ''}`, 'phase');
+
     await writeContactMapAndAssignments(supabase, runId, rolledRows);
 
     const assignedCount = rolledRows.length;
@@ -1545,6 +1648,11 @@ export async function runAssignment(
         cost_usd: totalCost,
         coverage_summary: coverageSummary,
         quality_warnings: qualityWarnings,
+        generic_audit: {
+            reclaimed: auditRes.reclaimed,
+            targets: auditRes.targets,
+            ran_at: new Date().toISOString()
+        },
         assignment_completed_at: new Date().toISOString()
     }).eq('id', runId);
 
@@ -1604,8 +1712,12 @@ function makeGeneralContactRow(
         contact_id: contact.contact_id,
         industry_string: (contact.classification || contact.industry || '').trim(),
         primary_identity: '',
+        functional_core: '',
         functional_specialization: '',
+        sector_core: '',
         sector_focus: '',
+        canonical_classification: 'Disqualified',
+        bucket_reason: `Unclassifiable: ${reason}`,
         pre_rollup_bucket_name: RESERVED_DISQUALIFIED,
         bucket_name: RESERVED_DISQUALIFIED,
         rollup_level: 'general',
@@ -1630,7 +1742,9 @@ function makeMatchedContactRow(
     contact: ContactRouteInput,
     params: {
         primary_identity: string;
+        functional_core?: string;
         functional_specialization: string;
+        sector_core?: string;
         sector_focus: string;
         source: string;
         confidence: number;
@@ -1643,13 +1757,25 @@ function makeMatchedContactRow(
         reasons?: Record<string, any>;
     }
 ): ContactMapRow {
+    const fc = params.functional_core || '';
+    const sc = params.sector_core || '';
+    const canonical = params.is_disqualified
+        ? 'Disqualified'
+        : (params.sector_focus && params.functional_specialization
+            ? `${params.sector_focus} ${params.functional_specialization}`
+            : (params.functional_specialization || params.primary_identity || 'Generic'));
+
     const row: ContactMapRow = {
         bucketing_run_id: runId,
         contact_id: contact.contact_id,
         industry_string: (contact.classification || contact.industry || '').trim(),
         primary_identity: params.primary_identity,
+        functional_core: fc,
         functional_specialization: params.functional_specialization,
+        sector_core: sc,
         sector_focus: params.sector_focus,
+        canonical_classification: canonical,
+        bucket_reason: '',
         pre_rollup_bucket_name: RESERVED_GENERAL,
         bucket_name: RESERVED_GENERAL,
         rollup_level: 'general',
@@ -1676,8 +1802,10 @@ function makeMatchedContactRow(
 }
 
 function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBudget: number): ContactMapRow[] {
-    const comboCounts = new Map<string, number>();
-    const specCounts = new Map<string, number>();
+    const comboCounts = new Map<string, number>();           // sector_focus + spec
+    const sectorCoreSpecCounts = new Map<string, number>();  // sector_core + spec
+    const specCounts = new Map<string, number>();            // spec only
+    const fcCounts = new Map<string, number>();              // functional_core only
     const identityCounts = new Map<string, number>();
 
     for (const row of rows) {
@@ -1688,6 +1816,13 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
                 const combo = `${row.sector_focus} ${row.functional_specialization}`;
                 comboCounts.set(combo, (comboCounts.get(combo) || 0) + 1);
             }
+            if (row.sector_core && row.sector_core !== 'Multi-industry') {
+                const sc = `${row.sector_core} ${row.functional_specialization}`;
+                sectorCoreSpecCounts.set(sc, (sectorCoreSpecCounts.get(sc) || 0) + 1);
+            }
+        }
+        if (row.functional_core) {
+            fcCounts.set(row.functional_core, (fcCounts.get(row.functional_core) || 0) + 1);
         }
         if (row.primary_identity) {
             identityCounts.set(row.primary_identity, (identityCounts.get(row.primary_identity) || 0) + 1);
@@ -1701,27 +1836,44 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
             next.bucket_name = RESERVED_DISQUALIFIED;
             next.rollup_level = 'general';
             next.general_reason = next.general_reason || 'disqualified';
+            next.bucket_reason = next.bucket_reason || 'Identity flagged disqualified';
         } else if (next.is_generic && !next.primary_identity) {
             next.bucket_name = RESERVED_GENERAL;
             next.rollup_level = 'general';
             next.general_reason = next.general_reason || 'generic_low_confidence';
+            next.bucket_reason = next.bucket_reason || 'Inviteable but insufficient classification evidence';
         } else if (next.functional_specialization && next.sector_focus && next.sector_focus !== 'Multi-industry'
             && (comboCounts.get(`${next.sector_focus} ${next.functional_specialization}`) || 0) >= minVolume) {
             next.bucket_name = `${next.sector_focus} ${next.functional_specialization}`;
             next.rollup_level = 'combo';
             next.general_reason = null;
+            next.bucket_reason = `Sector_focus + specialization combo cleared ${minVolume}-lead threshold`;
+        } else if (next.functional_specialization && next.sector_core && next.sector_core !== 'Multi-industry'
+            && (sectorCoreSpecCounts.get(`${next.sector_core} ${next.functional_specialization}`) || 0) >= minVolume) {
+            next.bucket_name = `${next.sector_core} ${next.functional_specialization}`;
+            next.rollup_level = 'sector_core_specialization';
+            next.general_reason = null;
+            next.bucket_reason = `Sector_core + specialization cleared threshold; sector_focus combination too small`;
         } else if (next.functional_specialization && (specCounts.get(next.functional_specialization) || 0) >= minVolume) {
             next.bucket_name = next.functional_specialization;
             next.rollup_level = 'specialization';
             next.general_reason = null;
+            next.bucket_reason = `Specialization cleared threshold; sector combinations too small`;
+        } else if (next.functional_core && (fcCounts.get(next.functional_core) || 0) >= minVolume) {
+            next.bucket_name = next.functional_core;
+            next.rollup_level = 'functional_core';
+            next.general_reason = null;
+            next.bucket_reason = `Rolled up to functional_core; specialization too small`;
         } else if (next.primary_identity && (identityCounts.get(next.primary_identity) || 0) >= minVolume) {
             next.bucket_name = next.primary_identity;
             next.rollup_level = 'identity';
             next.general_reason = null;
+            next.bucket_reason = `Rolled up to primary_identity; functional_core too small`;
         } else {
             next.bucket_name = RESERVED_GENERAL;
             next.rollup_level = 'general';
             next.general_reason = next.general_reason || 'rolled_up_to_general';
+            next.bucket_reason = next.bucket_reason || 'No layer cleared the volume threshold';
         }
         return next;
     });
@@ -1740,20 +1892,96 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
         if (!smallest) break;
         for (const row of rolled) {
             if (row.bucket_name !== smallest) continue;
-            if (row.rollup_level === 'combo' && row.functional_specialization) {
+            if (row.rollup_level === 'combo' && row.functional_specialization && row.sector_core && row.sector_core !== 'Multi-industry') {
+                row.bucket_name = `${row.sector_core} ${row.functional_specialization}`;
+                row.rollup_level = 'sector_core_specialization';
+            } else if ((row.rollup_level === 'combo' || row.rollup_level === 'sector_core_specialization') && row.functional_specialization) {
                 row.bucket_name = row.functional_specialization;
                 row.rollup_level = 'specialization';
-            } else if (row.rollup_level === 'specialization' && row.primary_identity) {
+            } else if (row.rollup_level === 'specialization' && row.functional_core) {
+                row.bucket_name = row.functional_core;
+                row.rollup_level = 'functional_core';
+            } else if ((row.rollup_level === 'specialization' || row.rollup_level === 'functional_core') && row.primary_identity) {
                 row.bucket_name = row.primary_identity;
                 row.rollup_level = 'identity';
             } else {
                 row.bucket_name = RESERVED_GENERAL;
                 row.rollup_level = 'general';
                 row.general_reason = row.general_reason || 'bucket_budget_rollup';
+                row.bucket_reason = row.bucket_reason || 'Bucket budget exceeded — rolled up';
             }
         }
     }
     return rolled;
+}
+
+// Generic Audit — runs after computeContactRollup. Looks at rows currently
+// in the General bucket, groups them by (functional_core OR primary_identity,
+// sector_core), and re-routes groups of ≥ floor(minVolume/4) rows to a
+// matching functional_core / identity bucket if one exists in the run.
+// This recovers volume that the threshold pass left in General because the
+// narrowest (combo/spec) layer was too small, but a broader layer in the
+// same identity family already had a bucket.
+function runGenericAudit(rows: ContactMapRow[], minVolume: number): {
+    rows: ContactMapRow[];
+    reclaimed: number;
+    targets: { bucket: string; count: number; from: string }[];
+} {
+    const liveBuckets = new Set<string>();
+    for (const r of rows) {
+        if (r.bucket_name && r.bucket_name !== RESERVED_GENERAL && r.bucket_name !== RESERVED_DISQUALIFIED) {
+            liveBuckets.add(r.bucket_name);
+        }
+    }
+
+    // Threshold for a recovery group — quarter of min_volume but at least 50.
+    const groupFloor = Math.max(50, Math.floor((minVolume || 0) / 4));
+
+    // Group General rows by (target_bucket_candidate). Try four candidates
+    // in priority order; the first one that matches a live bucket wins.
+    const groups = new Map<string, { rows: ContactMapRow[]; from: string }>();
+    for (const r of rows) {
+        if (r.bucket_name !== RESERVED_GENERAL) continue;
+        if (r.is_disqualified) continue;
+        const candidates: { name: string; from: string }[] = [];
+        if (r.sector_core && r.functional_specialization) {
+            candidates.push({ name: `${r.sector_core} ${r.functional_specialization}`, from: 'sector_core+spec' });
+        }
+        if (r.functional_specialization) {
+            candidates.push({ name: r.functional_specialization, from: 'specialization' });
+        }
+        if (r.functional_core) {
+            candidates.push({ name: r.functional_core, from: 'functional_core' });
+        }
+        if (r.primary_identity) {
+            candidates.push({ name: r.primary_identity, from: 'identity' });
+        }
+        const target = candidates.find(c => liveBuckets.has(c.name));
+        if (!target) continue;
+        const g = groups.get(target.name) || { rows: [], from: target.from };
+        g.rows.push(r);
+        groups.set(target.name, g);
+    }
+
+    let reclaimed = 0;
+    const targets: { bucket: string; count: number; from: string }[] = [];
+    for (const [bucketName, g] of groups.entries()) {
+        if (g.rows.length < groupFloor) continue;
+        for (const r of g.rows) {
+            r.bucket_name = bucketName;
+            r.rollup_level = g.from === 'identity' ? 'identity'
+                : g.from === 'functional_core' ? 'functional_core'
+                : g.from === 'specialization' ? 'specialization'
+                : 'sector_core_specialization';
+            r.general_reason = null;
+            r.bucket_reason = `Generic Audit: re-routed from General to ${bucketName} (matched on ${g.from})`;
+        }
+        reclaimed += g.rows.length;
+        targets.push({ bucket: bucketName, count: g.rows.length, from: g.from });
+    }
+
+    targets.sort((a, b) => b.count - a.count);
+    return { rows, reclaimed, targets };
 }
 
 async function writeContactMapAndAssignments(
@@ -1766,8 +1994,12 @@ async function writeContactMapAndAssignments(
         contact_id: row.contact_id,
         industry_string: row.industry_string,
         primary_identity: row.primary_identity || null,
+        functional_core: row.functional_core || null,
         functional_specialization: row.functional_specialization || null,
+        sector_core: row.sector_core || null,
         sector_focus: row.sector_focus || null,
+        canonical_classification: row.canonical_classification || null,
+        bucket_reason: row.bucket_reason || null,
         pre_rollup_bucket_name: row.pre_rollup_bucket_name,
         bucket_name: row.bucket_name,
         rollup_level: row.rollup_level,
@@ -1798,8 +2030,12 @@ async function writeContactMapAndAssignments(
         bucket_ancestor: row.primary_identity || null,
         bucket_root: row.primary_identity || null,
         primary_identity: row.primary_identity || null,
+        functional_core: row.functional_core || null,
         functional_specialization: row.functional_specialization || null,
+        sector_core: row.sector_core || null,
         sector_focus: row.sector_focus || null,
+        canonical_classification: row.canonical_classification || null,
+        bucket_reason: row.bucket_reason || null,
         pre_rollup_bucket_name: row.pre_rollup_bucket_name,
         rollup_level: row.rollup_level,
         general_reason: row.general_reason,
