@@ -13,7 +13,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Layers, Loader2, AlertCircle, ArrowLeft, Plus, X, Trash2, Download,
-  Play, BookMarked, CheckCircle2, Edit3, Archive
+  Play, BookMarked, CheckCircle2, Edit3, Archive, Upload
 } from 'lucide-react';
 import Papa from 'papaparse';
 import type { BucketingRun, BucketProposal, LibraryBucket } from './types';
@@ -1124,6 +1124,7 @@ function BucketingLibrary({ library, onRefresh, onError }: {
 }) {
   const [editing, setEditing] = useState<LibraryBucket | null>(null);
   const [creating, setCreating] = useState(false);
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   const onArchive = async (id: string, archived: boolean) => {
     onError(null);
@@ -1159,7 +1160,13 @@ function BucketingLibrary({ library, onRefresh, onError }: {
 
   return (
     <div className="space-y-3">
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-2">
+        <button
+          onClick={() => setBulkOpen(true)}
+          className="px-3 py-1.5 rounded text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e] flex items-center gap-1"
+        >
+          <Upload className="w-3 h-3" /> Bulk import
+        </button>
         <button
           onClick={() => setCreating(true)}
           className="px-3 py-1.5 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] flex items-center gap-1"
@@ -1167,6 +1174,13 @@ function BucketingLibrary({ library, onRefresh, onError }: {
           <Plus className="w-3 h-3" /> New library bucket
         </button>
       </div>
+      {bulkOpen && (
+        <LibraryBulkImport
+          onCancel={() => setBulkOpen(false)}
+          onDone={() => { setBulkOpen(false); onRefresh(); }}
+          onError={onError}
+        />
+      )}
       {(creating || editing) && (
         <LibraryBucketEditor
           existing={editing}
@@ -1302,6 +1316,95 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
 }
 
 // Local StatCard so this file has no dependency on App.tsx internals.
+function LibraryBulkImport({ onCancel, onDone, onError }: {
+  onCancel: () => void;
+  onDone: () => void;
+  onError: (msg: string | null) => void;
+}) {
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<{ saved: number; skipped: { name: string; reason: string }[] } | null>(null);
+
+  const sample = `# One bucket per line. Optional: spec | identity | description
+# Empty lines and # comments are ignored.
+
+SEO Agency | Agency | Search engine optimization for B2B
+Performance Marketing Agency | Agency
+Branding & Creative Agency | Agency
+Private Equity Firm | Financial Services
+Venture Capital Fund | Financial Services
+Managed IT Services | IT Services
+MarTech SaaS | Software & SaaS`;
+
+  const importNow = async () => {
+    setBusy(true);
+    onError(null);
+    try {
+      const res = await fetch('/api/bucketing/library/bulk-import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+      setResult(data);
+      if (data.saved > 0) onDone();
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="border border-[#3ecf8e]/30 rounded-xl bg-[#0e0e0e] p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Bulk import library buckets</div>
+        <button onClick={onCancel} className="text-gray-500 hover:text-white"><X className="w-4 h-4" /></button>
+      </div>
+      <p className="text-[11px] text-gray-500">
+        One bucket per line. Use <code className="bg-[#1c1c1c] px-1 rounded text-[10px]">|</code> to separate optional fields:
+        <code className="ml-1 bg-[#1c1c1c] px-1 rounded text-[10px]">spec | primary_identity | description</code>.
+        Names alone are fine — you can edit identity later. Existing names are upserted (no duplicates created).
+      </p>
+      <textarea
+        value={text}
+        onChange={e => setText(e.target.value)}
+        placeholder={sample}
+        rows={12}
+        className="w-full px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-700 focus:outline-none focus:border-[#3ecf8e] font-mono"
+      />
+      {result && (
+        <div className="text-[11px]">
+          <div className="text-[#3ecf8e] font-bold">Saved {result.saved} bucket(s).</div>
+          {result.skipped.length > 0 && (
+            <details className="mt-1">
+              <summary className="text-amber-400 cursor-pointer">Skipped {result.skipped.length}</summary>
+              <ul className="text-amber-400/80 ml-4 mt-1">
+                {result.skipped.slice(0, 20).map((s, i) => (
+                  <li key={i}><span className="font-mono">{s.name}</span> — {s.reason}</li>
+                ))}
+                {result.skipped.length > 20 && <li className="text-gray-500">…and {result.skipped.length - 20} more</li>}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
+      <div className="flex justify-end gap-2">
+        <button onClick={onCancel} className="px-3 py-1.5 rounded text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e]">Close</button>
+        <button
+          onClick={importNow}
+          disabled={busy || !text.trim()}
+          className="px-3 py-1.5 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1"
+        >
+          {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Upload className="w-3 h-3" />}
+          Import
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function StatCard({ label, value, color }: { label: string; value: string; color: string }) {
   return (
     <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-6 shadow-sm">

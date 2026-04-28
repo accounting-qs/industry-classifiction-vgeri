@@ -168,6 +168,30 @@ interface MatchChain {
     disqualified: boolean;
 }
 
+// ─── heartbeat wrapper ─────────────────────────────────────────────
+// Any operation that can run silent for more than ~30s should be wrapped
+// in withHeartbeat — it pings ctx.log every HEARTBEAT_MS so the user sees
+// forward motion in the live log stream instead of a frozen UI. Default
+// 30s, max 60s gap is the user's stated tolerance.
+const HEARTBEAT_MS = 30_000;
+
+async function withHeartbeat<T>(
+    label: string,
+    op: () => Promise<T>,
+    ctx?: BucketingCtx
+): Promise<T> {
+    const start = Date.now();
+    const beat = ctx ? setInterval(() => {
+        const elapsed = Math.round((Date.now() - start) / 1000);
+        ctx.log(`[Bucketing] ${label} still running, elapsed ${elapsed}s…`);
+    }, HEARTBEAT_MS) : null;
+    try {
+        return await op();
+    } finally {
+        if (beat) clearInterval(beat);
+    }
+}
+
 // ─── single-shot vocabulary fetch ──────────────────────────────────
 // Pagination over .rpc().range() re-executed the full JOIN+GROUP+aggregate
 // on every page (PostgREST function-call semantics), causing multi-minute
@@ -184,24 +208,14 @@ async function fetchFullVocabulary(
     listNames: string[],
     ctx?: BucketingCtx
 ): Promise<VocabRow[]> {
-    const start = Date.now();
-    // Heartbeat log every 10s so the user sees forward motion during the
-    // potentially-slow GROUP BY on big lists. Cleared in finally.
-    const heartbeat = ctx ? setInterval(() => {
-        const elapsed = Math.round((Date.now() - start) / 1000);
-        ctx.log(`[Bucketing] vocabulary fetch in progress, elapsed ${elapsed}s…`);
-    }, 10_000) : null;
-
-    try {
+    return withHeartbeat('vocabulary fetch', async () => {
         const { data, error } = await supabase.rpc('get_industry_vocabulary', {
             p_list_names: listNames,
             p_limit: VOCAB_HARD_LIMIT
         });
         if (error) throw new Error(`vocabulary fetch failed: ${error.message}`);
         return (data || []) as VocabRow[];
-    } finally {
-        if (heartbeat) clearInterval(heartbeat);
-    }
+    }, ctx);
 }
 
 // ─── PROJECT CONTEXT (4-layer model, identity-first) ──────────────
@@ -400,7 +414,8 @@ export async function runTaxonomyProposal(
     if (preferred.length > 0) {
         ctx.log(`[Bucketing ${runId}] Phase 1a step 1/3: library-first match against ${preferred.length} preferred buckets`, 'phase');
         ctx.progress({ phase: 'phase1a', step: 'library_match', note: `Matching against ${preferred.length} library buckets…` });
-        const libRes = await runLibraryFirstMatch(vocabRows, preferred, [], runId);
+        const libRes = await withHeartbeat('library-first match (Phase 1a)',
+            () => runLibraryFirstMatch(vocabRows, preferred, [], runId), ctx);
         totalCost += libRes.costUsd;
 
         if (libRes.autoAssigned.length > 0) {
@@ -424,7 +439,11 @@ export async function runTaxonomyProposal(
     ctx.log(`[Bucketing ${runId}] Phase 1a step 2/3: discovery LLM on ${discoveryVocab.length} residual industries`, 'phase');
     ctx.progress({ phase: 'phase1a', step: 'discovery_llm', note: `Running discovery LLM (${discoveryVocab.length} residual industries)…` });
     const t0 = Date.now();
-    const { discovery, costUsd, modelUsed } = await callDiscoveryLLM(supabase, discoveryVocab, preferred);
+    const { discovery, costUsd, modelUsed } = await withHeartbeat(
+        `discovery LLM (${discoveryVocab.length} industries)`,
+        () => callDiscoveryLLM(supabase, discoveryVocab, preferred),
+        ctx
+    );
     totalCost += costUsd;
     ctx.log(`[Bucketing ${runId}] discovery LLM (${modelUsed}): ${(Date.now() - t0) / 1000}s, $${costUsd.toFixed(4)}, ${discovery.buckets.length} discovered specs`);
 
@@ -528,7 +547,11 @@ export async function runTaxonomyProposal(
     const stillPending = vocabRows.filter(r => !libraryMatchedIndustries.has(r.industry));
     ctx.log(`[Bucketing ${runId}] Phase 1a step 3/3: embedding preview against ${leaves.length} specs over ${stillPending.length} pending industries`, 'phase');
     ctx.progress({ phase: 'phase1a', step: 'preview_embedding', current: 0, total: stillPending.length, note: 'Computing per-spec preview counts via embedding…' });
-    const previewRes = await runPreviewEmbedding(stillPending, leaves, sectorVocab, runId);
+    const previewRes = await withHeartbeat(
+        `preview embedding (${stillPending.length} industries × ${leaves.length} specs)`,
+        () => runPreviewEmbedding(stillPending, leaves, sectorVocab, runId),
+        ctx
+    );
     totalCost += previewRes.costUsd;
     if (previewRes.rows.length > 0) {
         for (let i = 0; i < previewRes.rows.length; i += 1000) {
@@ -1066,7 +1089,8 @@ export async function runAssignment(
     if (libraryBuckets.length > 0) {
         ctx.log(`[Bucketing ${runId}] step 2/5: library-first match against ${libraryBuckets.length} preferred buckets`, 'phase');
         ctx.progress({ phase: 'phase1b', step: 'library_match', note: `Matching against ${libraryBuckets.length} library buckets…` });
-        const libRes = await runLibraryFirstMatch(vocab, libraryBuckets, sectorVocab, runId);
+        const libRes = await withHeartbeat('library-first match (Phase 1b)',
+            () => runLibraryFirstMatch(vocab, libraryBuckets, sectorVocab, runId), ctx);
         totalCost += libRes.costUsd;
         assignedRows = libRes.autoAssigned;
         pendingIndustries = libRes.pending;
@@ -1078,7 +1102,11 @@ export async function runAssignment(
     if (EMBED_PREFILTER_ENABLED && pendingIndustries.length > 0) {
         ctx.log(`[Bucketing ${runId}] step 3/5: embedding pre-filter (sector-aware)`, 'phase');
         ctx.progress({ phase: 'phase1b', step: 'embedding_prefilter', note: `Embedding pre-filter on ${pendingIndustries.length} industries…` });
-        const embedRes = await runEmbeddingPrefilter(pendingIndustries, leaves, sectorVocab, runId);
+        const embedRes = await withHeartbeat(
+            `embedding pre-filter (${pendingIndustries.length} industries)`,
+            () => runEmbeddingPrefilter(pendingIndustries, leaves, sectorVocab, runId),
+            ctx
+        );
         totalCost += embedRes.costUsd;
         assignedRows = assignedRows.concat(embedRes.autoAssigned);
         pendingIndustries = embedRes.pending;
@@ -1105,16 +1133,27 @@ export async function runAssignment(
 
     ctx.log(`[Bucketing ${runId}] step 5/5: volume rollup + fan-out`, 'phase');
     ctx.progress({ phase: 'phase1b', step: 'rollup_fanout', note: 'Computing campaign buckets and writing per-contact assignments…' });
-    const { error: rollupErr } = await supabase.rpc('bucketing_apply_volume_rollup', { p_run_id: runId });
+    const { error: rollupErr } = await withHeartbeat(
+        'volume rollup (SQL)',
+        async () => supabase.rpc('bucketing_apply_volume_rollup', { p_run_id: runId }),
+        ctx
+    );
     if (rollupErr) throw new Error(`volume rollup failed: ${rollupErr.message}`);
 
     await supabase.from('bucket_assignments').delete().eq('bucketing_run_id', runId);
-    const { data: fanoutCount, error: fanErr } = await supabase
-        .rpc('bucketing_deterministic_fanout', { p_run_id: runId });
+    const { data: fanoutCount, error: fanErr } = await withHeartbeat(
+        'fan-out to bucket_assignments (SQL)',
+        async () => supabase.rpc('bucketing_deterministic_fanout', { p_run_id: runId }),
+        ctx
+    );
     if (fanErr) throw new Error(`fanout failed: ${fanErr.message}`);
     ctx.log(`[Bucketing ${runId}] fan-out wrote ${Number(fanoutCount || 0)} assignments`);
 
-    const { error: catchErr } = await supabase.rpc('bucketing_catchall_other', { p_run_id: runId });
+    const { error: catchErr } = await withHeartbeat(
+        'catch-all sweep (SQL)',
+        async () => supabase.rpc('bucketing_catchall_other', { p_run_id: runId }),
+        ctx
+    );
     if (catchErr) throw new Error(`catch-all failed: ${catchErr.message}`);
 
     const { count: assignedCount } = await supabase

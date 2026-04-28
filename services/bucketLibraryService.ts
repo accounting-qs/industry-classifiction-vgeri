@@ -106,6 +106,56 @@ export async function deleteLibraryBucket(
 }
 
 /**
+ * Bulk-import library buckets from a flexible newline+pipe format. Each
+ * non-empty line is one bucket. Pipe separators define optional fields:
+ *
+ *   "SEO Agency"
+ *   "SEO Agency | Agency"
+ *   "SEO Agency | Agency | Performance + content marketing for B2B"
+ *
+ * Empty lines, lines starting with '#' (comments), and duplicate names
+ * are skipped. Returns counts and the list of names that were skipped.
+ */
+export async function bulkImportLibraryFromText(
+    supabase: SupabaseClient,
+    text: string
+): Promise<{ saved: number; skipped: { name: string; reason: string }[] }> {
+    const lines = (text || '').split(/\r?\n/);
+    const seen = new Set<string>();
+    const skipped: { name: string; reason: string }[] = [];
+    let saved = 0;
+
+    for (const raw of lines) {
+        const line = raw.trim();
+        if (!line || line.startsWith('#')) continue;
+
+        const parts = line.split('|').map(p => p.trim());
+        const spec = parts[0];
+        const ident = parts[1] || '';
+        const desc = parts[2] || '';
+
+        if (!spec) continue;
+        if (seen.has(spec.toLowerCase())) {
+            skipped.push({ name: spec, reason: 'duplicate within import' });
+            continue;
+        }
+        seen.add(spec.toLowerCase());
+
+        try {
+            await upsertLibraryBucket(supabase, {
+                functional_specialization: spec,
+                primary_identity: ident,
+                description: desc
+            });
+            saved++;
+        } catch (e: any) {
+            skipped.push({ name: spec, reason: e.message?.slice(0, 200) || 'upsert failed' });
+        }
+    }
+    return { saved, skipped };
+}
+
+/**
  * Save selected specializations from a completed run into the library.
  * Inputs are functional_specialization names (the new shape). Legacy
  * bucket_name lookup is also accepted for forward-compat.

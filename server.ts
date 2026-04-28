@@ -18,7 +18,8 @@ import {
     upsertLibraryBucket,
     archiveLibraryBucket,
     deleteLibraryBucket,
-    saveRunBucketsToLibrary
+    saveRunBucketsToLibrary,
+    bulkImportLibraryFromText
 } from './services/bucketLibraryService';
 import { getSetting, setSetting, maskSecret } from './services/appSettings';
 
@@ -1627,6 +1628,21 @@ app.post('/api/bucketing/library', async (req, res) => {
     try {
         const bucket = await upsertLibraryBucket(supabase, req.body || {});
         res.json(bucket);
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+// Bulk import from a newline+pipe text blob:
+//   "SEO Agency"
+//   "SEO Agency | Agency"
+//   "SEO Agency | Agency | Performance + content marketing for B2B"
+app.post('/api/bucketing/library/bulk-import', async (req, res) => {
+    try {
+        const text = String((req.body || {}).text || '');
+        if (!text.trim()) return res.status(400).json({ error: 'text is required' });
+        const result = await bulkImportLibraryFromText(supabase, text);
+        res.json(result);
     } catch (err: any) {
         res.status(400).json({ error: err.message });
     }
