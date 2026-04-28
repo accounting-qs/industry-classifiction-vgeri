@@ -168,28 +168,40 @@ interface MatchChain {
     disqualified: boolean;
 }
 
-// ─── paginated vocabulary fetch ────────────────────────────────────
-const VOCAB_PAGE_SIZE = 1000;
-const VOCAB_MAX_ROWS = 100_000;
+// ─── single-shot vocabulary fetch ──────────────────────────────────
+// Pagination over .rpc().range() re-executed the full JOIN+GROUP+aggregate
+// on every page (PostgREST function-call semantics), causing multi-minute
+// hangs on 100k+ long-tail lists. The v2.6 RPC accepts an optional p_limit
+// and runs with statement_timeout=300s, so we fetch everything in ONE call.
+//
+// Cap at 10k distinct labels — covers any realistic list (the LLM only
+// looks at the top ~2500 anyway, and the long tail beyond 10k contributes
+// effectively nothing to discovery quality).
+const VOCAB_HARD_LIMIT = 10_000;
 
 async function fetchFullVocabulary(
     supabase: SupabaseClient,
-    listNames: string[]
+    listNames: string[],
+    ctx?: BucketingCtx
 ): Promise<VocabRow[]> {
-    const all: VocabRow[] = [];
-    let offset = 0;
-    while (offset < VOCAB_MAX_ROWS) {
-        const { data, error } = await supabase
-            .rpc('get_industry_vocabulary', { p_list_names: listNames })
-            .range(offset, offset + VOCAB_PAGE_SIZE - 1);
+    const start = Date.now();
+    // Heartbeat log every 10s so the user sees forward motion during the
+    // potentially-slow GROUP BY on big lists. Cleared in finally.
+    const heartbeat = ctx ? setInterval(() => {
+        const elapsed = Math.round((Date.now() - start) / 1000);
+        ctx.log(`[Bucketing] vocabulary fetch in progress, elapsed ${elapsed}s…`);
+    }, 10_000) : null;
+
+    try {
+        const { data, error } = await supabase.rpc('get_industry_vocabulary', {
+            p_list_names: listNames,
+            p_limit: VOCAB_HARD_LIMIT
+        });
         if (error) throw new Error(`vocabulary fetch failed: ${error.message}`);
-        const page = (data || []) as VocabRow[];
-        if (page.length === 0) break;
-        all.push(...page);
-        if (page.length < VOCAB_PAGE_SIZE) break;
-        offset += VOCAB_PAGE_SIZE;
+        return (data || []) as VocabRow[];
+    } finally {
+        if (heartbeat) clearInterval(heartbeat);
     }
-    return all;
 }
 
 // ─── PROJECT CONTEXT (4-layer model, identity-first) ──────────────
@@ -346,7 +358,7 @@ export async function runTaxonomyProposal(
         .from('bucketing_runs').select('*').eq('id', runId).single();
     if (runErr || !run) throw new Error(`Run not found: ${runErr?.message}`);
 
-    const vocabRows = await fetchFullVocabulary(supabase, run.list_names);
+    const vocabRows = await fetchFullVocabulary(supabase, run.list_names, ctx);
     const totalContacts = vocabRows.reduce((s, r) => s + Number(r.n || 0), 0);
     ctx.log(`[Bucketing ${runId}] vocabulary: ${vocabRows.length} distinct industries, ${totalContacts} contacts`);
     ctx.progress({ phase: 'phase1a', step: 'vocabulary_loaded', current: vocabRows.length, total: vocabRows.length, note: `${vocabRows.length} distinct industries, ${totalContacts.toLocaleString()} contacts` });
@@ -971,7 +983,7 @@ async function rebuildPreviewMap(
     ctx: BucketingCtx
 ): Promise<void> {
     if (!Array.isArray(listNames) || listNames.length === 0) return;
-    const vocab = await fetchFullVocabulary(supabase, listNames);
+    const vocab = await fetchFullVocabulary(supabase, listNames, ctx);
     if (vocab.length === 0) return;
 
     // Drop only the preview-source rows; keep any library_match rows the
@@ -1041,7 +1053,7 @@ export async function runAssignment(
 
     ctx.log(`[Bucketing ${runId}] step 1/5: load vocabulary`, 'phase');
     ctx.progress({ phase: 'phase1b', step: 'load_vocabulary', note: 'Loading vocabulary…' });
-    const vocab = await fetchFullVocabulary(supabase, run.list_names);
+    const vocab = await fetchFullVocabulary(supabase, run.list_names, ctx);
     ctx.log(`[Bucketing ${runId}] ${vocab.length} distinct industries to match`);
     ctx.progress({ phase: 'phase1b', step: 'vocabulary_loaded', current: vocab.length, total: vocab.length, note: `${vocab.length} distinct industries to match` });
 
