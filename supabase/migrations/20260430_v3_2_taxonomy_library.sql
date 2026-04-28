@@ -209,7 +209,20 @@ INSERT INTO taxonomy_sectors (name, synonyms, created_by, sort_order) VALUES
 ON CONFLICT (name) DO NOTHING;
 
 -- =====================================================================
--- 3. Tagging columns on bucket_industry_map
+-- 3. Backfill bucket_assignments columns from v3.1 (in case the
+--    earlier migration partially failed before the ALTER ran).
+-- =====================================================================
+
+ALTER TABLE bucket_assignments
+    ADD COLUMN IF NOT EXISTS primary_identity TEXT,
+    ADD COLUMN IF NOT EXISTS functional_specialization TEXT,
+    ADD COLUMN IF NOT EXISTS pre_rollup_bucket_name TEXT,
+    ADD COLUMN IF NOT EXISTS rollup_level TEXT,
+    ADD COLUMN IF NOT EXISTS general_reason TEXT,
+    ADD COLUMN IF NOT EXISTS reasons JSONB;
+
+-- =====================================================================
+-- 4. Tagging columns on bucket_industry_map
 -- =====================================================================
 
 ALTER TABLE bucket_industry_map
@@ -249,7 +262,7 @@ BEFORE INSERT OR UPDATE ON bucket_industry_map
 FOR EACH ROW EXECUTE FUNCTION public.bucket_industry_map_mirror_tags();
 
 -- =====================================================================
--- 4. Run-level taxonomy version snapshot
+-- 5. Run-level taxonomy version snapshot
 -- =====================================================================
 
 ALTER TABLE bucketing_runs
@@ -257,7 +270,7 @@ ALTER TABLE bucketing_runs
     ADD COLUMN IF NOT EXISTS taxonomy_snapshot JSONB;
 
 -- =====================================================================
--- 5. Vocabulary RPC sourced from enrichments.classification
+-- 6. Vocabulary RPC sourced from enrichments.classification
 -- =====================================================================
 
 DROP FUNCTION IF EXISTS public.get_industry_vocabulary(TEXT[]);
@@ -319,7 +332,7 @@ GRANT EXECUTE ON FUNCTION public.get_industry_vocabulary(TEXT[], INTEGER)
     TO anon, authenticated, service_role;
 
 -- =====================================================================
--- 6. Backfill missing v3.1 RPCs (general breakdown + run diagnostics)
+-- 7. Backfill missing v3.1 RPCs (general breakdown + run diagnostics)
 -- =====================================================================
 
 CREATE OR REPLACE FUNCTION public.get_bucket_general_breakdown(p_run_id UUID)
@@ -458,7 +471,7 @@ GRANT EXECUTE ON FUNCTION public.get_bucketing_run_diagnostics(UUID)
     TO anon, authenticated, service_role;
 
 -- =====================================================================
--- 7. Reload PostgREST schema cache
+-- 8. Reload PostgREST schema cache
 -- =====================================================================
 
 NOTIFY pgrst, 'reload schema';
