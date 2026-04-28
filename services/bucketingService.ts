@@ -42,8 +42,14 @@ const EMBEDDING_MODEL = 'text-embedding-3-small';
 const MATCH_BATCH_SIZE = 8;
 const MATCH_CONCURRENCY = 40;
 const EMBED_PREFILTER_ENABLED = true;
-const EMBED_AUTO_THRESHOLD = 0.85;
-const EMBED_MARGIN = 0.10;
+// Lowered from 0.85/0.10 — at the old thresholds, the live data showed
+// "embedding auto-assigned 0/1000" and "preview embedding wrote 0 map
+// rows" because narrow industry strings rarely scored above 0.85 against
+// the broader spec definitions. 0.78/0.07 is still tight enough to avoid
+// gross misroutes (Phase 1b LLM still gets the residuals, and the user
+// reviews specs before assignment).
+const EMBED_AUTO_THRESHOLD = 0.78;
+const EMBED_MARGIN = 0.07;
 const OPENAI_TIMEOUT_MS = 90_000;
 const TAXONOMY_TIMEOUT_MS = 180_000;
 

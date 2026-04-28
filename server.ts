@@ -1551,8 +1551,24 @@ app.post('/api/bucketing/runs/:id/assign', async (req, res) => {
             return res.status(400).json({ error: `Cannot assign from status: ${run.status}` });
         }
 
-        // Clear any stale cancel flag from a prior aborted run.
-        await supabase.from('bucketing_runs').update({ cancel_requested: false }).eq('id', id);
+        // Flip status BEFORE returning so the client's next refresh sees
+        // 'assigning' and renders the live progress panel. Without this,
+        // runAssignment() flips status as its first step but that races
+        // with the client's refresh after the 202 — UI stayed stuck on
+        // the Review screen for the entire Phase 1b run.
+        await supabase.from('bucketing_runs').update({
+            status: 'assigning',
+            cancel_requested: false,
+            progress: {
+                phase: 'phase1b',
+                step: 'starting',
+                note: 'Starting Phase 1b…',
+                pct: null,
+                eta_seconds: null,
+                elapsed_seconds: 0,
+                updated_at: new Date().toISOString()
+            }
+        }).eq('id', id);
         runAssignment(supabase, id, buildBucketingCtx(id)).catch(async (err: any) => {
             const cancelled = err instanceof BucketingCancelledError;
             console.error(`[Bucketing] Assignment ${cancelled ? 'cancelled' : 'failed'} for ${id}:`, err);
