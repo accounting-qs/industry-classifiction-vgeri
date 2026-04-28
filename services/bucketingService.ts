@@ -582,7 +582,6 @@ export async function runTaxonomyProposal(
             llm_reason: `enrichment_status=${reason}`,
             // Mirror trigger fills primary_identity/etc; leave nulls so they
             // survive as nulls in the legacy columns too.
-            example_industries: [v.industry]
         });
     }
 
@@ -653,8 +652,7 @@ export async function runTaxonomyProposal(
                 is_disqualified: isDisqualified,
                 is_generic: false,
                 needs_qa: lowConf,
-                llm_reason: t.reason,
-                example_industries: [t.industry]
+                llm_reason: t.reason
             });
 
             // If this is the first time we've seen vocab.n on a tagged row,
