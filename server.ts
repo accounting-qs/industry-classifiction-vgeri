@@ -1349,10 +1349,9 @@ app.delete('/api/export-jobs/:id', async (req, res) => {
 // ============================================
 // BUCKETING — wider campaign-segment assignment
 //
-// Phase 1: review industry classifications across selected lists, propose
-// 6–15 outreach buckets via one LLM call (gpt-4.1).
-// Phase 2: assign exactly one bucket per contact via deterministic SQL JOIN
-// + embedding fallback + residual LLM batch + catch-all "Other" sweep.
+// Phase 1: discover identity/specialization taxonomy from enriched labels.
+// Phase 2: route every selected contact using company-specific enrichment
+// context, then roll up contact-level decisions into campaign buckets.
 // Each run is its own campaign — same contact can land in different buckets
 // across runs, history is preserved.
 // ============================================
@@ -1462,7 +1461,7 @@ app.get('/api/bucketing/runs', async (_req, res) => {
     try {
         const { data, error } = await supabase
             .from('bucketing_runs')
-            .select('id,name,list_names,min_volume,status,total_contacts,assigned_contacts,cost_usd,created_at,taxonomy_completed_at,assignment_completed_at,error_message')
+            .select('id,name,list_names,min_volume,status,total_contacts,assigned_contacts,cost_usd,quality_warnings,created_at,taxonomy_completed_at,assignment_completed_at,error_message')
             .order('created_at', { ascending: false });
         if (error) return res.status(500).json({ error: error.message });
         res.json({ runs: data || [] });
@@ -1483,39 +1482,28 @@ app.get('/api/bucketing/runs/:id', async (req, res) => {
         // assignments table. Both via RPC for one query each.
         let bucketCounts: any[] = [];
         let sectorMix: any[] = [];
+        let generalBreakdown: any[] = [];
         if (run.status === 'completed' || run.status === 'assigning') {
             const { data: counts } = await supabase
                 .rpc('get_bucket_assignment_counts', { p_run_id: id });
             bucketCounts = counts || [];
 
             // Sector_focus distribution per bucket — drives the "served sectors"
-            // chip on Results so users can see the leaf split (e.g. an "M&A
-            // Advisory" bucket might be 40% Healthcare / 30% Tech / 30% other).
+            // chip on Results. SQL-aggregated to dodge PostgREST's 1000-row cap.
             const { data: smix } = await supabase
-                .from('bucket_assignments')
-                .select('bucket_name,sector_focus')
-                .eq('bucketing_run_id', id)
-                .not('sector_focus', 'is', null);
-            const tally = new Map<string, Map<string, number>>();
-            for (const row of (smix || []) as any[]) {
-                if (!row.sector_focus) continue;
-                if (!tally.has(row.bucket_name)) tally.set(row.bucket_name, new Map());
-                const inner = tally.get(row.bucket_name)!;
-                inner.set(row.sector_focus, (inner.get(row.sector_focus) || 0) + 1);
-            }
-            sectorMix = Array.from(tally.entries()).map(([bucket_name, secMap]) => ({
-                bucket_name,
-                sectors: Array.from(secMap.entries())
-                    .map(([sector, count]) => ({ sector, count }))
-                    .sort((a, b) => b.count - a.count)
-            }));
+                .rpc('get_bucket_sector_mix', { p_run_id: id });
+            sectorMix = (smix || []) as any[];
+
+            const { data: gmix } = await supabase
+                .rpc('get_bucket_general_breakdown', { p_run_id: id });
+            generalBreakdown = (gmix || []) as any[];
         } else if (run.status === 'taxonomy_ready') {
             const { data: counts } = await supabase
                 .rpc('get_bucket_map_counts', { p_run_id: id });
             bucketCounts = counts || [];
         }
 
-        res.json({ run, bucket_counts: bucketCounts, sector_mix: sectorMix });
+        res.json({ run, bucket_counts: bucketCounts, sector_mix: sectorMix, general_breakdown: generalBreakdown });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }
@@ -1680,15 +1668,34 @@ app.get('/api/bucketing/runs/:id/contacts', async (req, res) => {
     const pageSize = Math.min(500, Math.max(10, parseInt(String(req.query.pageSize || '100'), 10)));
 
     try {
+        // No FK between bucket_assignments and contacts, so we can't use
+        // PostgREST's embed syntax. Fetch the assignment page first, then
+        // hydrate contact fields via a second IN-list query.
         let q: any = supabase.from('bucket_assignments')
-            .select('contact_id,bucket_name,bucket_leaf,bucket_ancestor,bucket_root,sector_focus,is_generic,is_disqualified,source,confidence,assigned_at,contacts!inner(email,first_name,last_name,company_name,company_website,industry,lead_list_name)', { count: 'estimated' })
+            .select('contact_id,bucket_name,bucket_leaf,bucket_ancestor,bucket_root,primary_identity,functional_specialization,sector_focus,pre_rollup_bucket_name,rollup_level,general_reason,reasons,is_generic,is_disqualified,source,confidence,assigned_at', { count: 'estimated' })
             .eq('bucketing_run_id', id);
         if (bucket) q = q.eq('bucket_name', bucket);
         q = q.order('assigned_at', { ascending: true })
             .range((page - 1) * pageSize, page * pageSize - 1);
-        const { data, count, error } = await q;
+        const { data: assigns, count, error } = await q;
         if (error) return res.status(500).json({ error: error.message });
-        res.json({ data: data || [], count: count || 0, page, pageSize });
+
+        const ids = (assigns || []).map((r: any) => r.contact_id);
+        let contactMap = new Map<string, any>();
+        if (ids.length > 0) {
+            const { data: cs, error: cErr } = await supabase
+                .from('contacts')
+                .select('contact_id,email,first_name,last_name,company_name,company_website,industry,lead_list_name')
+                .in('contact_id', ids);
+            if (cErr) return res.status(500).json({ error: cErr.message });
+            for (const c of (cs || []) as any[]) contactMap.set(c.contact_id, c);
+        }
+
+        const data = (assigns || []).map((r: any) => ({
+            ...r,
+            contacts: contactMap.get(r.contact_id) || null,
+        }));
+        res.json({ data, count: count || 0, page, pageSize });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }

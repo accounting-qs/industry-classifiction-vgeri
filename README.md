@@ -22,6 +22,114 @@ View your app in AI Studio: https://ai.studio/apps/drive/1SsZS6oTE5W2czc9diNkXfH
 # industry-classifiction-vgeri
 # industry-classifiction-vgeri
 
+## Bucketing V3 process
+
+### Deleting a bucketing run
+
+Deleting a run from the Bucketing UI calls:
+
+```http
+DELETE /api/bucketing/runs/:id
+```
+
+The server deletes the row from `bucketing_runs`. The run-scoped tables use
+`ON DELETE CASCADE`, so the related rows are removed with it:
+
+- `bucket_industry_map`
+- `bucket_contact_map`
+- `bucket_assignments`
+- `bucketing_run_logs`
+- `bucket_library_usage`
+
+If the UI delete succeeds, assigned buckets for that run are removed. If cleanup
+ever needs to be run manually, delete the run row:
+
+```sql
+DELETE FROM bucketing_runs
+WHERE id = '<bucketing_run_id>';
+```
+
+If you need to clear assignments while keeping the run for forensics, clear only
+the run-scoped assignment/map rows:
+
+```sql
+DELETE FROM bucket_contact_map
+WHERE bucketing_run_id = '<bucketing_run_id>';
+
+DELETE FROM bucket_assignments
+WHERE bucketing_run_id = '<bucketing_run_id>';
+
+DELETE FROM bucket_industry_map
+WHERE bucketing_run_id = '<bucketing_run_id>';
+```
+
+### Phase 1A: taxonomy discovery
+
+Phase 1A looks at the selected lists' enriched industry vocabulary and discovers
+the reusable taxonomy. It does not assign final campaign buckets yet.
+
+It produces:
+
+- `primary_identity`: the broad functional core of the company, such as
+  `Agency`, `Consulting & Advisory`, `Software & SaaS`, or `Financial Services`.
+- `functional_specialization`: the subtype under that identity, such as
+  `SEO Agency`, `Private Equity Firm`, or `Managed IT Services`.
+- `sector_focus_vocabulary`: allowed sector terms used later for served-market
+  context, such as `Healthcare`, `Real Estate`, or `Manufacturing`.
+
+There is no separate persisted `sector_core` field in the current schema.
+Sector information is stored as `sector_focus` during Phase 1B.
+
+### Phase 1B: per-contact routing
+
+Phase 1B routes every selected contact, not just distinct industry strings.
+For each contact it stores a pre-rollup row in `bucket_contact_map` and a final
+row in `bucket_assignments`.
+
+Per contact, the assignment stores:
+
+- `primary_identity`
+- `functional_specialization`
+- `sector_focus`
+- `pre_rollup_bucket_name`
+- final `bucket_name`
+- `rollup_level`
+- `general_reason`, confidence, source, and model reasons
+
+Contacts with failed enrichment, `Site Error`, `Scrape Error`, `Unknown`, or
+empty industry data go to `General` with an explicit reason. Usable contacts
+are routed with library matching, strict embedding shortlisting/auto-match, and
+then the Phase 1B LLM.
+
+### Volume rollup
+
+After every selected contact has a pre-rollup decision, the app counts the total
+contacts at each level and applies the user-configured `min_volume` and
+`bucket_budget`.
+
+The rollup order is:
+
+1. `{sector_focus} {functional_specialization}`
+2. `functional_specialization`
+3. `primary_identity`
+4. `General`
+
+Example with `min_volume = 1000`:
+
+- If `Real Estate SEO Agency` has at least 1000 contacts, use that bucket.
+- If it has fewer than 1000, roll those contacts to `SEO Agency`.
+- If `SEO Agency` also has fewer than 1000, roll them to `Agency`.
+- If `Agency` has fewer than 1000, roll them to `General`.
+
+If the number of populated non-General buckets exceeds `bucket_budget`, the app
+rolls up the smallest buckets one level at a time until the budget is satisfied.
+The diagnostic script is for inspection after a run; it is not what performs
+rollup:
+
+```bash
+npx tsx scripts/bucketing-diagnostics.ts <bucketing_run_id>
+```
+
 
 ## Enrichment `source` values
 

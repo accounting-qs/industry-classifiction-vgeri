@@ -117,6 +117,8 @@ export interface BucketingRun {
   total_contacts?: number | null;
   assigned_contacts?: number | null;
   cost_usd?: number | null;
+  quality_warnings?: string[] | null;
+  coverage_summary?: any;
   progress?: BucketingProgress | null;
   cancel_requested?: boolean | null;
   error_message?: string | null;
@@ -158,12 +160,15 @@ export interface BucketAssignmentRow {
   // 'deterministic'      — fanout copied a map row that came from any source below
   // 'library_match'      — embedding match against a library bucket (Phase 1a)
   // 'preview_embedding'  — Phase 1a preview seed (replaced on assignment)
-  // 'embedding'          — Phase 1b sector-aware embedding match
+  // 'embedding'          — legacy distinct-industry embedding match
+  // 'embedding_high_confidence' — strict per-contact embedding match
   // 'llm_phase1b'        — Phase 1b routing LLM
-  // 'catchall'           — bucketing_catchall_other RPC (no map row, contact had no industry)
+  // 'unclassifiable'     — failed/no-data contacts routed straight to General
+  // 'catchall'           — legacy catchall sweep
   // legacy: 'llm_phase2', 'llm_phase1', 'manual', 'other'
   source: 'deterministic' | 'library_match' | 'preview_embedding' | 'embedding'
-        | 'llm_phase1b' | 'catchall' | 'llm_phase2' | 'llm_phase1' | 'manual' | 'other';
+        | 'embedding_high_confidence' | 'llm_phase1b' | 'unclassifiable'
+        | 'catchall' | 'llm_phase2' | 'llm_phase1' | 'manual' | 'other';
   confidence: number | null;
   assigned_at: string;
   bucket_leaf?: string | null;
@@ -172,6 +177,10 @@ export interface BucketAssignmentRow {
   primary_identity?: string | null;
   functional_specialization?: string | null;
   sector_focus?: string | null;
+  pre_rollup_bucket_name?: string | null;
+  rollup_level?: string | null;
+  general_reason?: string | null;
+  reasons?: Record<string, any> | null;
   is_generic?: boolean | null;
   is_disqualified?: boolean | null;
 }

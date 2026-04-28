@@ -34,6 +34,7 @@ export function BucketingTab({ importLists }: {
   const [activeRun, setActiveRun] = useState<BucketingRun | null>(null);
   const [bucketCounts, setBucketCounts] = useState<any[]>([]);
   const [sectorMix, setSectorMix] = useState<any[]>([]);
+  const [generalBreakdown, setGeneralBreakdown] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -66,6 +67,7 @@ export function BucketingTab({ importLists }: {
         setActiveRun(data.run);
         setBucketCounts(Array.isArray(data.bucket_counts) ? data.bucket_counts : []);
         setSectorMix(Array.isArray(data.sector_mix) ? data.sector_mix : []);
+        setGeneralBreakdown(Array.isArray(data.general_breakdown) ? data.general_breakdown : []);
       }
     } catch (e: any) {
       setError(e.message);
@@ -202,6 +204,7 @@ export function BucketingTab({ importLists }: {
             run={activeRun}
             bucketCounts={bucketCounts}
             sectorMix={sectorMix}
+            generalBreakdown={generalBreakdown}
             onRefresh={fetchActive}
             onError={setError}
             onLibrarySaved={refreshLibrary}
@@ -657,10 +660,11 @@ function formatDuration(seconds: number): string {
   return `${h}h ${m % 60}m`;
 }
 
-function BucketingDetail({ run, bucketCounts, sectorMix, onRefresh, onError, onLibrarySaved }: {
+function BucketingDetail({ run, bucketCounts, sectorMix, generalBreakdown, onRefresh, onError, onLibrarySaved }: {
   run: BucketingRun;
   bucketCounts: any[];
   sectorMix: any[];
+  generalBreakdown: any[];
   onRefresh: () => void;
   onError: (msg: string | null) => void;
   onLibrarySaved: () => void;
@@ -687,7 +691,7 @@ function BucketingDetail({ run, bucketCounts, sectorMix, onRefresh, onError, onL
   if (run.status === 'taxonomy_ready') {
     return <BucketingReview run={run} bucketCounts={bucketCounts} onRefresh={onRefresh} onError={onError} />;
   }
-  return <BucketingResults run={run} bucketCounts={bucketCounts} sectorMix={sectorMix} onError={onError} onLibrarySaved={onLibrarySaved} />;
+  return <BucketingResults run={run} bucketCounts={bucketCounts} sectorMix={sectorMix} generalBreakdown={generalBreakdown} onError={onError} onLibrarySaved={onLibrarySaved} />;
 }
 
 // ───── REVIEW VIEW ──────────────────────────────────────────────
@@ -982,10 +986,11 @@ function BucketChainList({
 
 // ───── RESULTS VIEW ───────────────────────────────────────────────
 
-function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySaved }: {
+function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onError, onLibrarySaved }: {
   run: BucketingRun;
   bucketCounts: any[];
   sectorMix: any[];
+  generalBreakdown: any[];
   onError: (msg: string | null) => void;
   onLibrarySaved: () => void;
 }) {
@@ -1032,6 +1037,9 @@ function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySave
         sector_focus: r.sector_focus,
         is_generic: r.is_generic,
         is_disqualified: r.is_disqualified,
+        pre_rollup_bucket: r.pre_rollup_bucket_name,
+        rollup_level: r.rollup_level,
+        general_reason: r.general_reason,
         source: r.source,
         confidence: r.confidence,
         email: r.contacts?.email,
@@ -1087,6 +1095,30 @@ function BucketingResults({ run, bucketCounts, sectorMix, onError, onLibrarySave
         <StatCard label="Contacts assigned" value={total.toLocaleString()} color="text-[#3ecf8e]" />
         <StatCard label="Total cost" value={`$${(Number(run.cost_usd) || 0).toFixed(3)}`} color="text-white" />
       </div>
+
+      {Array.isArray(run.quality_warnings) && run.quality_warnings.length > 0 && (
+        <div className="border border-amber-500/30 rounded-xl bg-amber-500/5 p-4">
+          <div className="text-[10px] font-bold text-amber-400 uppercase tracking-widest mb-2">Quality warnings</div>
+          <ul className="space-y-1 text-xs text-amber-100/80">
+            {run.quality_warnings.map((w, i) => <li key={i}>{w}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {generalBreakdown.length > 0 && (
+        <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
+          <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-3">General breakdown</div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+            {generalBreakdown.map((g, i) => (
+              <div key={`${g.general_reason}-${g.source}-${i}`} className="px-3 py-2 rounded border border-[#2e2e2e] bg-[#1c1c1c]">
+                <div className="text-xs font-bold text-amber-300">{Number(g.contact_count || 0).toLocaleString()}</div>
+                <div className="text-[10px] text-gray-400">{g.general_reason || 'unspecified'}</div>
+                <div className="text-[9px] text-gray-600 font-mono">{g.source}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {bucketsInRun.length > 0 && (
         <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">

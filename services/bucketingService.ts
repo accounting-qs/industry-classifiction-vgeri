@@ -17,14 +17,13 @@
  *   - A separate sector-focus vocabulary (controlled list of sectors that may
  *     describe whom a company serves, NEVER what a company is).
  *
- * Phase 1b (MATCHING, per distinct industry): gpt-4.1-mini batched 8/call,
- * concurrency 40. Returns leaf+ancestor+root chain PLUS sector_focus,
- * generic/disqualified flags, identity_type. Strict routing rules in the
- * prompt — strong identity nouns (PE firm, agency, MSP, …) outrank sector
- * nouns (healthcare, government, …) unless operator evidence is present.
+ * Phase 1b (MATCHING, per contact): gpt-4.1-mini batched 8/call,
+ * concurrency 40. Uses company-specific context (name, website, enriched
+ * classification, confidence, reasoning) and writes contact-level pre-rollup
+ * decisions before computing final campaign buckets.
  *
- * Volume rollup is unchanged: leaf → ancestor → root → Generic. Disqualified
- * stays disqualified.
+ * Volume rollup: sector+specialization → specialization → identity → General.
+ * Disqualified / invalid rows land in General with audit reasons.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -50,6 +49,8 @@ const EMBED_PREFILTER_ENABLED = true;
 // reviews specs before assignment).
 const EMBED_AUTO_THRESHOLD = 0.78;
 const EMBED_MARGIN = 0.07;
+const CONTACT_EMBED_AUTO_THRESHOLD = 0.90;
+const CONTACT_EMBED_MARGIN = 0.12;
 const OPENAI_TIMEOUT_MS = 90_000;
 const TAXONOMY_TIMEOUT_MS = 180_000;
 
@@ -131,6 +132,26 @@ interface VocabRow {
     sample_reasoning: string[] | null;
 }
 
+interface ContactRouteInput {
+    contact_id: string;
+    company_name: string | null;
+    company_website: string | null;
+    industry: string | null;
+    lead_list_name: string | null;
+    enrichment_status: string | null;
+    classification: string | null;
+    confidence: number | null;
+    reasoning: string | null;
+    error_message: string | null;
+    embedding_candidates?: EmbeddingCandidate[];
+}
+
+interface EmbeddingCandidate {
+    functional_specialization: string;
+    primary_identity: string;
+    score: number;
+}
+
 // A primary_identity is a Layer-1 high-level business type (Agency,
 // Consulting & Advisory, Software & SaaS, …). Layer-2 functional
 // specializations are nested under it.
@@ -179,6 +200,27 @@ interface MatchChain {
     identity_type: string;
     generic: boolean;
     disqualified: boolean;
+}
+
+interface ContactMapRow {
+    bucketing_run_id: string;
+    contact_id: string;
+    industry_string: string;
+    primary_identity: string;
+    functional_specialization: string;
+    sector_focus: string;
+    pre_rollup_bucket_name: string;
+    bucket_name: string;
+    rollup_level: 'combo' | 'specialization' | 'identity' | 'general';
+    source: string;
+    confidence: number;
+    leaf_score: number;
+    ancestor_score: number;
+    root_score: number;
+    is_generic: boolean;
+    is_disqualified: boolean;
+    general_reason: string | null;
+    reasons: Record<string, any>;
 }
 
 // ─── heartbeat wrapper ─────────────────────────────────────────────
@@ -233,6 +275,66 @@ async function fetchFullVocabulary(
             .range(0, VOCAB_HARD_LIMIT - 1);
         if (error) throw new Error(`vocabulary fetch failed: ${error.message}`);
         return (data || []) as VocabRow[];
+    }, ctx);
+}
+
+const CONTACT_PAGE_SIZE = 1000;
+
+async function countSelectedContacts(
+    supabase: SupabaseClient,
+    listNames: string[]
+): Promise<number> {
+    const { count, error } = await supabase
+        .from('contacts')
+        .select('contact_id', { count: 'exact', head: true })
+        .in('lead_list_name', listNames);
+    if (error) throw new Error(`selected contact count failed: ${error.message}`);
+    return count || 0;
+}
+
+async function fetchContactsForRouting(
+    supabase: SupabaseClient,
+    listNames: string[],
+    ctx?: BucketingCtx
+): Promise<ContactRouteInput[]> {
+    return withHeartbeat('contact fetch', async () => {
+        const rows: ContactRouteInput[] = [];
+        let offset = 0;
+        while (true) {
+            await ctx?.checkCancel();
+            const { data, error } = await supabase
+                .from('contacts')
+                .select('contact_id,company_name,company_website,industry,lead_list_name,enrichments(status,classification,confidence,reasoning,error_message)')
+                .in('lead_list_name', listNames)
+                .order('contact_id', { ascending: true })
+                .range(offset, offset + CONTACT_PAGE_SIZE - 1);
+            if (error) throw new Error(`contact fetch failed: ${error.message}`);
+            const page = data || [];
+            for (const r of page as any[]) {
+                const enr = Array.isArray(r.enrichments) ? r.enrichments[0] : r.enrichments;
+                rows.push({
+                    contact_id: r.contact_id,
+                    company_name: r.company_name || null,
+                    company_website: r.company_website || null,
+                    industry: r.industry || null,
+                    lead_list_name: r.lead_list_name || null,
+                    enrichment_status: enr?.status || null,
+                    classification: enr?.classification || null,
+                    confidence: typeof enr?.confidence === 'number' ? enr.confidence : null,
+                    reasoning: enr?.reasoning || null,
+                    error_message: enr?.error_message || null
+                });
+            }
+            if (page.length < CONTACT_PAGE_SIZE) break;
+            offset += CONTACT_PAGE_SIZE;
+            ctx?.progress({
+                phase: 'phase1b',
+                step: 'load_contacts',
+                current: rows.length,
+                note: `Loaded ${rows.length.toLocaleString()} contacts…`
+            });
+        }
+        return rows;
     }, ctx);
 }
 
@@ -391,9 +493,10 @@ export async function runTaxonomyProposal(
     if (runErr || !run) throw new Error(`Run not found: ${runErr?.message}`);
 
     const vocabRows = await fetchFullVocabulary(supabase, run.list_names, ctx);
-    const totalContacts = vocabRows.reduce((s, r) => s + Number(r.n || 0), 0);
-    ctx.log(`[Bucketing ${runId}] vocabulary: ${vocabRows.length} distinct industries, ${totalContacts} contacts`);
-    ctx.progress({ phase: 'phase1a', step: 'vocabulary_loaded', current: vocabRows.length, total: vocabRows.length, note: `${vocabRows.length} distinct industries, ${totalContacts.toLocaleString()} contacts` });
+    const vocabularyContacts = vocabRows.reduce((s, r) => s + Number(r.n || 0), 0);
+    const totalContacts = await countSelectedContacts(supabase, run.list_names);
+    ctx.log(`[Bucketing ${runId}] vocabulary: ${vocabRows.length} distinct industries covering ${vocabularyContacts} classified contacts, ${totalContacts} selected contacts`);
+    ctx.progress({ phase: 'phase1a', step: 'vocabulary_loaded', current: vocabRows.length, total: vocabRows.length, note: `${vocabRows.length} distinct industries, ${totalContacts.toLocaleString()} selected contacts` });
 
     if (vocabRows.length === 0) {
         await supabase.from('bucketing_runs').update({
@@ -707,6 +810,11 @@ NO-SHORTCUTS RULES:
    synonym must be merged.
 4) An identity with no specializations is invalid. Every identity must
    have ≥1 specialization underneath it.
+5) Coverage requirement: proposed specializations + identities should
+   collectively cover at least 80% of usable contact volume represented
+   in the vocabulary. General is for bad/no-data, clear non-ICP, and true
+   no-fit cases — do NOT create a niche-only taxonomy that dumps normal
+   B2B companies into General.
 
 ❌ TOO BROAD as a SPECIALIZATION (must be a primary_identity instead):
 "SaaS", "B2B SaaS", "Marketing Agency", "Consulting Firm", "Software".
@@ -953,10 +1061,10 @@ export async function applyTaxonomyEdits(
 ): Promise<void> {
     const { data: run, error } = await supabase.from('bucketing_runs').select('*').eq('id', runId).single();
     if (error || !run) throw new Error(`Run not found: ${error?.message}`);
-    const proposal = run.taxonomy_proposal as DiscoveryOutput | null;
-    if (!proposal?.buckets) throw new Error('Taxonomy proposal missing — run Phase 1a first');
+    const sourceTaxonomy = (run.taxonomy_final || run.taxonomy_proposal) as DiscoveryOutput | null;
+    if (!sourceTaxonomy?.buckets) throw new Error('Taxonomy proposal missing — run Phase 1a first');
 
-    let leaves = proposal.buckets.map(b => ({ ...b }));
+    let leaves = sourceTaxonomy.buckets.map(b => ({ ...b }));
 
     if (edits.rename) {
         for (const [oldName, newName] of Object.entries(edits.rename)) {
@@ -994,9 +1102,9 @@ export async function applyTaxonomyEdits(
 
     const update: any = {
         taxonomy_final: {
-            observed_patterns: proposal.observed_patterns || [],
-            sector_focus_vocabulary: proposal.sector_focus_vocabulary || [],
-            primary_identities: (proposal as any).primary_identities || [],
+            observed_patterns: sourceTaxonomy.observed_patterns || [],
+            sector_focus_vocabulary: sourceTaxonomy.sector_focus_vocabulary || [],
+            primary_identities: (sourceTaxonomy as any).primary_identities || [],
             buckets: leaves
         }
     };
@@ -1013,7 +1121,7 @@ export async function applyTaxonomyEdits(
     // (renames / drops / new specs all change which industries map where).
     // Cheap: one batched embedding call against the run's vocab.
     try {
-        await rebuildPreviewMap(supabase, runId, leaves, proposal.sector_focus_vocabulary || [], run.list_names || [], ctx);
+        await rebuildPreviewMap(supabase, runId, leaves, sourceTaxonomy.sector_focus_vocabulary || [], run.list_names || [], ctx);
     } catch (e: any) {
         ctx.log(`[Bucketing ${runId}] preview rebuild failed (non-fatal): ${e.message}`, 'warn');
     }
@@ -1077,11 +1185,11 @@ export async function runAssignment(
     }
     const leaves = final.buckets;
     const sectorVocab: string[] = (final as any).sector_focus_vocabulary || [];
+    const finalSpecNames = new Set(leaves.map(l => l.functional_specialization));
 
-    // Library buckets the user opted into for this run. We match them first,
-    // deterministically, before LLM matching. They've earned their place
-    // across past runs — no point burning LLM tokens on industries they
-    // already cover.
+    // Library buckets the user opted into for this run. Only keep library
+    // specs that survived Review; a dropped library spec must not reappear
+    // during assignment.
     const preferredIds: string[] = Array.isArray(run.preferred_library_ids) ? run.preferred_library_ids : [];
     let libraryBuckets: any[] = [];
     if (preferredIds.length > 0) {
@@ -1089,6 +1197,7 @@ export async function runAssignment(
             .from('bucket_library').select('*').in('id', preferredIds);
         libraryBuckets = (data || []).filter((b: any) =>
             (b.functional_specialization || b.bucket_name) && (b.primary_identity || b.direct_ancestor)
+            && finalSpecNames.has(b.functional_specialization || b.bucket_name)
         );
     }
 
@@ -1097,106 +1206,391 @@ export async function runAssignment(
     let totalCost = Number(run.cost_usd || 0);
 
     await ctx.checkCancel();
-    ctx.log(`[Bucketing ${runId}] step 1/5: load vocabulary`, 'phase');
-    ctx.progress({ phase: 'phase1b', step: 'load_vocabulary', note: 'Loading vocabulary…' });
-    const vocab = await fetchFullVocabulary(supabase, run.list_names, ctx);
-    ctx.log(`[Bucketing ${runId}] ${vocab.length} distinct industries to match`);
-    ctx.progress({ phase: 'phase1b', step: 'vocabulary_loaded', current: vocab.length, total: vocab.length, note: `${vocab.length} distinct industries to match` });
+    ctx.log(`[Bucketing ${runId}] step 1/5: load contacts`, 'phase');
+    ctx.progress({ phase: 'phase1b', step: 'load_contacts', note: 'Loading selected contacts…' });
+    const contacts = await fetchContactsForRouting(supabase, run.list_names, ctx);
+    ctx.log(`[Bucketing ${runId}] ${contacts.length} contacts to route`);
+    ctx.progress({ phase: 'phase1b', step: 'contacts_loaded', current: contacts.length, total: contacts.length, note: `${contacts.length.toLocaleString()} contacts loaded` });
 
-    await supabase.from('bucket_industry_map').delete().eq('bucketing_run_id', runId);
+    const { error: clearContactMapError } = await supabase
+        .from('bucket_contact_map')
+        .delete()
+        .eq('bucketing_run_id', runId);
+    if (clearContactMapError) throw new Error(`contact map cleanup failed: ${clearContactMapError.message}`);
+    const { error: clearAssignmentsError } = await supabase
+        .from('bucket_assignments')
+        .delete()
+        .eq('bucketing_run_id', runId);
+    if (clearAssignmentsError) throw new Error(`assignment cleanup failed: ${clearAssignmentsError.message}`);
 
-    let assignedRows: any[] = [];
-    let pendingIndustries: VocabRow[] = vocab;
+    const assignedRows: ContactMapRow[] = [];
+    const usableContacts: ContactRouteInput[] = [];
+    for (const contact of contacts) {
+        const reason = getUnclassifiableReason(contact);
+        if (reason) assignedRows.push(makeGeneralContactRow(runId, contact, reason));
+        else usableContacts.push(contact);
+    }
+    let pendingContacts: ContactRouteInput[] = usableContacts;
+    ctx.log(`[Bucketing ${runId}] usable contacts: ${usableContacts.length}; General before routing: ${assignedRows.length}`);
 
-    // Step 2 (NEW): library-first deterministic match.
-    if (libraryBuckets.length > 0) {
+    // Step 2: selected-library high-confidence match, per contact.
+    if (libraryBuckets.length > 0 && pendingContacts.length > 0) {
         await ctx.checkCancel();
         ctx.log(`[Bucketing ${runId}] step 2/5: library-first match against ${libraryBuckets.length} preferred buckets`, 'phase');
         ctx.progress({ phase: 'phase1b', step: 'library_match', note: `Matching against ${libraryBuckets.length} library buckets…` });
         const libRes = await withHeartbeat('library-first match (Phase 1b)',
-            () => runLibraryFirstMatch(vocab, libraryBuckets, sectorVocab, runId), ctx);
+            () => runContactLibraryFirstMatch(pendingContacts, libraryBuckets, sectorVocab, runId), ctx);
         totalCost += libRes.costUsd;
-        assignedRows = libRes.autoAssigned;
-        pendingIndustries = libRes.pending;
-        ctx.log(`[Bucketing ${runId}] library matched ${assignedRows.length}/${vocab.length}, ${pendingIndustries.length} pending`);
-        ctx.progress({ phase: 'phase1b', step: 'library_match_done', current: assignedRows.length, total: vocab.length, note: `${assignedRows.length} matched via library, ${pendingIndustries.length} pending` });
+        assignedRows.push(...libRes.autoAssigned);
+        pendingContacts = libRes.pending;
+        ctx.log(`[Bucketing ${runId}] library matched ${libRes.autoAssigned.length}/${usableContacts.length}, ${pendingContacts.length} pending`);
+        ctx.progress({ phase: 'phase1b', step: 'library_match_done', current: assignedRows.length, total: contacts.length, note: `${libRes.autoAssigned.length} matched via library, ${pendingContacts.length} pending` });
     }
 
-    // Step 3: sector-aware embedding pre-filter.
-    if (EMBED_PREFILTER_ENABLED && pendingIndustries.length > 0) {
+    // Step 3: strict contact-level embedding auto-match. This is intentionally
+    // stricter than the review preview threshold; otherwise the LLM handles it.
+    if (EMBED_PREFILTER_ENABLED && pendingContacts.length > 0) {
         await ctx.checkCancel();
-        ctx.log(`[Bucketing ${runId}] step 3/5: embedding pre-filter (sector-aware)`, 'phase');
-        ctx.progress({ phase: 'phase1b', step: 'embedding_prefilter', note: `Embedding pre-filter on ${pendingIndustries.length} industries…` });
+        ctx.log(`[Bucketing ${runId}] step 3/5: strict embedding pre-filter`, 'phase');
+        ctx.progress({ phase: 'phase1b', step: 'embedding_prefilter', note: `Embedding pre-filter on ${pendingContacts.length.toLocaleString()} contacts…` });
         const embedRes = await withHeartbeat(
-            `embedding pre-filter (${pendingIndustries.length} industries)`,
-            () => runEmbeddingPrefilter(pendingIndustries, leaves, sectorVocab, runId),
+            `contact embedding pre-filter (${pendingContacts.length} contacts)`,
+            () => runContactEmbeddingPrefilter(pendingContacts, leaves, sectorVocab, runId),
             ctx
         );
         totalCost += embedRes.costUsd;
-        assignedRows = assignedRows.concat(embedRes.autoAssigned);
-        pendingIndustries = embedRes.pending;
-        ctx.log(`[Bucketing ${runId}] embedding auto-assigned ${embedRes.autoAssigned.length}/${vocab.length}, ${pendingIndustries.length} still pending`);
-        ctx.progress({ phase: 'phase1b', step: 'embedding_prefilter_done', current: vocab.length - pendingIndustries.length, total: vocab.length, note: `${embedRes.autoAssigned.length} matched via embedding, ${pendingIndustries.length} still pending LLM` });
+        assignedRows.push(...embedRes.autoAssigned);
+        pendingContacts = embedRes.pending;
+        ctx.log(`[Bucketing ${runId}] embedding auto-assigned ${embedRes.autoAssigned.length}/${usableContacts.length}, ${pendingContacts.length} still pending`);
+        ctx.progress({ phase: 'phase1b', step: 'embedding_prefilter_done', current: contacts.length - pendingContacts.length, total: contacts.length, note: `${embedRes.autoAssigned.length} matched via strict embedding, ${pendingContacts.length} still pending LLM` });
     }
 
     await ctx.checkCancel();
     ctx.log(`[Bucketing ${runId}] step 4/5: routing LLM matching`, 'phase');
-    ctx.progress({ phase: 'phase1b', step: 'llm_routing', current: 0, total: pendingIndustries.length, note: `LLM routing on ${pendingIndustries.length} industries…` });
-    const llmRes = await runMatchingLLM(pendingIndustries, leaves, sectorVocab, runId, ctx);
+    ctx.progress({ phase: 'phase1b', step: 'llm_routing', current: 0, total: pendingContacts.length, note: `LLM routing on ${pendingContacts.length.toLocaleString()} contacts…` });
+    const llmRes = await runContactMatchingLLM(pendingContacts, leaves, sectorVocab, runId, ctx);
     totalCost += llmRes.costUsd;
-    assignedRows = assignedRows.concat(llmRes.rows);
-    ctx.log(`[Bucketing ${runId}] LLM matched ${llmRes.rows.length}, total chain rows ${assignedRows.length}, cost so far $${totalCost.toFixed(4)}`);
-    ctx.progress({ phase: 'phase1b', step: 'llm_routing_done', current: vocab.length, total: vocab.length, note: `LLM matched ${llmRes.rows.length} industries, $${totalCost.toFixed(4)} spent` });
-
-    if (assignedRows.length > 0) {
-        for (let i = 0; i < assignedRows.length; i += 1000) {
-            const chunk = assignedRows.slice(i, i + 1000);
-            const { error: upErr } = await supabase.from('bucket_industry_map')
-                .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
-            if (upErr) throw new Error(`map insert failed: ${upErr.message}`);
-        }
-    }
+    assignedRows.push(...llmRes.rows);
+    ctx.log(`[Bucketing ${runId}] LLM routed ${llmRes.rows.length}, total contact rows ${assignedRows.length}, cost so far $${totalCost.toFixed(4)}`);
+    ctx.progress({ phase: 'phase1b', step: 'llm_routing_done', current: contacts.length, total: contacts.length, note: `LLM routed ${llmRes.rows.length.toLocaleString()} contacts, $${totalCost.toFixed(4)} spent` });
 
     await ctx.checkCancel();
-    ctx.log(`[Bucketing ${runId}] step 5/5: volume rollup + fan-out`, 'phase');
-    ctx.progress({ phase: 'phase1b', step: 'rollup_fanout', note: 'Computing campaign buckets and writing per-contact assignments…' });
-    const { error: rollupErr } = await withHeartbeat(
-        'volume rollup (SQL)',
-        async () => supabase.rpc('bucketing_apply_volume_rollup', { p_run_id: runId }),
-        ctx
-    );
-    if (rollupErr) throw new Error(`volume rollup failed: ${rollupErr.message}`);
+    ctx.log(`[Bucketing ${runId}] step 5/5: contact-level volume rollup + write`, 'phase');
+    ctx.progress({ phase: 'phase1b', step: 'rollup_write', note: 'Computing contact-level campaign buckets…' });
+    const rolledRows = computeContactRollup(assignedRows, Number(run.min_volume || 0), Number(run.bucket_budget || 30));
+    await writeContactMapAndAssignments(supabase, runId, rolledRows);
 
-    await supabase.from('bucket_assignments').delete().eq('bucketing_run_id', runId);
-    const { data: fanoutCount, error: fanErr } = await withHeartbeat(
-        'fan-out to bucket_assignments (SQL)',
-        async () => supabase.rpc('bucketing_deterministic_fanout', { p_run_id: runId }),
-        ctx
-    );
-    if (fanErr) throw new Error(`fanout failed: ${fanErr.message}`);
-    ctx.log(`[Bucketing ${runId}] fan-out wrote ${Number(fanoutCount || 0)} assignments`);
-
-    const { error: catchErr } = await withHeartbeat(
-        'catch-all sweep (SQL)',
-        async () => supabase.rpc('bucketing_catchall_other', { p_run_id: runId }),
-        ctx
-    );
-    if (catchErr) throw new Error(`catch-all failed: ${catchErr.message}`);
-
-    const { count: assignedCount } = await supabase
-        .from('bucket_assignments')
-        .select('contact_id', { count: 'exact', head: true })
-        .eq('bucketing_run_id', runId);
+    const assignedCount = rolledRows.length;
+    const coverageSummary = buildCoverageSummary(contacts, rolledRows);
+    const qualityWarnings = buildQualityWarnings(coverageSummary, rolledRows);
 
     await supabase.from('bucketing_runs').update({
         status: 'completed',
-        assigned_contacts: assignedCount || 0,
+        assigned_contacts: assignedCount,
         cost_usd: totalCost,
+        coverage_summary: coverageSummary,
+        quality_warnings: qualityWarnings,
         assignment_completed_at: new Date().toISOString()
     }).eq('id', runId);
 
-    ctx.log(`[Bucketing ${runId}] DONE — ${assignedCount} contacts assigned, total cost $${totalCost.toFixed(4)}`, 'phase');
-    ctx.progress({ phase: 'phase1b', step: 'done', current: 1, total: 1, note: `Assigned ${assignedCount?.toLocaleString()} contacts — total cost $${totalCost.toFixed(4)}` });
+    for (const warning of qualityWarnings) ctx.log(`[Bucketing ${runId}] warning: ${warning}`, 'warn');
+    ctx.log(`[Bucketing ${runId}] DONE — ${assignedCount.toLocaleString()} contacts assigned, total cost $${totalCost.toFixed(4)}`, 'phase');
+    ctx.progress({ phase: 'phase1b', step: 'done', current: assignedCount, total: contacts.length, note: `Assigned ${assignedCount.toLocaleString()} contacts — total cost $${totalCost.toFixed(4)}` });
+}
+
+function getUnclassifiableReason(contact: ContactRouteInput): string | null {
+    const label = (contact.classification || contact.industry || '').trim().toLowerCase();
+    if (contact.enrichment_status !== 'completed') return 'failed_enrichment';
+    if (!label) return 'missing_industry';
+    if (['site error', 'scrape error', 'unknown', 'error', 'n/a', 'na', 'none'].includes(label)) {
+        return 'scrape_site_unknown';
+    }
+    return null;
+}
+
+function contactRoutingText(contact: ContactRouteInput): string {
+    return [
+        contact.company_name ? `Company: ${contact.company_name}` : '',
+        contact.company_website ? `Website: ${contact.company_website}` : '',
+        contact.industry ? `Industry: ${contact.industry}` : '',
+        contact.classification && contact.classification !== contact.industry ? `Classification: ${contact.classification}` : '',
+        typeof contact.confidence === 'number' ? `Confidence: ${contact.confidence}` : '',
+        contact.reasoning ? `Reasoning: ${contact.reasoning}` : ''
+    ].filter(Boolean).join('\n');
+}
+
+function cleanScore(n: number | undefined | null): number {
+    if (typeof n !== 'number' || !Number.isFinite(n)) return 0;
+    return Number(Math.max(0, Math.min(1, n)).toFixed(2));
+}
+
+function preRollupName(row: Pick<ContactMapRow, 'sector_focus' | 'functional_specialization' | 'primary_identity' | 'is_generic' | 'is_disqualified'>): string {
+    if (row.is_generic || row.is_disqualified) return RESERVED_GENERAL;
+    if (row.functional_specialization && row.sector_focus && row.sector_focus !== 'Multi-industry') {
+        return `${row.sector_focus} ${row.functional_specialization}`;
+    }
+    if (row.functional_specialization) return row.functional_specialization;
+    if (row.primary_identity) return row.primary_identity;
+    return RESERVED_GENERAL;
+}
+
+function makeGeneralContactRow(
+    runId: string,
+    contact: ContactRouteInput,
+    reason: string
+): ContactMapRow {
+    return {
+        bucketing_run_id: runId,
+        contact_id: contact.contact_id,
+        industry_string: (contact.classification || contact.industry || '').trim(),
+        primary_identity: '',
+        functional_specialization: '',
+        sector_focus: '',
+        pre_rollup_bucket_name: RESERVED_GENERAL,
+        bucket_name: RESERVED_GENERAL,
+        rollup_level: 'general',
+        source: 'unclassifiable',
+        confidence: 0,
+        leaf_score: 0,
+        ancestor_score: 0,
+        root_score: 0,
+        is_generic: true,
+        is_disqualified: false,
+        general_reason: reason,
+        reasons: {
+            general_reason: reason,
+            enrichment_status: contact.enrichment_status,
+            error_message: contact.error_message
+        }
+    };
+}
+
+function makeMatchedContactRow(
+    runId: string,
+    contact: ContactRouteInput,
+    params: {
+        primary_identity: string;
+        functional_specialization: string;
+        sector_focus: string;
+        source: string;
+        confidence: number;
+        leaf_score: number;
+        ancestor_score: number;
+        root_score: number;
+        is_generic?: boolean;
+        is_disqualified?: boolean;
+        general_reason?: string | null;
+        reasons?: Record<string, any>;
+    }
+): ContactMapRow {
+    const row: ContactMapRow = {
+        bucketing_run_id: runId,
+        contact_id: contact.contact_id,
+        industry_string: (contact.classification || contact.industry || '').trim(),
+        primary_identity: params.primary_identity,
+        functional_specialization: params.functional_specialization,
+        sector_focus: params.sector_focus,
+        pre_rollup_bucket_name: RESERVED_GENERAL,
+        bucket_name: RESERVED_GENERAL,
+        rollup_level: 'general',
+        source: params.source,
+        confidence: cleanScore(params.confidence),
+        leaf_score: cleanScore(params.leaf_score),
+        ancestor_score: cleanScore(params.ancestor_score),
+        root_score: cleanScore(params.root_score),
+        is_generic: !!params.is_generic,
+        is_disqualified: !!params.is_disqualified,
+        general_reason: params.general_reason || null,
+        reasons: params.reasons || {}
+    };
+    row.pre_rollup_bucket_name = preRollupName(row);
+    row.bucket_name = row.pre_rollup_bucket_name;
+    row.rollup_level = row.bucket_name === RESERVED_GENERAL
+        ? 'general'
+        : row.functional_specialization && row.sector_focus && row.sector_focus !== 'Multi-industry'
+            ? 'combo'
+            : row.functional_specialization
+                ? 'specialization'
+                : 'identity';
+    return row;
+}
+
+function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBudget: number): ContactMapRow[] {
+    const comboCounts = new Map<string, number>();
+    const specCounts = new Map<string, number>();
+    const identityCounts = new Map<string, number>();
+
+    for (const row of rows) {
+        if (row.is_generic || row.is_disqualified) continue;
+        if (row.functional_specialization) {
+            specCounts.set(row.functional_specialization, (specCounts.get(row.functional_specialization) || 0) + 1);
+            if (row.sector_focus && row.sector_focus !== 'Multi-industry') {
+                const combo = `${row.sector_focus} ${row.functional_specialization}`;
+                comboCounts.set(combo, (comboCounts.get(combo) || 0) + 1);
+            }
+        }
+        if (row.primary_identity) {
+            identityCounts.set(row.primary_identity, (identityCounts.get(row.primary_identity) || 0) + 1);
+        }
+    }
+
+    const rolled = rows.map(row => {
+        const next = { ...row };
+        next.pre_rollup_bucket_name = preRollupName(next);
+        if (next.is_disqualified) {
+            next.bucket_name = RESERVED_GENERAL;
+            next.rollup_level = 'general';
+            next.general_reason = next.general_reason || 'disqualified';
+        } else if (next.is_generic && !next.primary_identity) {
+            next.bucket_name = RESERVED_GENERAL;
+            next.rollup_level = 'general';
+            next.general_reason = next.general_reason || 'generic_low_confidence';
+        } else if (next.functional_specialization && next.sector_focus && next.sector_focus !== 'Multi-industry'
+            && (comboCounts.get(`${next.sector_focus} ${next.functional_specialization}`) || 0) >= minVolume) {
+            next.bucket_name = `${next.sector_focus} ${next.functional_specialization}`;
+            next.rollup_level = 'combo';
+            next.general_reason = null;
+        } else if (next.functional_specialization && (specCounts.get(next.functional_specialization) || 0) >= minVolume) {
+            next.bucket_name = next.functional_specialization;
+            next.rollup_level = 'specialization';
+            next.general_reason = null;
+        } else if (next.primary_identity && (identityCounts.get(next.primary_identity) || 0) >= minVolume) {
+            next.bucket_name = next.primary_identity;
+            next.rollup_level = 'identity';
+            next.general_reason = null;
+        } else {
+            next.bucket_name = RESERVED_GENERAL;
+            next.rollup_level = 'general';
+            next.general_reason = next.general_reason || 'rolled_up_to_general';
+        }
+        return next;
+    });
+
+    const budget = Math.max(1, Math.floor(bucketBudget || 30));
+    let safety = 0;
+    while (safety++ < 300) {
+        const counts = new Map<string, number>();
+        for (const row of rolled) {
+            if (row.bucket_name === RESERVED_GENERAL) continue;
+            counts.set(row.bucket_name, (counts.get(row.bucket_name) || 0) + 1);
+        }
+        if (counts.size <= budget) break;
+        const smallest = Array.from(counts.entries()).sort((a, b) => a[1] - b[1])[0]?.[0];
+        if (!smallest) break;
+        for (const row of rolled) {
+            if (row.bucket_name !== smallest) continue;
+            if (row.rollup_level === 'combo' && row.functional_specialization) {
+                row.bucket_name = row.functional_specialization;
+                row.rollup_level = 'specialization';
+            } else if (row.rollup_level === 'specialization' && row.primary_identity) {
+                row.bucket_name = row.primary_identity;
+                row.rollup_level = 'identity';
+            } else {
+                row.bucket_name = RESERVED_GENERAL;
+                row.rollup_level = 'general';
+                row.general_reason = row.general_reason || 'bucket_budget_rollup';
+            }
+        }
+    }
+    return rolled;
+}
+
+async function writeContactMapAndAssignments(
+    supabase: SupabaseClient,
+    runId: string,
+    rows: ContactMapRow[]
+): Promise<void> {
+    const mapRows = rows.map(row => ({
+        bucketing_run_id: row.bucketing_run_id,
+        contact_id: row.contact_id,
+        industry_string: row.industry_string,
+        primary_identity: row.primary_identity || null,
+        functional_specialization: row.functional_specialization || null,
+        sector_focus: row.sector_focus || null,
+        pre_rollup_bucket_name: row.pre_rollup_bucket_name,
+        bucket_name: row.bucket_name,
+        rollup_level: row.rollup_level,
+        source: row.source,
+        confidence: row.confidence,
+        leaf_score: row.leaf_score,
+        ancestor_score: row.ancestor_score,
+        root_score: row.root_score,
+        is_generic: row.is_generic,
+        is_disqualified: row.is_disqualified,
+        general_reason: row.general_reason,
+        reasons: row.reasons
+    }));
+    for (let i = 0; i < mapRows.length; i += 1000) {
+        const chunk = mapRows.slice(i, i + 1000);
+        const { error } = await supabase.from('bucket_contact_map')
+            .upsert(chunk, { onConflict: 'bucketing_run_id,contact_id' });
+        if (error) throw new Error(`contact map insert failed: ${error.message}`);
+    }
+
+    const assignmentRows = rows.map(row => ({
+        bucketing_run_id: runId,
+        contact_id: row.contact_id,
+        bucket_name: row.bucket_name,
+        source: row.source,
+        confidence: row.confidence,
+        bucket_leaf: row.functional_specialization || null,
+        bucket_ancestor: row.primary_identity || null,
+        bucket_root: row.primary_identity || null,
+        primary_identity: row.primary_identity || null,
+        functional_specialization: row.functional_specialization || null,
+        sector_focus: row.sector_focus || null,
+        pre_rollup_bucket_name: row.pre_rollup_bucket_name,
+        rollup_level: row.rollup_level,
+        general_reason: row.general_reason,
+        reasons: row.reasons,
+        is_generic: row.is_generic,
+        is_disqualified: row.is_disqualified
+    }));
+    for (let i = 0; i < assignmentRows.length; i += 1000) {
+        const chunk = assignmentRows.slice(i, i + 1000);
+        const { error } = await supabase.from('bucket_assignments')
+            .upsert(chunk, { onConflict: 'bucketing_run_id,contact_id' });
+        if (error) throw new Error(`assignment insert failed: ${error.message}`);
+    }
+}
+
+function buildCoverageSummary(contacts: ContactRouteInput[], rows: ContactMapRow[]) {
+    const generalRows = rows.filter(r => r.bucket_name === RESERVED_GENERAL);
+    const sourceCounts: Record<string, number> = {};
+    const generalReasons: Record<string, number> = {};
+    for (const row of rows) sourceCounts[row.source] = (sourceCounts[row.source] || 0) + 1;
+    for (const row of generalRows) {
+        const reason = row.general_reason || 'unspecified';
+        generalReasons[reason] = (generalReasons[reason] || 0) + 1;
+    }
+    return {
+        selected_contacts: contacts.length,
+        assigned_contacts: rows.length,
+        usable_contacts: contacts.filter(c => !getUnclassifiableReason(c)).length,
+        unclassifiable_contacts: contacts.filter(c => !!getUnclassifiableReason(c)).length,
+        general_contacts: generalRows.length,
+        general_pct: rows.length > 0 ? Number(((generalRows.length / rows.length) * 100).toFixed(2)) : 0,
+        source_counts: sourceCounts,
+        general_reasons: generalReasons,
+        unexpected_unassigned_contacts: Math.max(0, contacts.length - rows.length)
+    };
+}
+
+function buildQualityWarnings(summary: any, rows: ContactMapRow[]): string[] {
+    const warnings: string[] = [];
+    if (summary.assigned_contacts !== summary.selected_contacts) {
+        warnings.push(`Assigned ${summary.assigned_contacts} of ${summary.selected_contacts} selected contacts.`);
+    }
+    if (summary.general_pct > 50) {
+        warnings.push(`General is ${summary.general_pct}% of assigned contacts; review General breakdown before using this run.`);
+    }
+    const catchall = rows.filter(r => r.source === 'catchall').length;
+    const unprocessed = Math.max(0, summary.selected_contacts - summary.assigned_contacts);
+    const denominator = Math.max(1, summary.selected_contacts);
+    if ((catchall + unprocessed) / denominator > 0.05) {
+        warnings.push(`Catchall/unprocessed contacts exceed 5% (${catchall + unprocessed} contacts).`);
+    }
+    return warnings;
 }
 
 // ─── sector_focus extraction (deterministic) ───────────────────────
@@ -1436,6 +1830,108 @@ async function runEmbeddingPrefilter(
     return { autoAssigned, pending, costUsd };
 }
 
+async function runContactLibraryFirstMatch(
+    contacts: ContactRouteInput[],
+    libraryBuckets: any[],
+    sectorVocab: string[],
+    runId: string
+): Promise<{ autoAssigned: ContactMapRow[]; pending: ContactRouteInput[]; costUsd: number }> {
+    if (contacts.length === 0 || libraryBuckets.length === 0) {
+        return { autoAssigned: [], pending: contacts, costUsd: 0 };
+    }
+    const libTexts = libraryBuckets.map(b => {
+        const spec = b.functional_specialization || b.bucket_name || '';
+        const ident = b.primary_identity || b.direct_ancestor || '';
+        const inc = (b.include_terms || []).slice(0, 8).join(', ');
+        const examples = (b.example_strings || []).slice(0, 4).join(' | ');
+        return `${spec} (under ${ident}): ${b.description || ''}. Includes: ${inc}. Examples: ${examples}.`;
+    });
+    const contactTexts = contacts.map(contactRoutingText);
+    const { embeddings, costUsd } = await embedBatch([...libTexts, ...contactTexts]);
+    const libVecs = embeddings.slice(0, libraryBuckets.length);
+    const contactVecs = embeddings.slice(libraryBuckets.length);
+
+    const autoAssigned: ContactMapRow[] = [];
+    const pending: ContactRouteInput[] = [];
+    for (let i = 0; i < contacts.length; i++) {
+        const sims = libVecs.map(lv => cosine(contactVecs[i], lv));
+        const sorted = sims.map((s, j) => ({ s, j })).sort((a, b) => b.s - a.s);
+        const top = sorted[0];
+        const second = sorted[1] || { s: 0 };
+        if (top.s >= CONTACT_EMBED_AUTO_THRESHOLD && (top.s - second.s) >= CONTACT_EMBED_MARGIN) {
+            const lib = libraryBuckets[top.j];
+            const spec = lib.functional_specialization || lib.bucket_name || '';
+            const ident = lib.primary_identity || lib.direct_ancestor || '';
+            autoAssigned.push(makeMatchedContactRow(runId, contacts[i], {
+                primary_identity: ident,
+                functional_specialization: spec,
+                sector_focus: extractSectorFocus(contactRoutingText(contacts[i]), sectorVocab),
+                source: 'library_match',
+                confidence: top.s,
+                leaf_score: top.s,
+                ancestor_score: top.s,
+                root_score: top.s,
+                reasons: { auto: 'library_match', library_bucket_id: lib.id, cosine: top.s }
+            }));
+        } else {
+            pending.push(contacts[i]);
+        }
+    }
+    return { autoAssigned, pending, costUsd };
+}
+
+async function runContactEmbeddingPrefilter(
+    contacts: ContactRouteInput[],
+    leaves: DiscoveredBucket[],
+    sectorVocab: string[],
+    runId: string
+): Promise<{ autoAssigned: ContactMapRow[]; pending: ContactRouteInput[]; costUsd: number }> {
+    if (contacts.length === 0 || leaves.length === 0) {
+        return { autoAssigned: [], pending: contacts, costUsd: 0 };
+    }
+    const leafTexts = leaves.map(l => {
+        const sig = (l.strong_identity_signals || []).slice(0, 6).join(', ');
+        const inc = (l.include || []).slice(0, 6).join(', ');
+        const examples = (l.example_strings || []).slice(0, 4).join(' | ');
+        return `${l.functional_specialization} (under ${l.primary_identity}): ${l.description || ''}. Identity: ${l.identity_type}. Strong signals: ${sig}. Include: ${inc}. Examples: ${examples}.`;
+    });
+    const contactTexts = contacts.map(contactRoutingText);
+    const { embeddings, costUsd } = await embedBatch([...leafTexts, ...contactTexts]);
+    const leafVecs = embeddings.slice(0, leaves.length);
+    const contactVecs = embeddings.slice(leaves.length);
+
+    const autoAssigned: ContactMapRow[] = [];
+    const pending: ContactRouteInput[] = [];
+    for (let i = 0; i < contacts.length; i++) {
+        const sims = leafVecs.map(lv => cosine(contactVecs[i], lv));
+        const sorted = sims.map((s, j) => ({ s, j })).sort((a, b) => b.s - a.s);
+        const top = sorted[0];
+        const second = sorted[1] || { s: 0 };
+        const leaf = leaves[top.j];
+        if (!leaf.operator_required && top.s >= CONTACT_EMBED_AUTO_THRESHOLD && (top.s - second.s) >= CONTACT_EMBED_MARGIN) {
+            autoAssigned.push(makeMatchedContactRow(runId, contacts[i], {
+                primary_identity: leaf.primary_identity,
+                functional_specialization: leaf.functional_specialization,
+                sector_focus: extractSectorFocus(contactRoutingText(contacts[i]), sectorVocab),
+                source: 'embedding_high_confidence',
+                confidence: top.s,
+                leaf_score: top.s,
+                ancestor_score: top.s,
+                root_score: top.s,
+                reasons: { auto: 'contact embedding pre-filter', cosine: top.s, identity_type: leaf.identity_type }
+            }));
+        } else {
+            const embedding_candidates = sorted.slice(0, 8).map(({ s, j }) => ({
+                functional_specialization: leaves[j].functional_specialization,
+                primary_identity: leaves[j].primary_identity,
+                score: Number(s.toFixed(3))
+            }));
+            pending.push({ ...contacts[i], embedding_candidates });
+        }
+    }
+    return { autoAssigned, pending, costUsd };
+}
+
 async function embedBatch(inputs: string[]): Promise<{ embeddings: number[][]; costUsd: number }> {
     const BATCH = 1024;
     const all: number[][] = [];
@@ -1474,6 +1970,257 @@ function cosine(a: number[], b: number[]): number {
 }
 
 // ─── routing LLM (Phase 1b) ────────────────────────────────────────
+async function runContactMatchingLLM(
+    pending: ContactRouteInput[],
+    leaves: DiscoveredBucket[],
+    sectorVocab: string[],
+    runId: string,
+    ctx?: BucketingCtx
+): Promise<{ rows: ContactMapRow[]; costUsd: number }> {
+    if (pending.length === 0) return { rows: [], costUsd: 0 };
+
+    const validSpecNames = new Set(leaves.map(l => l.functional_specialization));
+    const validIdentityNames = new Set(leaves.map(l => l.primary_identity));
+    const identityBySpec = new Map(leaves.map(l => [l.functional_specialization, l.primary_identity]));
+    const refByIdentity: Record<string, any[]> = {};
+    for (const l of leaves) {
+        const ident = l.primary_identity;
+        if (!refByIdentity[ident]) refByIdentity[ident] = [];
+        refByIdentity[ident].push({
+            functional_specialization: l.functional_specialization,
+            description: l.description,
+            identity_type: l.identity_type,
+            operator_required: l.operator_required,
+            priority_rank: l.priority_rank,
+            include: (l.include || []).slice(0, 8),
+            exclude: (l.exclude || []).slice(0, 8),
+            example_strings: (l.example_strings || []).slice(0, 8)
+        });
+    }
+    const bucketReferenceJson = JSON.stringify(refByIdentity);
+    const limit = pLimit(MATCH_CONCURRENCY);
+    const batches: ContactRouteInput[][] = [];
+    for (let i = 0; i < pending.length; i += MATCH_BATCH_SIZE) batches.push(pending.slice(i, i + MATCH_BATCH_SIZE));
+
+    let totalCost = 0;
+    let completedBatches = 0;
+    const rows: ContactMapRow[] = [];
+    const totalBatches = batches.length;
+
+    await Promise.all(batches.map(batch => limit(async () => {
+        if (ctx) { try { await ctx.checkCancel(); } catch { return; } }
+        const { results, costUsd } = await classifyContactBatch(
+            batch, bucketReferenceJson, sectorVocab, validSpecNames, validIdentityNames
+        );
+        totalCost += costUsd;
+        completedBatches++;
+        if (ctx) {
+            const completedItems = Math.min(pending.length, completedBatches * MATCH_BATCH_SIZE);
+            ctx.progress({
+                phase: 'phase1b',
+                step: 'llm_routing',
+                current: completedItems,
+                total: pending.length,
+                note: `LLM batch ${completedBatches}/${totalBatches} done (${completedItems.toLocaleString()}/${pending.length.toLocaleString()} contacts)`
+            });
+        }
+        for (let i = 0; i < batch.length; i++) {
+            const contact = batch[i];
+            const r = results[i] || makeFallbackChain();
+            const specOk = !!r.functional_specialization.name
+                && validSpecNames.has(r.functional_specialization.name)
+                && r.functional_specialization.score >= 0.40;
+            const specName = specOk ? r.functional_specialization.name : '';
+            const identityCandidate = specOk
+                ? (identityBySpec.get(specName) || r.primary_identity.name)
+                : r.primary_identity.name;
+            const identityOk = !!identityCandidate
+                && validIdentityNames.has(identityCandidate)
+                && r.primary_identity.score >= 0.40;
+            const identName = identityOk ? identityCandidate : '';
+            const isDisqualified = !!r.disqualified;
+            const isGeneric = isDisqualified ? false : (!specName && !identName);
+            rows.push(makeMatchedContactRow(runId, contact, {
+                primary_identity: isDisqualified ? '' : identName,
+                functional_specialization: isDisqualified ? '' : specName,
+                sector_focus: isDisqualified ? '' : (r.sector_focus || '').trim(),
+                source: 'llm_phase1b',
+                confidence: specName ? r.functional_specialization.score : r.primary_identity.score,
+                leaf_score: r.functional_specialization.score,
+                ancestor_score: r.primary_identity.score,
+                root_score: r.primary_identity.score,
+                is_generic: isGeneric,
+                is_disqualified: isDisqualified,
+                general_reason: isDisqualified ? 'disqualified' : (isGeneric ? 'generic_low_confidence' : null),
+                reasons: {
+                    spec: r.functional_specialization.reason,
+                    identity: r.primary_identity.reason,
+                    identity_type: r.identity_type,
+                    model_generic: r.generic
+                }
+            }));
+        }
+    })));
+
+    return { rows, costUsd: totalCost };
+}
+
+async function classifyContactBatch(
+    batch: ContactRouteInput[],
+    bucketReferenceJson: string,
+    sectorVocab: string[],
+    validSpecNames: Set<string>,
+    validIdentityNames: Set<string>
+): Promise<{ results: MatchChain[]; costUsd: number }> {
+    const systemPrompt = `${PROJECT_CONTEXT}
+
+========================================
+PHASE 1B — ROUTE EACH CONTACT TO IDENTITY + SPECIALIZATION + SECTOR
+========================================
+
+You classify individual company contacts, not abstract industry labels.
+Use the company name, website, enriched classification, model confidence,
+and reasoning. Do not invent facts beyond those fields.
+
+Return three separate fields:
+- primary_identity: Layer 1, must be one of BUCKET_REFERENCE keys
+- functional_specialization: Layer 2, must be listed under that identity
+- sector_focus: Layer 3, must be from SECTOR_VOCABULARY, "Multi-industry", or ""
+
+General is a last resort. If a primary_identity is a reasonable fit, return it
+even when no specialization is precise. Only leave both names blank when the
+business is truly unclear, bad data, clear non-ICP, or confidence is below 0.40.
+
+Each contact may include embedding_candidate_buckets. Treat these as a shortlist,
+not a decision. Prefer them when the text supports them, but choose another
+reference bucket if the contact evidence is clearly better.
+
+Rules:
+- Strong business-model nouns beat sector nouns.
+- "Serving X" does not mean "is X"; X belongs in sector_focus.
+- Operator specializations require explicit operator evidence.
+- Disqualify only clear ecommerce/DTC physical, local geo-tied services,
+  brick-and-mortar retail, or low-ticket consumer.
+- Scores are alignment scores, not probabilities. Use >=0.40 for a reasonable
+  identity/specialization fit, >=0.70 for strong fit.
+- Reasons: max 18 words each and cite the contact fields.
+
+Return strict JSON only.`;
+
+    const contactPayload = batch.map(c => ({
+        company_name: c.company_name || '',
+        website: c.company_website || '',
+        industry: c.industry || '',
+        enriched_classification: c.classification || '',
+        enrichment_confidence: c.confidence,
+        enrichment_reasoning: c.reasoning || '',
+        embedding_candidate_buckets: c.embedding_candidates || []
+    }));
+
+    const userPrompt = `BUCKET_REFERENCE (grouped by primary_identity):
+${bucketReferenceJson}
+
+SECTOR_VOCABULARY: ${JSON.stringify(sectorVocab)}
+
+CONTACTS_TO_CLASSIFY (same order as output):
+${JSON.stringify(contactPayload)}
+
+Return JSON: { "assignments": [<one object per contact in the same order>] }
+Each assignment object:
+{
+  "primary_identity": {"name": "<identity key from BUCKET_REFERENCE or empty>", "score": 0.00, "reason": ""},
+  "functional_specialization": {"name": "<spec under that identity, or empty>", "score": 0.00, "reason": ""},
+  "sector_focus": "<from SECTOR_VOCABULARY, 'Multi-industry', or ''>",
+  "identity_type": "<operator|service_provider|agency|software_vendor|investor|advisor|staffing|distributor|media|other>",
+  "generic": false,
+  "disqualified": false
+}`;
+
+    const schema = {
+        type: 'object',
+        additionalProperties: false,
+        required: ['assignments'],
+        properties: {
+            assignments: {
+                type: 'array',
+                items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['primary_identity', 'functional_specialization',
+                               'sector_focus', 'identity_type', 'generic', 'disqualified'],
+                    properties: {
+                        primary_identity: chainItemSchema(),
+                        functional_specialization: chainItemSchema(),
+                        sector_focus: { type: 'string' },
+                        identity_type: { type: 'string' },
+                        generic: { type: 'boolean' },
+                        disqualified: { type: 'boolean' }
+                    }
+                }
+            }
+        }
+    };
+
+    const callOnce = async () => {
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
+        try {
+            const res = await fetch('https://api.openai.com/v1/chat/completions', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: MATCH_MODEL,
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt }
+                    ],
+                    response_format: {
+                        type: 'json_schema',
+                        json_schema: { name: 'phase1b_contact_match', strict: true, schema }
+                    },
+                    temperature: 0.1
+                }),
+                signal: controller.signal
+            });
+            if (!res.ok) {
+                const body = await res.text().catch(() => '');
+                throw new Error(`contact match ${res.status}: ${body.slice(0, 300)}`);
+            }
+            const data = await res.json();
+            const text = data.choices?.[0]?.message?.content;
+            const parsed = JSON.parse(text);
+            const usage = data.usage || {};
+            const cached = usage.prompt_tokens_details?.cached_tokens || 0;
+            const uncached = (usage.prompt_tokens || 0) - cached;
+            const costUsd = computeOpenAICost(MATCH_MODEL, uncached, cached, usage.completion_tokens || 0);
+            return { assignments: parsed.assignments as MatchChain[], costUsd };
+        } finally {
+            clearTimeout(t);
+        }
+    };
+
+    let result;
+    try { result = await callOnce(); }
+    catch { result = await callOnce(); }
+
+    let { assignments, costUsd } = result;
+    const drift = assignments.some(a =>
+        (a.functional_specialization.name && !validSpecNames.has(a.functional_specialization.name)) ||
+        (a.primary_identity.name && !validIdentityNames.has(a.primary_identity.name))
+    );
+    if (drift) {
+        try {
+            const retried = await callOnce();
+            assignments = retried.assignments;
+            costUsd += retried.costUsd;
+        } catch { /* keep original */ }
+    }
+
+    const padded: MatchChain[] = [];
+    for (let i = 0; i < batch.length; i++) padded.push(assignments[i] || makeFallbackChain());
+    return { results: padded, costUsd };
+}
+
 async function runMatchingLLM(
     pending: VocabRow[],
     leaves: DiscoveredBucket[],
