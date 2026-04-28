@@ -18,7 +18,7 @@ import {
 import Papa from 'papaparse';
 import type { BucketingRun, BucketProposal, LibraryBucket } from './types';
 
-type BucketingView = 'index' | 'setup' | 'detail' | 'library';
+type BucketingView = 'index' | 'setup' | 'detail' | 'library' | 'taxonomy';
 
 const RESERVED_GENERAL = 'General';
 // Recognize legacy names too, in case a run was created before v2.3.
@@ -157,6 +157,12 @@ export function BucketingTab({ importLists }: {
             {view === 'index' && (
               <>
                 <button
+                  onClick={() => { setView('taxonomy'); setError(null); }}
+                  className="px-3 py-1.5 rounded-md text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e] flex items-center gap-1"
+                >
+                  <Layers className="w-3 h-3" /> Taxonomy
+                </button>
+                <button
                   onClick={() => { setView('library'); refreshLibrary(); setError(null); }}
                   className="px-3 py-1.5 rounded-md text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e] flex items-center gap-1"
                 >
@@ -197,6 +203,10 @@ export function BucketingTab({ importLists }: {
 
         {view === 'library' && (
           <BucketingLibrary library={library} onRefresh={refreshLibrary} onError={setError} />
+        )}
+
+        {view === 'taxonomy' && (
+          <TaxonomyLibrary onError={setError} />
         )}
 
         {view === 'detail' && activeRun && (
@@ -776,6 +786,9 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
           </div>
         )}
       </div>
+
+      <Phase1aProposedTagsPanel runId={run.id} onError={onError} />
+      <Phase1aQAQueuePanel runId={run.id} onError={onError} />
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
         <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between">
@@ -1531,6 +1544,383 @@ function StatCard({ label, value, color }: { label: string; value: string; color
     <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-6 shadow-sm">
       <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">{label}</p>
       <p className={`text-3xl font-bold ${color}`}>{value}</p>
+    </div>
+  );
+}
+
+// ───── Phase 1a: AI-proposed tag review panel ─────────────────────
+
+function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: (m: string | null) => void }) {
+  const [proposed, setProposed] = useState<{ identities: any[]; characteristics: any[]; sectors: any[] } | null>(null);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/proposed-tags`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+      setProposed(data);
+    } catch (e: any) { onError(e.message); }
+  }, [runId, onError]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const accept = async (kind: 'identities' | 'characteristics' | 'sectors', name: string, parent?: string) => {
+    setBusyKey(`${kind}:${name}`);
+    onError(null);
+    try {
+      const body: any = { name, created_by: 'ai' };
+      if (kind === 'characteristics' && parent) body.parent_identity = parent;
+      const res = await fetch(`/api/bucketing/taxonomy/${kind}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+      await refresh();
+    } catch (e: any) { onError(e.message); }
+    finally { setBusyKey(null); }
+  };
+
+  if (!proposed) return null;
+  const total = proposed.identities.length + proposed.characteristics.length + proposed.sectors.length;
+  if (total === 0) return null;
+
+  return (
+    <div className="border border-amber-500/30 rounded-xl bg-amber-500/5 p-4">
+      <div className="text-[10px] font-bold text-amber-400 uppercase tracking-widest mb-2">
+        AI-proposed taxonomy additions ({total})
+      </div>
+      <p className="text-[11px] text-gray-400 mb-3">
+        The tagger proposed entries that aren't in the library. Accept to add them permanently to the library, or ignore (they're already used in this run regardless).
+      </p>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        {(['identities','characteristics','sectors'] as const).map(kind => (
+          <div key={kind}>
+            <div className="text-[10px] font-bold text-gray-400 uppercase mb-1.5">
+              {kind} ({proposed[kind].length})
+            </div>
+            <ul className="space-y-1">
+              {proposed[kind].map((p: any) => {
+                const key = `${kind}:${p.name}`;
+                return (
+                  <li key={key} className="flex items-center justify-between gap-2 px-2 py-1.5 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-[11px]">
+                    <div className="min-w-0 flex-1">
+                      <div className="font-bold text-white truncate" title={p.name}>{p.name}</div>
+                      <div className="text-[10px] text-gray-500 truncate" title={p.samples?.join(' · ')}>
+                        {p.count}× · ex: {(p.samples || []).slice(0, 2).join(' · ')}
+                      </div>
+                      {kind === 'characteristics' && p.parent && (
+                        <div className="text-[9px] text-gray-600">under {p.parent}</div>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => accept(kind, p.name, p.parent)}
+                      disabled={busyKey === key}
+                      className="shrink-0 px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
+                    >
+                      {busyKey === key ? '…' : 'Accept'}
+                    </button>
+                  </li>
+                );
+              })}
+              {proposed[kind].length === 0 && <li className="text-[10px] text-gray-600 italic">none</li>}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Phase1aQAQueuePanel({ runId, onError }: { runId: string; onError: (m: string | null) => void }) {
+  const [queue, setQueue] = useState<any[] | null>(null);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/qa-queue`)
+      .then(r => r.json())
+      .then(d => { if (!cancelled) setQueue(d.queue || []); })
+      .catch(e => onError(e.message));
+    return () => { cancelled = true; };
+  }, [runId, onError]);
+
+  if (!queue || queue.length === 0) return null;
+
+  return (
+    <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="w-full px-4 py-3 flex items-center justify-between text-left hover:bg-white/[0.02]"
+      >
+        <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+          Low-confidence QA queue ({queue.length})
+        </span>
+        <span className="text-[11px] text-gray-500">{open ? 'Hide' : 'Review'}</span>
+      </button>
+      {open && (
+        <div className="border-t border-[#2e2e2e] max-h-96 overflow-y-auto">
+          <table className="w-full text-[11px]">
+            <thead className="bg-[#0e0e0e] sticky top-0">
+              <tr className="border-b border-[#2e2e2e] text-[9px] font-bold text-gray-500 uppercase tracking-wider">
+                <th className="px-4 py-2 text-left">Industry</th>
+                <th className="px-4 py-2 text-left">Identity</th>
+                <th className="px-4 py-2 text-left">Characteristic</th>
+                <th className="px-4 py-2 text-left">Sector</th>
+                <th className="px-4 py-2 text-right">Conf</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-[#2e2e2e]">
+              {queue.map((q, i) => (
+                <tr key={i} className="hover:bg-white/[0.02]">
+                  <td className="px-4 py-2 text-gray-200 max-w-md truncate" title={q.industry_string}>{q.industry_string}</td>
+                  <td className="px-4 py-2 text-gray-400">{q.identity || '—'}</td>
+                  <td className="px-4 py-2 text-gray-400">{q.characteristic || '—'}</td>
+                  <td className="px-4 py-2 text-gray-400">{q.sector || '—'}</td>
+                  <td className="px-4 py-2 text-right text-amber-400 font-mono">{q.confidence != null ? Number(q.confidence).toFixed(2) : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ───── Taxonomy Library: editable Identity / Characteristic / Sector lists ─────
+
+interface TaxRow {
+  id: string;
+  name: string;
+  description?: string | null;
+  parent_identity?: string | null;
+  is_disqualified?: boolean;
+  synonyms?: string | null;
+  created_by: 'seed' | 'user' | 'ai';
+  archived: boolean;
+}
+
+function TaxonomyLibrary({ onError }: { onError: (m: string | null) => void }) {
+  const [tab, setTab] = useState<'identities' | 'characteristics' | 'sectors'>('identities');
+  const [data, setData] = useState<{ identities: TaxRow[]; characteristics: TaxRow[]; sectors: TaxRow[] }>({ identities: [], characteristics: [], sectors: [] });
+  const [loading, setLoading] = useState(false);
+  const [editing, setEditing] = useState<TaxRow | null>(null);
+  const [creating, setCreating] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/bucketing/taxonomy');
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || `Failed (${res.status})`);
+      setData(d);
+    } catch (e: any) { onError(e.message); }
+    finally { setLoading(false); }
+  }, [onError]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const rows = data[tab];
+
+  const saveRow = async (kind: typeof tab, payload: Partial<TaxRow> & { id?: string }) => {
+    onError(null);
+    try {
+      const res = payload.id
+        ? await fetch(`/api/bucketing/taxonomy/${kind}/${encodeURIComponent(payload.id)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          })
+        : await fetch(`/api/bucketing/taxonomy/${kind}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...payload, created_by: 'user' })
+          });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || `Failed (${res.status})`);
+      setEditing(null); setCreating(false);
+      refresh();
+    } catch (e: any) { onError(e.message); }
+  };
+
+  const deleteRow = async (kind: typeof tab, id: string) => {
+    if (!confirm('Delete permanently? Existing runs are unaffected.')) return;
+    try {
+      const res = await fetch(`/api/bucketing/taxonomy/${kind}/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.error || `Failed (${res.status})`);
+      }
+      refresh();
+    } catch (e: any) { onError(e.message); }
+  };
+
+  const archiveRow = async (kind: typeof tab, row: TaxRow) => {
+    try {
+      const res = await fetch(`/api/bucketing/taxonomy/${kind}/${encodeURIComponent(row.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ archived: !row.archived })
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.error || `Failed (${res.status})`);
+      }
+      refresh();
+    } catch (e: any) { onError(e.message); }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
+        <p className="text-[11px] text-gray-400">
+          The Phase 1a tagger uses these lists as the allowed set of tags. AI-proposed additions surface in the run review with Accept controls. Editing here is global — affects all future runs.
+        </p>
+      </div>
+      <div className="flex justify-between items-center">
+        <div className="flex gap-1">
+          {(['identities', 'characteristics', 'sectors'] as const).map(t => (
+            <button
+              key={t}
+              onClick={() => { setTab(t); setEditing(null); setCreating(false); }}
+              className={`px-3 py-1.5 rounded-md text-xs font-bold ${tab === t ? 'bg-[#3ecf8e] text-black' : 'bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e]'}`}
+            >
+              {t.charAt(0).toUpperCase() + t.slice(1)} ({data[t].length})
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={() => { setCreating(true); setEditing(null); }}
+          className="px-3 py-1.5 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] flex items-center gap-1"
+        >
+          <Plus className="w-3 h-3" /> New {tab.slice(0, -1)}
+        </button>
+      </div>
+
+      {(creating || editing) && (
+        <TaxonomyEditor
+          kind={tab}
+          existing={editing}
+          identities={data.identities}
+          onCancel={() => { setCreating(false); setEditing(null); }}
+          onSave={(payload) => saveRow(tab, payload)}
+        />
+      )}
+
+      <div className="border border-[#2e2e2e] rounded-xl overflow-hidden bg-[#0e0e0e]">
+        <table className="w-full text-[11px]">
+          <thead className="bg-[#0e0e0e]">
+            <tr className="border-b border-[#2e2e2e] text-[9px] font-bold text-gray-500 uppercase tracking-wider">
+              <th className="px-5 py-3 text-left">Name</th>
+              {tab === 'characteristics' && <th className="px-5 py-3 text-left">Parent identity</th>}
+              <th className="px-5 py-3 text-left">{tab === 'sectors' ? 'Synonyms' : 'Description'}</th>
+              {tab === 'identities' && <th className="px-5 py-3 text-center">DQ</th>}
+              <th className="px-5 py-3 text-center">Source</th>
+              <th className="px-5 py-3 text-right"></th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[#2e2e2e]">
+            {rows.length === 0 && !loading && (
+              <tr><td colSpan={6} className="px-5 py-8 text-center text-gray-600 text-[11px] italic">No {tab} yet — run the migration to seed defaults.</td></tr>
+            )}
+            {rows.map(r => (
+              <tr key={r.id} className={`hover:bg-white/[0.02] ${r.archived ? 'opacity-50' : ''}`}>
+                <td className="px-5 py-2 font-bold text-white">{r.name}</td>
+                {tab === 'characteristics' && <td className="px-5 py-2 text-gray-300">{r.parent_identity || '—'}</td>}
+                <td className="px-5 py-2 text-gray-400 max-w-md truncate">
+                  {tab === 'sectors' ? (r.synonyms || '—') : (r.description || '—')}
+                </td>
+                {tab === 'identities' && (
+                  <td className="px-5 py-2 text-center">{r.is_disqualified ? <span className="text-red-400 font-bold">DQ</span> : ''}</td>
+                )}
+                <td className="px-5 py-2 text-center">
+                  <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
+                    r.created_by === 'ai' ? 'bg-amber-500/20 text-amber-400' :
+                    r.created_by === 'seed' ? 'bg-gray-500/20 text-gray-400' :
+                    'bg-blue-500/20 text-blue-400'
+                  }`}>{r.created_by}</span>
+                </td>
+                <td className="px-5 py-2 text-right">
+                  <div className="flex items-center justify-end gap-1">
+                    <button onClick={() => { setEditing(r); setCreating(false); }} className="p-1.5 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-white" title="Edit">
+                      <Edit3 className="w-3 h-3" />
+                    </button>
+                    <button onClick={() => archiveRow(tab, r)} className="p-1.5 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-amber-400" title={r.archived ? 'Unarchive' : 'Archive'}>
+                      <Archive className="w-3 h-3" />
+                    </button>
+                    <button onClick={() => deleteRow(tab, r.id)} className="p-1.5 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-red-400" title="Delete">
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function TaxonomyEditor({ kind, existing, identities, onCancel, onSave }: {
+  kind: 'identities' | 'characteristics' | 'sectors';
+  existing: TaxRow | null;
+  identities: TaxRow[];
+  onCancel: () => void;
+  onSave: (payload: any) => void;
+}) {
+  const [name, setName] = useState(existing?.name || '');
+  const [description, setDescription] = useState(existing?.description || '');
+  const [parent, setParent] = useState(existing?.parent_identity || (identities[0]?.name || ''));
+  const [synonyms, setSynonyms] = useState(existing?.synonyms || '');
+  const [isDq, setIsDq] = useState(!!existing?.is_disqualified);
+
+  return (
+    <div className="border border-[#3ecf8e]/40 rounded-xl bg-[#0e0e0e] p-4 space-y-3">
+      <div className="text-[10px] font-bold text-[#3ecf8e] uppercase tracking-widest">
+        {existing ? 'Edit' : 'Create'} {kind.slice(0, -1)}
+      </div>
+      <input value={name} onChange={e => setName(e.target.value)} placeholder="Name"
+        className="w-full px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]" />
+      {kind === 'characteristics' && (
+        <select value={parent} onChange={e => setParent(e.target.value)}
+          className="w-full px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]">
+          {identities.filter(i => !i.archived).map(i => <option key={i.id} value={i.name}>{i.name}</option>)}
+        </select>
+      )}
+      {kind === 'sectors' ? (
+        <textarea value={synonyms} onChange={e => setSynonyms(e.target.value)} placeholder="Synonyms / signals (comma-separated)" rows={2}
+          className="w-full px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]" />
+      ) : (
+        <textarea value={description} onChange={e => setDescription(e.target.value)} placeholder="Description / signals" rows={2}
+          className="w-full px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]" />
+      )}
+      {kind === 'identities' && (
+        <label className="flex items-center gap-2 text-[11px] text-gray-300">
+          <input type="checkbox" checked={isDq} onChange={e => setIsDq(e.target.checked)} className="rounded" />
+          Disqualified — contacts with this identity route to the Disqualified bucket
+        </label>
+      )}
+      <div className="flex justify-end gap-2">
+        <button onClick={onCancel} className="px-3 py-1.5 rounded text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e]">Cancel</button>
+        <button
+          onClick={() => onSave({
+            id: existing?.id,
+            name: name.trim(),
+            description,
+            ...(kind === 'characteristics' ? { parent_identity: parent } : {}),
+            ...(kind === 'sectors' ? { synonyms } : {}),
+            ...(kind === 'identities' ? { is_disqualified: isDq } : {})
+          })}
+          disabled={!name.trim()}
+          className="px-3 py-1.5 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
+        >
+          {existing ? 'Save' : 'Create'}
+        </button>
+      </div>
     </div>
   );
 }

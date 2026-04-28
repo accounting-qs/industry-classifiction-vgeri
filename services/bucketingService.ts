@@ -66,11 +66,14 @@ const ANTHROPIC_PRICING: Record<string, { input: number; output: number }> = {
 };
 const EMBEDDING_PRICE_PER_1M = 0.02;
 
-// Single catch-all bucket for everything that doesn't earn its own segment:
-// generic, disqualified, sub-threshold rollups, scrape failures.
-// is_disqualified flag is still tracked per row for audit but no longer
-// drives a separate bucket.
+// Two reserved buckets:
+//   General      — low-confidence routing, sub-threshold rollups, no good
+//                  taxonomy fit. Still considered usable for outreach review.
+//   Disqualified — failed enrichments, missing industries, identities the
+//                  user has flagged as DQ in the taxonomy library. Excluded
+//                  from outreach by default.
 const RESERVED_GENERAL = 'General';
+const RESERVED_DISQUALIFIED = 'Disqualified';
 
 // Live progress + log surface used by the Bucketing UI. Server.ts builds
 // one of these per run and passes it through the entry points; every step
@@ -100,6 +103,12 @@ const RESERVED = new Set([
     'general', 'generic', 'disqualified', 'other'
 ]);
 
+// Confidence floor — Sonnet returns 1-10, anything below this routes the
+// industry to General with needs_qa=true so the user can review post-run.
+const PHASE1A_QA_FLOOR = 6;
+const PHASE1A_BATCH_SIZE = 8;
+const PHASE1A_CONCURRENCY = 40;
+
 const ANTHROPIC_KEY_NAME = 'ANTHROPIC_API_KEY';
 
 // ─── secret access ─────────────────────────────────────────────────
@@ -127,9 +136,41 @@ async function getAnthropic(supabase: SupabaseClient): Promise<Anthropic | null>
 interface VocabRow {
     industry: string;
     n: number;
+    enrichment_status?: string | null;   // completed | scrape_error | unenriched | failed | pending
     avg_conf: number;
     sample_companies: string[] | null;
     sample_reasoning: string[] | null;
+}
+
+interface TaxonomyEntry {
+    id: string;
+    name: string;
+    description?: string | null;
+    parent_identity?: string | null;     // characteristics only
+    is_disqualified?: boolean;           // identities only
+    synonyms?: string | null;            // sectors only
+    created_by?: string;
+    archived: boolean;
+    sort_order?: number | null;
+}
+
+interface TaxonomySnapshot {
+    identities: TaxonomyEntry[];
+    characteristics: TaxonomyEntry[];
+    sectors: TaxonomyEntry[];
+}
+
+interface IndustryTagging {
+    industry: string;
+    identity: string | null;
+    is_new_identity: boolean;
+    characteristic: string | null;
+    is_new_characteristic: boolean;
+    sector: string | null;
+    is_new_sector: boolean;
+    is_disqualified: boolean;
+    confidence: number;          // 1-10
+    reason: string;
 }
 
 interface ContactRouteInput {
@@ -485,7 +526,7 @@ export async function runTaxonomyProposal(
     runId: string,
     ctx: BucketingCtx
 ): Promise<void> {
-    ctx.log(`[Bucketing ${runId}] Phase 1a: starting discovery`, 'phase');
+    ctx.log(`[Bucketing ${runId}] Phase 1a: tag-based classification`, 'phase');
     ctx.progress({ phase: 'phase1a', step: 'load_vocabulary', note: 'Loading vocabulary from selected lists…' });
 
     const { data: run, error: runErr } = await supabase
@@ -493,237 +534,419 @@ export async function runTaxonomyProposal(
     if (runErr || !run) throw new Error(`Run not found: ${runErr?.message}`);
 
     const vocabRows = await fetchFullVocabulary(supabase, run.list_names, ctx);
-    const vocabularyContacts = vocabRows.reduce((s, r) => s + Number(r.n || 0), 0);
     const totalContacts = await countSelectedContacts(supabase, run.list_names);
-    ctx.log(`[Bucketing ${runId}] vocabulary: ${vocabRows.length} distinct industries covering ${vocabularyContacts} classified contacts, ${totalContacts} selected contacts`);
-    ctx.progress({ phase: 'phase1a', step: 'vocabulary_loaded', current: vocabRows.length, total: vocabRows.length, note: `${vocabRows.length} distinct industries, ${totalContacts.toLocaleString()} selected contacts` });
+    ctx.log(`[Bucketing ${runId}] vocabulary: ${vocabRows.length} distinct (industry, status) rows over ${totalContacts.toLocaleString()} selected contacts`);
 
     if (vocabRows.length === 0) {
         await supabase.from('bucketing_runs').update({
             status: 'failed',
-            error_message: 'No enriched contacts found for the selected lists.',
+            error_message: 'No contacts found for the selected lists.',
             total_contacts: 0
         }).eq('id', runId);
-        throw new Error('Empty vocabulary — none of the selected lists have completed enrichments.');
+        throw new Error('Empty vocabulary — selected lists have no contacts.');
     }
 
-    const preferredIds: string[] = Array.isArray(run.preferred_library_ids) ? run.preferred_library_ids : [];
-    let preferred: any[] = [];
-    if (preferredIds.length > 0) {
-        const { data: libRows } = await supabase
-            .from('bucket_library').select('*').in('id', preferredIds);
-        preferred = (libRows || []).filter((b: any) =>
-            (b.functional_specialization || b.bucket_name) && (b.primary_identity || b.direct_ancestor)
-        );
-    }
-
-    // Wipe any prior preview map rows for this run (idempotent on re-discover).
+    // Wipe any prior preview/proposal map rows (idempotent on re-run).
     await supabase.from('bucket_industry_map').delete().eq('bucketing_run_id', runId);
 
+    // ── Partition vocabulary by enrichment status ────────────────────
+    // Only `completed` rows go to the LLM. Everything else (scrape_error,
+    // unenriched, failed, pending) is a known-bad row and routes straight
+    // to the Disqualified bucket without spending a token.
+    const completedVocab = vocabRows.filter(r => (r.enrichment_status || 'completed') === 'completed');
+    const dqVocab = vocabRows.filter(r => (r.enrichment_status || 'completed') !== 'completed');
+    ctx.log(`[Bucketing ${runId}] partition: ${completedVocab.length} taggable, ${dqVocab.length} → Disqualified (failed/missing/scrape_error)`);
+
     let totalCost = 0;
+    const preMapRows: any[] = [];
 
-    // ── Step A: library-first match BEFORE discovery ──────────────────
-    // High-confidence matches against selected library buckets are written
-    // immediately, and those industries are removed from the vocabulary the
-    // discovery LLM sees. Saves prompt tokens AND prevents the model from
-    // re-inventing buckets we've already saved.
-    const sectorVocabPreview: string[] = []; // populated post-discovery
-    let discoveryVocab: VocabRow[] = vocabRows;
-    let libraryMatchedIndustries = new Set<string>();
-    let libraryUsageByBucketId = new Map<string, number>();
+    // ── Disqualified passthrough ─────────────────────────────────────
+    for (const v of dqVocab) {
+        const reason = v.enrichment_status || 'unknown';
+        preMapRows.push({
+            bucketing_run_id: runId,
+            industry_string: v.industry,
+            raw_industry: v.industry,
+            bucket_name: RESERVED_DISQUALIFIED,
+            source: 'disqualified_passthrough',
+            confidence: 0,
+            identity: null,
+            characteristic: null,
+            sector: null,
+            is_new_identity: false,
+            is_new_characteristic: false,
+            is_new_sector: false,
+            is_disqualified: true,
+            is_generic: false,
+            needs_qa: false,
+            llm_reason: `enrichment_status=${reason}`,
+            // Mirror trigger fills primary_identity/etc; leave nulls so they
+            // survive as nulls in the legacy columns too.
+            example_industries: [v.industry]
+        });
+    }
 
-    if (preferred.length > 0) {
+    // ── Load active taxonomy library (3 SELECTs) ─────────────────────
+    const snapshot = await loadTaxonomySnapshot(supabase);
+    ctx.log(`[Bucketing ${runId}] taxonomy library: ${snapshot.identities.length} identities, ${snapshot.characteristics.length} characteristics, ${snapshot.sectors.length} sectors`);
+
+    if (completedVocab.length > 0) {
+        // ── Tag completed industries via Sonnet (batched) ────────────
         await ctx.checkCancel();
-        ctx.log(`[Bucketing ${runId}] Phase 1a step 1/3: library-first match against ${preferred.length} preferred buckets`, 'phase');
-        ctx.progress({ phase: 'phase1a', step: 'library_match', note: `Matching against ${preferred.length} library buckets…` });
-        const libRes = await withHeartbeat('library-first match (Phase 1a)',
-            () => runLibraryFirstMatch(vocabRows, preferred, [], runId), ctx);
-        totalCost += libRes.costUsd;
+        ctx.progress({
+            phase: 'phase1a',
+            step: 'sonnet_tagging',
+            current: 0,
+            total: completedVocab.length,
+            note: `Tagging ${completedVocab.length} industries with Sonnet…`
+        });
+        const tagResult = await withHeartbeat(
+            `Sonnet tagging (${completedVocab.length} industries)`,
+            () => tagIndustriesWithSonnet(supabase, completedVocab, snapshot, runId, ctx),
+            ctx
+        );
+        totalCost += tagResult.costUsd;
+        ctx.log(`[Bucketing ${runId}] Sonnet tagging: ${tagResult.taggings.length} results, $${tagResult.costUsd.toFixed(4)}, model=${tagResult.modelUsed}`);
 
-        if (libRes.autoAssigned.length > 0) {
-            for (let i = 0; i < libRes.autoAssigned.length; i += 1000) {
-                const chunk = libRes.autoAssigned.slice(i, i + 1000);
-                const { error: upErr } = await supabase.from('bucket_industry_map')
-                    .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
-                if (upErr) throw new Error(`library map insert failed: ${upErr.message}`);
+        // ── Build map rows from taggings ─────────────────────────────
+        const identitySet = new Set(snapshot.identities.map(i => i.name));
+        const charSet = new Set(snapshot.characteristics.map(c => c.name));
+        const sectorSet = new Set(snapshot.sectors.map(s => s.name));
+        const dqIdentities = new Set(snapshot.identities.filter(i => i.is_disqualified).map(i => i.name));
+
+        for (const t of tagResult.taggings) {
+            const v = completedVocab.find(c => c.industry === t.industry);
+            const conf01 = Math.max(0, Math.min(1, (t.confidence || 0) / 10));
+            const lowConf = (t.confidence || 0) < PHASE1A_QA_FLOOR;
+            const identityIsDq = !!(t.identity && dqIdentities.has(t.identity));
+            const isDisqualified = t.is_disqualified || identityIsDq;
+
+            // Pre-rollup name: characteristic preferred → identity → fallback.
+            // The actual final bucket_name is rewritten by the volume rollup
+            // in Phase 1b. Disqualified is terminal — never rolled up.
+            let preBucket: string;
+            if (isDisqualified) {
+                preBucket = RESERVED_DISQUALIFIED;
+            } else if (lowConf) {
+                preBucket = RESERVED_GENERAL;
+            } else if (t.characteristic) {
+                preBucket = t.characteristic;
+            } else if (t.identity) {
+                preBucket = t.identity;
+            } else {
+                preBucket = RESERVED_GENERAL;
+            }
+
+            preMapRows.push({
+                bucketing_run_id: runId,
+                industry_string: t.industry,
+                raw_industry: t.industry,
+                bucket_name: preBucket,
+                source: 'llm_phase1a',
+                confidence: Number(conf01.toFixed(2)),
+                identity: t.identity,
+                characteristic: t.characteristic,
+                sector: t.sector,
+                is_new_identity: t.is_new_identity && !identitySet.has(t.identity || ''),
+                is_new_characteristic: t.is_new_characteristic && !charSet.has(t.characteristic || ''),
+                is_new_sector: t.is_new_sector && !sectorSet.has(t.sector || ''),
+                is_disqualified: isDisqualified,
+                is_generic: false,
+                needs_qa: lowConf,
+                llm_reason: t.reason,
+                example_industries: [t.industry]
+            });
+
+            // If this is the first time we've seen vocab.n on a tagged row,
+            // include n in reasons for downstream debug.
+        }
+        ctx.progress({
+            phase: 'phase1a',
+            step: 'sonnet_tagging',
+            current: tagResult.taggings.length,
+            total: completedVocab.length,
+            note: `Tagged ${tagResult.taggings.length} industries`
+        });
+    }
+
+    // ── Bulk insert all map rows ─────────────────────────────────────
+    for (let i = 0; i < preMapRows.length; i += 1000) {
+        const chunk = preMapRows.slice(i, i + 1000);
+        const { error: upErr } = await supabase.from('bucket_industry_map')
+            .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
+        if (upErr) throw new Error(`bucket_industry_map insert failed: ${upErr.message}`);
+    }
+    ctx.log(`[Bucketing ${runId}] wrote ${preMapRows.length} map rows`);
+
+    // ── Build a synthetic taxonomy_proposal for the existing UI ──────
+    // The Review screen reads taxonomy_proposal.{primary_identities, buckets}
+    // — we synthesize them from the unique tags actually used so the user
+    // sees a familiar tree (Identity → Characteristic) backed by the new
+    // tag-based classification.
+    const usedIdentitySet = new Set<string>();
+    const usedCharByKey = new Map<string, { spec: string; identity: string; description: string }>();
+    const usedSectors = new Set<string>();
+    for (const r of preMapRows) {
+        if (r.identity) usedIdentitySet.add(r.identity);
+        if (r.characteristic && r.identity) {
+            const key = `${r.identity}::${r.characteristic}`;
+            if (!usedCharByKey.has(key)) {
+                const charDesc = snapshot.characteristics.find(c => c.name === r.characteristic)?.description || '';
+                usedCharByKey.set(key, { spec: r.characteristic, identity: r.identity, description: charDesc });
             }
         }
-        for (const r of libRes.autoAssigned) {
-            libraryMatchedIndustries.add(r.industry_string);
-            const libId: string | undefined = r.reasons?.library_bucket_id;
-            if (libId) libraryUsageByBucketId.set(libId, (libraryUsageByBucketId.get(libId) || 0) + 1);
-        }
-        discoveryVocab = libRes.pending;
-        ctx.log(`[Bucketing ${runId}] library-matched ${libRes.autoAssigned.length}/${vocabRows.length}, ${discoveryVocab.length} sent to discovery`);
+        if (r.sector) usedSectors.add(r.sector);
     }
 
-    // ── Step B: discovery LLM on residual vocab ───────────────────────
-    await ctx.checkCancel();
-    ctx.log(`[Bucketing ${runId}] Phase 1a step 2/3: discovery LLM on ${discoveryVocab.length} residual industries`, 'phase');
-    ctx.progress({ phase: 'phase1a', step: 'discovery_llm', note: `Running discovery LLM (${discoveryVocab.length} residual industries)…` });
-    const t0 = Date.now();
-    const { discovery, costUsd, modelUsed } = await withHeartbeat(
-        `discovery LLM (${discoveryVocab.length} industries)`,
-        () => callDiscoveryLLM(supabase, discoveryVocab, preferred),
-        ctx
-    );
-    totalCost += costUsd;
-    ctx.log(`[Bucketing ${runId}] discovery LLM (${modelUsed}): ${(Date.now() - t0) / 1000}s, $${costUsd.toFixed(4)}, ${discovery.buckets.length} discovered specs`);
-
-    // Normalize primary_identities; drop any reserved names; dedupe.
-    const seenIdent = new Set<string>();
-    let primaryIdentities = (discovery.primary_identities || []).filter(p => {
-        const n = (p.name || '').trim();
-        if (!n || RESERVED.has(n.toLowerCase())) return false;
-        if (seenIdent.has(n)) return false;
-        seenIdent.add(n);
-        return true;
-    }).map(p => ({
-        name: p.name.trim(),
-        description: (p.description || '').trim(),
-        identity_type: (p.identity_type || 'other').trim(),
-        operator_required: !!p.operator_required
-    }));
-
-    // Merge in identities from selected library buckets so they appear in
-    // the Review tree even if the discovery model didn't list them.
-    for (const lib of preferred) {
-        const ident = (lib.primary_identity || lib.direct_ancestor || '').trim();
-        if (!ident || seenIdent.has(ident)) continue;
-        seenIdent.add(ident);
-        primaryIdentities.push({
-            name: ident,
-            description: lib.description || '',
-            identity_type: 'service_provider',
+    const primaryIdentities = Array.from(usedIdentitySet).map(name => {
+        const ent = snapshot.identities.find(i => i.name === name);
+        return {
+            name,
+            description: ent?.description || '',
+            identity_type: 'other',
             operator_required: false
-        });
-    }
+        };
+    });
 
-    // Validate specialization → identity references; drop dangling ones.
-    const identitySet = new Set(primaryIdentities.map(p => p.name));
-    const discoveredLeaves = discovery.buckets.filter(b => {
-        const spec = (b.functional_specialization || '').trim();
-        const ident = (b.primary_identity || '').trim();
-        return spec
-            && !RESERVED.has(spec.toLowerCase())
-            && ident
-            && identitySet.has(ident);
-    }).map(b => ({
-        ...b,
-        functional_specialization: b.functional_specialization.trim(),
-        primary_identity: b.primary_identity.trim(),
-        description: (b.description || '').trim(),
-        identity_type: (b.identity_type || 'other').trim(),
-        operator_required: !!b.operator_required,
-        priority_rank: typeof b.priority_rank === 'number' ? b.priority_rank : 5,
-        include: dedupe(b.include),
-        exclude: dedupe(b.exclude),
-        example_strings: dedupe(b.example_strings),
-        strong_identity_signals: dedupe(b.strong_identity_signals),
-        weak_sector_signals: dedupe(b.weak_sector_signals),
-        disqualifying_signals: dedupe(b.disqualifying_signals)
+    const buckets: DiscoveredBucket[] = Array.from(usedCharByKey.values()).map(c => ({
+        functional_specialization: c.spec,
+        primary_identity: c.identity,
+        description: c.description,
+        identity_type: 'other',
+        operator_required: false,
+        priority_rank: 5,
+        include: [],
+        exclude: [],
+        example_strings: [],
+        strong_identity_signals: [],
+        weak_sector_signals: [],
+        disqualifying_signals: []
     }));
-
-    // Inject library buckets that had at least one match into the proposal
-    // so the user can review/keep/drop them alongside discovered specs.
-    const lockedFromLibrary: DiscoveredBucket[] = [];
-    for (const lib of preferred) {
-        const spec = (lib.functional_specialization || lib.bucket_name || '').trim();
-        const ident = (lib.primary_identity || lib.direct_ancestor || '').trim();
-        if (!spec || !ident) continue;
-        if (discoveredLeaves.some(l => l.functional_specialization === spec)) continue;
-        lockedFromLibrary.push({
-            functional_specialization: spec,
-            primary_identity: ident,
-            description: lib.description || '',
-            identity_type: 'service_provider',
-            operator_required: false,
-            priority_rank: 3,
-            include: lib.include_terms || [],
-            exclude: lib.exclude_terms || [],
-            example_strings: lib.example_strings || [],
-            strong_identity_signals: [],
-            weak_sector_signals: [],
-            disqualifying_signals: [],
-            library_match_id: lib.id
-        });
-    }
-    const leaves = [...lockedFromLibrary, ...discoveredLeaves];
-    const sectorVocab = discovery.sector_focus_vocabulary || [];
 
     await supabase.from('bucketing_runs').update({
         taxonomy_proposal: {
-            observed_patterns: discovery.observed_patterns || [],
-            sector_focus_vocabulary: sectorVocab,
+            observed_patterns: [],
+            sector_focus_vocabulary: Array.from(usedSectors),
             primary_identities: primaryIdentities,
-            buckets: leaves
+            buckets: buckets
         },
-        taxonomy_model: modelUsed,
+        taxonomy_snapshot: {
+            identities: snapshot.identities,
+            characteristics: snapshot.characteristics,
+            sectors: snapshot.sectors
+        },
+        taxonomy_model: TAXONOMY_MODEL_ANTHROPIC,
         cost_usd: totalCost,
-        total_contacts: totalContacts
-    }).eq('id', runId);
-
-    // ── Step C: embedding preview against ALL proposed specs ──────────
-    // Replaces the old example_strings seed. Embed every still-unmatched
-    // industry against every proposed spec; cosine ≥ EMBED_AUTO_THRESHOLD
-    // and margin ≥ EMBED_MARGIN write a preview map row.
-    await ctx.checkCancel();
-    const stillPending = vocabRows.filter(r => !libraryMatchedIndustries.has(r.industry));
-    ctx.log(`[Bucketing ${runId}] Phase 1a step 3/3: embedding preview against ${leaves.length} specs over ${stillPending.length} pending industries`, 'phase');
-    ctx.progress({ phase: 'phase1a', step: 'preview_embedding', current: 0, total: stillPending.length, note: 'Computing per-spec preview counts via embedding…' });
-    const previewRes = await withHeartbeat(
-        `preview embedding (${stillPending.length} industries × ${leaves.length} specs)`,
-        () => runPreviewEmbedding(stillPending, leaves, sectorVocab, runId),
-        ctx
-    );
-    totalCost += previewRes.costUsd;
-    if (previewRes.rows.length > 0) {
-        for (let i = 0; i < previewRes.rows.length; i += 1000) {
-            const chunk = previewRes.rows.slice(i, i + 1000);
-            const { error: upErr } = await supabase.from('bucket_industry_map')
-                .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
-            if (upErr) throw new Error(`preview embedding insert failed: ${upErr.message}`);
-        }
-    }
-    ctx.log(`[Bucketing ${runId}] preview embedding wrote ${previewRes.rows.length} map rows`);
-
-    // Final cost + state
-    await supabase.from('bucketing_runs').update({
-        cost_usd: totalCost,
+        total_contacts: totalContacts,
         status: 'taxonomy_ready',
         taxonomy_completed_at: new Date().toISOString()
     }).eq('id', runId);
 
-    // Library link rows + usage counters
-    if (preferred.length > 0) {
-        const links: any[] = [];
-        for (const lib of preferred) {
-            const spec = (lib.functional_specialization || lib.bucket_name || '').trim();
-            if (!spec) continue;
-            links.push({
-                bucketing_run_id: runId,
-                library_bucket_id: lib.id,
-                bucket_name_in_run: spec
-            });
-        }
-        if (links.length > 0) {
-            await supabase.from('bucket_library_run_links').upsert(links, { onConflict: 'bucketing_run_id,library_bucket_id' });
-        }
-        for (const lib of preferred) {
-            const matched = libraryUsageByBucketId.get(lib.id) || 0;
-            if (matched > 0) {
-                await supabase.from('bucket_library')
-                    .update({
-                        times_used: (lib.times_used || 0) + 1,
-                        last_used_at: new Date().toISOString()
-                    })
-                    .eq('id', lib.id);
-            }
-        }
+    ctx.log(`[Bucketing ${runId}] Phase 1a done — tagged ${preMapRows.length} industries (${dqVocab.length} DQ, ${completedVocab.length} via LLM), $${totalCost.toFixed(4)}`, 'phase');
+    ctx.progress({
+        phase: 'phase1a', step: 'done', current: 1, total: 1,
+        note: `Tagging complete — ${primaryIdentities.length} identities, ${buckets.length} characteristics, ${usedSectors.size} sectors used`
+    });
+}
+
+// ────────────────────────────────────────────────────────────────────
+// PHASE 1A HELPERS — taxonomy snapshot + Sonnet tagging
+// ────────────────────────────────────────────────────────────────────
+
+async function loadTaxonomySnapshot(supabase: SupabaseClient): Promise<TaxonomySnapshot> {
+    const [idRes, chRes, secRes] = await Promise.all([
+        supabase.from('taxonomy_identities').select('*').eq('archived', false).order('sort_order'),
+        supabase.from('taxonomy_characteristics').select('*').eq('archived', false).order('sort_order'),
+        supabase.from('taxonomy_sectors').select('*').eq('archived', false).order('sort_order')
+    ]);
+    if (idRes.error) throw new Error(`taxonomy_identities load failed: ${idRes.error.message}`);
+    if (chRes.error) throw new Error(`taxonomy_characteristics load failed: ${chRes.error.message}`);
+    if (secRes.error) throw new Error(`taxonomy_sectors load failed: ${secRes.error.message}`);
+    return {
+        identities: (idRes.data || []) as TaxonomyEntry[],
+        characteristics: (chRes.data || []) as TaxonomyEntry[],
+        sectors: (secRes.data || []) as TaxonomyEntry[]
+    };
+}
+
+async function tagIndustriesWithSonnet(
+    supabase: SupabaseClient,
+    vocab: VocabRow[],
+    snapshot: TaxonomySnapshot,
+    runId: string,
+    ctx: BucketingCtx
+): Promise<{ taggings: IndustryTagging[]; costUsd: number; modelUsed: string }> {
+    const anthropic = await getAnthropic(supabase);
+    if (!anthropic) {
+        throw new Error('Anthropic API key not configured. Add it on the Connectors page (saved as ANTHROPIC_API_KEY).');
     }
 
-    ctx.log(`[Bucketing ${runId}] Phase 1a done — ${leaves.length} specs (${lockedFromLibrary.length} from library, ${discoveredLeaves.length} discovered), $${totalCost.toFixed(4)}`, 'phase');
-    ctx.progress({ phase: 'phase1a', step: 'done', current: 1, total: 1, note: `Discovery complete — ${leaves.length} specializations ready for review` });
+    const systemPrompt = buildTaggingSystemPrompt(snapshot);
+    const limit = pLimit(PHASE1A_CONCURRENCY);
+    const batches: VocabRow[][] = [];
+    for (let i = 0; i < vocab.length; i += PHASE1A_BATCH_SIZE) {
+        batches.push(vocab.slice(i, i + PHASE1A_BATCH_SIZE));
+    }
+
+    let totalIn = 0;
+    let totalOut = 0;
+    let totalCachedIn = 0;
+    let done = 0;
+    const taggings: IndustryTagging[] = [];
+
+    await Promise.all(batches.map((batch) => limit(async () => {
+        await ctx.checkCancel();
+        const userPrompt = JSON.stringify({
+            industries: batch.map((v, i) => ({
+                id: i,
+                industry: v.industry,
+                sample_companies: v.sample_companies?.slice(0, 2) || []
+            }))
+        });
+        try {
+            const resp = await anthropic.messages.create({
+                model: TAXONOMY_MODEL_ANTHROPIC,
+                max_tokens: 2000,
+                system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+                messages: [{ role: 'user', content: userPrompt }]
+            }, { timeout: TAXONOMY_TIMEOUT_MS });
+
+            // Track usage with cache awareness.
+            const usage: any = (resp as any).usage || {};
+            totalIn += usage.input_tokens || 0;
+            totalOut += usage.output_tokens || 0;
+            totalCachedIn += usage.cache_read_input_tokens || 0;
+
+            // Find the JSON block in the response.
+            const text = (resp.content as any[])
+                .filter(b => b.type === 'text').map(b => b.text).join('\n');
+            const parsed = parseTaggingJson(text, batch);
+            for (const t of parsed) taggings.push(t);
+        } catch (err: any) {
+            ctx.log(`[Bucketing ${runId}] tagging batch error (${batch.length} industries): ${err.message}`, 'error');
+            // Fail-open: emit needs_qa rows so we don't lose contacts.
+            for (const v of batch) {
+                taggings.push({
+                    industry: v.industry,
+                    identity: null,
+                    is_new_identity: false,
+                    characteristic: null,
+                    is_new_characteristic: false,
+                    sector: null,
+                    is_new_sector: false,
+                    is_disqualified: false,
+                    confidence: 0,
+                    reason: `tagging_error: ${err.message?.slice(0, 200)}`
+                });
+            }
+        }
+        done += batch.length;
+        if (done % (PHASE1A_BATCH_SIZE * 10) === 0 || done === vocab.length) {
+            ctx.progress({
+                phase: 'phase1a',
+                step: 'sonnet_tagging',
+                current: done,
+                total: vocab.length,
+                note: `Tagged ${done}/${vocab.length} industries…`
+            });
+        }
+    })));
+
+    const costUsd = computeAnthropicCost(TAXONOMY_MODEL_ANTHROPIC, totalIn - totalCachedIn, totalOut)
+        + (totalCachedIn / 1_000_000) * (ANTHROPIC_PRICING[TAXONOMY_MODEL_ANTHROPIC]?.input || 3) * 0.1; // cached at ~10%
+    return { taggings, costUsd, modelUsed: TAXONOMY_MODEL_ANTHROPIC };
+}
+
+function buildTaggingSystemPrompt(s: TaxonomySnapshot): string {
+    const idLines = s.identities.map(i =>
+        `  - ${i.name}${i.is_disqualified ? ' [DQ]' : ''}: ${i.description || ''}`
+    ).join('\n');
+    const chLines = s.characteristics.map(c =>
+        `  - ${c.name} (under ${c.parent_identity}): ${c.description || ''}`
+    ).join('\n');
+    const secLines = s.sectors.map(sec =>
+        `  - ${sec.name}: ${sec.synonyms || sec.description || ''}`
+    ).join('\n');
+
+    return `You are tagging B2B contact industries for outreach segmentation.
+
+For each industry text the user provides, return three independent tags:
+
+1. **Identity** (REQUIRED) — what kind of company is it? Pick from the IDENTITY library below. If nothing fits well (you have less than ~6/10 confidence), propose a new identity name and set is_new_identity=true. Identities marked [DQ] mean the company is disqualified for outreach.
+
+2. **Characteristic** (optional) — the more specific subtype within the identity. Pick from the CHARACTERISTICS library below; the parent_identity must match the identity you chose. If nothing fits well, propose a new one and set is_new_characteristic=true. If no characteristic applies, return null.
+
+3. **Sector** (optional) — what *vertical* does the company serve? Pick from the SECTOR library below. Sector is independent of identity (a "Marketing Agency serving Healthcare" has identity=Agency, characteristic=Specialty Marketing Agency, sector=Healthcare / Medical). If the company doesn't have a clear served sector (it's a generic service / cross-vertical), return null. If nothing fits, propose new and set is_new_sector=true.
+
+CLASSIFICATION RULES (critical):
+- Classify by core business identity FIRST, sector served SECOND. A PE firm focused on healthcare is identity=Financial Services (PE), NOT Healthcare.
+- Operators in a vertical (a hospital, a SaaS company) belong to that identity. Service providers TO that vertical (an agency that markets healthcare, a consultant to insurers) belong to the service identity, with the vertical going into sector.
+- If the identity is marked [DQ] in the library OR the company's core business is consumer-facing retail/hospitality/DTC, set is_disqualified=true.
+- confidence is 1-10. <6 means you weren't able to find a confident match.
+
+OUTPUT FORMAT — return ONLY valid JSON, no prose:
+{
+  "results": [
+    {
+      "id": <integer matching input id>,
+      "identity": "<library name or new>" | null,
+      "is_new_identity": <bool>,
+      "characteristic": "<library name or new>" | null,
+      "is_new_characteristic": <bool>,
+      "sector": "<library name or new>" | null,
+      "is_new_sector": <bool>,
+      "is_disqualified": <bool>,
+      "confidence": <1-10 integer>,
+      "reason": "<brief justification, <= 30 words>"
+    }, ...
+  ]
+}
+
+== IDENTITY LIBRARY ==
+${idLines}
+
+== CHARACTERISTICS LIBRARY ==
+${chLines}
+
+== SECTOR LIBRARY ==
+${secLines}`;
+}
+
+function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
+    // Accept the JSON either as the entire response or wrapped in ``` blocks.
+    let txt = (raw || '').trim();
+    const fence = txt.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fence) txt = fence[1].trim();
+    let parsed: any;
+    try { parsed = JSON.parse(txt); }
+    catch { throw new Error(`tagging response is not valid JSON: ${txt.slice(0, 200)}`); }
+
+    const out: IndustryTagging[] = [];
+    const arr = Array.isArray(parsed) ? parsed : (parsed.results || []);
+    for (const item of arr) {
+        const idx = typeof item.id === 'number' ? item.id : -1;
+        if (idx < 0 || idx >= batch.length) continue;
+        const v = batch[idx];
+        out.push({
+            industry: v.industry,
+            identity: nz(item.identity),
+            is_new_identity: !!item.is_new_identity,
+            characteristic: nz(item.characteristic),
+            is_new_characteristic: !!item.is_new_characteristic,
+            sector: nz(item.sector),
+            is_new_sector: !!item.is_new_sector,
+            is_disqualified: !!item.is_disqualified,
+            confidence: typeof item.confidence === 'number' ? item.confidence : 0,
+            reason: typeof item.reason === 'string' ? item.reason.slice(0, 500) : ''
+        });
+    }
+    return out;
+}
+
+function nz(v: any): string | null {
+    if (v === null || v === undefined) return null;
+    const s = String(v).trim();
+    return s.length > 0 ? s : null;
 }
 
 function dedupe(arr: string[] | undefined): string[] {
@@ -1325,7 +1548,8 @@ function cleanScore(n: number | undefined | null): number {
 }
 
 function preRollupName(row: Pick<ContactMapRow, 'sector_focus' | 'functional_specialization' | 'primary_identity' | 'is_generic' | 'is_disqualified'>): string {
-    if (row.is_generic || row.is_disqualified) return RESERVED_GENERAL;
+    if (row.is_disqualified) return RESERVED_DISQUALIFIED;
+    if (row.is_generic) return RESERVED_GENERAL;
     if (row.functional_specialization && row.sector_focus && row.sector_focus !== 'Multi-industry') {
         return `${row.sector_focus} ${row.functional_specialization}`;
     }
@@ -1339,6 +1563,10 @@ function makeGeneralContactRow(
     contact: ContactRouteInput,
     reason: string
 ): ContactMapRow {
+    // Unclassifiable rows (failed enrichment, missing industry, scrape errors)
+    // route to the dedicated Disqualified bucket — separate from General so
+    // outreach exports can exclude them by default while still being able to
+    // see why each contact landed there.
     return {
         bucketing_run_id: runId,
         contact_id: contact.contact_id,
@@ -1346,16 +1574,16 @@ function makeGeneralContactRow(
         primary_identity: '',
         functional_specialization: '',
         sector_focus: '',
-        pre_rollup_bucket_name: RESERVED_GENERAL,
-        bucket_name: RESERVED_GENERAL,
+        pre_rollup_bucket_name: RESERVED_DISQUALIFIED,
+        bucket_name: RESERVED_DISQUALIFIED,
         rollup_level: 'general',
         source: 'unclassifiable',
         confidence: 0,
         leaf_score: 0,
         ancestor_score: 0,
         root_score: 0,
-        is_generic: true,
-        is_disqualified: false,
+        is_generic: false,
+        is_disqualified: true,
         general_reason: reason,
         reasons: {
             general_reason: reason,
@@ -1438,7 +1666,7 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
         const next = { ...row };
         next.pre_rollup_bucket_name = preRollupName(next);
         if (next.is_disqualified) {
-            next.bucket_name = RESERVED_GENERAL;
+            next.bucket_name = RESERVED_DISQUALIFIED;
             next.rollup_level = 'general';
             next.general_reason = next.general_reason || 'disqualified';
         } else if (next.is_generic && !next.primary_identity) {
@@ -1472,6 +1700,7 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
         const counts = new Map<string, number>();
         for (const row of rolled) {
             if (row.bucket_name === RESERVED_GENERAL) continue;
+            if (row.bucket_name === RESERVED_DISQUALIFIED) continue;
             counts.set(row.bucket_name, (counts.get(row.bucket_name) || 0) + 1);
         }
         if (counts.size <= budget) break;

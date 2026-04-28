@@ -1783,6 +1783,181 @@ app.post('/api/bucketing/runs/:id/save-to-library', async (req, res) => {
 });
 
 // ============================================
+// TAXONOMY LIBRARY — editable Identity / Characteristic / Sector lists
+// ============================================
+//
+// The Phase 1a tagger reads these tables every run as the allowed set
+// of tags. AI-proposed additions (created_by='ai') surface in the
+// Review screen with Accept / Reject controls.
+
+const TAXONOMY_TABLES = {
+    identities: 'taxonomy_identities',
+    characteristics: 'taxonomy_characteristics',
+    sectors: 'taxonomy_sectors'
+} as const;
+
+type TaxonomyKind = keyof typeof TAXONOMY_TABLES;
+
+function pickTaxonomyTable(kind: string): string | null {
+    return (TAXONOMY_TABLES as any)[kind] || null;
+}
+
+app.get('/api/bucketing/taxonomy', async (_req, res) => {
+    try {
+        const [idRes, chRes, secRes] = await Promise.all([
+            supabase.from('taxonomy_identities').select('*').order('sort_order').order('name'),
+            supabase.from('taxonomy_characteristics').select('*').order('sort_order').order('name'),
+            supabase.from('taxonomy_sectors').select('*').order('sort_order').order('name')
+        ]);
+        if (idRes.error) throw new Error(idRes.error.message);
+        if (chRes.error) throw new Error(chRes.error.message);
+        if (secRes.error) throw new Error(secRes.error.message);
+        res.json({
+            identities: idRes.data || [],
+            characteristics: chRes.data || [],
+            sectors: secRes.data || []
+        });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/bucketing/taxonomy/:kind', async (req, res) => {
+    try {
+        const table = pickTaxonomyTable(req.params.kind);
+        if (!table) return res.status(400).json({ error: 'unknown taxonomy kind' });
+        const body = req.body || {};
+        const name = String(body.name || '').trim();
+        if (!name) return res.status(400).json({ error: 'name is required' });
+
+        const row: any = {
+            name,
+            description: typeof body.description === 'string' ? body.description : null,
+            created_by: body.created_by === 'ai' ? 'ai' : 'user',
+            archived: false,
+            updated_at: new Date().toISOString()
+        };
+        if (req.params.kind === 'identities') {
+            row.is_disqualified = !!body.is_disqualified;
+        }
+        if (req.params.kind === 'characteristics') {
+            const parent = String(body.parent_identity || '').trim();
+            if (!parent) return res.status(400).json({ error: 'parent_identity is required for characteristics' });
+            row.parent_identity = parent;
+        }
+        if (req.params.kind === 'sectors') {
+            row.synonyms = typeof body.synonyms === 'string' ? body.synonyms : null;
+        }
+        const { data, error } = await supabase.from(table).upsert(row, { onConflict: 'name' }).select().single();
+        if (error) return res.status(400).json({ error: error.message });
+        res.json(data);
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+app.patch('/api/bucketing/taxonomy/:kind/:id', async (req, res) => {
+    try {
+        const table = pickTaxonomyTable(req.params.kind);
+        if (!table) return res.status(400).json({ error: 'unknown taxonomy kind' });
+        const update: any = { updated_at: new Date().toISOString() };
+        const body = req.body || {};
+        if (typeof body.name === 'string' && body.name.trim()) update.name = body.name.trim();
+        if (typeof body.description === 'string') update.description = body.description;
+        if (typeof body.archived === 'boolean') update.archived = body.archived;
+        if (typeof body.created_by === 'string') update.created_by = body.created_by;
+        if (req.params.kind === 'identities' && typeof body.is_disqualified === 'boolean') {
+            update.is_disqualified = body.is_disqualified;
+        }
+        if (req.params.kind === 'characteristics' && typeof body.parent_identity === 'string' && body.parent_identity.trim()) {
+            update.parent_identity = body.parent_identity.trim();
+        }
+        if (req.params.kind === 'sectors' && typeof body.synonyms === 'string') {
+            update.synonyms = body.synonyms;
+        }
+        const { data, error } = await supabase.from(table).update(update).eq('id', req.params.id).select().single();
+        if (error) return res.status(400).json({ error: error.message });
+        res.json(data);
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+app.delete('/api/bucketing/taxonomy/:kind/:id', async (req, res) => {
+    try {
+        const table = pickTaxonomyTable(req.params.kind);
+        if (!table) return res.status(400).json({ error: 'unknown taxonomy kind' });
+        const { error } = await supabase.from(table).delete().eq('id', req.params.id);
+        if (error) return res.status(400).json({ error: error.message });
+        res.json({ ok: true });
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+// AI-proposed additions surfaced from Phase 1a results — `is_new_*=true`
+// rows in bucket_industry_map for a run. Returns a deduped list per kind.
+app.get('/api/bucketing/runs/:id/proposed-tags', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('bucket_industry_map')
+            .select('identity,is_new_identity,characteristic,is_new_characteristic,sector,is_new_sector,industry_string,confidence,llm_reason')
+            .eq('bucketing_run_id', req.params.id)
+            .or('is_new_identity.eq.true,is_new_characteristic.eq.true,is_new_sector.eq.true');
+        if (error) return res.status(500).json({ error: error.message });
+
+        const ids = new Map<string, { name: string; samples: string[]; count: number }>();
+        const chars = new Map<string, { name: string; parent: string | null; samples: string[]; count: number }>();
+        const secs = new Map<string, { name: string; samples: string[]; count: number }>();
+        for (const r of (data || []) as any[]) {
+            if (r.is_new_identity && r.identity) {
+                const e = ids.get(r.identity) || { name: r.identity, samples: [], count: 0 };
+                e.count++;
+                if (e.samples.length < 5) e.samples.push(r.industry_string);
+                ids.set(r.identity, e);
+            }
+            if (r.is_new_characteristic && r.characteristic) {
+                const e = chars.get(r.characteristic) || { name: r.characteristic, parent: r.identity || null, samples: [], count: 0 };
+                e.count++;
+                if (e.samples.length < 5) e.samples.push(r.industry_string);
+                chars.set(r.characteristic, e);
+            }
+            if (r.is_new_sector && r.sector) {
+                const e = secs.get(r.sector) || { name: r.sector, samples: [], count: 0 };
+                e.count++;
+                if (e.samples.length < 5) e.samples.push(r.industry_string);
+                secs.set(r.sector, e);
+            }
+        }
+        res.json({
+            identities: Array.from(ids.values()).sort((a, b) => b.count - a.count),
+            characteristics: Array.from(chars.values()).sort((a, b) => b.count - a.count),
+            sectors: Array.from(secs.values()).sort((a, b) => b.count - a.count)
+        });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Low-confidence (needs_qa=true) industries for a run, with sample contacts
+// — drives the Phase 1a QA panel.
+app.get('/api/bucketing/runs/:id/qa-queue', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('bucket_industry_map')
+            .select('industry_string,identity,characteristic,sector,confidence,llm_reason,is_disqualified,bucket_name')
+            .eq('bucketing_run_id', req.params.id)
+            .eq('needs_qa', true)
+            .order('confidence', { ascending: true })
+            .limit(500);
+        if (error) return res.status(500).json({ error: error.message });
+        res.json({ queue: data || [] });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ============================================
 // CONNECTORS — UI-managed runtime secrets
 // ============================================
 //
