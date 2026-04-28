@@ -12,7 +12,7 @@ import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { db } from './services/supabaseClient';
 import { JobProcessor } from './services/jobProcessor';
-import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment } from './services/bucketingService';
+import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, BucketingCancelledError } from './services/bucketingService';
 import {
     listLibrary,
     upsertLibraryBucket,
@@ -1409,6 +1409,14 @@ function buildBucketingCtx(runId: string) {
             if (now - lastWrite < 700) return;
             lastWrite = now;
             flush();
+        },
+        // Polled at every phase boundary. If the user clicked Stop,
+        // bucketing_runs.cancel_requested = true and we throw so the
+        // service unwinds cleanly.
+        checkCancel: async () => {
+            const { data } = await supabase
+                .from('bucketing_runs').select('cancel_requested').eq('id', runId).single();
+            if (data?.cancel_requested) throw new BucketingCancelledError();
         }
     };
 }
@@ -1435,10 +1443,12 @@ app.post('/api/bucketing/determine', async (req, res) => {
         // Fire-and-forget taxonomy build. Errors land on the run row, not the
         // response — the client already has the run id from this 202.
         runTaxonomyProposal(supabase, data.id, buildBucketingCtx(data.id)).catch(async (err: any) => {
-            console.error(`[Bucketing] Taxonomy failed for ${data.id}:`, err);
+            const cancelled = err instanceof BucketingCancelledError;
+            console.error(`[Bucketing] Taxonomy ${cancelled ? 'cancelled' : 'failed'} for ${data.id}:`, err);
             await supabase.from('bucketing_runs').update({
-                status: 'failed',
-                error_message: err.message?.slice(0, 1000) || String(err)
+                status: cancelled ? 'cancelled' : 'failed',
+                cancel_requested: false,
+                error_message: cancelled ? 'Cancelled by user' : (err.message?.slice(0, 1000) || String(err))
             }).eq('id', data.id);
         });
 
@@ -1541,15 +1551,85 @@ app.post('/api/bucketing/runs/:id/assign', async (req, res) => {
             return res.status(400).json({ error: `Cannot assign from status: ${run.status}` });
         }
 
+        // Clear any stale cancel flag from a prior aborted run.
+        await supabase.from('bucketing_runs').update({ cancel_requested: false }).eq('id', id);
         runAssignment(supabase, id, buildBucketingCtx(id)).catch(async (err: any) => {
-            console.error(`[Bucketing] Assignment failed for ${id}:`, err);
+            const cancelled = err instanceof BucketingCancelledError;
+            console.error(`[Bucketing] Assignment ${cancelled ? 'cancelled' : 'failed'} for ${id}:`, err);
             await supabase.from('bucketing_runs').update({
-                status: 'failed',
-                error_message: err.message?.slice(0, 1000) || String(err)
+                status: cancelled ? 'cancelled' : 'failed',
+                cancel_requested: false,
+                error_message: cancelled ? 'Cancelled by user' : (err.message?.slice(0, 1000) || String(err))
             }).eq('id', id);
         });
 
         res.status(202).json({ ok: true, id });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Stop / cancel a running bucketing job. Sets cancel_requested=true; the
+// service polls this flag at every phase boundary and unwinds cleanly,
+// landing the run at status='cancelled' with error_message='Cancelled by user'.
+app.post('/api/bucketing/runs/:id/cancel', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const { data: run } = await supabase
+            .from('bucketing_runs').select('status').eq('id', id).single();
+        if (!run) return res.status(404).json({ error: 'Run not found' });
+        if (run.status !== 'taxonomy_pending' && run.status !== 'assigning') {
+            return res.status(400).json({ error: `Cannot cancel from status: ${run.status}` });
+        }
+        await supabase.from('bucketing_runs')
+            .update({ cancel_requested: true })
+            .eq('id', id);
+        res.json({ ok: true });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Resume a cancelled run. If the cancel happened during Phase 1a, retrigger
+// runTaxonomyProposal. If during Phase 1b, retrigger runAssignment. Both
+// phases are idempotent at the phase level — they wipe and rebuild the
+// per-phase output tables so the resume is clean.
+app.post('/api/bucketing/runs/:id/resume', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const { data: run, error } = await supabase
+            .from('bucketing_runs').select('*').eq('id', id).single();
+        if (error || !run) return res.status(404).json({ error: error?.message || 'Run not found' });
+        if (run.status !== 'cancelled') {
+            return res.status(400).json({ error: `Cannot resume from status: ${run.status}` });
+        }
+
+        // Decide which phase to resume from. If a taxonomy_proposal already
+        // exists, Phase 1a finished; resume Phase 1b. Otherwise restart 1a.
+        const resumePhase: 'phase1a' | 'phase1b' = run.taxonomy_proposal ? 'phase1b' : 'phase1a';
+
+        await supabase.from('bucketing_runs').update({
+            cancel_requested: false,
+            error_message: null,
+            status: resumePhase === 'phase1a' ? 'taxonomy_pending' : 'assigning'
+        }).eq('id', id);
+
+        const ctx = buildBucketingCtx(id);
+        const fn = resumePhase === 'phase1a'
+            ? () => runTaxonomyProposal(supabase, id, ctx)
+            : () => runAssignment(supabase, id, ctx);
+
+        fn().catch(async (err: any) => {
+            const cancelled = err instanceof BucketingCancelledError;
+            console.error(`[Bucketing] Resumed ${resumePhase} ${cancelled ? 'cancelled' : 'failed'} for ${id}:`, err);
+            await supabase.from('bucketing_runs').update({
+                status: cancelled ? 'cancelled' : 'failed',
+                cancel_requested: false,
+                error_message: cancelled ? 'Cancelled by user' : (err.message?.slice(0, 1000) || String(err))
+            }).eq('id', id);
+        });
+
+        res.status(202).json({ ok: true, resumed: resumePhase });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }

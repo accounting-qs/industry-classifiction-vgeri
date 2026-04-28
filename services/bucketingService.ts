@@ -69,10 +69,17 @@ const RESERVED_GENERAL = 'General';
 // one of these per run and passes it through the entry points; every step
 // in Phase 1a / Phase 1b reports to it. log() persists to bucketing_run_logs;
 // progress() debounces writes to bucketing_runs.progress so we don't hammer
-// the DB on tight inner loops.
+// the DB on tight inner loops. checkCancel() reads the cancel_requested
+// flag and throws BucketingCancelledError if the user clicked Stop —
+// called at every phase boundary so the run shuts down cleanly.
 export interface BucketingCtx {
     log(msg: string, level?: 'info' | 'warn' | 'error' | 'phase'): void;
     progress(p: ProgressUpdate): void;
+    checkCancel(): Promise<void>;
+}
+
+export class BucketingCancelledError extends Error {
+    constructor() { super('Cancelled by user'); this.name = 'BucketingCancelledError'; }
 }
 
 export interface ProgressUpdate {
@@ -209,10 +216,15 @@ async function fetchFullVocabulary(
     ctx?: BucketingCtx
 ): Promise<VocabRow[]> {
     return withHeartbeat('vocabulary fetch', async () => {
-        const { data, error } = await supabase.rpc('get_industry_vocabulary', {
-            p_list_names: listNames,
-            p_limit: VOCAB_HARD_LIMIT
-        });
+        // .range() is required to bypass PostgREST's default db-max-rows
+        // (1000) on RPC responses — without it the function-level LIMIT
+        // doesn't matter, the response gets truncated at 1000 rows.
+        const { data, error } = await supabase
+            .rpc('get_industry_vocabulary', {
+                p_list_names: listNames,
+                p_limit: VOCAB_HARD_LIMIT
+            })
+            .range(0, VOCAB_HARD_LIMIT - 1);
         if (error) throw new Error(`vocabulary fetch failed: ${error.message}`);
         return (data || []) as VocabRow[];
     }, ctx);
@@ -412,6 +424,7 @@ export async function runTaxonomyProposal(
     let libraryUsageByBucketId = new Map<string, number>();
 
     if (preferred.length > 0) {
+        await ctx.checkCancel();
         ctx.log(`[Bucketing ${runId}] Phase 1a step 1/3: library-first match against ${preferred.length} preferred buckets`, 'phase');
         ctx.progress({ phase: 'phase1a', step: 'library_match', note: `Matching against ${preferred.length} library buckets…` });
         const libRes = await withHeartbeat('library-first match (Phase 1a)',
@@ -436,6 +449,7 @@ export async function runTaxonomyProposal(
     }
 
     // ── Step B: discovery LLM on residual vocab ───────────────────────
+    await ctx.checkCancel();
     ctx.log(`[Bucketing ${runId}] Phase 1a step 2/3: discovery LLM on ${discoveryVocab.length} residual industries`, 'phase');
     ctx.progress({ phase: 'phase1a', step: 'discovery_llm', note: `Running discovery LLM (${discoveryVocab.length} residual industries)…` });
     const t0 = Date.now();
@@ -544,6 +558,7 @@ export async function runTaxonomyProposal(
     // Replaces the old example_strings seed. Embed every still-unmatched
     // industry against every proposed spec; cosine ≥ EMBED_AUTO_THRESHOLD
     // and margin ≥ EMBED_MARGIN write a preview map row.
+    await ctx.checkCancel();
     const stillPending = vocabRows.filter(r => !libraryMatchedIndustries.has(r.industry));
     ctx.log(`[Bucketing ${runId}] Phase 1a step 3/3: embedding preview against ${leaves.length} specs over ${stillPending.length} pending industries`, 'phase');
     ctx.progress({ phase: 'phase1a', step: 'preview_embedding', current: 0, total: stillPending.length, note: 'Computing per-spec preview counts via embedding…' });
@@ -611,18 +626,20 @@ async function callDiscoveryLLM(
     vocabRows: VocabRow[],
     preferred: any[]
 ): Promise<{ discovery: DiscoveryOutput; costUsd: number; modelUsed: string }> {
-    const HEAD_LIMIT = 2500;
+    // Lighter prompt: smaller head, drop reasoning excerpts (each was ~120
+    // chars × N rows = many thousands of tokens that contributed only
+    // marginal signal). Sonnet now sees a tight `industry | n | 2 samples`
+    // table that's ~3× smaller and resolves in ~30–60s instead of 90–180s.
+    const HEAD_LIMIT = 1500;
     const head = vocabRows.slice(0, HEAD_LIMIT);
     const tail = vocabRows.slice(HEAD_LIMIT);
     const tailContacts = tail.reduce((s, r) => s + Number(r.n || 0), 0);
     const headContacts = head.reduce((s, r) => s + Number(r.n || 0), 0);
-    const tailExamples = tail.slice(0, 50).map(r => r.industry);
+    const tailExamples = tail.slice(0, 40).map(r => r.industry);
 
     const vocabularyTable = head.map(r => {
         const samples = (r.sample_companies || []).slice(0, 2).filter(Boolean).join(' | ');
-        const reason = (r.sample_reasoning || [])[0] || '';
-        const trimmedReason = reason.length > 120 ? reason.slice(0, 120) + '…' : reason;
-        return `${r.industry} | n=${r.n} | companies=[${samples}] | reasoning="${trimmedReason}"`;
+        return `${r.industry} | n=${r.n} | companies=[${samples}]`;
     }).join('\n');
 
     const tailSection = tail.length > 0
@@ -709,9 +726,10 @@ PER-SPECIALIZATION ROUTING METADATA — REQUIRED FIELDS:
 - priority_rank: 1–10. 1 = strongest identity nouns (PE Firm, Law Firm,
   Marketing Agency, MSP). 10 = weakest (operator specializations that
   lose to enabler signals).
-- strong_identity_signals, weak_sector_signals, disqualifying_signals:
-  same as before — phrases that prove / hint at / route AWAY from this
-  specialization.
+- include / exclude / example_strings: keyword hints that drive Phase 1b
+  routing. include = phrases that PROVE this spec. exclude = phrases that
+  should route AWAY. example_strings = verbatim industry strings from the
+  vocabulary.
 ${preferredSection}
 
 REQUIRED PROCESS — DO NOT SKIP:
@@ -743,9 +761,6 @@ OUTPUT (strict JSON only, no prose, no markdown fences):
       "include": [<keywords>],
       "exclude": [<keywords>],
       "example_strings": [<6–10 verbatim from vocab>],
-      "strong_identity_signals": [<phrases>],
-      "weak_sector_signals": [<sector phrases that often appear but don't determine this spec>],
-      "disqualifying_signals": [<phrases that should route AWAY>],
       "estimated_usage_label": "<dominant|very_common|common|moderate|niche_but_meaningful|rare>",
       "rough_volume_estimate": "<e.g. ~8–12% of rows>",
       "library_match_id": "<id from PREFERRED, or empty string>"
@@ -877,10 +892,14 @@ function buildDiscoverySchema() {
                 items: {
                     type: 'object',
                     additionalProperties: false,
+                    // Trimmed required list. The three signals arrays
+                    // (strong_identity / weak_sector / disqualifying) used
+                    // to be required and forced ~5x the output tokens per
+                    // spec; we now derive equivalent hints from include /
+                    // exclude / example_strings instead.
                     required: ['functional_specialization', 'primary_identity', 'description',
                                'identity_type', 'operator_required', 'priority_rank',
                                'include', 'exclude', 'example_strings',
-                               'strong_identity_signals', 'weak_sector_signals', 'disqualifying_signals',
                                'estimated_usage_label', 'rough_volume_estimate', 'library_match_id'],
                     properties: {
                         functional_specialization: { type: 'string' },
@@ -892,9 +911,6 @@ function buildDiscoverySchema() {
                         include: { type: 'array', items: { type: 'string' } },
                         exclude: { type: 'array', items: { type: 'string' } },
                         example_strings: { type: 'array', items: { type: 'string' } },
-                        strong_identity_signals: { type: 'array', items: { type: 'string' } },
-                        weak_sector_signals: { type: 'array', items: { type: 'string' } },
-                        disqualifying_signals: { type: 'array', items: { type: 'string' } },
                         estimated_usage_label: { type: 'string' },
                         rough_volume_estimate: { type: 'string' },
                         library_match_id: { type: 'string' }
@@ -1074,6 +1090,7 @@ export async function runAssignment(
 
     let totalCost = Number(run.cost_usd || 0);
 
+    await ctx.checkCancel();
     ctx.log(`[Bucketing ${runId}] step 1/5: load vocabulary`, 'phase');
     ctx.progress({ phase: 'phase1b', step: 'load_vocabulary', note: 'Loading vocabulary…' });
     const vocab = await fetchFullVocabulary(supabase, run.list_names, ctx);
@@ -1087,6 +1104,7 @@ export async function runAssignment(
 
     // Step 2 (NEW): library-first deterministic match.
     if (libraryBuckets.length > 0) {
+        await ctx.checkCancel();
         ctx.log(`[Bucketing ${runId}] step 2/5: library-first match against ${libraryBuckets.length} preferred buckets`, 'phase');
         ctx.progress({ phase: 'phase1b', step: 'library_match', note: `Matching against ${libraryBuckets.length} library buckets…` });
         const libRes = await withHeartbeat('library-first match (Phase 1b)',
@@ -1100,6 +1118,7 @@ export async function runAssignment(
 
     // Step 3: sector-aware embedding pre-filter.
     if (EMBED_PREFILTER_ENABLED && pendingIndustries.length > 0) {
+        await ctx.checkCancel();
         ctx.log(`[Bucketing ${runId}] step 3/5: embedding pre-filter (sector-aware)`, 'phase');
         ctx.progress({ phase: 'phase1b', step: 'embedding_prefilter', note: `Embedding pre-filter on ${pendingIndustries.length} industries…` });
         const embedRes = await withHeartbeat(
@@ -1114,6 +1133,7 @@ export async function runAssignment(
         ctx.progress({ phase: 'phase1b', step: 'embedding_prefilter_done', current: vocab.length - pendingIndustries.length, total: vocab.length, note: `${embedRes.autoAssigned.length} matched via embedding, ${pendingIndustries.length} still pending LLM` });
     }
 
+    await ctx.checkCancel();
     ctx.log(`[Bucketing ${runId}] step 4/5: routing LLM matching`, 'phase');
     ctx.progress({ phase: 'phase1b', step: 'llm_routing', current: 0, total: pendingIndustries.length, note: `LLM routing on ${pendingIndustries.length} industries…` });
     const llmRes = await runMatchingLLM(pendingIndustries, leaves, sectorVocab, runId, ctx);
@@ -1131,6 +1151,7 @@ export async function runAssignment(
         }
     }
 
+    await ctx.checkCancel();
     ctx.log(`[Bucketing ${runId}] step 5/5: volume rollup + fan-out`, 'phase');
     ctx.progress({ phase: 'phase1b', step: 'rollup_fanout', note: 'Computing campaign buckets and writing per-contact assignments…' });
     const { error: rollupErr } = await withHeartbeat(
@@ -1495,6 +1516,11 @@ async function runMatchingLLM(
     const totalBatches = batches.length;
 
     await Promise.all(batches.map(batch => limit(async () => {
+        // Skip remaining queued batches if a cancel is requested. We don't
+        // throw mid-batch — that races with already-in-flight HTTP calls —
+        // but we DO bail out of starting any more, so cancel takes effect
+        // within ~1 batch (5–10s) instead of waiting for the whole loop.
+        if (ctx) { try { await ctx.checkCancel(); } catch (e) { return; } }
         const { results, costUsd } = await classifyBatch(
             batch, bucketReferenceJson, sectorVocab, validSpecNames, validIdentityNames
         );

@@ -54,7 +54,8 @@ export type BucketingRunStatus =
   | 'taxonomy_ready'
   | 'assigning'
   | 'completed'
-  | 'failed';
+  | 'failed'
+  | 'cancelled';
 
 // v2.2: Layer-1 primary identity + Layer-2 functional specialization.
 // Layer-3 sector_focus and Layer-4 campaign bucket are computed elsewhere.
@@ -117,6 +118,7 @@ export interface BucketingRun {
   assigned_contacts?: number | null;
   cost_usd?: number | null;
   progress?: BucketingProgress | null;
+  cancel_requested?: boolean | null;
   error_message?: string | null;
   created_at: string;
   taxonomy_completed_at?: string | null;

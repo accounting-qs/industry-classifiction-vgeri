@@ -13,7 +13,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Layers, Loader2, AlertCircle, ArrowLeft, Plus, X, Trash2, Download,
-  Play, BookMarked, CheckCircle2, Edit3, Archive, Upload
+  Play, BookMarked, CheckCircle2, Edit3, Archive, Upload, Square, RotateCcw
 } from 'lucide-react';
 import Papa from 'papaparse';
 import type { BucketingRun, BucketProposal, LibraryBucket } from './types';
@@ -78,6 +78,9 @@ export function BucketingTab({ importLists }: {
     if (!activeRunId) return;
     fetchActive();
     if (!activeRun) return;
+    // Poll while in-flight or cancelled (cancelled state needs to react
+    // to a Resume click). Stop polling once we land on a terminal stable
+    // state the user is reviewing.
     if (activeRun.status === 'completed' || activeRun.status === 'failed' || activeRun.status === 'taxonomy_ready') return;
     const t = setInterval(fetchActive, 1500);
     return () => clearInterval(t);
@@ -274,6 +277,7 @@ function BucketingStatusBadge({ status }: { status: string }) {
     'assigning':        'bg-blue-500/15 text-blue-400 border-blue-500/30 animate-pulse',
     'completed':        'bg-[#3ecf8e]/15 text-[#3ecf8e] border-[#3ecf8e]/40',
     'failed':           'bg-red-500/15 text-red-400 border-red-500/30',
+    'cancelled':        'bg-gray-500/15 text-gray-400 border-gray-500/30',
   };
   const labels: Record<string, string> = {
     'taxonomy_pending': 'Discovering…',
@@ -281,6 +285,7 @@ function BucketingStatusBadge({ status }: { status: string }) {
     'assigning':        'Assigning…',
     'completed':        'Completed',
     'failed':           'Failed',
+    'cancelled':        'Cancelled',
   };
   return (
     <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${styles[status] || 'bg-gray-500/15 text-gray-400 border-gray-500/30'}`}>
@@ -457,14 +462,86 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
 
 // ───── DETAIL ROUTER ──────────────────────────────────────────────
 
+// ───── CANCELLED PANEL ────────────────────────────────────────────
+// Shown after the user clicks Stop. Resume button retriggers whichever
+// phase was running (1a if no taxonomy_proposal yet, 1b otherwise).
+function BucketingCancelledPanel({ run, onRefresh, onError }: {
+  run: BucketingRun;
+  onRefresh: () => void;
+  onError: (msg: string | null) => void;
+}) {
+  const [resuming, setResuming] = useState(false);
+  const resumePhase = run.taxonomy_proposal ? 'Phase 1b (matching)' : 'Phase 1a (discovery)';
+
+  const onResume = async () => {
+    setResuming(true);
+    onError(null);
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/resume`, { method: 'POST' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Failed (${res.status})`);
+      }
+      onRefresh();
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setResuming(false);
+    }
+  };
+
+  return (
+    <div className="border border-gray-500/30 rounded-xl bg-gray-500/5 p-6">
+      <div className="flex items-center gap-3 mb-3">
+        <Square className="w-5 h-5 text-gray-400" />
+        <div className="flex-1">
+          <p className="text-sm font-bold text-gray-300">Run cancelled</p>
+          <p className="text-[11px] text-gray-500 mt-0.5">
+            {run.error_message || 'The run was stopped by the user.'} Resume restarts {resumePhase} from the start.
+          </p>
+        </div>
+      </div>
+      <button
+        onClick={onResume}
+        disabled={resuming}
+        className="px-4 py-2 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1"
+      >
+        {resuming ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
+        Resume
+      </button>
+    </div>
+  );
+}
+
 // ───── LIVE PROGRESS PANEL ────────────────────────────────────────
 // Renders the current step, % bar, ETA, and an auto-scrolling tail of
 // log lines. Polls /runs/:id/logs every ~1.5s for new entries.
 
-function BucketingProgressPanel({ run, title }: { run: BucketingRun; title: string }) {
+function BucketingProgressPanel({ run, title, onError }: {
+  run: BucketingRun;
+  title: string;
+  onError?: (msg: string | null) => void;
+}) {
   const [logs, setLogs] = useState<{ id: number; timestamp: string; level: string; message: string }[]>([]);
   const [sinceId, setSinceId] = useState(0);
+  const [stopping, setStopping] = useState(false);
   const logBoxRef = useRef<HTMLDivElement>(null);
+
+  const onStop = async () => {
+    if (!confirm('Stop this bucketing run? You can resume it from where it left off (current phase will restart).')) return;
+    setStopping(true);
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/cancel`, { method: 'POST' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Failed (${res.status})`);
+      }
+    } catch (e: any) {
+      onError?.(e.message);
+    } finally {
+      setStopping(false);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -515,6 +592,15 @@ function BucketingProgressPanel({ run, title }: { run: BucketingRun; title: stri
               {etaTxt ? `ETA ${etaTxt}` : (elapsedTxt ? `${elapsedTxt} elapsed` : 'estimating…')}
             </div>
           </div>
+          <button
+            onClick={onStop}
+            disabled={stopping}
+            className="px-3 py-2 rounded text-xs font-bold bg-red-500/10 border border-red-500/40 text-red-400 hover:bg-red-500/20 disabled:opacity-50 flex items-center gap-1 shrink-0"
+            title="Stop the run cleanly. You can resume afterwards."
+          >
+            {stopping ? <Loader2 className="w-3 h-3 animate-spin" /> : <Square className="w-3 h-3" />}
+            Stop
+          </button>
         </div>
         <div className="h-2 bg-[#1c1c1c] rounded-full overflow-hidden">
           <div
@@ -580,7 +666,10 @@ function BucketingDetail({ run, bucketCounts, sectorMix, onRefresh, onError, onL
   onLibrarySaved: () => void;
 }) {
   if (run.status === 'taxonomy_pending') {
-    return <BucketingProgressPanel run={run} title="Phase 1a — Discovering taxonomy" />;
+    return <BucketingProgressPanel run={run} title="Phase 1a — Discovering taxonomy" onError={onError} />;
+  }
+  if (run.status === 'cancelled') {
+    return <BucketingCancelledPanel run={run} onRefresh={onRefresh} onError={onError} />;
   }
   if (run.status === 'failed') {
     return (
@@ -593,7 +682,7 @@ function BucketingDetail({ run, bucketCounts, sectorMix, onRefresh, onError, onL
     );
   }
   if (run.status === 'assigning') {
-    return <BucketingProgressPanel run={run} title="Phase 1b — Matching contacts to buckets" />;
+    return <BucketingProgressPanel run={run} title="Phase 1b — Matching contacts to buckets" onError={onError} />;
   }
   if (run.status === 'taxonomy_ready') {
     return <BucketingReview run={run} bucketCounts={bucketCounts} onRefresh={onRefresh} onError={onError} />;
