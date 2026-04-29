@@ -1612,6 +1612,8 @@ function StatCard({ label, value, color }: { label: string; value: string; color
 function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: (m: string | null) => void }) {
   const [proposed, setProposed] = useState<{ identities: any[]; characteristics: any[]; sectors: any[] } | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [busyAllKind, setBusyAllKind] = useState<string | null>(null);
+  const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -1624,22 +1626,69 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
 
   useEffect(() => { refresh(); }, [refresh]);
 
+  // Accept a single proposed entry. Refresh the panel only when caller is
+  // a one-off button (not an Accept-all loop) to avoid hitting the
+  // proposed-tags endpoint N+1 times.
+  const acceptOne = async (
+    kind: 'identities' | 'characteristics' | 'sectors',
+    name: string,
+    parent?: string
+  ): Promise<void> => {
+    const body: any = { name, created_by: 'ai' };
+    if (kind === 'characteristics' && parent) body.parent_identity = parent;
+    const res = await fetch(`/api/bucketing/taxonomy/${kind}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+  };
+
   const accept = async (kind: 'identities' | 'characteristics' | 'sectors', name: string, parent?: string) => {
     setBusyKey(`${kind}:${name}`);
     onError(null);
     try {
-      const body: any = { name, created_by: 'ai' };
-      if (kind === 'characteristics' && parent) body.parent_identity = parent;
-      const res = await fetch(`/api/bucketing/taxonomy/${kind}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+      await acceptOne(kind, name, parent);
       await refresh();
     } catch (e: any) { onError(e.message); }
     finally { setBusyKey(null); }
+  };
+
+  const acceptAll = async (kind: 'identities' | 'characteristics' | 'sectors') => {
+    if (!proposed) return;
+    const items = proposed[kind];
+    if (items.length === 0) return;
+    setBusyAllKind(kind);
+    setBulkProgress({ done: 0, total: items.length });
+    onError(null);
+    let done = 0;
+    let firstError: string | null = null;
+    // For characteristics, identities must already exist in the library
+    // (they have a NOT NULL parent_identity FK-by-name). Accept any
+    // proposed identities whose name matches a characteristic's parent
+    // first, so the library is ready when we add the children.
+    if (kind === 'characteristics') {
+      const neededParents = new Set(items.map((p: any) => p.parent).filter(Boolean));
+      for (const ip of (proposed.identities || [])) {
+        if (neededParents.has(ip.name)) {
+          try { await acceptOne('identities', ip.name); } catch { /* best-effort */ }
+        }
+      }
+    }
+    for (const p of items) {
+      try {
+        await acceptOne(kind, p.name, p.parent);
+      } catch (e: any) {
+        if (!firstError) firstError = e.message;
+      }
+      done += 1;
+      setBulkProgress({ done, total: items.length });
+    }
+    setBusyAllKind(null);
+    setBulkProgress(null);
+    if (firstError) onError(`Some ${kind} couldn't be added: ${firstError}`);
+    await refresh();
   };
 
   if (!proposed) return null;
@@ -1657,8 +1706,22 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {(['identities','characteristics','sectors'] as const).map(kind => (
           <div key={kind}>
-            <div className="text-[10px] font-bold text-gray-400 uppercase mb-1.5">
-              {kind} ({proposed[kind].length})
+            <div className="flex items-center justify-between mb-1.5">
+              <div className="text-[10px] font-bold text-gray-400 uppercase">
+                {kind} ({proposed[kind].length})
+              </div>
+              {proposed[kind].length > 0 && (
+                <button
+                  onClick={() => acceptAll(kind)}
+                  disabled={busyAllKind !== null}
+                  className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
+                  title={`Accept every proposed ${kind.slice(0, -1)} into the library`}
+                >
+                  {busyAllKind === kind && bulkProgress
+                    ? `${bulkProgress.done}/${bulkProgress.total}…`
+                    : `Accept all (${proposed[kind].length})`}
+                </button>
+              )}
             </div>
             <ul className="space-y-1">
               {proposed[kind].map((p: any) => {
