@@ -82,6 +82,19 @@ interface ExportJob {
   error?: string;
 }
 
+interface DeleteJob {
+  id: string;
+  listId: string;
+  listName: string;
+  status: 'running' | 'done' | 'failed';
+  contactsTotal: number;
+  contactsDeleted: number;
+  enrichmentsDeleted: number;
+  createdAt: string;
+  completedAt?: string;
+  error?: string;
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<AppTab>(AppTab.IMPORT);
   const [contacts, setContacts] = useState<MergedContact[]>([]);
@@ -158,6 +171,7 @@ export default function App() {
   const [importListsLoading, setImportListsLoading] = useState(true);
   const [showListModal, setShowListModal] = useState(false);
   const [exportJobs, setExportJobs] = useState<ExportJob[]>([]);
+  const [deleteJobs, setDeleteJobs] = useState<DeleteJob[]>([]);
 
   const stopRequestedRef = useRef(false);
 
@@ -452,6 +466,69 @@ export default function App() {
     refreshLists();
   }, [refreshLists]);
 
+  // Kicks off a server-side deletion job and returns once the worker is
+  // running. The actual delete (chunked enrichments + contacts + list_row)
+  // runs independently of this HTTP connection, so the user can navigate
+  // or close the tab and the work still completes — progress polled via
+  // refreshDeleteJobs.
+  const deleteImportList = useCallback(async (id: string, name: string): Promise<boolean> => {
+    try {
+      const res = await fetch(`/api/import-lists/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        window.alert(data.error || `Delete failed (${res.status})`);
+        return false;
+      }
+      const job = data as DeleteJob;
+      // Splice the new job into local state so the row shows progress
+      // immediately, without waiting for the next poll tick.
+      setDeleteJobs(prev => {
+        const others = prev.filter(j => j.id !== job.id);
+        return [...others, job];
+      });
+      // Drop the active filter if it pointed at the list we just queued
+      // for deletion — otherwise the contacts table would briefly show
+      // "0 results" while the worker drains.
+      setActiveListFilter(prev => (prev === name ? null : prev));
+      setLeadListOptions(prev => prev.filter(n => n !== name));
+      addLog(`🗑️ Deleting list "${name}" in the background — safe to navigate away.`);
+      return true;
+    } catch (e: any) {
+      window.alert(e?.message || 'Delete failed');
+      return false;
+    }
+  }, []);
+
+  const refreshDeleteJobs = useCallback(async () => {
+    try {
+      const res = await fetch('/api/delete-jobs');
+      if (!res.ok) return;
+      const jobs: DeleteJob[] = await res.json();
+      setDeleteJobs(prev => {
+        // Detect transitions running → done so we can fire side effects
+        // exactly once per completion (refresh the list table, log).
+        for (const next of jobs) {
+          const before = prev.find(j => j.id === next.id);
+          if (before?.status === 'running' && next.status === 'done') {
+            addLog(`✅ List "${next.listName}" deleted: ${next.contactsDeleted.toLocaleString()} contacts, ${next.enrichmentsDeleted.toLocaleString()} enrichments removed.`);
+            refreshLists();
+          } else if (before?.status === 'running' && next.status === 'failed') {
+            addLog(`❌ Delete failed for "${next.listName}": ${next.error || 'unknown error'}`);
+            refreshLists();
+          }
+        }
+        return jobs;
+      });
+    } catch { /* transient; next poll will retry */ }
+  }, [refreshLists]);
+
+  const clearDeleteJob = useCallback(async (jobId: string) => {
+    try {
+      await fetch(`/api/delete-jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
+      setDeleteJobs(prev => prev.filter(j => j.id !== jobId));
+    } catch { /* non-fatal */ }
+  }, []);
+
   const enrichList = async (name: string, contactCount: number) => {
     setShowListModal(false);
     // Use 'in' operator so resolveFilteredContactIds (server.ts) takes the
@@ -495,9 +572,10 @@ export default function App() {
   useEffect(() => {
     if (showListModal || activeTab === AppTab.IMPORT) {
       refreshExportJobs();
+      refreshDeleteJobs();
       refreshLists();
     }
-  }, [showListModal, activeTab, refreshExportJobs, refreshLists]);
+  }, [showListModal, activeTab, refreshExportJobs, refreshDeleteJobs, refreshLists]);
 
   // Poll while any job is building — completion flips the button to Download.
   useEffect(() => {
@@ -507,6 +585,17 @@ export default function App() {
     const t = setInterval(refreshExportJobs, 3000);
     return () => clearInterval(t);
   }, [showListModal, activeTab, exportJobs, refreshExportJobs]);
+
+  // Mirror polling for delete jobs — progress bar updates while the
+  // worker drains the list, and the list table refreshes on completion.
+  // 2s feels responsive without hammering the server during a 30–60s job.
+  useEffect(() => {
+    if (!showListModal && activeTab !== AppTab.IMPORT) return;
+    const anyRunning = deleteJobs.some(j => j.status === 'running');
+    if (!anyRunning) return;
+    const t = setInterval(refreshDeleteJobs, 2000);
+    return () => clearInterval(t);
+  }, [showListModal, activeTab, deleteJobs, refreshDeleteJobs]);
 
   const startExportList = async (name: string) => {
     try {
@@ -598,6 +687,9 @@ export default function App() {
               onClearExport={clearExportJob}
               onRefreshLists={refreshLists}
               onRenameList={renameImportList}
+              onDeleteList={deleteImportList}
+              deleteJobs={deleteJobs}
+              onClearDeleteJob={clearDeleteJob}
             />
           ) : activeTab === AppTab.ENRICHMENT ? (
             <PipelineMonitor
@@ -789,6 +881,9 @@ export default function App() {
           onStartExport={startExportList}
           onClearExport={clearExportJob}
           onRenameList={renameImportList}
+          onDeleteList={deleteImportList}
+          deleteJobs={deleteJobs}
+          onClearDeleteJob={clearDeleteJob}
           onGoToImport={() => { setShowListModal(false); setActiveTab(AppTab.IMPORT); }}
         />
       )}
@@ -855,11 +950,14 @@ function ImportedListsTable({
   statsSource,
   activeListFilter,
   exportJobs,
+  deleteJobs,
   onOpenList,
   onEnrichList,
   onStartExport,
   onClearExport,
   onRenameList,
+  onDeleteList,
+  onClearDeleteJob,
   onGoToImport,
   showAllListsRow = true,
 }: {
@@ -868,11 +966,14 @@ function ImportedListsTable({
   statsSource: 'rpc' | 'fallback';
   activeListFilter: string | null;
   exportJobs: ExportJob[];
+  deleteJobs?: DeleteJob[];
   onOpenList: (name: string | null) => void;
   onEnrichList: (name: string, contactCount: number) => void;
   onStartExport: (name: string) => void;
   onClearExport: (jobId: string) => void;
   onRenameList?: (oldName: string, newName: string) => void;
+  onDeleteList?: (id: string, name: string) => Promise<boolean>;
+  onClearDeleteJob?: (jobId: string) => void;
   onGoToImport?: () => void;
   showAllListsRow?: boolean;
 }) {
@@ -887,9 +988,21 @@ function ImportedListsTable({
     }
   }
 
+  // Same idea for delete jobs, keyed by the list's stable id so a
+  // rename mid-delete doesn't decouple the row from its job.
+  const latestDeleteJobByListId = new Map<string, DeleteJob>();
+  for (const j of (deleteJobs || [])) {
+    const existing = latestDeleteJobByListId.get(j.listId);
+    const stamp = j.completedAt || j.createdAt;
+    if (!existing || stamp.localeCompare(existing.completedAt || existing.createdAt) > 0) {
+      latestDeleteJobByListId.set(j.listId, j);
+    }
+  }
+
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingValue, setEditingValue] = useState('');
   const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   // React batches state updates within an event tick, so editingId can still
   // read as `l.id` inside the onBlur that fires right after a Save click.
   // The ref short-circuits the second call without waiting for the re-render.
@@ -903,6 +1016,15 @@ function ImportedListsTable({
   const cancelRename = () => {
     setEditingId(null);
     setEditingValue('');
+  };
+
+  // Kick off the server-side delete job. The handler returns as soon as
+  // the worker is queued — actual progress comes from the polled
+  // deleteJobs prop, so closing the tab no longer cancels the work.
+  const handleDelete = async (l: { id: string; name: string }) => {
+    if (!onDeleteList) return;
+    setConfirmingDeleteId(null);
+    await onDeleteList(l.id, l.name);
   };
 
   const submitRename = async (l: { id: string; name: string }) => {
@@ -996,13 +1118,21 @@ function ImportedListsTable({
             {lists.map(l => {
               const active = activeListFilter === l.name;
               const job = latestJobByList.get(l.name);
+              const deleteJob = latestDeleteJobByListId.get(l.id);
               const isEditing = editingId === l.id;
               const isRenaming = renamingId === l.id;
+              const isDeleting = deleteJob?.status === 'running';
+              const deleteFailed = deleteJob?.status === 'failed';
+              const isConfirmingDelete = confirmingDeleteId === l.id;
+              const rowLocked = isEditing || isRenaming || isDeleting || isConfirmingDelete;
+              const deletePct = isDeleting && deleteJob && deleteJob.contactsTotal > 0
+                ? Math.min(100, Math.round((deleteJob.contactsDeleted / deleteJob.contactsTotal) * 100))
+                : 0;
               return (
                 <tr
                   key={l.id}
-                  onClick={() => { if (!isEditing && !isRenaming) onOpenList(l.name); }}
-                  className={`transition-colors ${isEditing || isRenaming ? '' : 'cursor-pointer'} ${active ? 'bg-[#3ecf8e]/10' : 'hover:bg-white/[0.02]'}`}
+                  onClick={() => { if (!rowLocked) onOpenList(l.name); }}
+                  className={`transition-colors ${rowLocked ? '' : 'cursor-pointer'} ${active ? 'bg-[#3ecf8e]/10' : 'hover:bg-white/[0.02]'} ${isConfirmingDelete || deleteFailed ? 'bg-red-500/5' : ''}`}
                 >
                   <td className={`px-5 py-2.5 font-medium ${active ? 'text-[#3ecf8e]' : 'text-gray-300'}`}>
                     {isEditing ? (
@@ -1023,6 +1153,26 @@ function ImportedListsTable({
                       <span className="flex items-center gap-2 text-gray-400">
                         <Loader2 className="w-3 h-3 animate-spin" />
                         Renaming…
+                      </span>
+                    ) : isDeleting ? (
+                      <div className="flex flex-col gap-1">
+                        <span className="flex items-center gap-2 text-red-400 text-[11px]">
+                          <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                          Deleting {l.name}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 h-1 bg-[#1c1c1c] rounded-full overflow-hidden max-w-[260px]">
+                            <div className="h-full bg-red-500 transition-all" style={{ width: `${deletePct}%` }} />
+                          </div>
+                          <span className="text-[9px] font-mono text-gray-500 tabular-nums shrink-0">
+                            {deleteJob!.contactsDeleted.toLocaleString()} / {deleteJob!.contactsTotal.toLocaleString()}
+                          </span>
+                        </div>
+                      </div>
+                    ) : deleteFailed ? (
+                      <span className="flex items-center gap-2 text-red-400">
+                        <AlertCircle className="w-3 h-3" />
+                        {l.name} <span className="text-[10px] text-red-400/70 font-normal">— delete failed: {deleteJob!.error || 'unknown error'}</span>
                       </span>
                     ) : (
                       l.name
@@ -1052,6 +1202,52 @@ function ImportedListsTable({
                             <X className="w-3 h-3" /> Cancel
                           </button>
                         </>
+                      ) : isConfirmingDelete ? (
+                        <>
+                          <span className="text-[10px] text-red-400 font-bold mr-1">
+                            Delete {l.contact_count.toLocaleString()} contacts + enrichments?
+                          </span>
+                          <button
+                            onClick={e => { e.stopPropagation(); handleDelete(l); }}
+                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-red-500 text-white hover:bg-red-600 transition-colors flex items-center gap-1"
+                            title="Confirm delete"
+                          >
+                            <Trash2 className="w-3 h-3" /> Yes, delete
+                          </button>
+                          <button
+                            onClick={e => { e.stopPropagation(); setConfirmingDeleteId(null); }}
+                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 hover:text-white transition-colors flex items-center gap-1"
+                            title="Cancel"
+                          >
+                            <X className="w-3 h-3" /> Cancel
+                          </button>
+                        </>
+                      ) : isDeleting ? (
+                        <span className="text-[10px] text-red-400 font-bold flex items-center gap-1">
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          Deleting… {deletePct}%
+                        </span>
+                      ) : deleteFailed ? (
+                        <>
+                          {onDeleteList && (
+                            <button
+                              onClick={e => { e.stopPropagation(); onDeleteList(l.id, l.name); }}
+                              className="px-2 py-1 rounded-md text-[10px] font-bold bg-red-500/15 border border-red-500/40 text-red-400 hover:bg-red-500/25 transition-colors flex items-center gap-1"
+                              title="Retry deletion"
+                            >
+                              <RefreshCw className="w-3 h-3" /> Retry
+                            </button>
+                          )}
+                          {onClearDeleteJob && deleteJob && (
+                            <button
+                              onClick={e => { e.stopPropagation(); onClearDeleteJob(deleteJob.id); }}
+                              className="p-1 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-white hover:border-gray-500 transition-colors"
+                              title="Dismiss error"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          )}
+                        </>
                       ) : (
                         <>
                           <button
@@ -1079,6 +1275,15 @@ function ImportedListsTable({
                             <Zap className="w-3 h-3" /> Enrich
                           </button>
                           <ExportButton job={job} listName={l.name} onStart={onStartExport} onClear={onClearExport} />
+                          {onDeleteList && (
+                            <button
+                              onClick={e => { e.stopPropagation(); setConfirmingDeleteId(l.id); }}
+                              className="p-1 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-red-400 hover:border-red-500/40 transition-colors"
+                              title="Delete list (removes contacts + enrichments)"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          )}
                         </>
                       )}
                     </div>
@@ -1099,12 +1304,15 @@ function ListSelectorModal({
   statsSource,
   activeListFilter,
   exportJobs,
+  deleteJobs,
   onClose,
   onOpenList,
   onEnrichList,
   onStartExport,
   onClearExport,
   onRenameList,
+  onDeleteList,
+  onClearDeleteJob,
   onGoToImport,
 }: {
   lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[];
@@ -1112,12 +1320,15 @@ function ListSelectorModal({
   statsSource: 'rpc' | 'fallback';
   activeListFilter: string | null;
   exportJobs: ExportJob[];
+  deleteJobs?: DeleteJob[];
   onClose: () => void;
   onOpenList: (name: string | null) => void;
   onEnrichList: (name: string, contactCount: number) => void;
   onStartExport: (name: string) => void;
   onClearExport: (jobId: string) => void;
   onRenameList?: (oldName: string, newName: string) => void;
+  onDeleteList?: (id: string, name: string) => Promise<boolean>;
+  onClearDeleteJob?: (jobId: string) => void;
   onGoToImport: () => void;
 }) {
   return (
@@ -1143,11 +1354,14 @@ function ListSelectorModal({
             statsSource={statsSource}
             activeListFilter={activeListFilter}
             exportJobs={exportJobs}
+            deleteJobs={deleteJobs}
             onOpenList={onOpenList}
             onEnrichList={onEnrichList}
             onStartExport={onStartExport}
             onClearExport={onClearExport}
             onRenameList={onRenameList}
+            onDeleteList={onDeleteList}
+            onClearDeleteJob={onClearDeleteJob}
             onGoToImport={onGoToImport}
           />
         </div>
@@ -2340,6 +2554,9 @@ function CSVImportWizard({
   onClearExport,
   onRefreshLists,
   onRenameList,
+  onDeleteList,
+  deleteJobs,
+  onClearDeleteJob,
 }: {
   onComplete: () => void;
   importLists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[];
@@ -2353,6 +2570,9 @@ function CSVImportWizard({
   onClearExport: (jobId: string) => void;
   onRefreshLists: () => void;
   onRenameList?: (oldName: string, newName: string) => void;
+  onDeleteList?: (id: string, name: string) => Promise<boolean>;
+  deleteJobs?: DeleteJob[];
+  onClearDeleteJob?: (jobId: string) => void;
 }) {
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [file, setFile] = useState<File | null>(null);
@@ -2945,11 +3165,14 @@ function CSVImportWizard({
             statsSource={listStatsSource}
             activeListFilter={activeListFilter}
             exportJobs={exportJobs}
+            deleteJobs={deleteJobs}
             onOpenList={onOpenList}
             onEnrichList={onEnrichList}
             onStartExport={onStartExport}
             onClearExport={onClearExport}
             onRenameList={onRenameList}
+            onDeleteList={onDeleteList}
+            onClearDeleteJob={onClearDeleteJob}
             showAllListsRow={false}
           />
         </div>

@@ -1081,6 +1081,61 @@ app.patch('/api/import-lists/:id', async (req, res) => {
     }
 });
 
+// List-deletion endpoints. The actual machinery is defined further down
+// (alongside the export-jobs pattern, since both share the same on-disk
+// registry directory). These endpoints just wire the kick-off and
+// progress polling into the existing /api/import-lists/* surface.
+//
+// Why a background job: a 200k-row list takes 30–60s to drain in chunks,
+// which is far longer than a typical browser tab will sit idle. If the
+// user navigates or closes the tab mid-request, a synchronous endpoint
+// just dies — leaving a partially-deleted list in the DB. The job-based
+// version keeps running independently of the HTTP connection and is
+// resumable on server restart (the loop is idempotent — each iteration
+// re-queries by lead_list_name, so picking up after a crash just means
+// the next page's "fetch contacts" returns whatever is left).
+app.delete('/api/import-lists/:id', async (req, res) => {
+    const id = String(req.params?.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'id is required' });
+
+    // Reuse an existing in-flight job for the same list — clicking Delete
+    // twice should attach to the running job, not start a parallel loop
+    // that fights it for the same rows.
+    const inflight = Array.from(deleteJobs.values()).find(j => j.listId === id && j.status === 'running');
+    if (inflight) return res.status(202).json(inflight);
+
+    const { data: list, error: listErr } = await supabase
+        .from('import_lists')
+        .select('id, name, contact_count')
+        .eq('id', id)
+        .single();
+    if (listErr || !list) {
+        return res.status(404).json({ error: listErr?.message || 'List not found' });
+    }
+
+    const job: DeleteJob = {
+        id: crypto.randomUUID(),
+        listId: list.id,
+        listName: list.name,
+        status: 'running',
+        contactsTotal: list.contact_count || 0,
+        contactsDeleted: 0,
+        enrichmentsDeleted: 0,
+        createdAt: new Date().toISOString(),
+    };
+    deleteJobs.set(job.id, job);
+    scheduleDeletePersist();
+
+    // Fire-and-forget — the response below hands the job id back so the
+    // client can poll /api/delete-jobs for progress. Crashes inside the
+    // worker are caught and reflected in job.status='failed'.
+    runDeleteJob(job).catch(err => {
+        console.error(`[Delete] Job ${job.id} crashed:`, err);
+    });
+
+    res.status(202).json(job);
+});
+
 // ============================================
 // EXPORT JOBS — async CSV builder
 //
@@ -1343,6 +1398,185 @@ app.delete('/api/export-jobs/:id', async (req, res) => {
     exportJobs.delete(id);
     await fsp.unlink(path.join(EXPORTS_DIR, `${id}.csv`)).catch(() => {});
     schedulePersist();
+    res.json({ ok: true });
+});
+
+// ============================================
+// DELETE JOBS — async list-deletion worker
+//
+// Mirrors the export-jobs pattern: in-memory Map + on-disk registry,
+// debounced persistence, restart-resume. The deletion itself is the
+// chunked enrichments→contacts→list_row flow that used to live inline
+// on the DELETE /api/import-lists/:id endpoint.
+//
+// Resumability: each iteration of the worker re-queries `contacts WHERE
+// lead_list_name = $1`, so an interrupted job picks up exactly where it
+// left off — the page it was about to delete is the same page the next
+// run sees. We don't checkpoint anything; the contacts table itself is
+// the cursor. Persisted counters (contactsDeleted, enrichmentsDeleted)
+// are only used for progress UI.
+// ============================================
+
+const DELETE_JOBS_REGISTRY = path.join(EXPORTS_DIR, 'delete-jobs.json');
+// Keep finished jobs around for a day so the user can see the "done"
+// state when they come back to the tab. After that they're noise.
+const DELETE_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+type DeleteJobStatus = 'running' | 'done' | 'failed';
+interface DeleteJob {
+    id: string;
+    listId: string;
+    listName: string;
+    status: DeleteJobStatus;
+    contactsTotal: number;       // snapshotted at start; just for UI progress
+    contactsDeleted: number;
+    enrichmentsDeleted: number;
+    createdAt: string;
+    completedAt?: string;
+    error?: string;
+}
+
+const deleteJobs = new Map<string, DeleteJob>();
+let deletePersistTimer: NodeJS.Timeout | null = null;
+
+const scheduleDeletePersist = () => {
+    if (deletePersistTimer) return;
+    deletePersistTimer = setTimeout(async () => {
+        deletePersistTimer = null;
+        try {
+            const payload = JSON.stringify(Array.from(deleteJobs.values()), null, 2);
+            await fsp.writeFile(DELETE_JOBS_REGISTRY, payload, 'utf-8');
+        } catch (e) {
+            console.error('[Delete] Failed to persist jobs registry:', e);
+        }
+    }, 200);
+};
+
+async function loadDeleteJobs() {
+    await fsp.mkdir(EXPORTS_DIR, { recursive: true });
+    try {
+        const raw = await fsp.readFile(DELETE_JOBS_REGISTRY, 'utf-8');
+        const arr: DeleteJob[] = JSON.parse(raw);
+        for (const j of arr) deleteJobs.set(j.id, j);
+    } catch {
+        // First boot — registry doesn't exist yet.
+    }
+
+    // Resume any job that was mid-run when the server died. Unlike export
+    // jobs (which write a partial file we have to throw away), deletion is
+    // idempotent — the next page query just returns whatever's still in
+    // the contacts table. Counters are reset to keep the progress bar
+    // honest about the work this run is doing.
+    for (const j of deleteJobs.values()) {
+        if (j.status === 'running') {
+            console.log(`[Delete] Resuming interrupted job ${j.id} for "${j.listName}"`);
+            runDeleteJob(j).catch(err => console.error(`[Delete] Resumed job ${j.id} crashed:`, err));
+        }
+    }
+    scheduleDeletePersist();
+}
+
+async function pruneExpiredDeleteJobs() {
+    const now = Date.now();
+    let pruned = 0;
+    for (const [id, job] of deleteJobs) {
+        if (job.status === 'running') continue;
+        const ref = new Date(job.completedAt || job.createdAt).getTime();
+        if (now - ref > DELETE_RETENTION_MS) {
+            deleteJobs.delete(id);
+            pruned++;
+        }
+    }
+    if (pruned > 0) {
+        scheduleDeletePersist();
+    }
+}
+
+async function runDeleteJob(job: DeleteJob) {
+    const PAGE_SIZE = 1000;
+    try {
+        while (true) {
+            // Fetch the next page of contact_ids for this list. We don't
+            // paginate by offset because each iteration deletes its page
+            // before fetching the next, so the filter narrows naturally.
+            const { data: page, error: pageErr } = await supabase
+                .from('contacts')
+                .select('contact_id')
+                .eq('lead_list_name', job.listName)
+                .limit(PAGE_SIZE);
+            if (pageErr) throw pageErr;
+            if (!page || page.length === 0) break;
+
+            const ids = page.map((r: any) => r.contact_id).filter(Boolean);
+            if (ids.length === 0) break;
+
+            // Enrichments first — the enrichments→contacts FK exists
+            // (PostgREST embed in jobProcessor confirms it) but cascade
+            // mode isn't pinned in this repo's migrations. Explicit order
+            // is safe regardless of CASCADE / NO ACTION / SET NULL.
+            const { data: enrDeleted, error: enrErr } = await supabase
+                .from('enrichments')
+                .delete()
+                .in('contact_id', ids)
+                .select('contact_id');
+            if (enrErr) throw enrErr;
+            job.enrichmentsDeleted += enrDeleted?.length || 0;
+
+            const { data: contDeleted, error: contErr } = await supabase
+                .from('contacts')
+                .delete()
+                .in('contact_id', ids)
+                .select('contact_id');
+            if (contErr) throw contErr;
+            job.contactsDeleted += contDeleted?.length || 0;
+
+            scheduleDeletePersist();
+
+            // Defensive guard: if a page returned but the DELETE removed
+            // zero rows (RLS/permission issue could cause this), bail
+            // instead of looping on the same page forever.
+            if (!contDeleted || contDeleted.length === 0) break;
+        }
+
+        // List row goes last so a mid-flight failure leaves the entry
+        // visible — the user can retry instead of being stuck with
+        // orphaned contacts under a name that has no list to click.
+        const { error: delListErr } = await supabase
+            .from('import_lists')
+            .delete()
+            .eq('id', job.listId);
+        if (delListErr) throw delListErr;
+
+        job.status = 'done';
+        job.completedAt = new Date().toISOString();
+        scheduleDeletePersist();
+        addServerLog(`🗑️ Deleted list "${job.listName}": ${job.contactsDeleted.toLocaleString()} contacts, ${job.enrichmentsDeleted.toLocaleString()} enrichments.`, 'Sync', 'info');
+    } catch (err: any) {
+        job.status = 'failed';
+        job.error = err.message || String(err);
+        job.completedAt = new Date().toISOString();
+        scheduleDeletePersist();
+        console.error(`[Delete] Job ${job.id} for "${job.listName}" failed:`, err);
+    }
+}
+
+// Polled by the client — same idea as /api/export-jobs.
+app.get('/api/delete-jobs', (_req, res) => {
+    res.json(Array.from(deleteJobs.values())
+        .sort((a, b) => (b.createdAt).localeCompare(a.createdAt)));
+});
+
+// Clear a finished/failed job from the registry. Refused while running
+// so the client can't accidentally orphan an in-flight worker (it would
+// keep deleting from the DB but no record would exist to surface
+// progress or completion).
+app.delete('/api/delete-jobs/:id', (req, res) => {
+    const id = String(req.params?.id || '');
+    const job = deleteJobs.get(id);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    if (job.status === 'running') return res.status(409).json({ error: 'Cannot clear a running job' });
+    deleteJobs.delete(id);
+    scheduleDeletePersist();
     res.json({ ok: true });
 });
 
@@ -2016,6 +2250,10 @@ app.listen(PORT, async () => {
     await loadExportJobs();
     await pruneExpiredExports();
     setInterval(pruneExpiredExports, 60 * 60 * 1000);
+
+    await loadDeleteJobs();
+    await pruneExpiredDeleteJobs();
+    setInterval(pruneExpiredDeleteJobs, 60 * 60 * 1000);
 
     // Resume any stale jobs from previous unexpected crashes
     await JobProcessor.recoverStaleJobs();
