@@ -2942,9 +2942,70 @@ function CSVImportWizard({
                   value={listNameOverride}
                   onChange={(e) => setListNameOverride(e.target.value)}
                   placeholder="e.g. Q2 Prospects"
-                  className="w-full bg-[#1c1c1c] border border-[#2e2e2e] rounded-lg px-3 py-2 text-sm text-gray-300 placeholder-gray-600 focus:border-[#3ecf8e] focus:outline-none transition-colors"
+                  list="existing-list-names"
+                  className={`w-full bg-[#1c1c1c] border rounded-lg px-3 py-2 text-sm text-gray-300 placeholder-gray-600 focus:outline-none transition-colors ${
+                    (() => {
+                      const t = listNameOverride.trim().toLowerCase();
+                      if (!t) return 'border-[#2e2e2e] focus:border-[#3ecf8e]';
+                      if (importLists.some(l => l.name.toLowerCase() === t)) return 'border-[#3ecf8e]/60 focus:border-[#3ecf8e]';
+                      return 'border-[#2e2e2e] focus:border-[#3ecf8e]';
+                    })()
+                  }`}
                 />
-                <p className="text-[10px] text-gray-600 mt-1">Applied to all contacts. Leave blank to use mapped CSV column value.</p>
+                {/* Native autocomplete from existing names — encourages
+                    re-using a name instead of typing "v2"/"(1)" suffix. */}
+                <datalist id="existing-list-names">
+                  {importLists.map(l => <option key={l.id} value={l.name} />)}
+                </datalist>
+                {(() => {
+                  const trimmed = listNameOverride.trim();
+                  if (!trimmed) {
+                    return <p className="text-[10px] text-gray-600 mt-1">Applied to all contacts. Leave blank to use mapped CSV column value.</p>;
+                  }
+                  const match = importLists.find(l => l.name.toLowerCase() === trimmed.toLowerCase());
+                  if (match) {
+                    return (
+                      <p className="text-[10px] text-[#3ecf8e] mt-1 flex items-start gap-1.5">
+                        <CheckCircle2 className="w-3 h-3 mt-0.5 shrink-0" />
+                        <span>
+                          Adding to existing list <span className="font-bold">"{match.name}"</span> ({match.contact_count.toLocaleString()} contacts).
+                          Duplicates skip; new emails join this same list.
+                        </span>
+                      </p>
+                    );
+                  }
+                  // Detect "name + v2/v3/(1)" patterns where the user is
+                  // re-uploading the same list under a slightly modified
+                  // name. The original case the user hit was three lists
+                  // tagged "...US", "...US v2", "...US v3" — all the
+                  // same CSV. Stripping the suffix and matching catches
+                  // it before they fragment again.
+                  const stripped = trimmed.replace(/\s+v\d+\s*$|\s*\(\d+\)\s*$/i, '').trim().toLowerCase();
+                  const nearMatch = stripped !== trimmed.toLowerCase()
+                    ? importLists.find(l => l.name.toLowerCase() === stripped)
+                    : importLists.find(l => {
+                        const a = l.name.toLowerCase();
+                        const b = trimmed.toLowerCase();
+                        return (a.length > 6 && b.startsWith(a + ' ')) || (b.length > 6 && a.startsWith(b + ' '));
+                      });
+                  if (nearMatch) {
+                    return (
+                      <p className="text-[10px] text-amber-400 mt-1 flex items-start gap-1.5">
+                        <AlertCircle className="w-3 h-3 mt-0.5 shrink-0" />
+                        <span>
+                          Did you mean <span className="font-bold">"{nearMatch.name}"</span>?
+                          Re-uploading under a different name fragments the same data across separate lists.
+                          Use the exact existing name to add to it.
+                        </span>
+                      </p>
+                    );
+                  }
+                  return (
+                    <p className="text-[10px] text-gray-600 mt-1">
+                      Will create a new list. Tip: type the exact name of an existing list to add to it (duplicates skip).
+                    </p>
+                  );
+                })()}
               </div>
 
               {/* Duplicate Handling */}

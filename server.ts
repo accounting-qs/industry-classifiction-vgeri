@@ -1052,6 +1052,40 @@ app.post('/api/import-lists', async (req, res) => {
     if (!name) return res.status(400).json({ error: 'Name is required' });
 
     try {
+        // Idempotent on name: if a list with this exact name already
+        // exists, fold the new run's contact_count into it instead of
+        // inserting a second row. Without this, a user re-uploading the
+        // same CSV under the same name (e.g. to recover contacts dropped
+        // by a transient Supabase fetch failure) gets two rows in the
+        // import history that look identical but split contacts across
+        // two `lead_list_name` values. The contacts table is keyed by
+        // name, not list-id, so the only way to merge them after the
+        // fact is by editing rows directly. Easier to never fragment in
+        // the first place.
+        const { data: existing, error: lookupErr } = await supabase
+            .from('import_lists')
+            .select('id, name, contact_count, created_at')
+            .eq('name', name)
+            .maybeSingle();
+        if (lookupErr) return res.status(500).json({ error: lookupErr.message });
+
+        if (existing) {
+            // Add the delta. Not strictly equal to a fresh COUNT(*) on
+            // contacts (overwriteDuplicates=true paths can shuffle rows
+            // between lists), but close enough for the import-history
+            // tile. The accurate enrichment count comes from the
+            // get_list_enrichment_stats RPC anyway.
+            const newCount = (existing.contact_count || 0) + (contact_count || 0);
+            const { data: updated, error: updErr } = await supabase
+                .from('import_lists')
+                .update({ contact_count: newCount })
+                .eq('id', existing.id)
+                .select()
+                .single();
+            if (updErr) return res.status(500).json({ error: updErr.message });
+            return res.json({ ...updated, merged: true, prior_count: existing.contact_count || 0 });
+        }
+
         const { data, error } = await supabase
             .from('import_lists')
             .insert({ name, contact_count: contact_count || 0 })
