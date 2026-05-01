@@ -1493,49 +1493,30 @@ async function pruneExpiredDeleteJobs() {
 }
 
 async function runDeleteJob(job: DeleteJob) {
-    const PAGE_SIZE = 1000;
+    // PAGE_LIMIT > 1000 is now safe: the contact_id list never crosses
+    // the wire as a URL parameter — the RPC scans contacts.lead_list_name
+    // and DELETEs both tables atomically server-side. The previous
+    // Node-side .in(ids) approach overflowed PostgREST's request-line
+    // cap and 400'd before deleting a single row.
+    const PAGE_LIMIT = 5000;
     try {
         while (true) {
-            // Fetch the next page of contact_ids for this list. We don't
-            // paginate by offset because each iteration deletes its page
-            // before fetching the next, so the filter narrows naturally.
-            const { data: page, error: pageErr } = await supabase
-                .from('contacts')
-                .select('contact_id')
-                .eq('lead_list_name', job.listName)
-                .limit(PAGE_SIZE);
-            if (pageErr) throw pageErr;
-            if (!page || page.length === 0) break;
-
-            const ids = page.map((r: any) => r.contact_id).filter(Boolean);
-            if (ids.length === 0) break;
-
-            // Enrichments first — the enrichments→contacts FK exists
-            // (PostgREST embed in jobProcessor confirms it) but cascade
-            // mode isn't pinned in this repo's migrations. Explicit order
-            // is safe regardless of CASCADE / NO ACTION / SET NULL.
-            const { data: enrDeleted, error: enrErr } = await supabase
-                .from('enrichments')
-                .delete()
-                .in('contact_id', ids)
-                .select('contact_id');
-            if (enrErr) throw enrErr;
-            job.enrichmentsDeleted += enrDeleted?.length || 0;
-
-            const { data: contDeleted, error: contErr } = await supabase
-                .from('contacts')
-                .delete()
-                .in('contact_id', ids)
-                .select('contact_id');
-            if (contErr) throw contErr;
-            job.contactsDeleted += contDeleted?.length || 0;
-
+            const { data, error } = await supabase
+                .rpc('delete_import_list_page', {
+                    p_list_name: job.listName,
+                    p_limit: PAGE_LIMIT,
+                });
+            if (error) throw error;
+            const row = (data || [])[0] || { contacts_deleted: 0, enrichments_deleted: 0 };
+            const c = Number(row.contacts_deleted) || 0;
+            const e = Number(row.enrichments_deleted) || 0;
+            job.contactsDeleted += c;
+            job.enrichmentsDeleted += e;
             scheduleDeletePersist();
-
-            // Defensive guard: if a page returned but the DELETE removed
-            // zero rows (RLS/permission issue could cause this), bail
-            // instead of looping on the same page forever.
-            if (!contDeleted || contDeleted.length === 0) break;
+            // Page returned no contacts → list is empty, exit the loop.
+            // Also doubles as the defensive guard against an RLS-blocked
+            // page silently returning zero.
+            if (c === 0) break;
         }
 
         // List row goes last so a mid-flight failure leaves the entry
