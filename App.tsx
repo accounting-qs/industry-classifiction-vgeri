@@ -2697,18 +2697,41 @@ function CSVImportWizard({
     let sentToServer = 0; // Tracks rows actually sent (after API response), not just parsed
     const errors: string[] = [];
     const allFailedContacts: { email: string; row: number; reason: string }[] = [];
+    // Chunks the server couldn't ingest in the first pass (500s, browser
+    // fetch throws). Drained after Papa finishes parsing — see the
+    // sendPromise.then(...) block at the bottom of this function. Without
+    // this buffer, a single Render→Supabase blip dropped 2000 contacts on
+    // the floor with the only signal being a one-line "TypeError: fetch
+    // failed" in the import history.
+    const failedChunks: any[][] = [];
     const CHUNK_SIZE = 2000;
+    const RETRY_CHUNK_SIZE = 500;
 
-    const sendChunk = async (chunk: any[]): Promise<void> => {
+    const sendChunk = async (chunk: any[], isRetry = false): Promise<void> => {
       try {
         const res = await fetch('/api/import', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ contacts: chunk, overwriteDuplicates })
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          errors.push(data.error || `HTTP ${res.status}`);
+          // First-pass server failure → re-queue for the retry sweep.
+          // Retry-pass server failure → treat as terminal: record the
+          // contacts as lost so the user sees an honest "failed" count
+          // instead of a phantom success.
+          if (!isRetry) {
+            failedChunks.push(chunk);
+          } else {
+            const reason = data.error || `HTTP ${res.status}`;
+            errors.push(`${reason} (${chunk.length} contacts)`);
+            totalFailed += chunk.length;
+            allFailedContacts.push({
+              email: `(network failure — ${chunk.length} contacts)`,
+              row: 0,
+              reason: `${reason}. Re-running import will recover these via duplicate detection.`,
+            });
+          }
         } else {
           totalInserted += data.inserted || 0;
           totalUpdated += data.updated || 0;
@@ -2718,11 +2741,26 @@ function CSVImportWizard({
           if (data.failedContacts?.length) allFailedContacts.push(...data.failedContacts);
         }
       } catch (err: any) {
-        errors.push(err.message);
+        // Browser-level throw (network down, server crashed mid-response).
+        // Same first-pass-vs-retry logic as above.
+        if (!isRetry) {
+          failedChunks.push(chunk);
+        } else {
+          errors.push(`${err.message} (${chunk.length} contacts)`);
+          totalFailed += chunk.length;
+          allFailedContacts.push({
+            email: `(network failure — ${chunk.length} contacts)`,
+            row: 0,
+            reason: `${err.message}. Re-running import will recover these via duplicate detection.`,
+          });
+        }
       }
-      // Update progress AFTER the API call completes
-      sentToServer += chunk.length;
-      setImportProgress(sentToServer);
+      // Progress only advances on the first pass — the retry pass re-sends
+      // the same rows, so bumping again would push the bar past 100%.
+      if (!isRetry) {
+        sentToServer += chunk.length;
+        setImportProgress(sentToServer);
+      }
       setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
     };
 
@@ -2767,6 +2805,27 @@ function CSVImportWizard({
 
         sendPromise.then(async () => {
           setImportProgress(sentToServer);
+          setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
+
+          // Retry sweep: drain any chunks that 500'd or fetch-threw on
+          // the first pass. We split each failed chunk into smaller pieces
+          // (RETRY_CHUNK_SIZE) so a stuck pooler that timed out on 2000
+          // rows has a much better shot at 500. Sequential, with a small
+          // pause between original-chunk groups, so we don't immediately
+          // hammer the server that just told us it was unhappy.
+          if (failedChunks.length > 0) {
+            const chunksToRetry = [...failedChunks];
+            failedChunks.length = 0;
+            errors.push(`Retrying ${chunksToRetry.length} failed chunk(s) in smaller pieces…`);
+            setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
+            for (const failed of chunksToRetry) {
+              for (let i = 0; i < failed.length; i += RETRY_CHUNK_SIZE) {
+                await sendChunk(failed.slice(i, i + RETRY_CHUNK_SIZE), true);
+              }
+              await new Promise(r => setTimeout(r, 250));
+            }
+          }
+
           setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
           setImportStatus(totalFailed > 0 || errors.length > 0 ? 'error' : 'done');
 

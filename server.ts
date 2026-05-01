@@ -722,6 +722,53 @@ app.get('/api/distinct/:column', async (req, res) => {
     }
 });
 
+// Treat transient transport / Postgres errors as retryable. The Postgres
+// codes are statement_timeout (57014) and the two serialization conflicts
+// (40001, 40P01). The string matches catch undici's "fetch failed", DNS
+// blips (EAI_AGAIN), socket resets (ECONNRESET), and pooler hangs
+// (ETIMEDOUT, "socket hang up"). Render → Supabase has all of these
+// fire intermittently under load, and the original code only retried the
+// Postgres ones — every other transient turned into a 500 that dropped
+// the whole 2000-row chunk on the floor.
+const isTransientImportError = (err: any): boolean => {
+    if (!err) return false;
+    if (err.code === '57014' || err.code === '40001' || err.code === '40P01') return true;
+    const msg = String(err?.message || err || '').toLowerCase();
+    return /fetch failed|econnreset|etimedout|eai_again|enotfound|socket hang up|network|aborted|connection reset/.test(msg);
+};
+
+// Wraps a Supabase builder call so transport throws and tuple-shaped
+// errors are funneled through the same retry path. supabase-js usually
+// returns transport errors via the {data, error} tuple, but TypeError
+// fetch failures from undici can throw out of `await` directly — we have
+// to handle both shapes or one of them slips past. The factory returns
+// PromiseLike (not Promise) because Supabase's PostgrestFilterBuilder is
+// thenable but isn't a real Promise; await coerces it either way.
+async function importSupabaseRetry(
+    label: string,
+    fn: () => PromiseLike<{ data: any; error: any }>,
+    maxRetries = 5
+): Promise<{ data: any; error: any }> {
+    let attempt = 0;
+    while (true) {
+        let result: { data: any; error: any };
+        try {
+            result = await fn();
+        } catch (thrown: any) {
+            result = { data: null, error: thrown };
+        }
+        if (!result.error || !isTransientImportError(result.error) || attempt >= maxRetries) {
+            return result;
+        }
+        attempt++;
+        // Capped exponential backoff. 8s ceiling so a stuck pooler doesn't
+        // park the whole import waiting tens of seconds per chunk.
+        const backoff = Math.min(8000, 500 * Math.pow(2, attempt));
+        console.warn(`[${label}] transient error (${result.error?.message || 'unknown'}); retry ${attempt}/${maxRetries} in ${backoff}ms`);
+        await new Promise(r => setTimeout(r, backoff));
+    }
+}
+
 app.post('/api/import', async (req, res) => {
     const { contacts, overwriteDuplicates } = req.body;
 
@@ -770,25 +817,43 @@ app.post('/api/import', async (req, res) => {
         // 3. Check which emails already exist in the database. Retry
         // on Postgres statement_timeout (57014) with a smaller batch —
         // shared-pooler contention can push a 500-email IN query past
-        // the 8s limit even though the column is indexed.
+        // the 8s limit even though the column is indexed. Transport
+        // errors (undici "fetch failed", ECONNRESET, etc.) are retried
+        // in importSupabaseRetry without shrinking the batch.
+        //
+        // CRITICAL: this stage soft-fails. If a batch can't be checked
+        // even after retries, we skip duplicate detection for that batch
+        // and continue. The downstream upsert uses `onConflict: 'email'`
+        // which is idempotent — duplicates become no-ops, never bad
+        // inserts. The only side-effect of giving up here is a slightly
+        // undercounted "duplicates" tile in the UI. That is *vastly*
+        // preferable to throwing (the previous behavior), which surfaced
+        // a 500 to the client and dropped all 2000 contacts in the chunk.
         const existingEmails = new Set<string>();
         let emailCheckChunk = 500;
+        let preCheckSkipped = 0;
         for (let i = 0; i < allEmails.length;) {
             const emailBatch = allEmails.slice(i, i + emailCheckChunk);
-            const { data: existing, error } = await supabase
-                .from('contacts')
-                .select('email')
-                .in('email', emailBatch);
+            const { data: existing, error } = await importSupabaseRetry(
+                'Import.preCheck',
+                () => supabase.from('contacts').select('email').in('email', emailBatch)
+            );
             if (error) {
                 if (error.code === '57014' && emailCheckChunk > 50) {
                     emailCheckChunk = Math.max(50, Math.floor(emailCheckChunk / 2));
                     console.warn(`[Import] Email pre-check timeout; retrying at chunk=${emailCheckChunk}`);
                     continue;
                 }
-                throw error;
+                console.warn(`[Import] Email pre-check gave up for batch of ${emailBatch.length} after retries (${error.message || 'unknown'}); skipping dedup, upsert will still be safe.`);
+                preCheckSkipped += emailBatch.length;
+                i += emailBatch.length;
+                continue;
             }
             if (existing) existing.forEach((r: any) => existingEmails.add(r.email?.toLowerCase()));
             i += emailBatch.length;
+        }
+        if (preCheckSkipped > 0) {
+            addServerLog(`⚠️ Import: pre-check soft-failed for ${preCheckSkipped} emails — duplicates may be undercounted but no data is lost.`, 'Sync', 'warn');
         }
 
         // 4. Separate new vs existing contacts
@@ -853,15 +918,26 @@ app.post('/api/import', async (req, res) => {
                 let attempts = 0;
                 let success = false;
                 while (true) {
-                    const op = kind === 'insert'
-                        ? supabase.from('contacts').upsert(chunk, { onConflict: 'email', ignoreDuplicates: true })
-                        : supabase.from('contacts').upsert(chunk, { onConflict: 'email' });
-                    const { error } = await op;
+                    // importSupabaseRetry handles the transport-level retries
+                    // (fetch failed, ECONNRESET, etc). The outer loop here
+                    // owns the chunk-shrinking strategy for Postgres
+                    // statement_timeout, which transport retry alone can't
+                    // cure — a 1000-row upsert that times out at 8s will
+                    // time out again unless we cut the size.
+                    const { error } = await importSupabaseRetry(
+                        `Import.${kind}`,
+                        () => kind === 'insert'
+                            ? supabase.from('contacts').upsert(chunk, { onConflict: 'email', ignoreDuplicates: true })
+                            : supabase.from('contacts').upsert(chunk, { onConflict: 'email' })
+                    );
                     if (!error) { success = true; break; }
 
-                    const transient = error.code === '57014' || error.code === '40001' || error.code === '40P01';
+                    // Only Postgres statement_timeout / serialization
+                    // benefits from chunk-halving. Transport errors that
+                    // survived importSupabaseRetry are genuinely terminal.
+                    const sizeRetryable = error.code === '57014' || error.code === '40001' || error.code === '40P01';
                     attempts++;
-                    if (!transient || attempts >= MAX_RETRIES || chunkSize <= MIN_CHUNK) {
+                    if (!sizeRetryable || attempts >= MAX_RETRIES || chunkSize <= MIN_CHUNK) {
                         console.error(`${kind} chunk error at row ${i}:`, error);
                         errors.push(`Chunk ${i}: ${error.message}`);
                         dbFailed += chunk.length;
