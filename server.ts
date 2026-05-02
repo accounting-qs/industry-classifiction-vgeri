@@ -992,7 +992,9 @@ app.get('/api/import-lists', async (_req, res) => {
         const { data: stats, error: rpcErr } = await supabase.rpc('get_list_enrichment_stats');
         const statsByList = new Map<string, { completed: number; failed: number; total: number }>();
         let statsSource: 'rpc' | 'fallback' = 'rpc';
+
         if (!rpcErr && Array.isArray(stats)) {
+            // RPC worked. Trust it as the source of truth.
             for (const row of stats as any[]) {
                 statsByList.set(row.lead_list_name, {
                     completed: Number(row.completed_count) || 0,
@@ -1000,19 +1002,27 @@ app.get('/api/import-lists', async (_req, res) => {
                     total: Number(row.total_count) || 0,
                 });
             }
-        } else if (rpcErr) {
+            // Any list in `import_lists` but missing from the RPC result has
+            // zero rows in the contacts table — the GROUP BY would have
+            // surfaced it otherwise. Fill these in as 0/0/0 instead of
+            // running per-list count=estimated queries (the previous code
+            // here mislabeled the whole response as 'fallback' on a single
+            // empty list, so users with the RPC installed kept seeing the
+            // "RPC isn't installed yet" banner forever).
+            for (const l of lists) {
+                if (!statsByList.has(l.name)) {
+                    statsByList.set(l.name, { completed: 0, failed: 0, total: 0 });
+                }
+            }
+        } else {
+            // RPC truly unavailable (function missing, schema cache stale,
+            // permission denied, etc). Fall back to per-list estimated
+            // counts and tell the client the numbers may drift. Logging
+            // the error code + message so we can tell which failure mode
+            // triggered it from the server logs.
             statsSource = 'fallback';
-            console.warn('[import-lists] RPC get_list_enrichment_stats unavailable — falling back to per-list estimated counts:', rpcErr.message);
-        }
-
-        // Fallback for environments where the RPC hasn't been applied yet.
-        // These counts are unreliable (count=estimated can drift or return
-        // 0 randomly) — the client surfaces a banner to say so.
-        const needFallback = lists.some((l: any) => !statsByList.has(l.name));
-        if (needFallback) {
-            statsSource = 'fallback';
+            console.warn(`[import-lists] RPC get_list_enrichment_stats unavailable (code=${(rpcErr as any)?.code || 'n/a'}): ${rpcErr?.message || 'unknown'} — falling back to per-list estimated counts`);
             await Promise.all(lists.map(async (l: any) => {
-                if (statsByList.has(l.name)) return;
                 const [completed, failed] = await Promise.all([
                     supabase.from('contacts')
                         .select('contact_id, enrichments!inner(status)', { count: 'estimated', head: true })
