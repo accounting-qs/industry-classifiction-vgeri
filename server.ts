@@ -1778,7 +1778,7 @@ function buildBucketingCtx(runId: string) {
 
 // Create a new run + fire taxonomy proposal in the background. min_volume,
 // bucket_budget, and preferred_library_ids are now collected on the Phase 1b
-// review screen (after Sonnet has proposed a taxonomy), so /determine only
+// review screen (after the tagger has proposed a taxonomy), so /determine only
 // needs the bare minimum. The DB column defaults seed the row; the user
 // finalises the values via PATCH /taxonomy before clicking Apply & Assign.
 app.post('/api/bucketing/determine', async (req, res) => {

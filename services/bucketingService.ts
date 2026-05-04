@@ -7,7 +7,9 @@
  *   firm — not a healthcare operator. Only operators in a sector belong in
  *   that sector's bucket.
  *
- * Phase 1a (DISCOVERY, ONE call): Sonnet (or gpt-4.1 fallback) reads the
+ * Phase 1a (TAGGING, batched): the user-selected tagger (gpt-4.1-mini default,
+ * Claude Haiku 4.5 optional) reads each distinct enrichments.classification
+ * string and assigns identity / characteristic / sector + per-tag confidence.
  * vocabulary and produces:
  *   - Identity-first leaf taxonomy (30–60 leaves), each tagged with
  *     identity_type (operator | service_provider | agency | software_vendor |
@@ -22,7 +24,7 @@
  * classification, confidence, reasoning) and writes contact-level pre-rollup
  * decisions before computing final campaign buckets.
  *
- * Volume rollup: sector+specialization → specialization → identity → General.
+ * Volume rollup: sector+characteristic → characteristic → identity → General.
  * Disqualified / invalid rows land in General with audit reasons.
  */
 
@@ -133,7 +135,7 @@ const RESERVED = new Set([
     'general', 'generic', 'disqualified', 'other'
 ]);
 
-// Confidence floor — Sonnet returns 1-10, anything below this routes the
+// Confidence floor — taggers return 1-10, anything below this routes the
 // industry to General with needs_qa=true so the user can review post-run.
 const PHASE1A_QA_FLOOR = 6;
 // Disqualification requires HIGH identity confidence (>= 7/10). Soft DQ
@@ -236,7 +238,7 @@ interface EmbeddingCandidate {
 
 // A primary_identity is a Layer-1 high-level business type (Agency,
 // Consulting & Advisory, Software & SaaS, …). Layer-2 functional
-// specializations are nested under it.
+// characteristics are nested under it.
 interface PrimaryIdentity {
     name: string;
     description: string;
@@ -270,7 +272,7 @@ interface DiscoveryOutput {
     observed_patterns: string[];
     sector_vocabulary: string[];
     primary_identities: PrimaryIdentity[];
-    buckets: DiscoveredBucket[];   // Layer-2 specializations
+    buckets: DiscoveredBucket[];   // Layer-2 characteristics
 }
 
 // Phase 1b returns Layer-1 + Layer-2 + Layer-3 per industry string. Layer-4
@@ -598,7 +600,7 @@ This is NOT an academic taxonomy exercise.
 This is NOT a generic classification task.
 
 ========================================
-THE 4-LAYER CLASSIFICATION MODEL
+THE 3-LAYER CLASSIFICATION MODEL
 ========================================
 
 Every company is described along three independent axes. The campaign
@@ -611,7 +613,7 @@ Layer 1 — PRIMARY IDENTITY (high-level business type, ~6-12 total)
    "Healthcare Operator", "Education Operator", "Staffing & Recruiting",
    "Legal Services", "Accounting & Tax".
 
-Layer 2 — FUNCTIONAL SPECIALIZATION (subtype within identity)
+Layer 2 — CHARACTERISTIC (subtype within identity)
    What kind of {identity} is it?
    Examples (always coupled to a primary identity):
      Agency → "SEO Agency", "Branding Agency", "Performance Marketing
@@ -625,22 +627,22 @@ Layer 2 — FUNCTIONAL SPECIALIZATION (subtype within identity)
      IT Services → "Managed IT Services", "Cybersecurity Services",
               "Cloud Migration Services"
 
-Layer 3 — SECTOR FOCUS (optional vertical served, ~10-20 total)
+Layer 3 — SECTOR (optional vertical served, ~10-20 total)
    Who do they MAINLY serve, if explicitly stated?
    Examples: "Healthcare", "Real Estate", "Government", "Education",
    "Manufacturing", "Financial Services", "Hospitality", "Energy",
    "Non-profit", "Multi-industry", or "" (none).
 
-Layer 4 — CAMPAIGN BUCKET (decided downstream, NOT by you)
-   The actual outreach bucket is computed from the data — not predicted.
-   The routing engine combines volume across the three axes:
-     - Use "{sector} {specialization}" if that combo has enough
-       leads (e.g. "Real Estate SEO Agency").
-     - Else fall back to "{specialization}" (e.g. "SEO Agency").
-     - Else fall back to "{primary_identity}" (e.g. "Agency").
-     - Else "General" (single catch-all bucket — disqualified rows go here too).
-   You DO NOT predict campaign buckets. You produce accurate Layer 1-3
-   classifications. The system computes Layer 4 from your output + counts.
+CAMPAIGN BUCKET (decided downstream, NOT by you)
+   The actual outreach bucket is computed by the rollup engine — not
+   predicted. It combines volume across the three axes:
+     - "{sector} {characteristic}" if that combo has enough leads
+       (e.g. "Real Estate SEO Agency").
+     - Else "{characteristic}" (e.g. "SEO Agency").
+     - Else "{primary_identity}" (e.g. "Agency").
+     - Else "General" (single catch-all — disqualified rows go here too).
+   You produce accurate Layer 1-3 classifications. The system computes
+   the bucket name from your output + per-bucket contact counts.
 
 ========================================
 UNIVERSAL ROUTING PRINCIPLE
@@ -722,7 +724,7 @@ CRITICAL CONSTRAINTS
 1. Identity > Sector. Bucket the company by what it IS.
 2. Operator evidence required for operator identities.
 3. Accuracy > Coverage. Do not force-fit.
-4. Reusability > Novelty. Identities + specializations must be reusable.
+4. Reusability > Novelty. Identities + characteristics must be reusable.
 5. Determinism > Creativity. Predictable behavior at scale.`;
 
 // ────────────────────────────────────────────────────────────────────
@@ -739,7 +741,7 @@ export async function runTaxonomyProposal(
 
     // Pre-flight schema check — fails fast with a precise list of
     // missing tables/columns/RPCs instead of letting the run get half-
-    // way through Sonnet calls and crash on a column write.
+    // way through tagger calls and crash on a column write.
     const schemaRes = await checkBucketingSchema(supabase);
     if (!schemaRes.ok) {
         ctx.log(`[Bucketing ${runId}] schema check failed:\n${schemaRes.summary}`, 'error');
@@ -834,7 +836,7 @@ export async function runTaxonomyProposal(
         await ctx.checkCancel();
         // Per-run model choice from the Setup screen, written to
         // bucketing_runs.taxonomy_model in /determine. Fall back to the
-        // historical Sonnet default if a run pre-dates the picker.
+        // historical Anthropic default if a run pre-dates the picker.
         const phase1aModel: string = (run as any).taxonomy_model || TAXONOMY_MODEL_ANTHROPIC;
         ctx.progress({
             phase: 'phase1a',
@@ -856,7 +858,7 @@ export async function runTaxonomyProposal(
         const charSet = new Set(snapshot.characteristics.map(c => c.name));
         const sectorSet = new Set(snapshot.sectors.map(s => s.name));
         const dqIdentities = new Set(snapshot.identities.filter(i => i.is_disqualified).map(i => i.name));
-        // Identity-DQ cascade is OFF by default — we trust Sonnet's per-row
+        // Identity-DQ cascade is OFF by default — we trust the tagger's per-row
         // is_disqualified judgment. Set apply_identity_dq_cascade=true on
         // the run to restore the old auto-DQ behavior for [DQ]-flagged
         // identities (e.g. force every "Consumer & Retail" tag to DQ).
@@ -866,7 +868,7 @@ export async function runTaxonomyProposal(
             const conf01 = Math.max(0, Math.min(1, (t.confidence || 0) / 10));
             const lowConf = (t.confidence || 0) < PHASE1A_QA_FLOOR;
             const identityIsDq = !!(t.identity && dqIdentities.has(t.identity));
-            // DQ confidence floor — only honor a DQ verdict when Sonnet is
+            // DQ confidence floor — only honor a DQ verdict when the tagger is
             // ≥ 7/10 sure about the identity. Below that, route to General
             // (with needs_qa=true so the user can spot-check) instead of
             // silently excluding the contact from outreach.
@@ -933,7 +935,7 @@ export async function runTaxonomyProposal(
         }
         ctx.progress({
             phase: 'phase1a',
-            step: 'sonnet_tagging',
+            step: 'tagging',
             current: tagResult.taggings.length,
             total: completedVocab.length,
             note: `Tagged ${tagResult.taggings.length} industries`
@@ -989,8 +991,8 @@ export async function runTaxonomyProposal(
         };
     });
 
-    // Only emit a bucket per (identity, characteristic) pair where Sonnet
-    // committed to BOTH layers. Identity-only rows (Sonnet was sure about
+    // Only emit a bucket per (identity, characteristic) pair where the tagger
+    // committed to BOTH layers. Identity-only rows (the tagger was sure about
     // identity but not characteristic) don't get a fake "identity as spec"
     // bucket — instead Phase 1b's rollup decides their fate based on
     // identity volume vs the threshold (clears → identity bucket, doesn't →
@@ -1042,7 +1044,7 @@ export async function runTaxonomyProposal(
 }
 
 // ────────────────────────────────────────────────────────────────────
-// PHASE 1A HELPERS — taxonomy snapshot + Sonnet tagging
+// PHASE 1A HELPERS — taxonomy snapshot + per-string tagging
 // ────────────────────────────────────────────────────────────────────
 
 async function loadTaxonomySnapshot(supabase: SupabaseClient): Promise<TaxonomySnapshot> {
@@ -1306,7 +1308,7 @@ function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
         const idx = typeof item.id === 'number' ? item.id : -1;
         if (idx < 0 || idx >= batch.length) continue;
         const v = batch[idx];
-        // Per-tag confidences with back-compat: if Sonnet returns the
+        // Per-tag confidences with back-compat: if the tagger returns the
         // legacy single `confidence` (e.g. older cached prompts), use it
         // for all three. The min becomes the overall confidence.
         const legacyConf = typeof item.confidence === 'number' ? item.confidence : 0;
@@ -1349,7 +1351,7 @@ async function callDiscoveryLLM(
 ): Promise<{ discovery: DiscoveryOutput; costUsd: number; modelUsed: string }> {
     // Lighter prompt: smaller head, drop reasoning excerpts (each was ~120
     // chars × N rows = many thousands of tokens that contributed only
-    // marginal signal). Sonnet now sees a tight `industry | n | 2 samples`
+    // marginal signal). The discovery LLM now sees a tight `industry | n | 2 samples`
     // table that's ~3× smaller and resolves in ~30–60s instead of 90–180s.
     const HEAD_LIMIT = 1500;
     const head = vocabRows.slice(0, HEAD_LIMIT);
@@ -1373,13 +1375,13 @@ async function callDiscoveryLLM(
 PREFERRED SPECIALIZATIONS (from library)
 ========================================
 
-These specializations were defined in prior runs and have proven useful. If
+These characteristics were defined in prior runs and have proven useful. If
 a discovered pattern aligns with one of these at score >= 0.7, REUSE it:
 copy characteristic, primary_identity, and description VERBATIM
 and set library_match_id. Do NOT invent a near-duplicate with different
 wording.
 
-${preferred.map(p => `id=${p.id} | spec="${p.bucket_name}" | identity="${p.direct_ancestor || p.root_category}" | desc="${p.description || ''}"`).join('\n')}` : '';
+${preferred.map(p => `id=${p.id} | characteristic="${p.bucket_name}" | identity="${p.direct_ancestor || p.root_category}" | desc="${p.description || ''}"`).join('\n')}` : '';
 
     const userPrompt = `${PROJECT_CONTEXT}
 
@@ -1397,8 +1399,8 @@ A) PRIMARY IDENTITIES (Layer 1): 6–12 high-level identities present in the
    "Legal Services", "Accounting & Tax", "Media & Publishing".
    Each identity must be evidenced by multiple companies in the vocabulary.
 
-B) FUNCTIONAL SPECIALIZATIONS (Layer 2): 30–60 specializations across the
-   identities. Each specialization belongs to exactly ONE primary_identity.
+B) CHARACTERISTICS (Layer 2): 30–60 characteristics across the identities.
+   Each characteristic belongs to exactly ONE primary_identity.
    Examples (always coupled): Agency → "SEO Agency", "Branding Agency",
    "Performance Marketing Agency", "B2B Demand Generation Agency". Consulting
    & Advisory → "IT Consulting", "Management Consulting", "Revenue Operations
@@ -1406,10 +1408,10 @@ B) FUNCTIONAL SPECIALIZATIONS (Layer 2): 30–60 specializations across the
    "Venture Capital Fund", "Family Office". Software & SaaS → "MarTech SaaS",
    "FinTech SaaS", "Vertical SaaS", "PropTech SaaS".
 
-C) SECTOR FOCUS VOCABULARY (Layer 3): a controlled list of sector terms
-   that appear in the data as "served vertical" signals. These NEVER become
-   primary identities or specializations — they are sector values used
-   in Phase 1b. Examples: "Healthcare", "Real Estate", "Government",
+C) SECTOR VOCABULARY (Layer 3): a controlled list of sector terms that
+   appear in the data as "served vertical" signals. These NEVER become
+   primary identities or characteristics — they are sector values used in
+   Phase 1b. Examples: "Healthcare", "Real Estate", "Government",
    "Education", "Manufacturing", "Financial Services", "Hospitality",
    "Energy", "Non-profit", "Legal", "Multi-industry".
 
@@ -1420,22 +1422,22 @@ NO-SHORTCUTS RULES:
    governments, etc.) AND that identity carries operator_required=true.
 3) No near-duplicates. Specializations differing only by word order or
    synonym must be merged.
-4) An identity with no specializations is invalid. Every identity must
-   have ≥1 specialization underneath it.
-5) Coverage requirement: proposed specializations + identities should
+4) An identity with no characteristics is invalid. Every identity must
+   have ≥1 characteristic underneath it.
+5) Coverage requirement: proposed characteristics + identities should
    collectively cover at least 80% of usable contact volume represented
    in the vocabulary. General is for bad/no-data, clear non-ICP, and true
    no-fit cases — do NOT create a niche-only taxonomy that dumps normal
    B2B companies into General.
 
-❌ TOO BROAD as a SPECIALIZATION (must be a primary_identity instead):
+❌ TOO BROAD as a CHARACTERISTIC (must be a primary_identity instead):
 "SaaS", "B2B SaaS", "Marketing Agency", "Consulting Firm", "Software".
 
 ❌ TOO NARROW (forbidden):
 "TikTok ads agency for DTC candle brands", "Family office for German
 real estate developers", "RevOps consulting for Series B HR SaaS".
 
-✅ GOLDILOCKS specializations:
+✅ GOLDILOCKS characteristics:
 "SEO Agency", "Performance Marketing Agency", "B2B Demand Generation Agency",
 "IT Consulting", "Revenue Operations Consulting", "M&A Advisory",
 "Private Equity Firm", "Venture Capital Fund", "MarTech SaaS",
@@ -1443,31 +1445,31 @@ real estate developers", "RevOps consulting for Series B HR SaaS".
 "Healthcare Clinic / Hospital" [operator_required=true],
 "K-12 School District" [operator_required=true].
 
-PER-SPECIALIZATION ROUTING METADATA — REQUIRED FIELDS:
+PER-CHARACTERISTIC ROUTING METADATA — REQUIRED FIELDS:
 - identity_type ∈ {operator, service_provider, agency, software_vendor,
   investor, advisor, staffing, distributor, media, other}
-- operator_required: true ONLY for specializations whose identity is an
+- operator_required: true ONLY for characteristics whose identity is an
   operator identity (Healthcare Operator → "Medical Clinic / Hospital",
   Education Operator → "K-12 School District").
 - priority_rank: 1–10. 1 = strongest identity nouns (PE Firm, Law Firm,
-  Marketing Agency, MSP). 10 = weakest (operator specializations that
+  Marketing Agency, MSP). 10 = weakest (operator characteristics that
   lose to enabler signals).
 - include / exclude / example_strings: keyword hints that drive Phase 1b
-  routing. include = phrases that PROVE this spec. exclude = phrases that
-  should route AWAY. example_strings = verbatim industry strings from the
-  vocabulary.
+  routing. include = phrases that PROVE this characteristic. exclude =
+  phrases that should route AWAY. example_strings = verbatim industry
+  strings from the vocabulary.
 ${preferredSection}
 
 REQUIRED PROCESS — DO NOT SKIP:
 A) List 10–15 high-frequency patterns observed in the vocabulary.
 B) Use those patterns to justify the top primary_identities and which
-   specializations belong under each.
+   characteristics belong under each.
 
 OUTPUT (strict JSON only, no prose, no markdown fences):
 
 {
   "observed_patterns": [<10–15 strings>],
-  "sector_vocabulary": [<sector terms; NEVER appear as identities or specs>],
+  "sector_vocabulary": [<sector terms; NEVER appear as identities or characteristics>],
   "primary_identities": [
     {
       "name": "<identity, Layer 1>",
@@ -1478,7 +1480,7 @@ OUTPUT (strict JSON only, no prose, no markdown fences):
   ],
   "buckets": [
     {
-      "characteristic": "<spec, Layer 2>",
+      "characteristic": "<characteristic, Layer 2>",
       "primary_identity": "<MUST exactly match a name in primary_identities above>",
       "description": "<1 sentence — what the company IS>",
       "identity_type": "<...>",
@@ -1497,8 +1499,8 @@ OUTPUT (strict JSON only, no prose, no markdown fences):
 Rules:
 - Specializations ordered MOST common → LEAST common.
 - example_strings MUST be verbatim from the vocabulary.
-- 6–12 primary_identities, 30–60 specializations total.
-- Every spec's primary_identity field exactly matches a name in the
+- 6–12 primary_identities, 30–60 characteristics total.
+- Every characteristic's primary_identity field exactly matches a name in the
   primary_identities array.
 
 ========================================
@@ -1731,7 +1733,7 @@ export async function applyTaxonomyEdits(
         update.preferred_library_ids = edits.preferred_library_ids;
     }
     await supabase.from('bucketing_runs').update(update).eq('id', runId);
-    ctx.log(`[Bucketing ${runId}] taxonomy edits applied: ${leaves.length} specializations`);
+    ctx.log(`[Bucketing ${runId}] taxonomy edits applied: ${leaves.length} characteristics`);
 
     // Rebuild the preview map so Review counts reflect the edited taxonomy
     // (renames / drops / new specs all change which industries map where).
@@ -2316,8 +2318,8 @@ function makeMatchedContactRow(
 }
 
 // Per-tag confidence floor below which we don't trust a tag to drive
-// routing. Sonnet returns 1-10, persisted as 0-1 — so 0.4 = "<4/10".
-// Lowered from 0.6 → 0.4 because Sonnet's 5/10 confidence is "this is the
+// routing. The tagger returns 1-10, persisted as 0-1 — so 0.4 = "<4/10".
+// Lowered from 0.6 → 0.4 because the tagger's 5/10 confidence is "this is the
 // closest available option in the taxonomy", not "I'm wrong" — so we use
 // the tag and let the cascade roll up to the right level.
 const TAG_CONF_FLOOR = 0.4;
@@ -2823,7 +2825,7 @@ async function runEmbeddingPrefilter(
     if (vocab.length === 0 || leaves.length === 0) return { autoAssigned: [], pending: vocab, costUsd: 0 };
 
     // Embedding text leans on identity signals so cosine matches the
-    // specialization, not the vertical the company serves.
+    // characteristic, not the vertical the company serves.
     const leafTexts = leaves.map(l => {
         const sig = (l.strong_identity_signals || []).slice(0, 6).join(', ');
         const inc = (l.include || []).slice(0, 6).join(', ');
@@ -3140,7 +3142,7 @@ Return three separate fields:
 - sector: Layer 3, must be from SECTOR_VOCABULARY, "Multi-industry", or ""
 
 General is a last resort. If a primary_identity is a reasonable fit, return it
-even when no specialization is precise. Only leave both names blank when the
+even when no characteristic is precise. Only leave both names blank when the
 business is truly unclear, bad data, clear non-ICP, or confidence is below 0.40.
 
 Each contact may include embedding_candidate_buckets. Treat these as a shortlist,
@@ -3150,19 +3152,19 @@ reference bucket if the contact evidence is clearly better.
 Rules:
 - Strong business-model nouns beat sector nouns.
 - "Serving X" does not mean "is X"; X belongs in sector.
-- Operator specializations require explicit operator evidence.
+- Operator characteristics require explicit operator evidence.
 - Disqualify only clear ecommerce/DTC physical, local geo-tied services,
   brick-and-mortar retail, or low-ticket consumer.
 - SERVICES vs PRODUCTS — never tag a company that rents/maintains/repairs/
   operates-as-a-service as "B2B Product Manufacturer" or any product
-  manufacturer specialization. If no services-side specialization fits,
+  manufacturer characteristic. If no services-side characteristic fits,
   prefer the identity-only fallback (return primary_identity, leave
   characteristic "") rather than picking a wrong product label.
 - Talent / artist / sports management firms are Agency, not Consulting.
 - Game / software studios are Software & SaaS, not Hospitality / Travel /
   Consumer Retail — only DQ if unambiguously pure-consumer, no B2B angle.
 - Scores are alignment scores, not probabilities. Use >=0.40 for a reasonable
-  identity/specialization fit, >=0.70 for strong fit.
+  identity/characteristic fit, >=0.70 for strong fit.
 - Reasons: max 18 words each and cite the contact fields.
 
 Return strict JSON only.`;
@@ -3420,7 +3422,7 @@ PHASE 1B — ROUTE EACH COMPANY TO IDENTITY + SPECIALIZATION + SECTOR
 
 You produce three separate classifications per company:
   - primary_identity      (Layer 1, MUST be one of the identity keys in BUCKET_REFERENCE)
-  - characteristic (Layer 2, MUST be one of the specialization
+  - characteristic (Layer 2, MUST be one of the characteristic
                           names listed UNDER that identity in BUCKET_REFERENCE)
   - sector          (Layer 3, optional — from SECTOR_VOCABULARY only)
 
@@ -3440,7 +3442,7 @@ DECISION SEQUENCE (apply in this order):
 3) Determine SECTOR FOCUS — the vertical the company SERVES if explicitly
    stated. If multiple, use "Multi-industry". If unspecified, "".
 
-4) If neither identity nor specialization fits at >= 0.55 confidence,
+4) If neither identity nor characteristic fits at >= 0.55 confidence,
    set generic = true and leave the name fields empty. Never use a sector
    word as a shortcut bucket.
 
@@ -3460,7 +3462,7 @@ Rule 2 — "Serving X" does NOT mean "is X".
   • marketing for law firms ≠ law firm
   • IT services for government agencies ≠ government entity
 
-Rule 3 — Operator specializations (operator_required=true) require
+Rule 3 — Operator characteristics (operator_required=true) require
   EXPLICIT operator evidence: "clinic", "hospital", "school district",
   "university", "city government", "church", "property management
   company", "factory". Generic sector mentions are NOT evidence.
@@ -3503,7 +3505,7 @@ EXPLICIT EXAMPLES — INCORRECT:
   • "Software for schools" → primary_identity = Education ❌
 
 PRESSURE TEST: "If outreach were written for this primary_identity +
-specialization, would the recipient say 'yes that's me' or 'no that's
+characteristic, would the recipient say 'yes that's me' or 'no that's
 my client'?" If 'my client' → routing is wrong.
 
 OUTPUT CONSTRAINTS:

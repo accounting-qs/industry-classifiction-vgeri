@@ -1,13 +1,13 @@
 /**
- * Bucketing UI v2.2 — 4-layer model (identity → specialization → sector → campaign bucket).
+ * Bucketing UI v5 — 3-layer model (identity → characteristic → sector) → campaign bucket.
  *
  * Five views:
  *   - Index    : past runs + library shortcut
  *   - Setup    : pick lists, name, min_volume, bucket_budget, optional library
- *   - Review   : Phase 1a proposal — observed patterns + specializations grouped
+ *   - Review   : Phase 1a proposal — observed patterns + characteristics grouped
  *                under primary identities, keep/drop/rename/add, threshold preview
  *   - Results  : Phase 1b assignments rolled up to campaign buckets, save-to-library
- *   - Library  : CRUD for reusable specializations across runs
+ *   - Library  : CRUD for reusable characteristics across runs
  */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
@@ -142,7 +142,7 @@ export function BucketingTab({ importLists }: {
               <Layers className="w-5 h-5 text-[#3ecf8e]" /> Bucketing
             </h2>
             <p className="text-xs text-gray-500 mt-1">
-              Phase 1a discovers identities + specializations. Phase 1b matches every contact (identity + specialization + sector). Volume rollup combines into campaign buckets within your bucket budget.
+              Phase 1a discovers identities + characteristics. Phase 1b matches every contact (identity + characteristic + sector). Volume rollup combines into campaign buckets within your bucket budget.
             </p>
           </div>
           <div className="flex gap-2">
@@ -327,7 +327,7 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
 }) {
   const [name, setName] = useState('');
   const [selectedLists, setSelectedLists] = useState<Set<string>>(new Set());
-  // Default OFF — trust Sonnet's per-row is_disqualified decision instead of
+  // Default OFF — trust the tagger's per-row is_disqualified decision instead of
   // auto-DQ'ing every contact whose identity is library-flagged [DQ].
   const [applyIdentityDqCascade, setApplyIdentityDqCascade] = useState(false);
   const [phase1aModel, setPhase1aModel] = useState<Phase1aModel>('gpt-4.1-mini');
@@ -385,7 +385,7 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-3 text-[11px] text-gray-400">
-        <span className="text-gray-300 font-bold">Bucket sizing &amp; library reuse</span> are set on the next screen, after Phase 1a proposes a taxonomy — that way you size against the actual specializations the LLM found.
+        <span className="text-gray-300 font-bold">Bucket sizing &amp; library reuse</span> are set on the next screen, after Phase 1a proposes a taxonomy — that way you size against the actual characteristics the tagger found.
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-3">
@@ -432,7 +432,7 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
               Auto-disqualify contacts whose identity is library-flagged [DQ]
             </span>
             <span className="block text-[10px] text-gray-500 italic mt-0.5">
-              Off (recommended): trust Sonnet's per-row decision — even contacts tagged "Consumer & Retail" stay inviteable when they show a B2B angle. On: any contact tagged with a [DQ] identity routes straight to Disqualified, no exceptions.
+              Off (recommended): trust the tagger's per-row decision — even contacts tagged "Consumer & Retail" stay inviteable when they show a B2B angle. On: any contact tagged with a [DQ] identity routes straight to Disqualified, no exceptions.
             </span>
           </span>
         </label>
@@ -793,7 +793,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
     <div className="space-y-4">
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
         <div className="text-xs text-gray-300">
-          <span className="font-bold text-white">{primaryIdentities.length}</span> primary identities · <span className="font-bold text-white">{sourceBuckets.length}</span> functional specializations · <span className="font-bold text-white">{run.total_contacts?.toLocaleString() || '?'}</span> contacts
+          <span className="font-bold text-white">{primaryIdentities.length}</span> primary identities · <span className="font-bold text-white">{sourceBuckets.length}</span> characteristics · <span className="font-bold text-white">{run.total_contacts?.toLocaleString() || '?'}</span> contacts
           {run.taxonomy_model && <span className="text-gray-500"> · model: {run.taxonomy_model}</span>}
         </div>
         {observedPatterns.length > 0 && (
@@ -815,9 +815,9 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
         <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between">
-          <span>Discovered specializations (grouped by primary identity)</span>
+          <span>Discovered characteristics (grouped by primary identity)</span>
           <span className="text-gray-600 normal-case tracking-normal font-normal">
-            Phase 1b counts decide the campaign bucket: combo → spec → identity → General.
+            Phase 1b counts decide the campaign bucket: combo → characteristic → identity → General.
           </span>
         </div>
         <BucketChainList
@@ -833,9 +833,9 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
-        <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-3">Add custom specialization</div>
+        <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-3">Add custom characteristic</div>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-          <input value={newSpec} onChange={e => setNewSpec(e.target.value)} placeholder="Functional specialization (Layer 2)"
+          <input value={newSpec} onChange={e => setNewSpec(e.target.value)} placeholder="Characteristic (Layer 2)"
             className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e]" />
           <select value={newIdentity} onChange={e => setNewIdentity(e.target.value)}
             className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]">
@@ -944,7 +944,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
             onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
             className="w-28 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
           />
-          <p className="text-[10px] text-gray-500 italic mt-1">Combos below this fall to spec; specs below to identity; identities below to General.</p>
+          <p className="text-[10px] text-gray-500 italic mt-1">Combos below this fall to characteristic; characteristics below to identity; identities below to General.</p>
         </div>
         <div>
           <span className="block text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Bucket budget</span>
@@ -1052,7 +1052,7 @@ function BucketChainList({
                       <input type="checkbox" checked={isKept} onChange={() => onToggle(b.characteristic)} className="mt-1.5 w-3.5 h-3.5 shrink-0" />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 mb-1 flex-wrap">
-                          <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 shrink-0">↳ Specialization</span>
+                          <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 shrink-0">↳ Characteristic</span>
                           <input
                             value={displayName(b)}
                             onChange={e => onRename(b.characteristic, e.target.value)}
@@ -1271,7 +1271,7 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
         <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
           <div className="flex items-center justify-between mb-3">
             <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">
-              Save proven specializations to library ({librarySelection.size} selected)
+              Save proven characteristics to library ({librarySelection.size} selected)
             </span>
             <button
               onClick={saveSelectedToLibrary}
@@ -1311,13 +1311,13 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
             const barWidth = max > 0 ? (count / max) * 100 : 0;
             const name: string = b.bucket_name;
             const isGeneral = RESERVED_NAMES.has(name.toLowerCase());
-            // Bucket level: combo (sector + spec) > spec > identity > general
+            // Bucket level: combo (sector + characteristic) > characteristic > identity > general
             const isSpec = !isGeneral && specNames.has(name);
             const isIdentity = !isGeneral && identityNames.has(name) && !isSpec;
             const isCombo = !isSpec && !isIdentity && !isGeneral
                 && Array.from(specNames).some(s => name.endsWith(' ' + s));
-            const levelLabel = isCombo ? 'sector × specialization'
-                : isSpec ? 'specialization'
+            const levelLabel = isCombo ? 'sector × characteristic'
+                : isSpec ? 'characteristic'
                 : isIdentity ? 'identity (rolled up)'
                 : isGeneral ? 'general (catch-all)'
                 : 'rolled up';
@@ -1468,7 +1468,7 @@ function BucketingLibrary({ library, onRefresh, onError }: {
           <table className="w-full text-[11px]">
             <thead className="bg-[#0e0e0e]">
               <tr className="border-b border-[#2e2e2e] text-[9px] font-bold text-gray-500 uppercase tracking-wider">
-                <th className="px-5 py-3 text-left">Functional specialization</th>
+                <th className="px-5 py-3 text-left">Characteristic</th>
                 <th className="px-5 py-3 text-left">Primary identity</th>
                 <th className="px-5 py-3 text-right">Used</th>
                 <th className="px-5 py-3 text-right">Last used</th>
@@ -1558,7 +1558,7 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
     <div className="border border-[#3ecf8e]/30 rounded-xl bg-[#0e0e0e] p-4 space-y-3">
       <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{existing ? 'Edit' : 'New'} library bucket</div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-        <input value={spec} onChange={e => setSpec(e.target.value)} placeholder="Functional specialization (Layer 2, unique)"
+        <input value={spec} onChange={e => setSpec(e.target.value)} placeholder="Characteristic (Layer 2, unique)"
           disabled={!!existing}
           className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e] disabled:opacity-60" />
         <input value={identity} onChange={e => setIdentity(e.target.value)} placeholder="Primary identity (Layer 1)"
@@ -1925,7 +1925,7 @@ function Phase1aQAQueuePanel({ runId, onError }: { runId: string; onError: (m: s
         className="w-full px-4 py-3 flex items-center justify-between text-left hover:bg-white/[0.02]"
       >
         <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">
-          Low-confidence Sonnet decisions ({queue.length}) — inspection only, all rows still bucketed via fallback
+          Low-confidence tagger decisions ({queue.length}) — inspection only, all rows still bucketed via fallback
         </span>
         <span className="text-[11px] text-gray-500">{open ? 'Hide' : 'Review'}</span>
       </button>
