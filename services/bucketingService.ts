@@ -2820,7 +2820,7 @@ async function classifyContactBatch(
     const systemPrompt = `${PROJECT_CONTEXT}
 
 ========================================
-PHASE 1B — ROUTE EACH CONTACT TO IDENTITY + SPECIALIZATION + SECTOR
+PHASE 1B — ROUTE EACH CONTACT TO IDENTITY + CHARACTERISTIC + SECTOR
 ========================================
 
 You classify individual company contacts, not abstract industry labels.
@@ -3108,7 +3108,7 @@ async function classifyBatch(
     const systemPrompt = `${PROJECT_CONTEXT}
 
 ========================================
-PHASE 1B — ROUTE EACH COMPANY TO IDENTITY + SPECIALIZATION + SECTOR
+PHASE 1B — ROUTE EACH COMPANY TO IDENTITY + CHARACTERISTIC + SECTOR
 ========================================
 
 You produce three separate classifications per company:
@@ -3126,11 +3126,11 @@ DECISION SEQUENCE (apply in this order):
    Investor? Software vendor? Agency? Consulting firm? Staffing firm?
    MSP? Operator (clinic, school, government entity)?
 
-2) Inside that identity, pick the FUNCTIONAL SPECIALIZATION that best fits.
+2) Inside that identity, pick the CHARACTERISTIC that best fits.
    Examples: under "Agency" → "SEO Agency"; under "Financial Services" →
    "Private Equity Firm"; under "Consulting & Advisory" → "IT Consulting".
 
-3) Determine SECTOR FOCUS — the vertical the company SERVES if explicitly
+3) Determine SECTOR — the vertical the company SERVES if explicitly
    stated. If multiple, use "Multi-industry". If unspecified, "".
 
 4) If neither identity nor characteristic fits at >= 0.55 confidence,
