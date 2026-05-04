@@ -1,30 +1,58 @@
 -- =====================================================================
 -- v5 — taxonomy schema simplification
 --
--- Rationale: Phase 1a's LLM output was being persisted under TWO sets of
--- column names (canonical: identity / characteristic / sector; legacy
--- aliases: primary_identity / functional_specialization / sector_focus)
--- with a mirror trigger keeping them in sync. We also had functional_core
--- and sector_core "intermediate rollup" columns that only existed to add
--- two extra fallback levels to computeContactRollup.
+-- Rationale: bucket_industry_map had the canonical columns (identity /
+-- characteristic / sector) plus a mirror trigger that filled the legacy
+-- aliases (primary_identity / functional_specialization / sector_focus).
+-- bucket_contact_map and bucket_assignments only ever had the LEGACY
+-- columns. We also had functional_core / sector_core "intermediate
+-- rollup" columns that only existed to add two extra fallback levels to
+-- computeContactRollup.
 --
 -- This migration:
---   1. Updates RPCs to read the canonical columns BEFORE we drop the
+--   1. Adds the canonical columns to bucket_contact_map and
+--      bucket_assignments (they only had the legacy aliases) and
+--      backfills them from the legacy values.
+--   2. Updates RPCs to read the canonical columns BEFORE we drop the
 --      legacy aliases (so nothing breaks mid-deploy).
---   2. Drops the bucket_industry_map mirror trigger (no longer needed).
---   3. Drops legacy alias columns: functional_specialization, sector_focus.
---   4. Drops intermediate rollup columns: functional_core, sector_core
+--   3. Drops the bucket_industry_map mirror trigger (no longer needed).
+--   4. Drops legacy alias columns: functional_specialization, sector_focus.
+--   5. Drops intermediate rollup columns: functional_core, sector_core
 --      (and their is_new_* flags).
---   5. Drops functional_core from taxonomy_characteristics, sector_core
+--   6. Drops functional_core from taxonomy_characteristics, sector_core
 --      from taxonomy_sectors (those library tables no longer model the
 --      intermediate layer).
 --
 -- Run this AFTER deploying the v5 application code — the new code stops
--- writing the dropped columns and reads only the canonical ones, so the
--- two systems can coexist briefly during the deploy window.
+-- writing the dropped columns and writes only the canonical ones.
 -- =====================================================================
 
--- ── 1) Update RPCs to use canonical column names ─────────────────────
+-- ── 1) Add canonical columns + backfill from legacy aliases ──────────
+
+ALTER TABLE bucket_contact_map ADD COLUMN IF NOT EXISTS characteristic TEXT;
+ALTER TABLE bucket_contact_map ADD COLUMN IF NOT EXISTS sector         TEXT;
+ALTER TABLE bucket_assignments ADD COLUMN IF NOT EXISTS characteristic TEXT;
+ALTER TABLE bucket_assignments ADD COLUMN IF NOT EXISTS sector         TEXT;
+
+-- Backfill the new columns from the legacy aliases. Idempotent — only
+-- fills where the canonical column is currently NULL.
+UPDATE bucket_contact_map
+   SET characteristic = functional_specialization
+ WHERE characteristic IS NULL AND functional_specialization IS NOT NULL;
+
+UPDATE bucket_contact_map
+   SET sector = sector_focus
+ WHERE sector IS NULL AND sector_focus IS NOT NULL;
+
+UPDATE bucket_assignments
+   SET characteristic = functional_specialization
+ WHERE characteristic IS NULL AND functional_specialization IS NOT NULL;
+
+UPDATE bucket_assignments
+   SET sector = sector_focus
+ WHERE sector IS NULL AND sector_focus IS NOT NULL;
+
+-- ── 2) Update RPCs to use canonical column names ─────────────────────
 
 -- get_bucket_sector_mix: switch sector_focus → sector.
 CREATE OR REPLACE FUNCTION public.get_bucket_sector_mix(p_run_id UUID)
@@ -170,11 +198,11 @@ $$;
 GRANT EXECUTE ON FUNCTION public.get_bucketing_run_diagnostics(UUID)
     TO anon, authenticated, service_role;
 
--- ── 2) Drop the mirror trigger ───────────────────────────────────────
+-- ── 3) Drop the mirror trigger ───────────────────────────────────────
 DROP TRIGGER  IF EXISTS bucket_industry_map_mirror_tags ON bucket_industry_map;
 DROP FUNCTION IF EXISTS public.bucket_industry_map_mirror_tags();
 
--- ── 3) Drop legacy alias columns ─────────────────────────────────────
+-- ── 4) Drop legacy alias columns ─────────────────────────────────────
 ALTER TABLE bucket_industry_map  DROP COLUMN IF EXISTS functional_specialization;
 ALTER TABLE bucket_industry_map  DROP COLUMN IF EXISTS sector_focus;
 ALTER TABLE bucket_contact_map   DROP COLUMN IF EXISTS functional_specialization;
@@ -183,7 +211,7 @@ ALTER TABLE bucket_assignments   DROP COLUMN IF EXISTS functional_specialization
 ALTER TABLE bucket_assignments   DROP COLUMN IF EXISTS sector_focus;
 ALTER TABLE bucket_library       DROP COLUMN IF EXISTS functional_specialization;
 
--- ── 4) Drop intermediate rollup columns (functional_core / sector_core)
+-- ── 5) Drop intermediate rollup columns (functional_core / sector_core)
 ALTER TABLE bucket_industry_map  DROP COLUMN IF EXISTS functional_core;
 ALTER TABLE bucket_industry_map  DROP COLUMN IF EXISTS sector_core;
 ALTER TABLE bucket_industry_map  DROP COLUMN IF EXISTS is_new_functional_core;
@@ -193,9 +221,9 @@ ALTER TABLE bucket_contact_map   DROP COLUMN IF EXISTS sector_core;
 ALTER TABLE bucket_assignments   DROP COLUMN IF EXISTS functional_core;
 ALTER TABLE bucket_assignments   DROP COLUMN IF EXISTS sector_core;
 
--- ── 5) Drop intermediate columns from the taxonomy library tables ────
+-- ── 6) Drop intermediate columns from the taxonomy library tables ────
 ALTER TABLE taxonomy_characteristics DROP COLUMN IF EXISTS functional_core;
 ALTER TABLE taxonomy_sectors         DROP COLUMN IF EXISTS sector_core;
 
--- ── 6) PostgREST schema reload ───────────────────────────────────────
+-- ── 7) PostgREST schema reload ───────────────────────────────────────
 NOTIFY pgrst, 'reload schema';
