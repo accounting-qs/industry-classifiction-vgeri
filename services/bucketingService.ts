@@ -411,12 +411,17 @@ async function fetchContactsChunk(
     ctx?: BucketingCtx
 ): Promise<{ rows: ContactRouteInput[]; nextLastId: string | null; hasMore: boolean; pageMs: number; enrichmentMs: number }> {
     const pageStart = Date.now();
+    // .range() (not .limit()) is required to bypass PostgREST's default
+    // db-max-rows cap of 1000 — without this, page.length stayed at 1000
+    // even for pageSize=2000, which made hasMore evaluate false on chunk
+    // 1 and the entire run silently stopped after 1k contacts. Same fix
+    // already lives on the vocab RPC at line 375.
     let q = supabase
         .from('contacts')
         .select('contact_id,company_name,company_website,industry,lead_list_name')
         .in('lead_list_name', listNames)
         .order('contact_id', { ascending: true })
-        .limit(pageSize);
+        .range(0, pageSize - 1);
     if (lastId !== null) q = q.gt('contact_id', lastId);
     const { data, error } = await q;
     const pageMs = Date.now() - pageStart;
@@ -500,12 +505,15 @@ async function fetchContactsForRouting(
             await ctx?.checkCancel();
             pageNum++;
             const pageStart = Date.now();
+            // .range() (not .limit()) — PostgREST default db-max-rows is
+            // 1000, so .limit(2000) silently returned 1000 rows. See the
+            // matching fix in fetchContactsChunk above.
             let q = supabase
                 .from('contacts')
                 .select('contact_id,company_name,company_website,industry,lead_list_name')
                 .in('lead_list_name', listNames)
                 .order('contact_id', { ascending: true })
-                .limit(CONTACT_PAGE_SIZE);
+                .range(0, CONTACT_PAGE_SIZE - 1);
             if (lastId !== null) q = q.gt('contact_id', lastId);
             const { data, error } = await q;
             const pageMs = Date.now() - pageStart;
