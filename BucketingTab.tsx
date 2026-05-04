@@ -1635,11 +1635,18 @@ function StatCard({ label, value, color }: { label: string; value: string; color
 
 // ───── Phase 1a: AI-proposed tag review panel ─────────────────────
 
+type TaxKind = 'identities' | 'characteristics' | 'sectors';
+
 function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: (m: string | null) => void }) {
   const [proposed, setProposed] = useState<{ identities: any[]; characteristics: any[]; sectors: any[] } | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [busyAllKind, setBusyAllKind] = useState<string | null>(null);
   const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
+  // Per-kind selection sets — drives the "Apply selected (N)" buttons.
+  // Stored as Sets keyed by item name; reset whenever proposals change.
+  const [selected, setSelected] = useState<Record<TaxKind, Set<string>>>({
+    identities: new Set(), characteristics: new Set(), sectors: new Set()
+  });
 
   const refresh = useCallback(async () => {
     try {
@@ -1647,19 +1654,22 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
       setProposed(data);
+      // Drop any selection entries whose item is no longer in the panel
+      // (e.g. accepted in a prior pass). Avoids stale checkmarks.
+      setSelected(prev => {
+        const next: Record<TaxKind, Set<string>> = { identities: new Set(), characteristics: new Set(), sectors: new Set() };
+        for (const k of ['identities', 'characteristics', 'sectors'] as TaxKind[]) {
+          const live = new Set((data[k] || []).map((p: any) => p.name));
+          for (const n of prev[k]) if (live.has(n)) next[k].add(n);
+        }
+        return next;
+      });
     } catch (e: any) { onError(e.message); }
   }, [runId, onError]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
-  // Accept a single proposed entry. Refresh the panel only when caller is
-  // a one-off button (not an Accept-all loop) to avoid hitting the
-  // proposed-tags endpoint N+1 times.
-  const acceptOne = async (
-    kind: 'identities' | 'characteristics' | 'sectors',
-    name: string,
-    parent?: string
-  ): Promise<void> => {
+  const acceptOne = async (kind: TaxKind, name: string, parent?: string): Promise<void> => {
     const body: any = { name, created_by: 'ai' };
     if (kind === 'characteristics' && parent) body.parent_identity = parent;
     const res = await fetch(`/api/bucketing/taxonomy/${kind}`, {
@@ -1671,7 +1681,7 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
     if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
   };
 
-  const accept = async (kind: 'identities' | 'characteristics' | 'sectors', name: string, parent?: string) => {
+  const accept = async (kind: TaxKind, name: string, parent?: string) => {
     setBusyKey(`${kind}:${name}`);
     onError(null);
     try {
@@ -1681,21 +1691,18 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
     finally { setBusyKey(null); }
   };
 
-  const acceptAll = async (kind: 'identities' | 'characteristics' | 'sectors') => {
-    if (!proposed) return;
-    const items = proposed[kind];
-    if (items.length === 0) return;
+  // Generic batch-apply for a set of items (used by Accept-all + Apply-selected).
+  // For characteristics, parent identities must exist first — we accept any
+  // selected/proposed parents before the children to avoid FK-by-name fails.
+  const applyBatch = async (kind: TaxKind, items: any[]) => {
+    if (!proposed || items.length === 0) return;
     setBusyAllKind(kind);
     setBulkProgress({ done: 0, total: items.length });
     onError(null);
     let done = 0;
     let firstError: string | null = null;
-    // For characteristics, identities must already exist in the library
-    // (they have a NOT NULL parent_identity FK-by-name). Accept any
-    // proposed identities whose name matches a characteristic's parent
-    // first, so the library is ready when we add the children.
     if (kind === 'characteristics') {
-      const neededParents = new Set(items.map((p: any) => p.parent).filter(Boolean));
+      const neededParents = new Set(items.map(p => p.parent).filter(Boolean));
       for (const ip of (proposed.identities || [])) {
         if (neededParents.has(ip.name)) {
           try { await acceptOne('identities', ip.name); } catch { /* best-effort */ }
@@ -1714,7 +1721,36 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
     setBusyAllKind(null);
     setBulkProgress(null);
     if (firstError) onError(`Some ${kind} couldn't be added: ${firstError}`);
+    setSelected(prev => ({ ...prev, [kind]: new Set() }));
     await refresh();
+  };
+
+  const acceptAll = (kind: TaxKind) => proposed && applyBatch(kind, proposed[kind]);
+
+  const applySelected = (kind: TaxKind) => {
+    if (!proposed) return;
+    const want = selected[kind];
+    const items = proposed[kind].filter((p: any) => want.has(p.name));
+    return applyBatch(kind, items);
+  };
+
+  const toggleSelect = (kind: TaxKind, name: string) => {
+    setSelected(prev => {
+      const s = new Set(prev[kind]);
+      s.has(name) ? s.delete(name) : s.add(name);
+      return { ...prev, [kind]: s };
+    });
+  };
+
+  const toggleSelectAll = (kind: TaxKind) => {
+    if (!proposed) return;
+    const all = proposed[kind].map((p: any) => p.name as string);
+    setSelected(prev => {
+      const cur = prev[kind];
+      // If everything is selected, clear; else select all.
+      const nextSet = cur.size === all.length ? new Set<string>() : new Set(all);
+      return { ...prev, [kind]: nextSet };
+    });
   };
 
   if (!proposed) return null;
@@ -1727,56 +1763,92 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
         AI-proposed taxonomy additions ({total})
       </div>
       <p className="text-[11px] text-gray-400 mb-3">
-        The tagger proposed entries that aren't in the library. Accept to add them permanently to the library, or ignore (they're already used in this run regardless).
+        The tagger proposed entries that aren't in the library. Tick the ones you want to keep and click "Apply selected", or use "Accept all" / individual "Accept" buttons. Rejecting just means leaving them unchecked — they're already used in this run regardless.
       </p>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-        {(['identities','characteristics','sectors'] as const).map(kind => (
-          <div key={kind}>
-            <div className="flex items-center justify-between mb-1.5">
-              <div className="text-[10px] font-bold text-gray-400 uppercase">
-                {kind} ({proposed[kind].length})
-              </div>
-              {proposed[kind].length > 0 && (
-                <button
-                  onClick={() => acceptAll(kind)}
-                  disabled={busyAllKind !== null}
-                  className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
-                  title={`Accept every proposed ${kind.slice(0, -1)} into the library`}
-                >
-                  {busyAllKind === kind && bulkProgress
-                    ? `${bulkProgress.done}/${bulkProgress.total}…`
-                    : `Accept all (${proposed[kind].length})`}
-                </button>
-              )}
-            </div>
-            <ul className="space-y-1">
-              {proposed[kind].map((p: any) => {
-                const key = `${kind}:${p.name}`;
-                return (
-                  <li key={key} className="flex items-center justify-between gap-2 px-2 py-1.5 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-[11px]">
-                    <div className="min-w-0 flex-1">
-                      <div className="font-bold text-white truncate" title={p.name}>{p.name}</div>
-                      <div className="text-[10px] text-gray-500 truncate" title={p.samples?.join(' · ')}>
-                        {p.count}× · ex: {(p.samples || []).slice(0, 2).join(' · ')}
-                      </div>
-                      {kind === 'characteristics' && p.parent && (
-                        <div className="text-[9px] text-gray-600">under {p.parent}</div>
-                      )}
-                    </div>
+        {(['identities','characteristics','sectors'] as const).map(kind => {
+          const items = proposed[kind];
+          const sel = selected[kind];
+          const allSelected = items.length > 0 && sel.size === items.length;
+          const someSelected = sel.size > 0;
+          return (
+            <div key={kind}>
+              <div className="flex flex-wrap items-center justify-between gap-1 mb-1.5">
+                <label className="flex items-center gap-1.5 text-[10px] font-bold text-gray-400 uppercase cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={allSelected}
+                    ref={el => { if (el) el.indeterminate = someSelected && !allSelected; }}
+                    onChange={() => toggleSelectAll(kind)}
+                    disabled={items.length === 0}
+                    className="w-3 h-3 accent-[#3ecf8e]"
+                  />
+                  {kind} ({items.length})
+                </label>
+                {items.length > 0 && (
+                  <div className="flex gap-1">
                     <button
-                      onClick={() => accept(kind, p.name, p.parent)}
-                      disabled={busyKey === key}
-                      className="shrink-0 px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
+                      onClick={() => applySelected(kind)}
+                      disabled={busyAllKind !== null || sel.size === 0}
+                      className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-30"
+                      title={`Add only the checked ${kind} to the library`}
                     >
-                      {busyKey === key ? '…' : 'Accept'}
+                      {busyAllKind === kind && bulkProgress
+                        ? `${bulkProgress.done}/${bulkProgress.total}…`
+                        : `Apply selected (${sel.size})`}
                     </button>
-                  </li>
-                );
-              })}
-              {proposed[kind].length === 0 && <li className="text-[10px] text-gray-600 italic">none</li>}
-            </ul>
-          </div>
-        ))}
+                    <button
+                      onClick={() => acceptAll(kind)}
+                      disabled={busyAllKind !== null}
+                      className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-200 hover:bg-[#3e3e3e] disabled:opacity-50"
+                      title={`Add every proposed ${kind.slice(0, -1)} to the library`}
+                    >
+                      Accept all ({items.length})
+                    </button>
+                  </div>
+                )}
+              </div>
+              <ul className="space-y-1">
+                {items.map((p: any) => {
+                  const key = `${kind}:${p.name}`;
+                  const isChecked = sel.has(p.name);
+                  return (
+                    <li
+                      key={key}
+                      className={`flex items-center justify-between gap-2 px-2 py-1.5 border rounded text-[11px] transition-colors ${
+                        isChecked ? 'bg-[#3ecf8e]/10 border-[#3ecf8e]/40' : 'bg-[#1c1c1c] border-[#2e2e2e]'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={() => toggleSelect(kind, p.name)}
+                        className="w-3 h-3 accent-[#3ecf8e] shrink-0"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="font-bold text-white truncate" title={p.name}>{p.name}</div>
+                        <div className="text-[10px] text-gray-500 truncate" title={p.samples?.join(' · ')}>
+                          {p.count}× · ex: {(p.samples || []).slice(0, 2).join(' · ')}
+                        </div>
+                        {kind === 'characteristics' && p.parent && (
+                          <div className="text-[9px] text-gray-600">under {p.parent}</div>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => accept(kind, p.name, p.parent)}
+                        disabled={busyKey === key}
+                        className="shrink-0 px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
+                      >
+                        {busyKey === key ? '…' : 'Accept'}
+                      </button>
+                    </li>
+                  );
+                })}
+                {items.length === 0 && <li className="text-[10px] text-gray-600 italic">none</li>}
+              </ul>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
