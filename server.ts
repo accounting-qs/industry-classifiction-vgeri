@@ -1782,17 +1782,23 @@ function buildBucketingCtx(runId: string) {
 // needs the bare minimum. The DB column defaults seed the row; the user
 // finalises the values via PATCH /taxonomy before clicking Apply & Assign.
 app.post('/api/bucketing/determine', async (req, res) => {
-    const { name, list_names, apply_identity_dq_cascade } = req.body || {};
+    const { name, list_names, apply_identity_dq_cascade, phase1a_model } = req.body || {};
     if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name is required' });
     if (!Array.isArray(list_names) || list_names.length === 0) {
         return res.status(400).json({ error: 'list_names must be a non-empty array' });
     }
+    // Whitelist the model choice so callers can't sneak in arbitrary
+    // strings; default to gpt-4.1-mini if missing/invalid.
+    const ALLOWED_PHASE1A_MODELS = new Set(['gpt-4.1-mini', 'claude-haiku-4-5']);
+    const phase1aModel = (typeof phase1a_model === 'string' && ALLOWED_PHASE1A_MODELS.has(phase1a_model))
+        ? phase1a_model : 'gpt-4.1-mini';
 
     try {
         const { data, error } = await supabase.from('bucketing_runs').insert({
             name: name.trim(),
             list_names,
             apply_identity_dq_cascade: !!apply_identity_dq_cascade,
+            taxonomy_model: phase1aModel,
             status: 'taxonomy_pending'
         }).select().single();
         if (error) return res.status(500).json({ error: error.message });

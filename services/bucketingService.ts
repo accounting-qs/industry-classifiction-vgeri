@@ -846,22 +846,26 @@ export async function runTaxonomyProposal(
     ctx.log(`[Bucketing ${runId}] taxonomy library: ${snapshot.identities.length} identities, ${snapshot.characteristics.length} characteristics, ${snapshot.sectors.length} sectors`);
 
     if (completedVocab.length > 0) {
-        // ── Tag completed industries via Sonnet (batched) ────────────
+        // ── Tag completed industries (batched, model selected at Setup) ────
         await ctx.checkCancel();
+        // Per-run model choice from the Setup screen, written to
+        // bucketing_runs.taxonomy_model in /determine. Fall back to the
+        // historical Sonnet default if a run pre-dates the picker.
+        const phase1aModel: string = (run as any).taxonomy_model || TAXONOMY_MODEL_ANTHROPIC;
         ctx.progress({
             phase: 'phase1a',
-            step: 'sonnet_tagging',
+            step: 'tagging',
             current: 0,
             total: completedVocab.length,
-            note: `Tagging ${completedVocab.length} industries with Sonnet…`
+            note: `Tagging ${completedVocab.length} industries with ${phase1aModel}…`
         });
         const tagResult = await withHeartbeat(
-            `Sonnet tagging (${completedVocab.length} industries)`,
-            () => tagIndustriesWithSonnet(supabase, completedVocab, snapshot, runId, ctx),
+            `${phase1aModel} tagging (${completedVocab.length} industries)`,
+            () => tagIndustries(supabase, phase1aModel, completedVocab, snapshot, runId, ctx),
             ctx
         );
         totalCost += tagResult.costUsd;
-        ctx.log(`[Bucketing ${runId}] Sonnet tagging: ${tagResult.taggings.length} results, $${tagResult.costUsd.toFixed(4)}, model=${tagResult.modelUsed}`);
+        ctx.log(`[Bucketing ${runId}] tagging: ${tagResult.taggings.length} results, $${tagResult.costUsd.toFixed(4)}, model=${tagResult.modelUsed}`);
 
         // ── Build map rows from taggings ─────────────────────────────
         const identitySet = new Set(snapshot.identities.map(i => i.name));
@@ -1056,7 +1060,8 @@ export async function runTaxonomyProposal(
             characteristics: snapshot.characteristics,
             sectors: snapshot.sectors
         },
-        taxonomy_model: TAXONOMY_MODEL_ANTHROPIC,
+        // taxonomy_model is now set by /determine from the user's Setup
+        // screen choice — don't overwrite it here.
         cost_usd: totalCost,
         total_contacts: totalContacts,
         status: 'taxonomy_ready',
@@ -1090,15 +1095,27 @@ async function loadTaxonomySnapshot(supabase: SupabaseClient): Promise<TaxonomyS
     };
 }
 
-async function tagIndustriesWithSonnet(
+// Unified Phase 1a tagger. Dispatches by model: Anthropic for `claude-*`,
+// OpenAI for `gpt-*`. Both paths consume the same batched system+user
+// prompts and produce the same IndustryTagging[] shape, so the rest of
+// runTaxonomyProposal is model-agnostic. Cost is computed via the
+// matching pricing table.
+async function tagIndustries(
     supabase: SupabaseClient,
+    model: string,
     vocab: VocabRow[],
     snapshot: TaxonomySnapshot,
     runId: string,
     ctx: BucketingCtx
 ): Promise<{ taggings: IndustryTagging[]; costUsd: number; modelUsed: string }> {
-    const anthropic = await getAnthropic(supabase);
-    if (!anthropic) {
+    const isAnthropic = model.startsWith('claude-');
+    const isOpenAI = model.startsWith('gpt-');
+    if (!isAnthropic && !isOpenAI) {
+        throw new Error(`Unsupported Phase 1a model: ${model}`);
+    }
+
+    const anthropic = isAnthropic ? await getAnthropic(supabase) : null;
+    if (isAnthropic && !anthropic) {
         throw new Error('Anthropic API key not configured. Add it on the Connectors page (saved as ANTHROPIC_API_KEY).');
     }
 
@@ -1129,22 +1146,49 @@ async function tagIndustriesWithSonnet(
             }))
         });
         try {
-            const resp = await anthropic.messages.create({
-                model: TAXONOMY_MODEL_ANTHROPIC,
-                max_tokens: 2000,
-                system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
-                messages: [{ role: 'user', content: userPrompt }]
-            }, { timeout: TAXONOMY_TIMEOUT_MS });
-
-            // Track usage with cache awareness.
-            const usage: any = (resp as any).usage || {};
-            totalIn += usage.input_tokens || 0;
-            totalOut += usage.output_tokens || 0;
-            totalCachedIn += usage.cache_read_input_tokens || 0;
-
-            // Find the JSON block in the response.
-            const text = (resp.content as any[])
-                .filter(b => b.type === 'text').map(b => b.text).join('\n');
+            let text = '';
+            if (isAnthropic) {
+                const resp = await anthropic!.messages.create({
+                    model,
+                    max_tokens: 2000,
+                    system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+                    messages: [{ role: 'user', content: userPrompt }]
+                }, { timeout: TAXONOMY_TIMEOUT_MS });
+                const usage: any = (resp as any).usage || {};
+                totalIn += usage.input_tokens || 0;
+                totalOut += usage.output_tokens || 0;
+                totalCachedIn += usage.cache_read_input_tokens || 0;
+                text = (resp.content as any[])
+                    .filter(b => b.type === 'text').map(b => b.text).join('\n');
+            } else {
+                // OpenAI chat completions with json_object response_format
+                // forces valid JSON without us hand-rolling a schema.
+                const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model,
+                        max_tokens: 2000,
+                        response_format: { type: 'json_object' },
+                        messages: [
+                            { role: 'system', content: systemPrompt },
+                            { role: 'user', content: userPrompt }
+                        ]
+                    }),
+                    signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+                });
+                if (!resp.ok) {
+                    const body = await resp.text();
+                    throw new Error(`OpenAI ${resp.status}: ${body.slice(0, 300)}`);
+                }
+                const json: any = await resp.json();
+                const usage = json.usage || {};
+                const cached = usage.prompt_tokens_details?.cached_tokens || 0;
+                totalIn += (usage.prompt_tokens || 0);
+                totalCachedIn += cached;
+                totalOut += usage.completion_tokens || 0;
+                text = json.choices?.[0]?.message?.content || '';
+            }
             const parsed = parseTaggingJson(text, batch);
             for (const t of parsed) taggings.push(t);
         } catch (err: any) {
@@ -1178,7 +1222,7 @@ async function tagIndustriesWithSonnet(
         if (done % (PHASE1A_BATCH_SIZE * 10) === 0 || done === vocab.length) {
             ctx.progress({
                 phase: 'phase1a',
-                step: 'sonnet_tagging',
+                step: 'tagging',
                 current: done,
                 total: vocab.length,
                 note: `Tagged ${done}/${vocab.length} industries…`
@@ -1187,21 +1231,23 @@ async function tagIndustriesWithSonnet(
     })));
 
     // Catastrophic failure detection: if more than half of all batches
-    // failed, the run is producing garbage (almost certainly an
-    // Anthropic auth / rate-limit / network problem). Better to fail
-    // loud than ship a 100%-needs-qa "successful" run.
+    // failed, the run is producing garbage (almost certainly an API auth /
+    // rate-limit / network problem). Better to fail loud than ship a
+    // 100%-needs-qa "successful" run.
     if (batchesAttempted > 0 && batchesFailed / batchesAttempted > 0.5) {
         const pct = Math.round((batchesFailed / batchesAttempted) * 100);
         throw new Error(
-            `Sonnet tagging failed for ${pct}% of batches (${batchesFailed}/${batchesAttempted}). ` +
-            `First error: ${firstError || 'unknown'}. Most likely causes: (1) Anthropic API key invalid or out of credit, ` +
+            `${model} tagging failed for ${pct}% of batches (${batchesFailed}/${batchesAttempted}). ` +
+            `First error: ${firstError || 'unknown'}. Most likely causes: (1) API key invalid or out of credit, ` +
             `(2) rate limit hit, (3) network outage. Check the Connectors page and retry.`
         );
     }
 
-    const costUsd = computeAnthropicCost(TAXONOMY_MODEL_ANTHROPIC, totalIn - totalCachedIn, totalOut)
-        + (totalCachedIn / 1_000_000) * (ANTHROPIC_PRICING[TAXONOMY_MODEL_ANTHROPIC]?.input || 3) * 0.1; // cached at ~10%
-    return { taggings, costUsd, modelUsed: TAXONOMY_MODEL_ANTHROPIC };
+    const costUsd = isAnthropic
+        ? computeAnthropicCost(model, totalIn - totalCachedIn, totalOut)
+            + (totalCachedIn / 1_000_000) * (ANTHROPIC_PRICING[model]?.input || 3) * 0.1
+        : computeOpenAICost(model, totalIn - totalCachedIn, totalCachedIn, totalOut);
+    return { taggings, costUsd, modelUsed: model };
 }
 
 function buildTaggingSystemPrompt(s: TaxonomySnapshot): string {

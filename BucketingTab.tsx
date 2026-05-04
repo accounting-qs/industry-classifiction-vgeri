@@ -98,7 +98,7 @@ export function BucketingTab({ importLists }: {
 
   const openRun = (id: string) => { setActiveRunId(id); setView('detail'); };
 
-  const startNew = async (payload: { name: string; list_names: string[]; apply_identity_dq_cascade: boolean }) => {
+  const startNew = async (payload: { name: string; list_names: string[]; apply_identity_dq_cascade: boolean; phase1a_model: string }) => {
     setLoading(true);
     setError(null);
     try {
@@ -309,10 +309,20 @@ function BucketingStatusBadge({ status }: { status: string }) {
 
 // ───── SETUP VIEW ──────────────────────────────────────────────────
 
+// Phase 1a model options surfaced on the Setup screen. The cost field is
+// "approx for 100k contacts" — based on the typical 32k distinct
+// classification strings we've measured (dedup ratio ~1.45). Actual cost
+// scales with vocab size, not raw contact count.
+const PHASE1A_MODEL_OPTIONS = [
+  { id: 'gpt-4.1-mini',     label: 'gpt-4.1-mini (default)', approxCost100k: '~$15–25', note: 'Cheapest. Good quality on structured taxonomy picks.' },
+  { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5',       approxCost100k: '~$40–70', note: 'Slightly stronger on edge-case identities.' },
+] as const;
+type Phase1aModel = typeof PHASE1A_MODEL_OPTIONS[number]['id'];
+
 function BucketingSetup({ importLists, onCancel, onStart, loading }: {
   importLists: { name: string; contact_count: number; enriched_count?: number }[];
   onCancel: () => void;
-  onStart: (p: { name: string; list_names: string[]; apply_identity_dq_cascade: boolean }) => void;
+  onStart: (p: { name: string; list_names: string[]; apply_identity_dq_cascade: boolean; phase1a_model: Phase1aModel }) => void;
   loading: boolean;
 }) {
   const [name, setName] = useState('');
@@ -320,6 +330,7 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
   // Default OFF — trust Sonnet's per-row is_disqualified decision instead of
   // auto-DQ'ing every contact whose identity is library-flagged [DQ].
   const [applyIdentityDqCascade, setApplyIdentityDqCascade] = useState(false);
+  const [phase1aModel, setPhase1aModel] = useState<Phase1aModel>('gpt-4.1-mini');
 
   const toggleList = (n: string) => {
     const s = new Set(selectedLists);
@@ -374,7 +385,38 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-3 text-[11px] text-gray-400">
-        <span className="text-gray-300 font-bold">Bucket sizing &amp; library reuse</span> are set on the next screen, after Phase 1a proposes a taxonomy — that way you size against the actual specializations Sonnet found.
+        <span className="text-gray-300 font-bold">Bucket sizing &amp; library reuse</span> are set on the next screen, after Phase 1a proposes a taxonomy — that way you size against the actual specializations the LLM found.
+      </div>
+
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-3">
+        <div className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Phase 1a model (taxonomy tagging)</div>
+        <div className="space-y-2">
+          {PHASE1A_MODEL_OPTIONS.map(opt => {
+            const isSel = phase1aModel === opt.id;
+            return (
+              <label
+                key={opt.id}
+                className={`flex items-start gap-2 cursor-pointer p-2 rounded border ${isSel ? 'border-[#3ecf8e] bg-[#3ecf8e]/5' : 'border-[#2e2e2e] hover:bg-white/[0.02]'}`}
+              >
+                <input
+                  type="radio"
+                  name="phase1a_model"
+                  checked={isSel}
+                  onChange={() => setPhase1aModel(opt.id)}
+                  className="mt-0.5 accent-[#3ecf8e]"
+                />
+                <span className="flex-1 min-w-0">
+                  <span className="flex items-baseline justify-between gap-2 flex-wrap">
+                    <span className={`text-[11px] font-bold ${isSel ? 'text-[#3ecf8e]' : 'text-gray-200'}`}>{opt.label}</span>
+                    <span className="text-[10px] font-mono text-gray-500">{opt.approxCost100k} / 100k contacts</span>
+                  </span>
+                  <span className="block text-[10px] text-gray-500 italic mt-0.5">{opt.note}</span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+        <p className="text-[10px] text-gray-600 italic mt-2">Cost depends on the number of <em>distinct</em> enrichment.classification strings, not raw contact count. Phase 1b uses gpt-4.1-mini regardless and now mostly skips the LLM via JOIN-first lookup.</p>
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-3">
@@ -402,7 +444,8 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
           onClick={() => onStart({
             name: name.trim(),
             list_names: Array.from(selectedLists),
-            apply_identity_dq_cascade: applyIdentityDqCascade
+            apply_identity_dq_cascade: applyIdentityDqCascade,
+            phase1a_model: phase1aModel
           })}
           disabled={!canStart}
           className={`px-4 py-2 rounded text-xs font-bold flex items-center gap-1 ${canStart ? 'bg-[#3ecf8e] text-black hover:bg-[#2fb37a]' : 'bg-[#2e2e2e] text-gray-500 cursor-not-allowed'}`}
