@@ -2067,6 +2067,112 @@ app.get('/api/bucketing/runs/:id/contacts', async (req, res) => {
     }
 });
 
+// Per-contact view of Phase 1a taxonomy. Available as soon as a run reaches
+// taxonomy_ready, so the user can export and ship 1a output without ever
+// running Phase 1b. Joins contacts × enrichments × bucket_industry_map on
+// industry_string (the same key Phase 1b uses to count). Keyset-paginated by
+// contact_id; the client repeatedly bumps `cursor` until has_more=false.
+app.get('/api/bucketing/runs/:id/taxonomy-contacts', async (req, res) => {
+    const id = req.params.id;
+    const cursor = req.query.cursor ? String(req.query.cursor) : null;
+    const limit = Math.min(2000, Math.max(50, parseInt(String(req.query.limit || '1000'), 10)));
+
+    try {
+        const { data: run, error: runErr } = await supabase
+            .from('bucketing_runs').select('list_names,status').eq('id', id).single();
+        if (runErr || !run) return res.status(404).json({ error: runErr?.message || 'Run not found' });
+        const listNames: string[] = Array.isArray(run.list_names) ? run.list_names : [];
+        if (listNames.length === 0) return res.json({ data: [], next_cursor: null, has_more: false });
+
+        // Page contacts (keyset) for this run's selected lists. Order by
+        // contact_id matches the existing Phase 1b chunk pattern.
+        let cq: any = supabase.from('contacts')
+            .select('contact_id,email,first_name,last_name,company_name,company_website,industry,lead_list_name')
+            .in('lead_list_name', listNames)
+            .order('contact_id', { ascending: true })
+            .limit(limit);
+        if (cursor) cq = cq.gt('contact_id', cursor);
+        const { data: contacts, error: cErr } = await cq;
+        if (cErr) return res.status(500).json({ error: cErr.message });
+        const page = (contacts || []) as any[];
+        if (page.length === 0) return res.json({ data: [], next_cursor: null, has_more: false });
+
+        // Hydrate enrichments for this page (mirrors fetchContactsChunk's
+        // ENRICHMENT_BATCH_SIZE=200 to keep the IN-list URL under length caps).
+        const ids = page.map(r => r.contact_id);
+        const enrichmentMap = new Map<string, any>();
+        for (let i = 0; i < ids.length; i += 200) {
+            const slice = ids.slice(i, i + 200);
+            const { data: edata, error: eErr } = await supabase
+                .from('enrichments')
+                .select('contact_id,status,classification,confidence,reasoning,error_message')
+                .in('contact_id', slice);
+            if (eErr) return res.status(500).json({ error: eErr.message });
+            for (const e of (edata || []) as any[]) enrichmentMap.set(e.contact_id, e);
+        }
+
+        // Pull every taxonomy row for the run in one shot. The map is small
+        // (one row per distinct industry_string — typically 2–5k for 100k
+        // contacts) so refetching it per page is cheap and keeps the
+        // endpoint stateless.
+        const { data: mapRows, error: mErr } = await supabase
+            .from('bucket_industry_map')
+            .select('industry_string,primary_identity,functional_core,functional_specialization,characteristic,sector_core,sector,sector_focus,bucket_name,canonical_classification,source,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,reasons')
+            .eq('bucketing_run_id', id)
+            .range(0, 49999);
+        if (mErr) return res.status(500).json({ error: mErr.message });
+        const taxonomyByIndustry = new Map<string, any>();
+        for (const row of (mapRows || []) as any[]) taxonomyByIndustry.set(row.industry_string, row);
+
+        const data = page.map(c => {
+            const enr = enrichmentMap.get(c.contact_id) || null;
+            // contacts.industry is the key Phase 1a / 1b actually join on; if
+            // it's empty fall back to enrichments.classification so the export
+            // still surfaces a row even when the join would miss.
+            const industryKey = c.industry || enr?.classification || null;
+            const tax = industryKey ? taxonomyByIndustry.get(industryKey) : null;
+            return {
+                contact_id: c.contact_id,
+                email: c.email,
+                first_name: c.first_name,
+                last_name: c.last_name,
+                company_name: c.company_name,
+                company_website: c.company_website,
+                lead_list_name: c.lead_list_name,
+                industry: c.industry,
+                enrichment_status: enr?.status || null,
+                enrichment_classification: enr?.classification || null,
+                enrichment_confidence: enr?.confidence || null,
+                enrichment_reasoning: enr?.reasoning || null,
+                enrichment_error: enr?.error_message || null,
+                primary_identity: tax?.primary_identity || null,
+                functional_core: tax?.functional_core || null,
+                functional_specialization: tax?.functional_specialization || null,
+                characteristic: tax?.characteristic || null,
+                sector_core: tax?.sector_core || null,
+                sector: tax?.sector || null,
+                sector_focus: tax?.sector_focus || null,
+                canonical_classification: tax?.canonical_classification || null,
+                bucket_name: tax?.bucket_name || null,
+                taxonomy_source: tax?.source || null,
+                identity_confidence: tax?.identity_confidence ?? null,
+                characteristic_confidence: tax?.characteristic_confidence ?? null,
+                sector_confidence: tax?.sector_confidence ?? null,
+                confidence: tax?.confidence ?? null,
+                is_generic: tax?.is_generic ?? null,
+                is_disqualified: tax?.is_disqualified ?? null,
+                llm_reason: tax?.llm_reason || null,
+            };
+        });
+
+        const hasMore = page.length === limit;
+        const nextCursor = hasMore ? page[page.length - 1].contact_id : null;
+        res.json({ data, next_cursor: nextCursor, has_more: hasMore });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Delete a bucketing run (cascades to map + assignments).
 app.delete('/api/bucketing/runs/:id', async (req, res) => {
     const id = req.params.id;

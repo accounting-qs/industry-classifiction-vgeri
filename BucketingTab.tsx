@@ -701,6 +701,42 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
     setKept(s);
   };
 
+  const [exporting, setExporting] = useState(false);
+  const exportTaxonomyCsv = async () => {
+    setExporting(true);
+    onError(null);
+    try {
+      const PAGE = 1000;
+      const rows: any[] = [];
+      let cursor: string | null = null;
+      // Loop until the server signals has_more=false. Server uses keyset
+      // pagination on contact_id so the cursor is the last contact_id of the
+      // previous page.
+      while (true) {
+        const url = `/api/bucketing/runs/${encodeURIComponent(run.id)}/taxonomy-contacts?limit=${PAGE}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+        const res = await fetch(url);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+        rows.push(...(data.data || []));
+        if (!data.has_more) break;
+        cursor = data.next_cursor;
+        if (!cursor) break;
+      }
+      const csv = Papa.unparse(rows);
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${run.name.replace(/[^a-z0-9-_]+/gi, '_')}_phase1a_taxonomy.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const apply = async (alsoAssign: boolean) => {
     setBusy(alsoAssign ? 'assigning' : 'saving');
     onError(null);
@@ -907,23 +943,34 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
         </div>
       </div>
 
-      <div className="flex justify-end gap-2">
+      <div className="flex justify-between items-center gap-2 flex-wrap">
         <button
-          onClick={() => apply(false)}
-          disabled={busy !== 'none'}
-          className="px-4 py-2 rounded text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e] disabled:opacity-50"
+          onClick={exportTaxonomyCsv}
+          disabled={exporting}
+          className="px-4 py-2 rounded text-xs font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:bg-[#2e2e2e] disabled:opacity-50 flex items-center gap-1"
+          title="Download every contact in this run with its Phase 1a taxonomy assignment. Phase 1b not required."
         >
-          {busy === 'saving' ? <Loader2 className="w-3 h-3 inline animate-spin mr-1" /> : null}
-          Save changes
+          {exporting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+          Export Phase 1a taxonomy (CSV)
         </button>
-        <button
-          onClick={() => apply(true)}
-          disabled={busy !== 'none' || kept.size === 0}
-          className="px-4 py-2 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1"
-        >
-          {busy === 'assigning' ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
-          Apply &amp; Assign
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={() => apply(false)}
+            disabled={busy !== 'none'}
+            className="px-4 py-2 rounded text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e] disabled:opacity-50"
+          >
+            {busy === 'saving' ? <Loader2 className="w-3 h-3 inline animate-spin mr-1" /> : null}
+            Save changes
+          </button>
+          <button
+            onClick={() => apply(true)}
+            disabled={busy !== 'none' || kept.size === 0}
+            className="px-4 py-2 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1"
+          >
+            {busy === 'assigning' ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+            Apply &amp; Assign
+          </button>
+        </div>
       </div>
     </div>
   );
