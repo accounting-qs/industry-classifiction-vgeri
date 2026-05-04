@@ -23,3 +23,6 @@ exports
 *.njsproj
 *.sln
 *.sw?
+
+# Helper project
+lloyd-enrichment-project-main

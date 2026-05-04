@@ -98,7 +98,7 @@ export function BucketingTab({ importLists }: {
 
   const openRun = (id: string) => { setActiveRunId(id); setView('detail'); };
 
-  const startNew = async (payload: { name: string; list_names: string[]; min_volume: number; bucket_budget: number; preferred_library_ids: string[] }) => {
+  const startNew = async (payload: { name: string; list_names: string[]; min_volume: number; bucket_budget: number; preferred_library_ids: string[]; apply_identity_dq_cascade: boolean }) => {
     setLoading(true);
     setError(null);
     try {
@@ -313,7 +313,7 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
   importLists: { name: string; contact_count: number; enriched_count?: number }[];
   library: LibraryBucket[];
   onCancel: () => void;
-  onStart: (p: { name: string; list_names: string[]; min_volume: number; bucket_budget: number; preferred_library_ids: string[] }) => void;
+  onStart: (p: { name: string; list_names: string[]; min_volume: number; bucket_budget: number; preferred_library_ids: string[]; apply_identity_dq_cascade: boolean }) => void;
   loading: boolean;
 }) {
   const [name, setName] = useState('');
@@ -322,6 +322,9 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
   const [bucketBudget, setBucketBudget] = useState(30);
   const [selectedLib, setSelectedLib] = useState<Set<string>>(new Set());
   const [showLib, setShowLib] = useState(false);
+  // Default OFF — trust Sonnet's per-row is_disqualified decision instead of
+  // auto-DQ'ing every contact whose identity is library-flagged [DQ].
+  const [applyIdentityDqCascade, setApplyIdentityDqCascade] = useState(false);
 
   const toggleList = (n: string) => {
     const s = new Set(selectedLists);
@@ -473,6 +476,25 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
         )}
       </div>
 
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-3">
+        <label className="flex items-start gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={applyIdentityDqCascade}
+            onChange={e => setApplyIdentityDqCascade(e.target.checked)}
+            className="w-3.5 h-3.5 mt-0.5 accent-[#3ecf8e]"
+          />
+          <span className="flex-1">
+            <span className="block text-[11px] font-bold text-gray-200">
+              Auto-disqualify contacts whose identity is library-flagged [DQ]
+            </span>
+            <span className="block text-[10px] text-gray-500 italic mt-0.5">
+              Off (recommended): trust Sonnet's per-row decision — even contacts tagged "Consumer & Retail" stay inviteable when they show a B2B angle. On: any contact tagged with a [DQ] identity routes straight to Disqualified, no exceptions.
+            </span>
+          </span>
+        </label>
+      </div>
+
       <div className="flex justify-end gap-2 pt-3 border-t border-[#2e2e2e]">
         <button onClick={onCancel} className="px-4 py-2 rounded text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e]">Cancel</button>
         <button
@@ -481,7 +503,8 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
             list_names: Array.from(selectedLists),
             min_volume: minVolume,
             bucket_budget: bucketBudget,
-            preferred_library_ids: Array.from(selectedLib)
+            preferred_library_ids: Array.from(selectedLib),
+            apply_identity_dq_cascade: applyIdentityDqCascade
           })}
           disabled={!canStart}
           className={`px-4 py-2 rounded text-xs font-bold flex items-center gap-1 ${canStart ? 'bg-[#3ecf8e] text-black hover:bg-[#2fb37a]' : 'bg-[#2e2e2e] text-gray-500 cursor-not-allowed'}`}
@@ -1089,6 +1112,9 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
         generic: r.is_generic,
         disqualified: r.is_disqualified,
         confidence_score: r.confidence,
+        identity_confidence: r.identity_confidence,
+        characteristic_confidence: r.characteristic_confidence,
+        sector_confidence: r.sector_confidence,
         source: r.source,
       }));
       const csv = Papa.unparse(csvRows);

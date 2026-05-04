@@ -1757,7 +1757,7 @@ function buildBucketingCtx(runId: string) {
 
 // Create a new run + fire taxonomy proposal in the background.
 app.post('/api/bucketing/determine', async (req, res) => {
-    const { name, list_names, min_volume, bucket_budget, preferred_library_ids } = req.body || {};
+    const { name, list_names, min_volume, bucket_budget, preferred_library_ids, apply_identity_dq_cascade } = req.body || {};
     if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name is required' });
     if (!Array.isArray(list_names) || list_names.length === 0) {
         return res.status(400).json({ error: 'list_names must be a non-empty array' });
@@ -1770,6 +1770,7 @@ app.post('/api/bucketing/determine', async (req, res) => {
             min_volume: typeof min_volume === 'number' && min_volume >= 0 ? Math.floor(min_volume) : 50,
             bucket_budget: typeof bucket_budget === 'number' && bucket_budget > 0 ? Math.floor(bucket_budget) : 30,
             preferred_library_ids: Array.isArray(preferred_library_ids) ? preferred_library_ids : [],
+            apply_identity_dq_cascade: !!apply_identity_dq_cascade,
             status: 'taxonomy_pending'
         }).select().single();
         if (error) return res.status(500).json({ error: error.message });
@@ -2007,7 +2008,7 @@ app.get('/api/bucketing/runs/:id/contacts', async (req, res) => {
         // PostgREST's embed syntax. Fetch the assignment page first, then
         // hydrate contact fields via a second IN-list query.
         let q: any = supabase.from('bucket_assignments')
-            .select('contact_id,bucket_name,bucket_leaf,bucket_ancestor,bucket_root,primary_identity,functional_core,functional_specialization,sector_core,sector_focus,canonical_classification,bucket_reason,pre_rollup_bucket_name,rollup_level,general_reason,reasons,is_generic,is_disqualified,source,confidence,assigned_at', { count: 'estimated' })
+            .select('contact_id,bucket_name,bucket_leaf,bucket_ancestor,bucket_root,primary_identity,functional_core,functional_specialization,sector_core,sector_focus,canonical_classification,bucket_reason,pre_rollup_bucket_name,rollup_level,general_reason,reasons,is_generic,is_disqualified,source,confidence,identity_confidence,characteristic_confidence,sector_confidence,assigned_at', { count: 'estimated' })
             .eq('bucketing_run_id', id);
         if (bucket) q = q.eq('bucket_name', bucket);
         q = q.order('assigned_at', { ascending: true })

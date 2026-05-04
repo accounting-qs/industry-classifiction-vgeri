@@ -175,7 +175,15 @@ interface IndustryTagging {
     sector: string | null;
     is_new_sector: boolean;
     is_disqualified: boolean;
-    confidence: number;          // 1-10
+    // Per-tag 1-10 scores. Drives smart fallbacks in Phase 1b: a row
+    // with identity=8, characteristic=4 should route at the identity
+    // level rather than tumble all the way to General. confidence is
+    // the legacy single score (= min of the three) kept for existing
+    // QA panel + reporting code.
+    identity_confidence: number;
+    characteristic_confidence: number;
+    sector_confidence: number;
+    confidence: number;
     reason: string;
 }
 
@@ -262,6 +270,12 @@ interface ContactMapRow {
     bucket_reason: string;
     pre_rollup_bucket_name: string;
     bucket_name: string;
+    // Per-tag confidence (0-1). Used by computeContactRollup to gate which
+    // layer the row may enter at: a row with sector_confidence < 0.6 is
+    // ineligible for combo / sector_core+spec layers.
+    identity_confidence: number;
+    characteristic_confidence: number;
+    sector_confidence: number;
     rollup_level: 'combo' | 'sector_core_specialization' | 'specialization' | 'functional_core' | 'identity' | 'general';
     source: string;
     confidence: number;
@@ -656,12 +670,17 @@ export async function runTaxonomyProposal(
         for (const sec of snapshot.sectors) if (sec.sector_core) scSet.add(sec.sector_core);
         const dqIdentities = new Set(snapshot.identities.filter(i => i.is_disqualified).map(i => i.name));
         const charByName = new Map(snapshot.characteristics.map(c => [c.name, c]));
+        // Identity-DQ cascade is OFF by default — we trust Sonnet's per-row
+        // is_disqualified judgment. Set apply_identity_dq_cascade=true on
+        // the run to restore the old auto-DQ behavior for [DQ]-flagged
+        // identities (e.g. force every "Consumer & Retail" tag to DQ).
+        const cascadeDq = !!(run as any).apply_identity_dq_cascade;
 
         for (const t of tagResult.taggings) {
             const conf01 = Math.max(0, Math.min(1, (t.confidence || 0) / 10));
             const lowConf = (t.confidence || 0) < PHASE1A_QA_FLOOR;
             const identityIsDq = !!(t.identity && dqIdentities.has(t.identity));
-            const isDisqualified = t.is_disqualified || identityIsDq;
+            const isDisqualified = t.is_disqualified || (cascadeDq && identityIsDq);
 
             // Backfill functional_core from the library if the LLM didn't provide
             // it but we know the mapping for this characteristic. This way the
@@ -702,6 +721,9 @@ export async function runTaxonomyProposal(
                 bucket_name: preBucket,
                 source: 'llm_phase1a',
                 confidence: Number(conf01.toFixed(2)),
+                identity_confidence: Number(((t.identity_confidence || 0) / 10).toFixed(2)),
+                characteristic_confidence: Number(((t.characteristic_confidence || 0) / 10).toFixed(2)),
+                sector_confidence: Number(((t.sector_confidence || 0) / 10).toFixed(2)),
                 identity: t.identity,
                 functional_core: functionalCore,
                 characteristic: t.characteristic,
@@ -911,6 +933,9 @@ async function tagIndustriesWithSonnet(
                     sector: null,
                     is_new_sector: false,
                     is_disqualified: false,
+                    identity_confidence: 0,
+                    characteristic_confidence: 0,
+                    sector_confidence: 0,
                     confidence: 0,
                     reason: `tagging_error: ${err.message?.slice(0, 200)}`
                 });
@@ -957,7 +982,7 @@ function buildTaggingSystemPrompt(s: TaxonomySnapshot): string {
 
 For each industry text the user provides, return five independent tags. The five tags form a layered truth model: identity is broadest, sector is narrowest, with two intermediate "core" layers used as rollup fallbacks.
 
-1. **Identity** (REQUIRED) — what kind of company is it at its core? Pick from the IDENTITY library below. If nothing fits well (less than ~6/10 confidence), propose a new identity name and set is_new_identity=true. Identities marked [DQ] mean the company is disqualified for outreach.
+1. **Identity** (REQUIRED) — what kind of company is it at its core? Pick from the IDENTITY library below. If nothing fits well, propose a new identity name and set is_new_identity=true. Identities marked [DQ] are *historically* disqualified for B2B outreach; treat the marker as a strong hint, not a hard rule (see DISQUALIFICATION RULES).
 
 2. **Functional core** (REQUIRED when identity is set) — the broad function family this company performs. Pick from the FUNCTIONAL_CORE library below. Each library characteristic shows its core — use that mapping. If you genuinely think a new core is needed, set is_new_functional_core=true. functional_core is broader than characteristic, narrower than identity (e.g. Identity=Agency, functional_core=Marketing Services, characteristic=SEO Agency).
 
@@ -970,9 +995,28 @@ For each industry text the user provides, return five independent tags. The five
 CLASSIFICATION RULES (critical):
 - Classify by core business identity FIRST, sector served SECOND. A PE firm focused on healthcare is identity=Financial Services, NOT Healthcare.
 - Operators in a vertical (a hospital, a SaaS company) belong to that identity. Service providers TO that vertical (an agency that markets healthcare, a consultant to insurers) belong to the service identity, with the vertical going into sector_core+sector.
-- If the identity is marked [DQ] in the library OR the company's core business is consumer-facing retail/hospitality/DTC, set is_disqualified=true.
 - functional_core must be consistent with identity. sector_core must be consistent with sector when both are set.
-- confidence is 1-10. <6 means you weren't able to find a confident match.
+
+DISQUALIFICATION RULES (be CONSERVATIVE — false negatives are worse than false positives):
+- Set is_disqualified=true ONLY when the text gives clear, explicit evidence the company is a pure-consumer / hyper-local / low-ticket business with no plausible B2B angle. Examples:
+    * "Family-owned restaurant in Austin"
+    * "Independent dog grooming salon"
+    * "Local plumbing business, residential only"
+    * "Direct-to-consumer candle brand"
+- Do NOT auto-DQ just because the identity is marked [DQ] or the text mentions retail/hospitality/consumer. Many such companies have a B2B / wholesale / SaaS / advisory arm that we'd want to invite. Examples that should stay inviteable (is_disqualified=false):
+    * "Hospitality SaaS for boutique hotels" → Software & SaaS, not DQ
+    * "Wholesale distribution platform for restaurants" → Software & SaaS or Consulting, not DQ
+    * "Multi-location dental group with 40+ practices" → Healthcare & Medical operator, not DQ
+    * "DTC brand with B2B wholesale channel" → keep inviteable
+- When uncertain, set is_disqualified=false and let the user decide downstream. The reason field should explain why if you DO disqualify.
+
+CONFIDENCE SCORING (per tag, 1-10):
+- Return THREE independent confidence scores: identity_confidence, characteristic_confidence, sector_confidence.
+- Each scores how sure you are about THAT tag specifically, not the whole row.
+- A "PE firm investing in healthcare" might be identity_confidence=10, characteristic_confidence=9, sector_confidence=8 (sector clear).
+- A "consulting firm" with no vertical mentioned might be identity_confidence=8, characteristic_confidence=5 (which kind of consulting?), sector_confidence=2 (no sector mentioned — return null sector and score 1-3).
+- <6 means: this specific tag is a guess; downstream code may ignore it.
+- If you return null for a tag (e.g. no sector applicable), set its confidence to 1.
 
 OUTPUT FORMAT — return ONLY valid JSON, no prose:
 {
@@ -990,7 +1034,9 @@ OUTPUT FORMAT — return ONLY valid JSON, no prose:
       "sector": "<library name or new>" | null,
       "is_new_sector": <bool>,
       "is_disqualified": <bool>,
-      "confidence": <1-10 integer>,
+      "identity_confidence": <1-10 integer>,
+      "characteristic_confidence": <1-10 integer>,
+      "sector_confidence": <1-10 integer>,
       "reason": "<brief justification, <= 30 words>"
     }, ...
   ]
@@ -1027,6 +1073,13 @@ function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
         const idx = typeof item.id === 'number' ? item.id : -1;
         if (idx < 0 || idx >= batch.length) continue;
         const v = batch[idx];
+        // Per-tag confidences with back-compat: if Sonnet returns the
+        // legacy single `confidence` (e.g. older cached prompts), use it
+        // for all three. The min becomes the overall confidence.
+        const legacyConf = typeof item.confidence === 'number' ? item.confidence : 0;
+        const idConf = typeof item.identity_confidence === 'number' ? item.identity_confidence : legacyConf;
+        const chConf = typeof item.characteristic_confidence === 'number' ? item.characteristic_confidence : legacyConf;
+        const secConf = typeof item.sector_confidence === 'number' ? item.sector_confidence : legacyConf;
         out.push({
             industry: v.industry,
             identity: nz(item.identity),
@@ -1040,7 +1093,10 @@ function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
             sector: nz(item.sector),
             is_new_sector: !!item.is_new_sector,
             is_disqualified: !!item.is_disqualified,
-            confidence: typeof item.confidence === 'number' ? item.confidence : 0,
+            identity_confidence: idConf,
+            characteristic_confidence: chConf,
+            sector_confidence: secConf,
+            confidence: Math.min(idConf || 10, chConf || 10, secConf || 10),
             reason: typeof item.reason === 'string' ? item.reason.slice(0, 500) : ''
         });
     }
@@ -1618,12 +1674,42 @@ export async function runAssignment(
     for (const s of hydrateSnapshot.sectors) {
         if (s.sector_core) scBySector.set(s.name, s.sector_core);
     }
+    // Pull per-industry per-tag confidences from Phase 1a's bucket_industry_map
+    // so the rollup can gate which layer each row may enter at. Phase 1b
+    // matchers (library, embedding, LLM) currently only return one overall
+    // score; here we backfill the per-tag scores from the source-of-truth.
+    const industryStrings = Array.from(new Set(assignedRows.map(r => r.industry_string).filter(Boolean)));
+    const confByIndustry = new Map<string, { id?: number; ch?: number; sec?: number }>();
+    if (industryStrings.length > 0) {
+        // Chunked fetch — `.in()` blows up on >1000 long strings.
+        for (let i = 0; i < industryStrings.length; i += 200) {
+            const slice = industryStrings.slice(i, i + 200);
+            const { data: confRows } = await supabase
+                .from('bucket_industry_map')
+                .select('industry_string,identity_confidence,characteristic_confidence,sector_confidence')
+                .eq('bucketing_run_id', runId)
+                .in('industry_string', slice);
+            for (const cr of (confRows || []) as any[]) {
+                confByIndustry.set(cr.industry_string, {
+                    id: typeof cr.identity_confidence === 'number' ? cr.identity_confidence : undefined,
+                    ch: typeof cr.characteristic_confidence === 'number' ? cr.characteristic_confidence : undefined,
+                    sec: typeof cr.sector_confidence === 'number' ? cr.sector_confidence : undefined
+                });
+            }
+        }
+    }
     for (const r of assignedRows) {
         if (!r.functional_core && r.functional_specialization) {
             r.functional_core = fcByChar.get(r.functional_specialization) || '';
         }
         if (!r.sector_core && r.sector_focus) {
             r.sector_core = scBySector.get(r.sector_focus) || '';
+        }
+        const c = confByIndustry.get(r.industry_string || '');
+        if (c) {
+            if (typeof c.id === 'number' && (r.identity_confidence == null || r.identity_confidence === 0)) r.identity_confidence = c.id;
+            if (typeof c.ch === 'number' && (r.characteristic_confidence == null || r.characteristic_confidence === 0)) r.characteristic_confidence = c.ch;
+            if (typeof c.sec === 'number' && (r.sector_confidence == null || r.sector_confidence === 0)) r.sector_confidence = c.sec;
         }
     }
 
@@ -1720,6 +1806,9 @@ function makeGeneralContactRow(
         bucket_reason: `Unclassifiable: ${reason}`,
         pre_rollup_bucket_name: RESERVED_DISQUALIFIED,
         bucket_name: RESERVED_DISQUALIFIED,
+        identity_confidence: 0,
+        characteristic_confidence: 0,
+        sector_confidence: 0,
         rollup_level: 'general',
         source: 'unclassifiable',
         confidence: 0,
@@ -1748,6 +1837,9 @@ function makeMatchedContactRow(
         sector_focus: string;
         source: string;
         confidence: number;
+        identity_confidence?: number;
+        characteristic_confidence?: number;
+        sector_confidence?: number;
         leaf_score: number;
         ancestor_score: number;
         root_score: number;
@@ -1778,6 +1870,9 @@ function makeMatchedContactRow(
         bucket_reason: '',
         pre_rollup_bucket_name: RESERVED_GENERAL,
         bucket_name: RESERVED_GENERAL,
+        identity_confidence: cleanScore(params.identity_confidence ?? params.confidence),
+        characteristic_confidence: cleanScore(params.characteristic_confidence ?? params.confidence),
+        sector_confidence: cleanScore(params.sector_confidence ?? params.confidence),
         rollup_level: 'general',
         source: params.source,
         confidence: cleanScore(params.confidence),
@@ -1801,79 +1896,145 @@ function makeMatchedContactRow(
     return row;
 }
 
+// Per-tag confidence floor below which we don't trust a tag to drive
+// routing. Sonnet returns 1-10, persisted as 0-1 — so 0.6 = "<6/10".
+const TAG_CONF_FLOOR = 0.6;
+
+// Build the "effective" routing view for a row by masking tags whose
+// per-tag confidence is below the floor. The original row keeps its
+// data for export / display; only the effective copy is used for
+// rollup counting and decisions. Returns null if even identity is
+// untrusted (whole row routes straight to General).
+function effectiveTags(row: ContactMapRow): {
+    primary_identity: string;
+    functional_core: string;
+    functional_specialization: string;
+    sector_core: string;
+    sector_focus: string;
+    masked: string[];   // names of layers we suppressed, for bucket_reason
+} | null {
+    const idLow = row.identity_confidence != null && row.identity_confidence < TAG_CONF_FLOOR;
+    const chLow = row.characteristic_confidence != null && row.characteristic_confidence < TAG_CONF_FLOOR;
+    const secLow = row.sector_confidence != null && row.sector_confidence < TAG_CONF_FLOOR;
+    if (idLow) return null;
+    const masked: string[] = [];
+    let fc = row.functional_core || '';
+    let spec = row.functional_specialization || '';
+    let sc = row.sector_core || '';
+    let sf = row.sector_focus || '';
+    if (chLow) {
+        if (spec) masked.push('characteristic');
+        spec = '';
+        // functional_core is library-derived from characteristic — if we
+        // don't trust the characteristic, the core is also suspect.
+        fc = '';
+    }
+    if (secLow) {
+        if (sf || sc) masked.push('sector');
+        sf = '';
+        sc = '';
+    }
+    return {
+        primary_identity: row.primary_identity || '',
+        functional_core: fc,
+        functional_specialization: spec,
+        sector_core: sc,
+        sector_focus: sf,
+        masked
+    };
+}
+
 function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBudget: number): ContactMapRow[] {
+    // Per-row effective view, computed once.
+    const effective = rows.map(r => effectiveTags(r));
+
     const comboCounts = new Map<string, number>();           // sector_focus + spec
     const sectorCoreSpecCounts = new Map<string, number>();  // sector_core + spec
     const specCounts = new Map<string, number>();            // spec only
     const fcCounts = new Map<string, number>();              // functional_core only
     const identityCounts = new Map<string, number>();
 
-    for (const row of rows) {
+    for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
         if (row.is_generic || row.is_disqualified) continue;
-        if (row.functional_specialization) {
-            specCounts.set(row.functional_specialization, (specCounts.get(row.functional_specialization) || 0) + 1);
-            if (row.sector_focus && row.sector_focus !== 'Multi-industry') {
-                const combo = `${row.sector_focus} ${row.functional_specialization}`;
+        const eff = effective[i];
+        if (!eff) continue;  // identity below floor — won't earn a bucket
+        if (eff.functional_specialization) {
+            specCounts.set(eff.functional_specialization, (specCounts.get(eff.functional_specialization) || 0) + 1);
+            if (eff.sector_focus && eff.sector_focus !== 'Multi-industry') {
+                const combo = `${eff.sector_focus} ${eff.functional_specialization}`;
                 comboCounts.set(combo, (comboCounts.get(combo) || 0) + 1);
             }
-            if (row.sector_core && row.sector_core !== 'Multi-industry') {
-                const sc = `${row.sector_core} ${row.functional_specialization}`;
+            if (eff.sector_core && eff.sector_core !== 'Multi-industry') {
+                const sc = `${eff.sector_core} ${eff.functional_specialization}`;
                 sectorCoreSpecCounts.set(sc, (sectorCoreSpecCounts.get(sc) || 0) + 1);
             }
         }
-        if (row.functional_core) {
-            fcCounts.set(row.functional_core, (fcCounts.get(row.functional_core) || 0) + 1);
+        if (eff.functional_core) {
+            fcCounts.set(eff.functional_core, (fcCounts.get(eff.functional_core) || 0) + 1);
         }
-        if (row.primary_identity) {
-            identityCounts.set(row.primary_identity, (identityCounts.get(row.primary_identity) || 0) + 1);
+        if (eff.primary_identity) {
+            identityCounts.set(eff.primary_identity, (identityCounts.get(eff.primary_identity) || 0) + 1);
         }
     }
 
-    const rolled = rows.map(row => {
+    const rolled = rows.map((row, i) => {
         const next = { ...row };
         next.pre_rollup_bucket_name = preRollupName(next);
+        const eff = effective[i];
+        const maskedSuffix = eff && eff.masked.length > 0
+            ? ` (low-confidence ${eff.masked.join(' + ')} masked)` : '';
+
         if (next.is_disqualified) {
             next.bucket_name = RESERVED_DISQUALIFIED;
             next.rollup_level = 'general';
             next.general_reason = next.general_reason || 'disqualified';
             next.bucket_reason = next.bucket_reason || 'Identity flagged disqualified';
-        } else if (next.is_generic && !next.primary_identity) {
+        } else if (!eff) {
+            // Identity below floor — Sonnet didn't trust the identity tag,
+            // so we have nothing to route on. Straight to General with a
+            // clear reason.
+            next.bucket_name = RESERVED_GENERAL;
+            next.rollup_level = 'general';
+            next.general_reason = next.general_reason || 'low_identity_confidence';
+            next.bucket_reason = `Identity confidence < ${TAG_CONF_FLOOR.toFixed(2)} — no trustworthy tag to route on`;
+        } else if (next.is_generic && !eff.primary_identity) {
             next.bucket_name = RESERVED_GENERAL;
             next.rollup_level = 'general';
             next.general_reason = next.general_reason || 'generic_low_confidence';
             next.bucket_reason = next.bucket_reason || 'Inviteable but insufficient classification evidence';
-        } else if (next.functional_specialization && next.sector_focus && next.sector_focus !== 'Multi-industry'
-            && (comboCounts.get(`${next.sector_focus} ${next.functional_specialization}`) || 0) >= minVolume) {
-            next.bucket_name = `${next.sector_focus} ${next.functional_specialization}`;
+        } else if (eff.functional_specialization && eff.sector_focus && eff.sector_focus !== 'Multi-industry'
+            && (comboCounts.get(`${eff.sector_focus} ${eff.functional_specialization}`) || 0) >= minVolume) {
+            next.bucket_name = `${eff.sector_focus} ${eff.functional_specialization}`;
             next.rollup_level = 'combo';
             next.general_reason = null;
-            next.bucket_reason = `Sector_focus + specialization combo cleared ${minVolume}-lead threshold`;
-        } else if (next.functional_specialization && next.sector_core && next.sector_core !== 'Multi-industry'
-            && (sectorCoreSpecCounts.get(`${next.sector_core} ${next.functional_specialization}`) || 0) >= minVolume) {
-            next.bucket_name = `${next.sector_core} ${next.functional_specialization}`;
+            next.bucket_reason = `Sector_focus + specialization combo cleared ${minVolume}-lead threshold${maskedSuffix}`;
+        } else if (eff.functional_specialization && eff.sector_core && eff.sector_core !== 'Multi-industry'
+            && (sectorCoreSpecCounts.get(`${eff.sector_core} ${eff.functional_specialization}`) || 0) >= minVolume) {
+            next.bucket_name = `${eff.sector_core} ${eff.functional_specialization}`;
             next.rollup_level = 'sector_core_specialization';
             next.general_reason = null;
-            next.bucket_reason = `Sector_core + specialization cleared threshold; sector_focus combination too small`;
-        } else if (next.functional_specialization && (specCounts.get(next.functional_specialization) || 0) >= minVolume) {
-            next.bucket_name = next.functional_specialization;
+            next.bucket_reason = `Sector_core + specialization cleared threshold; sector_focus combination too small${maskedSuffix}`;
+        } else if (eff.functional_specialization && (specCounts.get(eff.functional_specialization) || 0) >= minVolume) {
+            next.bucket_name = eff.functional_specialization;
             next.rollup_level = 'specialization';
             next.general_reason = null;
-            next.bucket_reason = `Specialization cleared threshold; sector combinations too small`;
-        } else if (next.functional_core && (fcCounts.get(next.functional_core) || 0) >= minVolume) {
-            next.bucket_name = next.functional_core;
+            next.bucket_reason = `Specialization cleared threshold; sector combinations too small${maskedSuffix}`;
+        } else if (eff.functional_core && (fcCounts.get(eff.functional_core) || 0) >= minVolume) {
+            next.bucket_name = eff.functional_core;
             next.rollup_level = 'functional_core';
             next.general_reason = null;
-            next.bucket_reason = `Rolled up to functional_core; specialization too small`;
-        } else if (next.primary_identity && (identityCounts.get(next.primary_identity) || 0) >= minVolume) {
-            next.bucket_name = next.primary_identity;
+            next.bucket_reason = `Rolled up to functional_core; specialization too small${maskedSuffix}`;
+        } else if (eff.primary_identity && (identityCounts.get(eff.primary_identity) || 0) >= minVolume) {
+            next.bucket_name = eff.primary_identity;
             next.rollup_level = 'identity';
             next.general_reason = null;
-            next.bucket_reason = `Rolled up to primary_identity; functional_core too small`;
+            next.bucket_reason = `Rolled up to primary_identity; functional_core too small${maskedSuffix}`;
         } else {
             next.bucket_name = RESERVED_GENERAL;
             next.rollup_level = 'general';
             next.general_reason = next.general_reason || 'rolled_up_to_general';
-            next.bucket_reason = next.bucket_reason || 'No layer cleared the volume threshold';
+            next.bucket_reason = next.bucket_reason || `No layer cleared the volume threshold${maskedSuffix}`;
         }
         return next;
     });
@@ -2005,6 +2166,9 @@ async function writeContactMapAndAssignments(
         rollup_level: row.rollup_level,
         source: row.source,
         confidence: row.confidence,
+        identity_confidence: row.identity_confidence ?? null,
+        characteristic_confidence: row.characteristic_confidence ?? null,
+        sector_confidence: row.sector_confidence ?? null,
         leaf_score: row.leaf_score,
         ancestor_score: row.ancestor_score,
         root_score: row.root_score,
@@ -2026,6 +2190,9 @@ async function writeContactMapAndAssignments(
         bucket_name: row.bucket_name,
         source: row.source,
         confidence: row.confidence,
+        identity_confidence: row.identity_confidence ?? null,
+        characteristic_confidence: row.characteristic_confidence ?? null,
+        sector_confidence: row.sector_confidence ?? null,
         bucket_leaf: row.functional_specialization || null,
         bucket_ancestor: row.primary_identity || null,
         bucket_root: row.primary_identity || null,
