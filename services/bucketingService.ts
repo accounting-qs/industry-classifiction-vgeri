@@ -343,7 +343,10 @@ async function fetchFullVocabulary(
 }
 
 const CONTACT_PAGE_SIZE = 2000;
-const ENRICHMENT_BATCH_SIZE = 500;
+// 200 UUIDs × ~37 chars ≈ 7,400-char URL — under PostgREST's 8KB request-line
+// cap. Same constraint that broke list deletion at 1,000 IDs. Don't raise
+// this without moving the IN list into a server-side RPC.
+const ENRICHMENT_BATCH_SIZE = 200;
 
 async function countSelectedContacts(
     supabase: SupabaseClient,
@@ -891,20 +894,47 @@ export async function runTaxonomyProposal(
         };
     });
 
-    const buckets: DiscoveredBucket[] = Array.from(usedCharByKey.values()).map(c => ({
-        functional_specialization: c.spec,
-        primary_identity: c.identity,
-        description: c.description,
-        identity_type: 'other',
-        operator_required: false,
-        priority_rank: 5,
-        include: [],
-        exclude: [],
-        example_strings: [],
-        strong_identity_signals: [],
-        weak_sector_signals: [],
-        disqualifying_signals: []
-    }));
+    const buckets: DiscoveredBucket[] = [];
+    const identitiesCovered = new Set<string>();
+    for (const c of usedCharByKey.values()) {
+        buckets.push({
+            functional_specialization: c.spec,
+            primary_identity: c.identity,
+            description: c.description,
+            identity_type: 'other',
+            operator_required: false,
+            priority_rank: 5,
+            include: [],
+            exclude: [],
+            example_strings: [],
+            strong_identity_signals: [],
+            weak_sector_signals: [],
+            disqualifying_signals: []
+        });
+        identitiesCovered.add(c.identity);
+    }
+    // For any identity tagged WITHOUT a characteristic (Sonnet was sure
+    // about the identity but not the subtype), synthesize an
+    // identity-as-spec bucket. Otherwise an identity-only run produces
+    // an empty buckets[] and Phase 1b refuses to start.
+    for (const ident of usedIdentitySet) {
+        if (identitiesCovered.has(ident)) continue;
+        const ent = snapshot.identities.find(i => i.name === ident);
+        buckets.push({
+            functional_specialization: ident,
+            primary_identity: ident,
+            description: ent?.description || '',
+            identity_type: 'other',
+            operator_required: false,
+            priority_rank: 5,
+            include: [],
+            exclude: [],
+            example_strings: [],
+            strong_identity_signals: [],
+            weak_sector_signals: [],
+            disqualifying_signals: []
+        });
+    }
 
     await supabase.from('bucketing_runs').update({
         taxonomy_proposal: {
@@ -975,10 +1005,14 @@ async function tagIndustriesWithSonnet(
     let totalOut = 0;
     let totalCachedIn = 0;
     let done = 0;
+    let batchesAttempted = 0;
+    let batchesFailed = 0;
+    let firstError: string | null = null;
     const taggings: IndustryTagging[] = [];
 
     await Promise.all(batches.map((batch) => limit(async () => {
         await ctx.checkCancel();
+        batchesAttempted++;
         const userPrompt = JSON.stringify({
             industries: batch.map((v, i) => ({
                 id: i,
@@ -1006,6 +1040,8 @@ async function tagIndustriesWithSonnet(
             const parsed = parseTaggingJson(text, batch);
             for (const t of parsed) taggings.push(t);
         } catch (err: any) {
+            batchesFailed++;
+            if (!firstError) firstError = err.message || String(err);
             ctx.log(`[Bucketing ${runId}] tagging batch error (${batch.length} industries): ${err.message}`, 'error');
             // Fail-open: emit needs_qa rows so we don't lose contacts.
             for (const v of batch) {
@@ -1041,6 +1077,19 @@ async function tagIndustriesWithSonnet(
             });
         }
     })));
+
+    // Catastrophic failure detection: if more than half of all batches
+    // failed, the run is producing garbage (almost certainly an
+    // Anthropic auth / rate-limit / network problem). Better to fail
+    // loud than ship a 100%-needs-qa "successful" run.
+    if (batchesAttempted > 0 && batchesFailed / batchesAttempted > 0.5) {
+        const pct = Math.round((batchesFailed / batchesAttempted) * 100);
+        throw new Error(
+            `Sonnet tagging failed for ${pct}% of batches (${batchesFailed}/${batchesAttempted}). ` +
+            `First error: ${firstError || 'unknown'}. Most likely causes: (1) Anthropic API key invalid or out of credit, ` +
+            `(2) rate limit hit, (3) network outage. Check the Connectors page and retry.`
+        );
+    }
 
     const costUsd = computeAnthropicCost(TAXONOMY_MODEL_ANTHROPIC, totalIn - totalCachedIn, totalOut)
         + (totalCachedIn / 1_000_000) * (ANTHROPIC_PRICING[TAXONOMY_MODEL_ANTHROPIC]?.input || 3) * 0.1; // cached at ~10%
@@ -1660,11 +1709,15 @@ export async function runAssignment(
     if (error || !run) throw new Error(`Run not found: ${error?.message}`);
 
     const final = (run.taxonomy_final || run.taxonomy_proposal) as DiscoveryOutput | null;
-    if (!final?.buckets || final.buckets.length === 0) {
-        throw new Error('No buckets defined for assignment');
+    // Empty buckets[] is a legitimate state when the entire selected
+    // list is unenriched / scrape-errored — every contact will route to
+    // Disqualified via the catchall in the rollup. Don't refuse the run
+    // just because there are no campaign buckets to fan out to.
+    const leaves = final?.buckets || [];
+    if (leaves.length === 0) {
+        ctx.log(`[Bucketing ${runId}] no proposal buckets — every contact will route to General/Disqualified per fallback rules`, 'warn');
     }
-    const leaves = final.buckets;
-    const sectorVocab: string[] = (final as any).sector_focus_vocabulary || [];
+    const sectorVocab: string[] = (final as any)?.sector_focus_vocabulary || [];
     const finalSpecNames = new Set(leaves.map(l => l.functional_specialization));
 
     // Library buckets the user opted into for this run. Only keep library
