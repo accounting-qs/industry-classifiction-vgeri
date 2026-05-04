@@ -1242,6 +1242,9 @@ CLASSIFICATION RULES (critical):
 - Classify by core business identity FIRST, sector served SECOND. A PE firm focused on healthcare is identity=Financial Services, NOT Healthcare.
 - Operators in a vertical (a hospital, a SaaS company) belong to that identity. Service providers TO that vertical (an agency that markets healthcare, a consultant to insurers) belong to the service identity, with the vertical going into sector_core+sector.
 - functional_core must be consistent with identity. sector_core must be consistent with sector when both are set.
+- **SERVICES vs PRODUCTS — do not collapse them**. Companies that *rent*, *maintain*, *repair*, or *operate-as-a-service* should NEVER be tagged "B2B Product Manufacturer" / "Industrial Equipment / Machinery" just because they're industrial-adjacent. If no services characteristic fits, prefer a Services / Field Services / Equipment Rental / Maintenance Services characteristic if one exists in the library — otherwise propose one (is_new_characteristic=true) rather than picking a wrong manufacturer label. Reserve Manufacturer characteristics for companies whose primary act is *making* a physical product.
+- **Talent / Artist Management is an Agency, not Consulting.** Don't tag artist management firms, modeling agencies, or sports management firms as Management Consulting.
+- **Game / Software studios are Software & SaaS (or a new Software identity), not Hospitality / Travel / Consumer Retail** — even if the games are sold to consumers. Use is_disqualified=true only if the company is unambiguously pure-consumer with no B2B angle.
 
 DISQUALIFICATION RULES (be CONSERVATIVE — false negatives are worse than false positives):
 - Set is_disqualified=true ONLY when the text gives clear, explicit evidence the company is a pure-consumer / hyper-local / low-ticket business with no plausible B2B angle. Examples:
@@ -2362,14 +2365,21 @@ function makeMatchedContactRow(
 }
 
 // Per-tag confidence floor below which we don't trust a tag to drive
-// routing. Sonnet returns 1-10, persisted as 0-1 — so 0.6 = "<6/10".
-const TAG_CONF_FLOOR = 0.6;
+// routing. Sonnet returns 1-10, persisted as 0-1 — so 0.4 = "<4/10".
+// Lowered from 0.6 → 0.4 because Sonnet's 5/10 confidence is "this is the
+// closest available option in the taxonomy", not "I'm wrong" — so we use
+// the tag and let the cascade roll up to the right level.
+const TAG_CONF_FLOOR = 0.4;
 
 // Build the "effective" routing view for a row by masking tags whose
 // per-tag confidence is below the floor. The original row keeps its
 // data for export / display; only the effective copy is used for
-// rollup counting and decisions. Returns null if even identity is
-// untrusted (whole row routes straight to General).
+// rollup counting and decisions.
+//
+// Cascade rule: when identity_confidence is low, we KEEP the identity but
+// mask spec / sector — the rollup will then try the identity-only bucket.
+// Only when primary_identity is genuinely empty does the row fall through
+// to General with REASON.LOW_VOLUME.
 function effectiveTags(row: ContactMapRow): {
     primary_identity: string;
     functional_core: string;
@@ -2377,27 +2387,40 @@ function effectiveTags(row: ContactMapRow): {
     sector_core: string;
     sector_focus: string;
     masked: string[];   // names of layers we suppressed, for bucket_reason
-} | null {
+} {
     const idLow = row.identity_confidence != null && row.identity_confidence < TAG_CONF_FLOOR;
     const chLow = row.characteristic_confidence != null && row.characteristic_confidence < TAG_CONF_FLOOR;
     const secLow = row.sector_confidence != null && row.sector_confidence < TAG_CONF_FLOOR;
-    if (idLow) return null;
     const masked: string[] = [];
     let fc = row.functional_core || '';
     let spec = row.functional_specialization || '';
     let sc = row.sector_core || '';
     let sf = row.sector_focus || '';
-    if (chLow) {
+    if (idLow) {
+        // Identity itself is shaky — drop everything below it so the
+        // cascade only attempts the identity-only bucket. functional_core
+        // and characteristic both lean on identity; sector is built on
+        // top of the company picture, so we drop it too.
         if (spec) masked.push('characteristic');
-        spec = '';
-        // functional_core is library-derived from characteristic — if we
-        // don't trust the characteristic, the core is also suspect.
-        fc = '';
-    }
-    if (secLow) {
         if (sf || sc) masked.push('sector');
+        masked.push('identity_low');
+        spec = '';
+        fc = '';
         sf = '';
         sc = '';
+    } else {
+        if (chLow) {
+            if (spec) masked.push('characteristic');
+            spec = '';
+            // functional_core is library-derived from characteristic — if we
+            // don't trust the characteristic, the core is also suspect.
+            fc = '';
+        }
+        if (secLow) {
+            if (sf || sc) masked.push('sector');
+            sf = '';
+            sc = '';
+        }
     }
     return {
         primary_identity: row.primary_identity || '',
@@ -2423,7 +2446,6 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
         const row = rows[i];
         if (row.is_generic || row.is_disqualified) continue;
         const eff = effective[i];
-        if (!eff) continue;  // identity below floor — won't earn a bucket
         if (eff.functional_specialization) {
             specCounts.set(eff.functional_specialization, (specCounts.get(eff.functional_specialization) || 0) + 1);
             if (eff.sector_focus && eff.sector_focus !== 'Multi-industry') {
@@ -2447,7 +2469,7 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
         const next = { ...row };
         next.pre_rollup_bucket_name = preRollupName(next);
         const eff = effective[i];
-        const maskedSuffix = eff && eff.masked.length > 0
+        const maskedSuffix = eff.masked.length > 0
             ? ` (low-confidence ${eff.masked.join(' + ')} masked)` : '';
 
         if (next.is_disqualified) {
@@ -2455,13 +2477,6 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
             next.rollup_level = 'general';
             next.general_reason = next.general_reason || REASON.DISQUALIFIED_BY_LLM;
             next.bucket_reason = next.bucket_reason || 'Disqualified — Sonnet flagged with high identity confidence';
-        } else if (!eff) {
-            // Identity confidence below floor → Sonnet didn't trust ANY tag.
-            // Send straight to General with a precise reason code.
-            next.bucket_name = RESERVED_GENERAL;
-            next.rollup_level = 'general';
-            next.general_reason = REASON.LOW_IDENTITY_CONFIDENCE;
-            next.bucket_reason = `Identity confidence < ${TAG_CONF_FLOOR.toFixed(2)} — no trustworthy tag to route on`;
         } else if (next.is_generic && !eff.primary_identity) {
             next.bucket_name = RESERVED_GENERAL;
             next.rollup_level = 'general';
@@ -3229,6 +3244,14 @@ Rules:
 - Operator specializations require explicit operator evidence.
 - Disqualify only clear ecommerce/DTC physical, local geo-tied services,
   brick-and-mortar retail, or low-ticket consumer.
+- SERVICES vs PRODUCTS — never tag a company that rents/maintains/repairs/
+  operates-as-a-service as "B2B Product Manufacturer" or any product
+  manufacturer specialization. If no services-side specialization fits,
+  prefer the identity-only fallback (return primary_identity, leave
+  functional_specialization "") rather than picking a wrong product label.
+- Talent / artist / sports management firms are Agency, not Consulting.
+- Game / software studios are Software & SaaS, not Hospitality / Travel /
+  Consumer Retail — only DQ if unambiguously pure-consumer, no B2B angle.
 - Scores are alignment scores, not probabilities. Use >=0.40 for a reasonable
   identity/specialization fit, >=0.70 for strong fit.
 - Reasons: max 18 words each and cite the contact fields.
