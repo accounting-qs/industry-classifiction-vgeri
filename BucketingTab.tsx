@@ -1945,7 +1945,7 @@ function Phase1aQAQueuePanel({ runId, onError }: { runId: string; onError: (m: s
               {queue.map((q, i) => (
                 <tr key={i} className="hover:bg-white/[0.02]">
                   <td className="px-4 py-2 text-gray-200 max-w-md truncate" title={q.industry_string}>{q.industry_string}</td>
-                  <td className="px-4 py-2 text-gray-400">{q.identity || '—'}</td>
+                  <td className="px-4 py-2 text-gray-400">{q.primary_identity || '—'}</td>
                   <td className="px-4 py-2 text-gray-400">{q.characteristic || '—'}</td>
                   <td className="px-4 py-2 text-gray-400">{q.sector || '—'}</td>
                   <td className="px-4 py-2 text-right text-amber-400 font-mono">{q.confidence != null ? Number(q.confidence).toFixed(2) : '—'}</td>

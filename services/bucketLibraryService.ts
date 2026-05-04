@@ -1,23 +1,21 @@
 /**
- * Bucket Library — reusable specialization definitions across runs.
+ * Bucket Library — reusable characteristic definitions across runs.
  *
- * The library persists proven (primary_identity, functional_specialization)
- * pairs and seeds future runs with them. The discovery LLM is asked to reuse
- * library specs verbatim at high alignment, AND Phase 1b matches against the
- * library deterministically before LLM matching, so saved knowledge wins.
+ * The library persists proven (primary_identity, characteristic) pairs and
+ * seeds future runs with them. Phase 1b matches contacts against the library
+ * deterministically before LLM matching, so saved knowledge wins.
  *
- * v2.3: rows now carry primary_identity + functional_specialization. The old
- * bucket_name / direct_ancestor / root_category columns stay for read-side
- * backward compat; new writes populate both old and new fields.
+ * v5: bucket_library.functional_specialization was dropped — bucket_name now
+ * holds the characteristic name. Inputs accept the new `characteristic` key
+ * as well as the legacy `bucket_name` alias.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 export interface LibraryBucket {
     id: string;
-    bucket_name: string;                         // == functional_specialization (kept for back-compat)
+    bucket_name: string;                         // holds the characteristic name
     primary_identity: string | null;
-    functional_specialization: string | null;
     description: string | null;
     direct_ancestor: string | null;              // legacy mirror of primary_identity
     root_category: string | null;                // legacy
@@ -34,8 +32,8 @@ export interface LibraryBucket {
 
 export interface LibraryBucketInput {
     primary_identity?: string;                   // preferred
-    functional_specialization?: string;          // preferred
-    bucket_name?: string;                        // legacy alias for functional_specialization
+    characteristic?: string;                     // preferred (v5)
+    bucket_name?: string;                        // legacy alias for characteristic
     direct_ancestor?: string;                    // legacy alias for primary_identity
     root_category?: string;                      // legacy
     description?: string;
@@ -60,15 +58,14 @@ export async function upsertLibraryBucket(
     supabase: SupabaseClient,
     input: LibraryBucketInput
 ): Promise<LibraryBucket> {
-    const spec = (input.functional_specialization || input.bucket_name || '').trim();
+    const spec = (input.characteristic || input.bucket_name || '').trim();
     const ident = (input.primary_identity || input.direct_ancestor || '').trim();
-    if (!spec) throw new Error('functional_specialization (or bucket_name) is required');
+    if (!spec) throw new Error('characteristic (or bucket_name) is required');
 
     const payload = {
-        bucket_name: spec,                       // legacy mirror
-        functional_specialization: spec,
+        bucket_name: spec,
         primary_identity: ident || null,
-        direct_ancestor: ident || null,          // legacy mirror
+        direct_ancestor: ident || null,          // legacy mirror, kept until v6
         root_category: input.root_category?.trim() || null,
         description: input.description?.trim() || null,
         include_terms: input.include_terms || [],
@@ -143,7 +140,7 @@ export async function bulkImportLibraryFromText(
 
         try {
             await upsertLibraryBucket(supabase, {
-                functional_specialization: spec,
+                characteristic: spec,
                 primary_identity: ident,
                 description: desc
             });
@@ -173,16 +170,16 @@ export async function saveRunBucketsToLibrary(
 
     const wanted = new Set(specNames.map(s => s.trim()));
     const selected = (final.buckets as any[]).filter(b => {
-        const spec = b.functional_specialization || b.bucket_name;
+        const spec = b.characteristic || b.bucket_name;
         return spec && wanted.has(spec);
     });
-    const matched = new Set(selected.map(b => (b.functional_specialization || b.bucket_name).trim()));
+    const matched = new Set(selected.map(b => (b.characteristic || b.bucket_name).trim()));
     const skipped = specNames.filter(n => !matched.has(n.trim()));
 
     let saved = 0;
     for (const b of selected) {
         await upsertLibraryBucket(supabase, {
-            functional_specialization: b.functional_specialization || b.bucket_name,
+            characteristic: b.characteristic || b.bucket_name,
             primary_identity: b.primary_identity || b.direct_ancestor,
             description: b.description,
             include_terms: b.include || b.include_terms || [],

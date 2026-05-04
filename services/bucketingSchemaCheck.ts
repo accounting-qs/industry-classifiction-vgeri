@@ -16,25 +16,23 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 const REQUIRED_SCHEMA: Record<string, string[]> = {
-    // Per-industry tagging output (Phase 1a writes here).
+    // Per-industry tagging output (Phase 1a writes here). v5: drops
+    // identity / functional_specialization / sector_focus / functional_core /
+    // sector_core. primary_identity is now the canonical identity column.
     bucket_industry_map: [
         'bucketing_run_id', 'industry_string', 'bucket_name', 'source', 'confidence',
-        'identity', 'characteristic', 'sector',
-        'functional_core', 'sector_core',
+        'primary_identity', 'characteristic', 'sector',
         'is_new_identity', 'is_new_characteristic', 'is_new_sector',
-        'is_new_functional_core', 'is_new_sector_core',
         'is_disqualified', 'is_generic',
         'needs_qa', 'raw_industry', 'llm_reason',
         'canonical_classification',
         'identity_confidence', 'characteristic_confidence', 'sector_confidence',
-        'primary_identity', 'functional_specialization', 'sector_focus',
     ],
     // Final per-contact assignments (Phase 1b writes here).
     bucket_assignments: [
         'bucketing_run_id', 'contact_id', 'bucket_name', 'source', 'confidence',
         'bucket_leaf', 'bucket_ancestor', 'bucket_root',
-        'primary_identity', 'functional_specialization', 'sector_focus',
-        'functional_core', 'sector_core',
+        'primary_identity', 'characteristic', 'sector',
         'pre_rollup_bucket_name', 'rollup_level',
         'general_reason', 'reasons',
         'is_generic', 'is_disqualified',
@@ -45,8 +43,7 @@ const REQUIRED_SCHEMA: Record<string, string[]> = {
     // Per-contact pre-rollup decisions (Phase 1b writes here).
     bucket_contact_map: [
         'bucketing_run_id', 'contact_id', 'industry_string',
-        'primary_identity', 'functional_specialization', 'sector_focus',
-        'functional_core', 'sector_core',
+        'primary_identity', 'characteristic', 'sector',
         'pre_rollup_bucket_name', 'bucket_name', 'rollup_level',
         'source', 'confidence',
         'leaf_score', 'ancestor_score', 'root_score',
@@ -69,10 +66,11 @@ const REQUIRED_SCHEMA: Record<string, string[]> = {
         'generic_audit',
         'apply_identity_dq_cascade',
     ],
-    // Editable taxonomy library (read by Phase 1a).
+    // Editable taxonomy library (read by Phase 1a). v5: dropped functional_core
+    // from characteristics, sector_core from sectors.
     taxonomy_identities: ['id', 'name', 'description', 'is_disqualified', 'created_by', 'archived'],
-    taxonomy_characteristics: ['id', 'name', 'parent_identity', 'description', 'created_by', 'archived', 'functional_core'],
-    taxonomy_sectors: ['id', 'name', 'synonyms', 'description', 'created_by', 'archived', 'sector_core'],
+    taxonomy_characteristics: ['id', 'name', 'parent_identity', 'description', 'created_by', 'archived'],
+    taxonomy_sectors: ['id', 'name', 'synonyms', 'description', 'created_by', 'archived'],
     bucketing_run_logs: ['id', 'bucketing_run_id', 'timestamp', 'level', 'message'],
 };
 

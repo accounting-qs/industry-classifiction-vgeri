@@ -2525,7 +2525,7 @@ app.get('/api/bucketing/runs/:id/proposed-tags', async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('bucket_industry_map')
-            .select('identity,is_new_identity,characteristic,is_new_characteristic,sector,is_new_sector,industry_string,confidence,llm_reason')
+            .select('primary_identity,is_new_identity,characteristic,is_new_characteristic,sector,is_new_sector,industry_string,confidence,llm_reason')
             .eq('bucketing_run_id', req.params.id)
             .or('is_new_identity.eq.true,is_new_characteristic.eq.true,is_new_sector.eq.true');
         if (error) return res.status(500).json({ error: error.message });
@@ -2534,14 +2534,14 @@ app.get('/api/bucketing/runs/:id/proposed-tags', async (req, res) => {
         const chars = new Map<string, { name: string; parent: string | null; samples: string[]; count: number }>();
         const secs = new Map<string, { name: string; samples: string[]; count: number }>();
         for (const r of (data || []) as any[]) {
-            if (r.is_new_identity && r.identity) {
-                const e = ids.get(r.identity) || { name: r.identity, samples: [], count: 0 };
+            if (r.is_new_identity && r.primary_identity) {
+                const e = ids.get(r.primary_identity) || { name: r.primary_identity, samples: [], count: 0 };
                 e.count++;
                 if (e.samples.length < 5) e.samples.push(r.industry_string);
-                ids.set(r.identity, e);
+                ids.set(r.primary_identity, e);
             }
             if (r.is_new_characteristic && r.characteristic) {
-                const e = chars.get(r.characteristic) || { name: r.characteristic, parent: r.identity || null, samples: [], count: 0 };
+                const e = chars.get(r.characteristic) || { name: r.characteristic, parent: r.primary_identity || null, samples: [], count: 0 };
                 e.count++;
                 if (e.samples.length < 5) e.samples.push(r.industry_string);
                 chars.set(r.characteristic, e);
@@ -2569,7 +2569,7 @@ app.get('/api/bucketing/runs/:id/qa-queue', async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('bucket_industry_map')
-            .select('industry_string,identity,characteristic,sector,confidence,llm_reason,is_disqualified,bucket_name')
+            .select('industry_string,primary_identity,characteristic,sector,confidence,llm_reason,is_disqualified,bucket_name')
             .eq('bucketing_run_id', req.params.id)
             .eq('needs_qa', true)
             .order('confidence', { ascending: true })

@@ -970,12 +970,12 @@ export async function runTaxonomyProposal(
     const usedCharByKey = new Map<string, { spec: string; identity: string; description: string }>();
     const usedSectors = new Set<string>();
     for (const r of finalRows) {
-        if (r.identity) usedIdentitySet.add(r.identity);
-        if (r.characteristic && r.identity) {
-            const key = `${r.identity}::${r.characteristic}`;
+        if (r.primary_identity) usedIdentitySet.add(r.primary_identity);
+        if (r.characteristic && r.primary_identity) {
+            const key = `${r.primary_identity}::${r.characteristic}`;
             if (!usedCharByKey.has(key)) {
                 const charDesc = snapshot.characteristics.find(c => c.name === r.characteristic)?.description || '';
-                usedCharByKey.set(key, { spec: r.characteristic, identity: r.identity, description: charDesc });
+                usedCharByKey.set(key, { spec: r.characteristic, identity: r.primary_identity, description: charDesc });
             }
         }
         if (r.sector) usedSectors.add(r.sector);
