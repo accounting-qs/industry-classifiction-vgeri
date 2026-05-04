@@ -320,7 +320,19 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
   const [selectedLists, setSelectedLists] = useState<Set<string>>(new Set());
   const [minVolume, setMinVolume] = useState(1000);
   const [bucketBudget, setBucketBudget] = useState(30);
+  // Default ON — pre-select every non-archived library bucket. Phase 1b's
+  // library_first match short-circuits the LLM for any contact whose
+  // industry maps to one of these buckets, so consistent-by-default is the
+  // right call on a curated library. The user can untick individual ones
+  // (e.g. campaign-specific buckets that don't fit this run).
   const [selectedLib, setSelectedLib] = useState<Set<string>>(new Set());
+  const libInitialized = useRef(false);
+  useEffect(() => {
+    if (libInitialized.current) return;
+    if (!Array.isArray(library) || library.length === 0) return;
+    setSelectedLib(new Set(library.filter(b => !b.archived).map(b => b.id)));
+    libInitialized.current = true;
+  }, [library]);
   const [showLib, setShowLib] = useState(false);
   // Default OFF — trust Sonnet's per-row is_disqualified decision instead of
   // auto-DQ'ing every contact whose identity is library-flagged [DQ].
@@ -439,13 +451,33 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
       </div>
 
       <div>
-        <button
-          onClick={() => setShowLib(s => !s)}
-          className="text-[11px] text-gray-400 hover:text-white flex items-center gap-1"
-        >
-          <BookMarked className="w-3 h-3" />
-          {showLib ? 'Hide' : 'Reuse'} library buckets ({selectedLib.size}/{library.length} selected)
-        </button>
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <button
+            onClick={() => setShowLib(s => !s)}
+            className="text-[11px] text-gray-400 hover:text-white flex items-center gap-1"
+          >
+            <BookMarked className="w-3 h-3" />
+            {showLib ? 'Hide' : 'Reuse'} library buckets ({selectedLib.size}/{library.length} selected)
+          </button>
+          {library.length > 0 && (
+            <div className="flex gap-1">
+              <button
+                onClick={() => setSelectedLib(new Set(library.filter(b => !b.archived).map(b => b.id)))}
+                className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-200 hover:bg-[#3e3e3e]"
+                title="Re-select every non-archived library bucket"
+              >
+                Select all
+              </button>
+              <button
+                onClick={() => setSelectedLib(new Set())}
+                disabled={selectedLib.size === 0}
+                className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-200 hover:bg-[#3e3e3e] disabled:opacity-40"
+              >
+                Select none
+              </button>
+            </div>
+          )}
+        </div>
         {showLib && (
           <div className="mt-2 border border-[#2e2e2e] rounded max-h-48 overflow-y-auto custom-scrollbar">
             {library.length === 0 ? (
