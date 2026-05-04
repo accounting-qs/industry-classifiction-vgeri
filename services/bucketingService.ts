@@ -30,6 +30,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import pLimit from 'p-limit';
 import Anthropic from '@anthropic-ai/sdk';
 import { getSetting } from './appSettings';
+import { checkBucketingSchema } from './bucketingSchemaCheck';
 
 // ─── HARD-CODED MODEL + CONCURRENCY CONFIG ─────────────────────────
 // Per user request: no env reliance for non-secret config. Only the
@@ -550,6 +551,15 @@ export async function runTaxonomyProposal(
 ): Promise<void> {
     ctx.log(`[Bucketing ${runId}] Phase 1a: tag-based classification`, 'phase');
     ctx.progress({ phase: 'phase1a', step: 'load_vocabulary', note: 'Loading vocabulary from selected lists…' });
+
+    // Pre-flight schema check — fails fast with a precise list of
+    // missing tables/columns/RPCs instead of letting the run get half-
+    // way through Sonnet calls and crash on a column write.
+    const schemaRes = await checkBucketingSchema(supabase);
+    if (!schemaRes.ok) {
+        ctx.log(`[Bucketing ${runId}] schema check failed:\n${schemaRes.summary}`, 'error');
+        throw new Error(schemaRes.summary);
+    }
 
     const { data: run, error: runErr } = await supabase
         .from('bucketing_runs').select('*').eq('id', runId).single();
@@ -1557,6 +1567,14 @@ export async function runAssignment(
     runId: string,
     ctx: BucketingCtx
 ): Promise<void> {
+    // Same pre-flight as Phase 1a — covers cases where the user retries
+    // assignment after a schema migration ran mid-cycle. Cheap probe.
+    const schemaRes = await checkBucketingSchema(supabase);
+    if (!schemaRes.ok) {
+        ctx.log(`[Bucketing ${runId}] schema check failed:\n${schemaRes.summary}`, 'error');
+        throw new Error(schemaRes.summary);
+    }
+
     const { data: run, error } = await supabase.from('bucketing_runs').select('*').eq('id', runId).single();
     if (error || !run) throw new Error(`Run not found: ${error?.message}`);
 

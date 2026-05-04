@@ -767,7 +767,9 @@ function BucketingDetail({ run, bucketCounts, sectorMix, generalBreakdown, onRef
         <p className="text-sm font-bold text-red-400 flex items-center gap-2">
           <AlertCircle className="w-4 h-4" /> Run failed
         </p>
-        <p className="text-xs text-gray-400 mt-2">{run.error_message || 'Unknown error.'}</p>
+        <pre className="text-xs text-gray-400 mt-2 whitespace-pre-wrap font-sans">
+          {run.error_message || 'Unknown error.'}
+        </pre>
       </div>
     );
   }
