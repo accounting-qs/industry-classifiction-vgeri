@@ -72,6 +72,13 @@ export class JobProcessor {
     // the loop is live and advancing, vs. merely idle.
     private static loopTick = 0;
     private static lastTickAt = Date.now();
+    // Postgres 57014 (statement_timeout) on the chunk-claim query keeps
+    // hitting the same code path. Without this counter the loop's catch
+    // would just sleep 5s and re-fire the same failing query forever, with
+    // no escalation and no log signal beyond a flat repeating error line.
+    // Once we hit the threshold we throw to the watchdog so its exponential
+    // backoff (5/10/20/40/80s) kicks in instead.
+    private static consecutiveStmtTimeouts = 0;
 
     // Per-list progress tracker: keyed by lead_list_name. `baseline` is the
     // completed+failed count at the moment we first saw this list in the
@@ -342,8 +349,27 @@ export class JobProcessor {
                 if (typeof global.gc === 'function') {
                     global.gc();
                 }
+
+                // Tick completed without throwing — reset the timeout counter.
+                this.consecutiveStmtTimeouts = 0;
             } catch (err: any) {
-                this.log('❌ JobProcessor Loop Error: ' + err.message, 'error');
+                const isStmtTimeout = err?.code === '57014'
+                    || /statement timeout|canceling statement/i.test(err?.message || '');
+
+                if (isStmtTimeout) {
+                    this.consecutiveStmtTimeouts++;
+                    const consec = this.consecutiveStmtTimeouts;
+                    this.log(`❌ JobProcessor Loop Error: ${err.message} (code 57014, consecutive=${consec})`, 'error');
+
+                    if (consec >= 5) {
+                        this.consecutiveStmtTimeouts = 0;
+                        throw new Error(`Statement timeout repeated ${consec}× — escalating to watchdog for backoff.`);
+                    }
+                } else {
+                    this.consecutiveStmtTimeouts = 0;
+                    this.log('❌ JobProcessor Loop Error: ' + err.message, 'error');
+                }
+
                 await new Promise(r => setTimeout(r, 5000)); // Backoff on unhandled error
             }
         }
