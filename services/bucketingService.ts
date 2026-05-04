@@ -1672,6 +1672,7 @@ interface TaxonomyEdits {
     }[];
     min_volume?: number;
     bucket_budget?: number;
+    preferred_library_ids?: string[];             // moved from Setup screen — see review screen
 }
 
 export async function applyTaxonomyEdits(
@@ -1734,6 +1735,9 @@ export async function applyTaxonomyEdits(
     }
     if (typeof edits.bucket_budget === 'number' && edits.bucket_budget > 0) {
         update.bucket_budget = Math.floor(edits.bucket_budget);
+    }
+    if (Array.isArray(edits.preferred_library_ids)) {
+        update.preferred_library_ids = edits.preferred_library_ids;
     }
     await supabase.from('bucketing_runs').update(update).eq('id', runId);
     ctx.log(`[Bucketing ${runId}] taxonomy edits applied: ${leaves.length} specializations`);

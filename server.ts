@@ -1776,9 +1776,13 @@ function buildBucketingCtx(runId: string) {
     };
 }
 
-// Create a new run + fire taxonomy proposal in the background.
+// Create a new run + fire taxonomy proposal in the background. min_volume,
+// bucket_budget, and preferred_library_ids are now collected on the Phase 1b
+// review screen (after Sonnet has proposed a taxonomy), so /determine only
+// needs the bare minimum. The DB column defaults seed the row; the user
+// finalises the values via PATCH /taxonomy before clicking Apply & Assign.
 app.post('/api/bucketing/determine', async (req, res) => {
-    const { name, list_names, min_volume, bucket_budget, preferred_library_ids, apply_identity_dq_cascade } = req.body || {};
+    const { name, list_names, apply_identity_dq_cascade } = req.body || {};
     if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name is required' });
     if (!Array.isArray(list_names) || list_names.length === 0) {
         return res.status(400).json({ error: 'list_names must be a non-empty array' });
@@ -1788,9 +1792,6 @@ app.post('/api/bucketing/determine', async (req, res) => {
         const { data, error } = await supabase.from('bucketing_runs').insert({
             name: name.trim(),
             list_names,
-            min_volume: typeof min_volume === 'number' && min_volume >= 0 ? Math.floor(min_volume) : 50,
-            bucket_budget: typeof bucket_budget === 'number' && bucket_budget > 0 ? Math.floor(bucket_budget) : 30,
-            preferred_library_ids: Array.isArray(preferred_library_ids) ? preferred_library_ids : [],
             apply_identity_dq_cascade: !!apply_identity_dq_cascade,
             status: 'taxonomy_pending'
         }).select().single();
@@ -1869,12 +1870,13 @@ app.get('/api/bucketing/runs/:id', async (req, res) => {
     }
 });
 
-// Apply user edits (rename / drop / add / threshold / bucket_budget) to the proposed taxonomy.
+// Apply user edits (rename / drop / add / threshold / bucket_budget /
+// preferred_library_ids) to the proposed taxonomy.
 app.patch('/api/bucketing/runs/:id/taxonomy', async (req, res) => {
     const id = req.params.id;
-    const { keep, rename, add, min_volume, bucket_budget } = req.body || {};
+    const { keep, rename, add, min_volume, bucket_budget, preferred_library_ids } = req.body || {};
     try {
-        await applyTaxonomyEdits(supabase, id, { keep, rename, add, min_volume, bucket_budget }, buildBucketingCtx(id));
+        await applyTaxonomyEdits(supabase, id, { keep, rename, add, min_volume, bucket_budget, preferred_library_ids }, buildBucketingCtx(id));
         const { data: run } = await supabase
             .from('bucketing_runs').select('*').eq('id', id).single();
         const { data: counts } = await supabase
