@@ -1699,6 +1699,27 @@ const bucketingLog = (msg: string, level: 'info' | 'warn' | 'error' = 'info') =>
 // live logs and progress. Logs are persisted to bucketing_run_logs and
 // also relayed to the global pipeline_logs stream. Progress writes are
 // throttled (one DB write per ~700ms) so tight loops don't spam Supabase.
+// Purge partial bucketing data when a run is cancelled or fails. Without
+// this, the bucket_industry_map / bucket_contact_map / bucket_assignments
+// tables accumulate orphaned rows from cancelled runs. The cascade FK on
+// bucketing_runs(id) only fires if the run row itself is deleted, but we
+// keep the run row for history — so we delete the data tables explicitly.
+//
+// keepPhase1a=true (used when assignment fails / cancels but the
+// taxonomy is still valid) preserves bucket_industry_map so a Resume
+// doesn't have to re-tag. Default: wipe everything.
+async function purgeBucketingRunData(runId: string, opts: { keepPhase1a?: boolean } = {}): Promise<void> {
+    try {
+        await supabase.from('bucket_assignments').delete().eq('bucketing_run_id', runId);
+        await supabase.from('bucket_contact_map').delete().eq('bucketing_run_id', runId);
+        if (!opts.keepPhase1a) {
+            await supabase.from('bucket_industry_map').delete().eq('bucketing_run_id', runId);
+        }
+    } catch (err: any) {
+        console.warn(`[Bucketing] purge for run ${runId} failed (non-fatal): ${err.message}`);
+    }
+}
+
 function buildBucketingCtx(runId: string) {
     let lastWrite = 0;
     let pending: any = null;
@@ -1785,6 +1806,9 @@ app.post('/api/bucketing/determine', async (req, res) => {
                 cancel_requested: false,
                 error_message: cancelled ? 'Cancelled by user' : (err.message?.slice(0, 1000) || String(err))
             }).eq('id', data.id);
+            // Purge partial Phase 1a state on cancel/failure so a Resume
+            // starts clean and no orphan rows accumulate in the DB.
+            await purgeBucketingRunData(data.id);
         });
 
         res.status(202).json(data);
@@ -1901,6 +1925,10 @@ app.post('/api/bucketing/runs/:id/assign', async (req, res) => {
                 cancel_requested: false,
                 error_message: cancelled ? 'Cancelled by user' : (err.message?.slice(0, 1000) || String(err))
             }).eq('id', id);
+            // Purge partial Phase 1b state. The taxonomy_proposal /
+            // bucket_industry_map are Phase 1a artefacts and stay so the
+            // user can re-launch assignment without re-tagging.
+            await purgeBucketingRunData(id, { keepPhase1a: true });
         });
 
         res.status(202).json({ ok: true, id });

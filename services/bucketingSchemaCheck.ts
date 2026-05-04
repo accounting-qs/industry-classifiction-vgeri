@@ -103,36 +103,56 @@ export interface SchemaCheckResult {
  * Runs the full pre-flight check. Returns ok=true when every table,
  * column, and RPC the bucketing pipeline depends on is live in the
  * Supabase schema cache.
+ *
+ * Fast path: a single call to the bucketing_schema_gaps RPC returns
+ * every missing (table, column) in one round-trip. Falls back to the
+ * legacy per-column probe loop if the RPC itself is missing — handles
+ * the bootstrap case where 20260505_bucketing_schema_gaps.sql hasn't
+ * been applied yet.
  */
 export async function checkBucketingSchema(supabase: SupabaseClient): Promise<SchemaCheckResult> {
     const gaps: SchemaGap[] = [];
 
-    for (const [table, columns] of Object.entries(REQUIRED_SCHEMA)) {
-        // Probe table existence first — any subsequent column probe fails
-        // with the same message anyway, so save the round-trips.
-        const { error: tableErr } = await supabase.from(table).select('*').limit(0);
-        if (tableErr && /schema cache|does not exist/i.test(tableErr.message)) {
-            gaps.push({ table, columns, note: `Table "${table}" not found in schema cache` });
-            continue;
-        }
+    // Fast path: ask the DB directly.
+    const { data: gapRows, error: gapErr } = await supabase.rpc('bucketing_schema_gaps');
+    const fastPathAvailable = !gapErr || !/function .* does not exist|not find the function/i.test(gapErr.message || '');
 
-        const missing: string[] = [];
-        for (const col of columns) {
-            const { error } = await supabase.from(table).select(col).limit(1);
-            if (error && /column .* does not exist|not find the .* column/i.test(error.message)) {
-                missing.push(col);
-            }
+    if (fastPathAvailable && !gapErr) {
+        // Group missing columns by table so the error message stays short.
+        const byTable = new Map<string, string[]>();
+        for (const r of (gapRows || []) as { table_name: string; column_name: string }[]) {
+            if (!byTable.has(r.table_name)) byTable.set(r.table_name, []);
+            byTable.get(r.table_name)!.push(r.column_name);
         }
-        if (missing.length > 0) {
-            gaps.push({ table, columns: missing, note: `Missing columns on ${table}` });
+        for (const [table, columns] of byTable.entries()) {
+            gaps.push({ table, columns, note: `Missing columns on ${table}` });
+        }
+    } else {
+        // Slow fallback — replicates the old behaviour for environments
+        // that haven't had 20260505 applied yet. Up to ~10s of round-trips.
+        for (const [table, columns] of Object.entries(REQUIRED_SCHEMA)) {
+            const { error: tableErr } = await supabase.from(table).select('*').limit(0);
+            if (tableErr && /schema cache|does not exist/i.test(tableErr.message)) {
+                gaps.push({ table, columns, note: `Table "${table}" not found in schema cache` });
+                continue;
+            }
+            const missing: string[] = [];
+            for (const col of columns) {
+                const { error } = await supabase.from(table).select(col).limit(1);
+                if (error && /column .* does not exist|not find the .* column/i.test(error.message)) {
+                    missing.push(col);
+                }
+            }
+            if (missing.length > 0) {
+                gaps.push({ table, columns: missing, note: `Missing columns on ${table}` });
+            }
         }
     }
 
+    // RPC presence check — kept unconditional; cheap and verifies
+    // bucketing_schema_gaps itself + the read-side RPCs.
     for (const rpc of REQUIRED_RPCS) {
         const { error } = await supabase.rpc(rpc.name, rpc.args);
-        // "function does not exist" / "Could not find the function" means
-        // the RPC isn't registered. Anything else (e.g. "run not found",
-        // "no rows", or success) means the function is live.
         if (error && /function .* does not exist|not find the function/i.test(error.message)) {
             gaps.push({ rpc: rpc.name, note: `RPC "${rpc.name}" not found` });
         }

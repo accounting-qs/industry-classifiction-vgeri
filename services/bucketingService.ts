@@ -76,6 +76,37 @@ const EMBEDDING_PRICE_PER_1M = 0.02;
 const RESERVED_GENERAL = 'General';
 const RESERVED_DISQUALIFIED = 'Disqualified';
 
+// Canonical reason codes for routing decisions. Persist these strings on
+// bucket_assignments / bucket_contact_map.general_reason so a campaign
+// operator can filter "show me everyone who landed in General because the
+// volume rollup couldn't find a layer over the threshold" without
+// regex-matching free text. The bucket_reason column still gets a
+// human-readable sentence; general_reason gets the code.
+export const REASON = {
+    // Routed into a real campaign bucket — five rollup levels:
+    COMBO_THRESHOLD_MET: 'combo_threshold_met',
+    SECTOR_CORE_SPEC_THRESHOLD_MET: 'sector_core_spec_threshold_met',
+    SPECIALIZATION_THRESHOLD_MET: 'specialization_threshold_met',
+    FUNCTIONAL_CORE_THRESHOLD_MET: 'functional_core_threshold_met',
+    IDENTITY_THRESHOLD_MET: 'identity_threshold_met',
+    // Generic Audit moved row out of General into a live bucket.
+    GENERIC_AUDIT_RECLAIMED: 'generic_audit_reclaimed',
+    // Routed to General:
+    LOW_VOLUME: 'no_layer_cleared_threshold',
+    BUDGET_ROLLUP: 'bucket_budget_rollup',
+    LOW_IDENTITY_CONFIDENCE: 'low_identity_confidence',
+    LOW_OVERALL_CONFIDENCE: 'low_overall_confidence',
+    NO_BUCKETS_DEFINED: 'no_buckets_defined',
+    UNCLASSIFIABLE_INVITEABLE: 'unclassifiable_inviteable',
+    // Routed to Disqualified:
+    DISQUALIFIED_BY_LLM: 'disqualified_by_llm',
+    DISQUALIFIED_BY_IDENTITY_CASCADE: 'disqualified_by_identity_cascade',
+    FAILED_ENRICHMENT: 'failed_enrichment',
+    MISSING_INDUSTRY: 'missing_industry',
+    SCRAPE_SITE_UNKNOWN: 'scrape_site_unknown',
+} as const;
+export type ReasonCode = typeof REASON[keyof typeof REASON];
+
 // Live progress + log surface used by the Bucketing UI. Server.ts builds
 // one of these per run and passes it through the entry points; every step
 // in Phase 1a / Phase 1b reports to it. log() persists to bucketing_run_logs;
@@ -107,6 +138,11 @@ const RESERVED = new Set([
 // Confidence floor — Sonnet returns 1-10, anything below this routes the
 // industry to General with needs_qa=true so the user can review post-run.
 const PHASE1A_QA_FLOOR = 6;
+// Disqualification requires HIGH identity confidence (>= 7/10). Soft DQ
+// rule: when in doubt, route to General — never auto-DQ on uncertain
+// identity. A "Consumer & Retail" tag at confidence 5 is too risky to
+// silently exclude from outreach.
+const PHASE1A_DQ_FLOOR = 7;
 const PHASE1A_BATCH_SIZE = 8;
 const PHASE1A_CONCURRENCY = 40;
 
@@ -360,24 +396,91 @@ async function countSelectedContacts(
     return count || 0;
 }
 
-// Keyset pagination + decoupled enrichments fetch.
-//
-// The previous OFFSET-based loop hit Postgres's statement_timeout on
-// large lists: at offset 60k+ on a 141k-contact list, a SELECT … JOIN
-// enrichments … ORDER BY contact_id OFFSET 60000 LIMIT 1000 forces a
-// scan-then-discard of 60k rows per page. Past ~30 pages this drifts
-// past the 60s timeout and the run dies with "canceling statement due
-// to statement timeout."
-//
-// Keyset pagination (WHERE contact_id > $last ORDER BY contact_id
-// LIMIT N) is O(log N) per page regardless of depth — the index on
-// (lead_list_name, contact_id) carries the whole query.
-//
-// The enrichments embed is also dropped: PostgREST embeds force the
-// join to materialise inside the SELECT, which interacts badly with
-// ORDER BY at scale. We fetch contact ids first, then hydrate
-// enrichments in batches keyed by contact_id. Two simple queries beat
-// one slow joined one.
+// Loads ONE keyset-paginated chunk of contacts and hydrates its
+// enrichments. Returns the rows + the cursor id for the next chunk.
+// Used by runAssignment to stream Phase 1b in chunks instead of
+// loading every contact into memory at once. Each chunk's
+// ContactRouteInput[] is short-lived — the caller routes it, appends
+// to the persistent ContactMapRow[] output, and lets GC reclaim the
+// chunk before the next iteration.
+async function fetchContactsChunk(
+    supabase: SupabaseClient,
+    listNames: string[],
+    lastId: string | null,
+    pageSize: number,
+    ctx?: BucketingCtx
+): Promise<{ rows: ContactRouteInput[]; nextLastId: string | null; hasMore: boolean; pageMs: number; enrichmentMs: number }> {
+    const pageStart = Date.now();
+    let q = supabase
+        .from('contacts')
+        .select('contact_id,company_name,company_website,industry,lead_list_name')
+        .in('lead_list_name', listNames)
+        .order('contact_id', { ascending: true })
+        .limit(pageSize);
+    if (lastId !== null) q = q.gt('contact_id', lastId);
+    const { data, error } = await q;
+    const pageMs = Date.now() - pageStart;
+    if (error) {
+        ctx?.log(`[Bucketing] contact page failed after ${pageMs}ms (lastId=${lastId?.slice(0, 8) || 'null'}): ${error.message}`, 'error');
+        throw new Error(`contact fetch failed: ${error.message}`);
+    }
+    const page = (data || []) as any[];
+    if (page.length === 0) {
+        return { rows: [], nextLastId: lastId, hasMore: false, pageMs, enrichmentMs: 0 };
+    }
+
+    const rows: ContactRouteInput[] = page.map((r: any) => ({
+        contact_id: r.contact_id,
+        company_name: r.company_name || null,
+        company_website: r.company_website || null,
+        industry: r.industry || null,
+        lead_list_name: r.lead_list_name || null,
+        enrichment_status: null,
+        classification: null,
+        confidence: null,
+        reasoning: null,
+        error_message: null,
+    }));
+
+    // Hydrate enrichments for this chunk only (200 IDs/batch — see
+    // ENRICHMENT_BATCH_SIZE comment for URL-length rationale).
+    const enrStart = Date.now();
+    const idToRow = new Map(rows.map(r => [r.contact_id, r]));
+    const ids = rows.map(r => r.contact_id);
+    for (let i = 0; i < ids.length; i += ENRICHMENT_BATCH_SIZE) {
+        const slice = ids.slice(i, i + ENRICHMENT_BATCH_SIZE);
+        const { data: edata, error: eErr } = await supabase
+            .from('enrichments')
+            .select('contact_id,status,classification,confidence,reasoning,error_message')
+            .in('contact_id', slice);
+        if (eErr) {
+            ctx?.log(`[Bucketing] enrichment batch failed: ${eErr.message}`, 'error');
+            throw new Error(`enrichment fetch failed: ${eErr.message}`);
+        }
+        for (const e of (edata || []) as any[]) {
+            const r = idToRow.get(e.contact_id);
+            if (!r) continue;
+            r.enrichment_status = e.status || null;
+            r.classification = e.classification || null;
+            r.confidence = typeof e.confidence === 'number' ? e.confidence : null;
+            r.reasoning = e.reasoning || null;
+            r.error_message = e.error_message || null;
+        }
+    }
+    const enrichmentMs = Date.now() - enrStart;
+
+    return {
+        rows,
+        nextLastId: page[page.length - 1].contact_id,
+        hasMore: page.length === pageSize,
+        pageMs,
+        enrichmentMs,
+    };
+}
+
+// Backwards-compat: full-load fetch. Kept because Phase 1a's preview
+// rebuild call still expects a single array. Phase 1b uses the chunked
+// loader directly so it never holds the full contacts[] array.
 async function fetchContactsForRouting(
     supabase: SupabaseClient,
     listNames: string[],
@@ -772,7 +875,19 @@ export async function runTaxonomyProposal(
             const conf01 = Math.max(0, Math.min(1, (t.confidence || 0) / 10));
             const lowConf = (t.confidence || 0) < PHASE1A_QA_FLOOR;
             const identityIsDq = !!(t.identity && dqIdentities.has(t.identity));
-            const isDisqualified = t.is_disqualified || (cascadeDq && identityIsDq);
+            // DQ confidence floor — only honor a DQ verdict when Sonnet is
+            // ≥ 7/10 sure about the identity. Below that, route to General
+            // (with needs_qa=true so the user can spot-check) instead of
+            // silently excluding the contact from outreach.
+            const idConf = t.identity_confidence || 0;
+            const dqByLLM = !!t.is_disqualified && idConf >= PHASE1A_DQ_FLOOR;
+            const dqByCascade = cascadeDq && identityIsDq && idConf >= PHASE1A_DQ_FLOOR;
+            const isDisqualified = dqByLLM || dqByCascade;
+            // Track when LLM said DQ but we overrode due to low confidence —
+            // flag for QA. Easy filter on bucket_industry_map: needs_qa=true
+            // AND is_disqualified=false AND llm_reason ILIKE '%dq%' would
+            // surface these soft-DQ borderlines.
+            const dqDowngraded = !!t.is_disqualified && idConf < PHASE1A_DQ_FLOOR;
 
             // Backfill functional_core from the library if the LLM didn't provide
             // it but we know the mapping for this characteristic. This way the
@@ -828,9 +943,11 @@ export async function runTaxonomyProposal(
                 is_new_sector: t.is_new_sector && !sectorSet.has(t.sector || ''),
                 is_disqualified: isDisqualified,
                 is_generic: false,
-                needs_qa: lowConf,
+                needs_qa: lowConf || dqDowngraded,
                 canonical_classification: canonical,
-                llm_reason: t.reason
+                llm_reason: dqDowngraded
+                    ? `DQ-downgraded (identity_confidence=${idConf}/10 below DQ floor of ${PHASE1A_DQ_FLOOR}). Original reason: ${t.reason}`
+                    : t.reason
             });
 
             // If this is the first time we've seen vocab.n on a tagged row,
@@ -894,36 +1011,19 @@ export async function runTaxonomyProposal(
         };
     });
 
+    // Only emit a bucket per (identity, characteristic) pair where Sonnet
+    // committed to BOTH layers. Identity-only rows (Sonnet was sure about
+    // identity but not characteristic) don't get a fake "identity as spec"
+    // bucket — instead Phase 1b's rollup decides their fate based on
+    // identity volume vs the threshold (clears → identity bucket, doesn't →
+    // General with reason=low_volume). This keeps the user's rule "if you
+    // can't decide, send to General" honest.
     const buckets: DiscoveredBucket[] = [];
-    const identitiesCovered = new Set<string>();
     for (const c of usedCharByKey.values()) {
         buckets.push({
             functional_specialization: c.spec,
             primary_identity: c.identity,
             description: c.description,
-            identity_type: 'other',
-            operator_required: false,
-            priority_rank: 5,
-            include: [],
-            exclude: [],
-            example_strings: [],
-            strong_identity_signals: [],
-            weak_sector_signals: [],
-            disqualifying_signals: []
-        });
-        identitiesCovered.add(c.identity);
-    }
-    // For any identity tagged WITHOUT a characteristic (Sonnet was sure
-    // about the identity but not the subtype), synthesize an
-    // identity-as-spec bucket. Otherwise an identity-only run produces
-    // an empty buckets[] and Phase 1b refuses to start.
-    for (const ident of usedIdentitySet) {
-        if (identitiesCovered.has(ident)) continue;
-        const ent = snapshot.identities.find(i => i.name === ident);
-        buckets.push({
-            functional_specialization: ident,
-            primary_identity: ident,
-            description: ent?.description || '',
             identity_type: 'other',
             operator_required: false,
             priority_rank: 5,
@@ -1758,15 +1858,6 @@ export async function runAssignment(
         }
     };
 
-    await ctx.checkCancel();
-    ctx.log(`[Bucketing ${runId}] step 1/5: load contacts`, 'phase');
-    ctx.progress({ phase: 'phase1b', step: 'load_contacts', note: 'Loading selected contacts…' });
-    const contacts = await timeStep('load_contacts', () =>
-        fetchContactsForRouting(supabase, run.list_names, ctx)
-    );
-    ctx.log(`[Bucketing ${runId}] ${contacts.length} contacts to route`);
-    ctx.progress({ phase: 'phase1b', step: 'contacts_loaded', current: contacts.length, total: contacts.length, note: `${contacts.length.toLocaleString()} contacts loaded` });
-
     await timeStep('clear_previous_assignments', async () => {
         const { error: clearContactMapError } = await supabase
             .from('bucket_contact_map')
@@ -1780,62 +1871,140 @@ export async function runAssignment(
         if (clearAssignmentsError) throw new Error(`assignment cleanup failed: ${clearAssignmentsError.message}`);
     });
 
-    const assignedRows: ContactMapRow[] = [];
-    const usableContacts: ContactRouteInput[] = [];
-    for (const contact of contacts) {
-        const reason = getUnclassifiableReason(contact);
-        if (reason) assignedRows.push(makeGeneralContactRow(runId, contact, reason));
-        else usableContacts.push(contact);
-    }
-    let pendingContacts: ContactRouteInput[] = usableContacts;
-    ctx.log(`[Bucketing ${runId}] usable contacts: ${usableContacts.length}; Disqualified before routing: ${assignedRows.length}`);
-
-    // Step 2: selected-library high-confidence match, per contact.
-    if (libraryBuckets.length > 0 && pendingContacts.length > 0) {
-        await ctx.checkCancel();
-        ctx.log(`[Bucketing ${runId}] step 2/5: library-first match against ${libraryBuckets.length} preferred buckets`, 'phase');
-        ctx.progress({ phase: 'phase1b', step: 'library_match', note: `Matching against ${libraryBuckets.length} library buckets…` });
-        const libRes = await timeStep('library_first_match', () =>
-            withHeartbeat('library-first match (Phase 1b)',
-                () => runContactLibraryFirstMatch(pendingContacts, libraryBuckets, sectorVocab, runId), ctx)
-        );
-        totalCost += libRes.costUsd;
-        assignedRows.push(...libRes.autoAssigned);
-        pendingContacts = libRes.pending;
-        ctx.log(`[Bucketing ${runId}] library matched ${libRes.autoAssigned.length}/${usableContacts.length}, ${pendingContacts.length} pending`);
-        ctx.progress({ phase: 'phase1b', step: 'library_match_done', current: assignedRows.length, total: contacts.length, note: `${libRes.autoAssigned.length} matched via library, ${pendingContacts.length} pending` });
-    }
-
-    // Step 3: strict contact-level embedding auto-match. This is intentionally
-    // stricter than the review preview threshold; otherwise the LLM handles it.
-    if (EMBED_PREFILTER_ENABLED && pendingContacts.length > 0) {
-        await ctx.checkCancel();
-        ctx.log(`[Bucketing ${runId}] step 3/5: strict embedding pre-filter`, 'phase');
-        ctx.progress({ phase: 'phase1b', step: 'embedding_prefilter', note: `Embedding pre-filter on ${pendingContacts.length.toLocaleString()} contacts…` });
-        const embedRes = await timeStep('embedding_prefilter', () =>
-            withHeartbeat(
-                `contact embedding pre-filter (${pendingContacts.length} contacts)`,
-                () => runContactEmbeddingPrefilter(pendingContacts, leaves, sectorVocab, runId),
-                ctx
-            )
-        );
-        totalCost += embedRes.costUsd;
-        assignedRows.push(...embedRes.autoAssigned);
-        pendingContacts = embedRes.pending;
-        ctx.log(`[Bucketing ${runId}] embedding auto-assigned ${embedRes.autoAssigned.length}/${usableContacts.length}, ${pendingContacts.length} still pending`);
-        ctx.progress({ phase: 'phase1b', step: 'embedding_prefilter_done', current: contacts.length - pendingContacts.length, total: contacts.length, note: `${embedRes.autoAssigned.length} matched via strict embedding, ${pendingContacts.length} still pending LLM` });
-    }
-
+    // Streaming Phase 1b: load contacts in keyset chunks, route each
+    // chunk through library / embedding / LLM matchers, append to the
+    // persistent assignedRows[] array, then drop the chunk from memory.
+    // Without this, peak memory holds both the contacts[] array (~100 MB
+    // on 500k contacts) AND the assignedRows[] (~150 MB) at the same
+    // time. Chunked: only the current chunk's contacts (~5 MB) plus
+    // assignedRows is alive.
     await ctx.checkCancel();
-    ctx.log(`[Bucketing ${runId}] step 4/5: routing LLM matching`, 'phase');
-    ctx.progress({ phase: 'phase1b', step: 'llm_routing', current: 0, total: pendingContacts.length, note: `LLM routing on ${pendingContacts.length.toLocaleString()} contacts…` });
-    const llmRes = await timeStep('llm_routing', () =>
-        runContactMatchingLLM(pendingContacts, leaves, sectorVocab, runId, ctx)
+    ctx.log(`[Bucketing ${runId}] step 1-4/5: streaming routing in chunks of ${CONTACT_PAGE_SIZE.toLocaleString()}`, 'phase');
+    ctx.progress({ phase: 'phase1b', step: 'streaming_route', note: 'Loading + routing contacts in chunks…' });
+
+    const assignedRows: ContactMapRow[] = [];
+    let lastContactId: string | null = null;
+    let chunkNum = 0;
+    let totalLoaded = 0;
+    let totalUsable = 0;
+    let totalDqEarly = 0;
+    let libraryMatched = 0;
+    let embeddingMatched = 0;
+    let llmRouted = 0;
+
+    await timeStep('streaming_route_all_chunks', async () => {
+        while (true) {
+            await ctx.checkCancel();
+            chunkNum++;
+
+            const chunk = await fetchContactsChunk(supabase, run.list_names, lastContactId, CONTACT_PAGE_SIZE, ctx);
+            if (chunk.rows.length === 0) break;
+            totalLoaded += chunk.rows.length;
+            lastContactId = chunk.nextLastId;
+
+            // Filter unclassifiable rows from the chunk straight to
+            // Disqualified — never sent to LLM, just pushed to output.
+            const usableInChunk: ContactRouteInput[] = [];
+            for (const c of chunk.rows) {
+                const reason = getUnclassifiableReason(c);
+                if (reason) {
+                    assignedRows.push(makeGeneralContactRow(runId, c, reason));
+                    totalDqEarly++;
+                } else {
+                    usableInChunk.push(c);
+                }
+            }
+            totalUsable += usableInChunk.length;
+
+            let pending: ContactRouteInput[] = usableInChunk;
+
+            // Library match (per chunk).
+            if (libraryBuckets.length > 0 && pending.length > 0) {
+                await ctx.checkCancel();
+                const libRes = await runContactLibraryFirstMatch(pending, libraryBuckets, sectorVocab, runId);
+                totalCost += libRes.costUsd;
+                assignedRows.push(...libRes.autoAssigned);
+                libraryMatched += libRes.autoAssigned.length;
+                pending = libRes.pending;
+            }
+
+            // Embedding pre-filter (per chunk). Re-embeds leaves each
+            // chunk — small constant cost vs the savings from streaming.
+            if (EMBED_PREFILTER_ENABLED && pending.length > 0 && leaves.length > 0) {
+                await ctx.checkCancel();
+                const embedRes = await runContactEmbeddingPrefilter(pending, leaves, sectorVocab, runId);
+                totalCost += embedRes.costUsd;
+                assignedRows.push(...embedRes.autoAssigned);
+                embeddingMatched += embedRes.autoAssigned.length;
+                pending = embedRes.pending;
+            }
+
+            // LLM routing (per chunk). Skipped when leaves=[] because
+            // the LLM has no candidate set to choose from — those
+            // contacts fall through to the rollup which routes them to
+            // General with reason=LOW_VOLUME.
+            if (pending.length > 0 && leaves.length > 0) {
+                await ctx.checkCancel();
+                const llmRes = await runContactMatchingLLM(pending, leaves, sectorVocab, runId, ctx);
+                totalCost += llmRes.costUsd;
+                assignedRows.push(...llmRes.rows);
+                llmRouted += llmRes.rows.length;
+            } else if (pending.length > 0) {
+                // No buckets defined — synthesize General rows per the
+                // user's "if you can't decide, send to General" rule.
+                for (const c of pending) {
+                    const row = makeGeneralContactRow(runId, c, REASON.NO_BUCKETS_DEFINED);
+                    row.bucket_reason = 'No buckets defined for this run — defaulted to General';
+                    assignedRows.push(row);
+                }
+            }
+
+            ctx.log(
+                `[Bucketing ${runId}] chunk ${chunkNum}: ` +
+                `loaded ${chunk.rows.length} (${chunk.pageMs}ms+${chunk.enrichmentMs}ms enrich), ` +
+                `total assignedRows=${assignedRows.length.toLocaleString()}`
+            );
+            ctx.progress({
+                phase: 'phase1b',
+                step: 'streaming_route',
+                current: totalLoaded,
+                note: `Routed ${assignedRows.length.toLocaleString()} contacts (chunk ${chunkNum}, library=${libraryMatched}, embed=${embeddingMatched}, llm=${llmRouted}, dq=${totalDqEarly})`
+            });
+
+            if (!chunk.hasMore) break;
+        }
+    });
+
+    ctx.log(
+        `[Bucketing ${runId}] streaming complete — ${totalLoaded.toLocaleString()} loaded, ` +
+        `${totalUsable.toLocaleString()} usable, ${totalDqEarly.toLocaleString()} early-DQ; ` +
+        `library=${libraryMatched}, embed=${embeddingMatched}, llm=${llmRouted}, $${totalCost.toFixed(4)}`,
+        'phase'
     );
-    totalCost += llmRes.costUsd;
-    assignedRows.push(...llmRes.rows);
-    ctx.log(`[Bucketing ${runId}] LLM routed ${llmRes.rows.length}, total contact rows ${assignedRows.length}, cost so far $${totalCost.toFixed(4)}`);
-    ctx.progress({ phase: 'phase1b', step: 'llm_routing_done', current: contacts.length, total: contacts.length, note: `LLM routed ${llmRes.rows.length.toLocaleString()} contacts, $${totalCost.toFixed(4)} spent` });
+    ctx.progress({
+        phase: 'phase1b',
+        step: 'streaming_route_done',
+        current: totalLoaded,
+        total: totalLoaded,
+        note: `Streaming complete — ${assignedRows.length.toLocaleString()} contacts in ${chunkNum} chunks, $${totalCost.toFixed(4)}`,
+    });
+
+    // Build a `contacts` reference for downstream coverage analytics.
+    // We don't need every field anymore — just the ids — but the
+    // existing buildCoverageSummary signature wants ContactRouteInput[].
+    // Reconstructing skeleton rows from assignedRows keeps memory tight.
+    const contacts: ContactRouteInput[] = assignedRows.map(r => ({
+        contact_id: r.contact_id,
+        company_name: null,
+        company_website: null,
+        industry: r.industry_string || null,
+        lead_list_name: null,
+        enrichment_status: r.is_disqualified ? 'failed' : 'completed',
+        classification: r.industry_string || null,
+        confidence: null,
+        reasoning: null,
+        error_message: null,
+    }));
 
     await ctx.checkCancel();
     ctx.log(`[Bucketing ${runId}] step 5/5: contact-level volume rollup + write`, 'phase');
@@ -1943,12 +2112,12 @@ export async function runAssignment(
     ctx.progress({ phase: 'phase1b', step: 'done', current: assignedCount, total: contacts.length, note: `Assigned ${assignedCount.toLocaleString()} contacts in ${(totalRunMs / 1000).toFixed(1)}s — total cost $${totalCost.toFixed(4)}` });
 }
 
-function getUnclassifiableReason(contact: ContactRouteInput): string | null {
+function getUnclassifiableReason(contact: ContactRouteInput): ReasonCode | null {
     const label = (contact.classification || contact.industry || '').trim().toLowerCase();
-    if (contact.enrichment_status !== 'completed') return 'failed_enrichment';
-    if (!label) return 'missing_industry';
+    if (contact.enrichment_status !== 'completed') return REASON.FAILED_ENRICHMENT;
+    if (!label) return REASON.MISSING_INDUSTRY;
     if (['site error', 'scrape error', 'unknown', 'error', 'n/a', 'na', 'none'].includes(label)) {
-        return 'scrape_site_unknown';
+        return REASON.SCRAPE_SITE_UNKNOWN;
     }
     return null;
 }
@@ -2184,53 +2353,52 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
         if (next.is_disqualified) {
             next.bucket_name = RESERVED_DISQUALIFIED;
             next.rollup_level = 'general';
-            next.general_reason = next.general_reason || 'disqualified';
-            next.bucket_reason = next.bucket_reason || 'Identity flagged disqualified';
+            next.general_reason = next.general_reason || REASON.DISQUALIFIED_BY_LLM;
+            next.bucket_reason = next.bucket_reason || 'Disqualified — Sonnet flagged with high identity confidence';
         } else if (!eff) {
-            // Identity below floor — Sonnet didn't trust the identity tag,
-            // so we have nothing to route on. Straight to General with a
-            // clear reason.
+            // Identity confidence below floor → Sonnet didn't trust ANY tag.
+            // Send straight to General with a precise reason code.
             next.bucket_name = RESERVED_GENERAL;
             next.rollup_level = 'general';
-            next.general_reason = next.general_reason || 'low_identity_confidence';
+            next.general_reason = REASON.LOW_IDENTITY_CONFIDENCE;
             next.bucket_reason = `Identity confidence < ${TAG_CONF_FLOOR.toFixed(2)} — no trustworthy tag to route on`;
         } else if (next.is_generic && !eff.primary_identity) {
             next.bucket_name = RESERVED_GENERAL;
             next.rollup_level = 'general';
-            next.general_reason = next.general_reason || 'generic_low_confidence';
+            next.general_reason = next.general_reason || REASON.LOW_OVERALL_CONFIDENCE;
             next.bucket_reason = next.bucket_reason || 'Inviteable but insufficient classification evidence';
         } else if (eff.functional_specialization && eff.sector_focus && eff.sector_focus !== 'Multi-industry'
             && (comboCounts.get(`${eff.sector_focus} ${eff.functional_specialization}`) || 0) >= minVolume) {
             next.bucket_name = `${eff.sector_focus} ${eff.functional_specialization}`;
             next.rollup_level = 'combo';
-            next.general_reason = null;
+            next.general_reason = REASON.COMBO_THRESHOLD_MET;
             next.bucket_reason = `Sector_focus + specialization combo cleared ${minVolume}-lead threshold${maskedSuffix}`;
         } else if (eff.functional_specialization && eff.sector_core && eff.sector_core !== 'Multi-industry'
             && (sectorCoreSpecCounts.get(`${eff.sector_core} ${eff.functional_specialization}`) || 0) >= minVolume) {
             next.bucket_name = `${eff.sector_core} ${eff.functional_specialization}`;
             next.rollup_level = 'sector_core_specialization';
-            next.general_reason = null;
-            next.bucket_reason = `Sector_core + specialization cleared threshold; sector_focus combination too small${maskedSuffix}`;
+            next.general_reason = REASON.SECTOR_CORE_SPEC_THRESHOLD_MET;
+            next.bucket_reason = `Sector_core + specialization cleared threshold${maskedSuffix}`;
         } else if (eff.functional_specialization && (specCounts.get(eff.functional_specialization) || 0) >= minVolume) {
             next.bucket_name = eff.functional_specialization;
             next.rollup_level = 'specialization';
-            next.general_reason = null;
-            next.bucket_reason = `Specialization cleared threshold; sector combinations too small${maskedSuffix}`;
+            next.general_reason = REASON.SPECIALIZATION_THRESHOLD_MET;
+            next.bucket_reason = `Specialization cleared threshold${maskedSuffix}`;
         } else if (eff.functional_core && (fcCounts.get(eff.functional_core) || 0) >= minVolume) {
             next.bucket_name = eff.functional_core;
             next.rollup_level = 'functional_core';
-            next.general_reason = null;
+            next.general_reason = REASON.FUNCTIONAL_CORE_THRESHOLD_MET;
             next.bucket_reason = `Rolled up to functional_core; specialization too small${maskedSuffix}`;
         } else if (eff.primary_identity && (identityCounts.get(eff.primary_identity) || 0) >= minVolume) {
             next.bucket_name = eff.primary_identity;
             next.rollup_level = 'identity';
-            next.general_reason = null;
+            next.general_reason = REASON.IDENTITY_THRESHOLD_MET;
             next.bucket_reason = `Rolled up to primary_identity; functional_core too small${maskedSuffix}`;
         } else {
             next.bucket_name = RESERVED_GENERAL;
             next.rollup_level = 'general';
-            next.general_reason = next.general_reason || 'rolled_up_to_general';
-            next.bucket_reason = next.bucket_reason || `No layer cleared the volume threshold${maskedSuffix}`;
+            next.general_reason = REASON.LOW_VOLUME;
+            next.bucket_reason = `No layer cleared the ${minVolume}-lead threshold${maskedSuffix}`;
         }
         return next;
     });
@@ -2264,8 +2432,8 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
             } else {
                 row.bucket_name = RESERVED_GENERAL;
                 row.rollup_level = 'general';
-                row.general_reason = row.general_reason || 'bucket_budget_rollup';
-                row.bucket_reason = row.bucket_reason || 'Bucket budget exceeded — rolled up';
+                row.general_reason = REASON.BUDGET_ROLLUP;
+                row.bucket_reason = row.bucket_reason || 'Bucket budget exceeded — rolled up to General';
             }
         }
     }
@@ -2330,7 +2498,7 @@ function runGenericAudit(rows: ContactMapRow[], minVolume: number): {
                 : g.from === 'functional_core' ? 'functional_core'
                 : g.from === 'specialization' ? 'specialization'
                 : 'sector_core_specialization';
-            r.general_reason = null;
+            r.general_reason = REASON.GENERIC_AUDIT_RECLAIMED;
             r.bucket_reason = `Generic Audit: re-routed from General to ${bucketName} (matched on ${g.from})`;
         }
         reclaimed += g.rows.length;
