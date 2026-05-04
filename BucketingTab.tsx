@@ -704,9 +704,9 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
   const sourceBuckets = run.taxonomy_final?.buckets || run.taxonomy_proposal?.buckets || [];
   const primaryIdentities = (run.taxonomy_final?.primary_identities || run.taxonomy_proposal?.primary_identities) || [];
   const observedPatterns = (run.taxonomy_final?.observed_patterns || run.taxonomy_proposal?.observed_patterns) || [];
-  const [kept, setKept] = useState<Set<string>>(new Set(sourceBuckets.map(b => b.functional_specialization)));
+  const [kept, setKept] = useState<Set<string>>(new Set(sourceBuckets.map(b => b.characteristic)));
   const [renames, setRenames] = useState<Record<string, string>>({});
-  const [adds, setAdds] = useState<{ functional_specialization: string; primary_identity: string; description: string }[]>([]);
+  const [adds, setAdds] = useState<{ characteristic: string; primary_identity: string; description: string }[]>([]);
   const [newSpec, setNewSpec] = useState('');
   const [newDesc, setNewDesc] = useState('');
   const [newIdentity, setNewIdentity] = useState('');
@@ -849,7 +849,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
           onClick={() => {
             if (!newSpec.trim() || !newIdentity.trim()) return;
             setAdds([...adds, {
-              functional_specialization: newSpec.trim(),
+              characteristic: newSpec.trim(),
               primary_identity: newIdentity.trim(),
               description: newDesc.trim()
             }]);
@@ -863,7 +863,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
           <div className="mt-3 space-y-1">
             {adds.map((a, i) => (
               <div key={i} className="flex items-center justify-between px-3 py-1.5 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-gray-300">
-                <span><span className="font-bold text-white">{a.functional_specialization}</span> · under {a.primary_identity} — {a.description}</span>
+                <span><span className="font-bold text-white">{a.characteristic}</span> · under {a.primary_identity} — {a.description}</span>
                 <button onClick={() => setAdds(adds.filter((_, j) => j !== i))} className="text-gray-500 hover:text-red-400">
                   <X className="w-3 h-3" />
                 </button>
@@ -920,7 +920,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
                     <input type="checkbox" checked={isSel} onChange={() => {}} className="w-3 h-3 mt-0.5" />
                     <span className="min-w-0">
                       <span className={`font-medium block ${isSel ? 'text-[#3ecf8e]' : 'text-gray-200'}`}>
-                        {b.functional_specialization || b.bucket_name}
+                        {b.characteristic || b.bucket_name}
                       </span>
                       <span className="text-[10px] text-gray-500 truncate block">
                         under {b.primary_identity || b.direct_ancestor || '—'} · used {b.times_used}×
@@ -1007,9 +1007,9 @@ function BucketChainList({
   onToggle: (name: string) => void;
   onRename: (oldName: string, val: string) => void;
 }) {
-  const displayName = (b: BucketProposal) => renames[b.functional_specialization] ?? b.functional_specialization;
+  const displayName = (b: BucketProposal) => renames[b.characteristic] ?? b.characteristic;
   const baseCountFor = (b: BucketProposal) =>
-    countByBucket.get(displayName(b)) ?? countByBucket.get(b.functional_specialization) ?? 0;
+    countByBucket.get(displayName(b)) ?? countByBucket.get(b.characteristic) ?? 0;
 
   // Group specializations by primary_identity. Use the order of `identities`
   // when available, then any leftover identities in the proposal.
@@ -1029,7 +1029,7 @@ function BucketChainList({
       {orderedIdents.map(identName => {
         const specs = byIdent.get(identName) || [];
         const meta = identities.find(p => p.name === identName);
-        const identCount = specs.reduce((s, l) => s + (kept.has(l.functional_specialization) ? baseCountFor(l) : 0), 0);
+        const identCount = specs.reduce((s, l) => s + (kept.has(l.characteristic) ? baseCountFor(l) : 0), 0);
         return (
           <div key={identName} className="py-3">
             <div className="px-4 pb-2 flex items-center gap-2 flex-wrap">
@@ -1043,19 +1043,19 @@ function BucketChainList({
             </div>
             <div className="pl-4 border-l-2 border-[#2e2e2e] ml-4 divide-y divide-[#2e2e2e]/40">
               {specs.map(b => {
-                const isKept = kept.has(b.functional_specialization);
+                const isKept = kept.has(b.characteristic);
                 const count = baseCountFor(b);
                 const willRollUp = isKept && count > 0 && count < minVolume;
                 return (
-                  <div key={b.functional_specialization} className={`py-2 pl-4 pr-3 ${isKept ? '' : 'opacity-50'}`}>
+                  <div key={b.characteristic} className={`py-2 pl-4 pr-3 ${isKept ? '' : 'opacity-50'}`}>
                     <div className="flex items-start gap-2">
-                      <input type="checkbox" checked={isKept} onChange={() => onToggle(b.functional_specialization)} className="mt-1.5 w-3.5 h-3.5 shrink-0" />
+                      <input type="checkbox" checked={isKept} onChange={() => onToggle(b.characteristic)} className="mt-1.5 w-3.5 h-3.5 shrink-0" />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 mb-1 flex-wrap">
                           <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 shrink-0">↳ Specialization</span>
                           <input
                             value={displayName(b)}
-                            onChange={e => onRename(b.functional_specialization, e.target.value)}
+                            onChange={e => onRename(b.characteristic, e.target.value)}
                             className="flex-1 min-w-[300px] bg-[#1c1c1c] border border-[#2e2e2e] rounded px-3 py-1.5 text-sm font-bold text-white focus:outline-none focus:border-[#3ecf8e]"
                           />
                           {b.library_match_id && (
@@ -1114,7 +1114,7 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
 
   const bucketsInRun = (run.taxonomy_final?.buckets || run.taxonomy_proposal?.buckets || []) as BucketProposal[];
   const identityNames = new Set(((run.taxonomy_final?.primary_identities || run.taxonomy_proposal?.primary_identities) || []).map(p => p.name));
-  const specNames = new Set(bucketsInRun.map(b => b.functional_specialization));
+  const specNames = new Set(bucketsInRun.map(b => b.characteristic));
 
   const toggleLibSel = (name: string) => {
     const s = new Set(librarySelection);
@@ -1146,12 +1146,10 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
         company_website: r.contacts?.company_website,
         lead_list_name: r.contacts?.lead_list_name,
         classification_text: r.contacts?.industry,
-        // 5-layer truth schema
+        // 3-layer truth schema (v5)
         primary_identity: r.primary_identity || r.bucket_ancestor || '',
-        functional_core: r.functional_core || '',
-        functional_specialization: r.functional_specialization || r.bucket_leaf || '',
-        sector_core: r.sector_core || '',
-        sector_focus: r.sector_focus || '',
+        characteristic: r.characteristic || r.bucket_leaf || '',
+        sector: r.sector || '',
         canonical_classification: r.canonical_classification || '',
         // Routing decision
         final_campaign_bucket: r.bucket_name,
@@ -1286,15 +1284,15 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
           </div>
           <div className="flex flex-wrap gap-1.5">
             {bucketsInRun.map(b => {
-              const sel = librarySelection.has(b.functional_specialization);
+              const sel = librarySelection.has(b.characteristic);
               return (
                 <button
-                  key={b.functional_specialization}
-                  onClick={() => toggleLibSel(b.functional_specialization)}
+                  key={b.characteristic}
+                  onClick={() => toggleLibSel(b.characteristic)}
                   className={`px-2 py-1 rounded text-[10px] font-bold border transition-colors ${sel ? 'bg-[#3ecf8e]/15 text-[#3ecf8e] border-[#3ecf8e]/40' : 'bg-[#1c1c1c] text-gray-300 border-[#2e2e2e] hover:border-gray-500'}`}
                   title={`under ${b.primary_identity}`}
                 >
-                  {b.functional_specialization}
+                  {b.characteristic}
                 </button>
               );
             })}
@@ -1481,7 +1479,7 @@ function BucketingLibrary({ library, onRefresh, onError }: {
               {library.map(b => (
                 <tr key={b.id} className={`hover:bg-white/[0.02] ${b.archived ? 'opacity-50' : ''}`}>
                   <td className="px-5 py-3">
-                    <div className="font-bold text-white">{b.functional_specialization || b.bucket_name}</div>
+                    <div className="font-bold text-white">{b.characteristic || b.bucket_name}</div>
                     {b.description && <div className="text-[10px] text-gray-500 truncate max-w-md">{b.description}</div>}
                   </td>
                   <td className="px-5 py-3 text-gray-300">{b.primary_identity || b.direct_ancestor || '—'}</td>
@@ -1518,7 +1516,7 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
   onSaved: () => void;
   onError: (msg: string | null) => void;
 }) {
-  const [spec, setSpec] = useState(existing?.functional_specialization || existing?.bucket_name || '');
+  const [spec, setSpec] = useState(existing?.characteristic || existing?.bucket_name || '');
   const [identity, setIdentity] = useState(existing?.primary_identity || existing?.direct_ancestor || '');
   const [desc, setDesc] = useState(existing?.description || '');
   const [include, setInclude] = useState((existing?.include_terms || []).join(', '));
@@ -1532,7 +1530,7 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
     onError(null);
     try {
       const payload = {
-        functional_specialization: spec.trim(),
+        characteristic: spec.trim(),
         primary_identity: identity.trim(),
         description: desc.trim(),
         include_terms: include.split(',').map(s => s.trim()).filter(Boolean),

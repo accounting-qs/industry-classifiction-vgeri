@@ -58,7 +58,7 @@ export type BucketingRunStatus =
   | 'cancelled';
 
 // v2.2: Layer-1 primary identity + Layer-2 functional specialization.
-// Layer-3 sector_focus and Layer-4 campaign bucket are computed elsewhere.
+// Layer-3 sector and Layer-4 campaign bucket are computed elsewhere.
 export interface PrimaryIdentity {
   name: string;
   description: string;
@@ -67,7 +67,7 @@ export interface PrimaryIdentity {
 }
 
 export interface BucketProposal {
-  functional_specialization: string;
+  characteristic: string;
   primary_identity: string;
   description: string;
   identity_type?: string;
@@ -86,7 +86,7 @@ export interface BucketProposal {
 
 export interface TaxonomyDoc {
   observed_patterns?: string[];
-  sector_focus_vocabulary?: string[];
+  sector_vocabulary?: string[];
   primary_identities?: PrimaryIdentity[];
   buckets: BucketProposal[];
 }
@@ -136,9 +136,9 @@ export interface BucketingLogEntry {
 
 export interface LibraryBucket {
   id: string;
-  bucket_name: string;                         // legacy mirror of functional_specialization
+  bucket_name: string;                         // legacy mirror of characteristic
   primary_identity: string | null;             // v2.3
-  functional_specialization: string | null;    // v2.3
+  characteristic: string | null;    // v2.3
   description: string | null;
   direct_ancestor: string | null;              // legacy mirror of primary_identity
   root_category: string | null;                // legacy
@@ -175,8 +175,8 @@ export interface BucketAssignmentRow {
   bucket_ancestor?: string | null;
   bucket_root?: string | null;
   primary_identity?: string | null;
-  functional_specialization?: string | null;
-  sector_focus?: string | null;
+  characteristic?: string | null;
+  sector?: string | null;
   pre_rollup_bucket_name?: string | null;
   rollup_level?: string | null;
   general_reason?: string | null;
