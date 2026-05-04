@@ -1448,12 +1448,17 @@ async function rebuildPreviewMap(
     const vocab = await fetchFullVocabulary(supabase, listNames, ctx);
     if (vocab.length === 0) return;
 
-    // Drop only the preview-source rows; keep any library_match rows the
-    // user might want to retain even after editing other specs.
+    // Drop the LLM-tagged + embedding-tagged rows so the user's taxonomy
+    // edits (rename / drop / add) actually propagate to per-industry
+    // routing. Keep library_match + disqualified_passthrough rows — those
+    // are sticky decisions the user shouldn't lose on a taxonomy tweak.
+    // (Note: source value is 'llm_phase1a' with the trailing 'a'; the old
+    // 'llm_phase1' value here was a typo that silently no-op'd this delete
+    // for years, leaving stale tags on already-LLM-tagged industries.)
     await supabase.from('bucket_industry_map')
         .delete()
         .eq('bucketing_run_id', runId)
-        .in('source', ['preview_embedding', 'llm_phase1', 'embedding']);
+        .in('source', ['preview_embedding', 'llm_phase1a', 'embedding']);
 
     // Industries still claimed by surviving non-preview rows (e.g. library
     // matches) shouldn't be re-assigned by the preview pass.
