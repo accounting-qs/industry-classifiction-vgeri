@@ -342,7 +342,8 @@ async function fetchFullVocabulary(
     }, ctx);
 }
 
-const CONTACT_PAGE_SIZE = 1000;
+const CONTACT_PAGE_SIZE = 2000;
+const ENRICHMENT_BATCH_SIZE = 500;
 
 async function countSelectedContacts(
     supabase: SupabaseClient,
@@ -356,48 +357,128 @@ async function countSelectedContacts(
     return count || 0;
 }
 
+// Keyset pagination + decoupled enrichments fetch.
+//
+// The previous OFFSET-based loop hit Postgres's statement_timeout on
+// large lists: at offset 60k+ on a 141k-contact list, a SELECT … JOIN
+// enrichments … ORDER BY contact_id OFFSET 60000 LIMIT 1000 forces a
+// scan-then-discard of 60k rows per page. Past ~30 pages this drifts
+// past the 60s timeout and the run dies with "canceling statement due
+// to statement timeout."
+//
+// Keyset pagination (WHERE contact_id > $last ORDER BY contact_id
+// LIMIT N) is O(log N) per page regardless of depth — the index on
+// (lead_list_name, contact_id) carries the whole query.
+//
+// The enrichments embed is also dropped: PostgREST embeds force the
+// join to materialise inside the SELECT, which interacts badly with
+// ORDER BY at scale. We fetch contact ids first, then hydrate
+// enrichments in batches keyed by contact_id. Two simple queries beat
+// one slow joined one.
 async function fetchContactsForRouting(
     supabase: SupabaseClient,
     listNames: string[],
     ctx?: BucketingCtx
 ): Promise<ContactRouteInput[]> {
     return withHeartbeat('contact fetch', async () => {
+        const overallStart = Date.now();
         const rows: ContactRouteInput[] = [];
-        let offset = 0;
+        let lastId: string | null = null;
+        let pageNum = 0;
+
+        // Step 1: keyset-paginate contacts. Each page is independent and
+        // O(log N) thanks to the (lead_list_name, contact_id) composite
+        // index. We log per-page timing so future slow-page bugs are
+        // visible at the page level instead of "the whole thing died".
         while (true) {
             await ctx?.checkCancel();
-            const { data, error } = await supabase
+            pageNum++;
+            const pageStart = Date.now();
+            let q = supabase
                 .from('contacts')
-                .select('contact_id,company_name,company_website,industry,lead_list_name,enrichments(status,classification,confidence,reasoning,error_message)')
+                .select('contact_id,company_name,company_website,industry,lead_list_name')
                 .in('lead_list_name', listNames)
                 .order('contact_id', { ascending: true })
-                .range(offset, offset + CONTACT_PAGE_SIZE - 1);
-            if (error) throw new Error(`contact fetch failed: ${error.message}`);
-            const page = data || [];
-            for (const r of page as any[]) {
-                const enr = Array.isArray(r.enrichments) ? r.enrichments[0] : r.enrichments;
+                .limit(CONTACT_PAGE_SIZE);
+            if (lastId !== null) q = q.gt('contact_id', lastId);
+            const { data, error } = await q;
+            const pageMs = Date.now() - pageStart;
+            if (error) {
+                ctx?.log(`[Bucketing] contact page ${pageNum} failed after ${pageMs}ms (lastId=${lastId?.slice(0, 8) || 'null'}): ${error.message}`, 'error');
+                throw new Error(`contact fetch failed: ${error.message}`);
+            }
+            const page = (data || []) as any[];
+            if (page.length === 0) break;
+            for (const r of page) {
                 rows.push({
                     contact_id: r.contact_id,
                     company_name: r.company_name || null,
                     company_website: r.company_website || null,
                     industry: r.industry || null,
                     lead_list_name: r.lead_list_name || null,
-                    enrichment_status: enr?.status || null,
-                    classification: enr?.classification || null,
-                    confidence: typeof enr?.confidence === 'number' ? enr.confidence : null,
-                    reasoning: enr?.reasoning || null,
-                    error_message: enr?.error_message || null
+                    // Enrichments fields populated below.
+                    enrichment_status: null,
+                    classification: null,
+                    confidence: null,
+                    reasoning: null,
+                    error_message: null,
                 });
             }
-            if (page.length < CONTACT_PAGE_SIZE) break;
-            offset += CONTACT_PAGE_SIZE;
+            lastId = page[page.length - 1].contact_id;
+            if (pageMs > 5000 || pageNum % 5 === 0) {
+                ctx?.log(`[Bucketing] contacts page ${pageNum} loaded in ${pageMs}ms — total ${rows.length.toLocaleString()}`);
+            }
             ctx?.progress({
                 phase: 'phase1b',
                 step: 'load_contacts',
                 current: rows.length,
-                note: `Loaded ${rows.length.toLocaleString()} contacts…`
+                note: `Loaded ${rows.length.toLocaleString()} contacts (page ${pageNum}, ${pageMs}ms)…`
             });
+            if (page.length < CONTACT_PAGE_SIZE) break;
         }
+
+        const contactsLoadedMs = Date.now() - overallStart;
+        ctx?.log(`[Bucketing] contacts loaded: ${rows.length.toLocaleString()} rows in ${pageNum} pages, ${(contactsLoadedMs / 1000).toFixed(1)}s`);
+
+        // Step 2: hydrate enrichments in batches keyed by contact_id.
+        // PostgREST .in() over very long ID lists blows past the URL
+        // size cap, so we chunk to ENRICHMENT_BATCH_SIZE per round trip.
+        // Most contacts have at most one enrichment row, so the result
+        // count tracks the input count closely.
+        const idToRow = new Map<string, ContactRouteInput>(rows.map(r => [r.contact_id, r]));
+        const ids = rows.map(r => r.contact_id);
+        const enrStart = Date.now();
+        let hydrated = 0;
+        for (let i = 0; i < ids.length; i += ENRICHMENT_BATCH_SIZE) {
+            await ctx?.checkCancel();
+            const slice = ids.slice(i, i + ENRICHMENT_BATCH_SIZE);
+            const batchStart = Date.now();
+            const { data, error } = await supabase
+                .from('enrichments')
+                .select('contact_id,status,classification,confidence,reasoning,error_message')
+                .in('contact_id', slice);
+            const batchMs = Date.now() - batchStart;
+            if (error) {
+                ctx?.log(`[Bucketing] enrichment batch ${i}/${ids.length} failed after ${batchMs}ms: ${error.message}`, 'error');
+                throw new Error(`enrichment fetch failed: ${error.message}`);
+            }
+            for (const e of (data || []) as any[]) {
+                const r = idToRow.get(e.contact_id);
+                if (!r) continue;
+                r.enrichment_status = e.status || null;
+                r.classification = e.classification || null;
+                r.confidence = typeof e.confidence === 'number' ? e.confidence : null;
+                r.reasoning = e.reasoning || null;
+                r.error_message = e.error_message || null;
+                hydrated++;
+            }
+            if (batchMs > 5000 || (i / ENRICHMENT_BATCH_SIZE) % 10 === 0) {
+                ctx?.log(`[Bucketing] enrichment batch ${i + slice.length}/${ids.length} hydrated in ${batchMs}ms`);
+            }
+        }
+
+        const totalMs = Date.now() - overallStart;
+        ctx?.log(`[Bucketing] contacts+enrichments fetch: ${rows.length.toLocaleString()} contacts (${hydrated.toLocaleString()} with enrichment), total ${(totalMs / 1000).toFixed(1)}s (contacts ${(contactsLoadedMs / 1000).toFixed(1)}s, enrichments ${((Date.now() - enrStart) / 1000).toFixed(1)}s)`, 'phase');
         return rows;
     }, ctx);
 }
@@ -1603,24 +1684,48 @@ export async function runAssignment(
     await supabase.from('bucketing_runs').update({ status: 'assigning' }).eq('id', runId);
 
     let totalCost = Number(run.cost_usd || 0);
+    // Step-level timing telemetry. Each step pushes its elapsed ms into
+    // `timings` so the run-end summary tells us exactly where the seconds
+    // went, and any future timeout pinpoints the slow step at a glance.
+    const runStart = Date.now();
+    const timings: { step: string; ms: number }[] = [];
+    const timeStep = async <T>(label: string, fn: () => Promise<T>): Promise<T> => {
+        const t0 = Date.now();
+        try {
+            const out = await fn();
+            const ms = Date.now() - t0;
+            timings.push({ step: label, ms });
+            ctx.log(`[Bucketing ${runId}] ⏱  ${label}: ${(ms / 1000).toFixed(2)}s`);
+            return out;
+        } catch (err: any) {
+            const ms = Date.now() - t0;
+            timings.push({ step: `${label} (FAILED)`, ms });
+            ctx.log(`[Bucketing ${runId}] ⏱  ${label} FAILED after ${(ms / 1000).toFixed(2)}s: ${err.message}`, 'error');
+            throw err;
+        }
+    };
 
     await ctx.checkCancel();
     ctx.log(`[Bucketing ${runId}] step 1/5: load contacts`, 'phase');
     ctx.progress({ phase: 'phase1b', step: 'load_contacts', note: 'Loading selected contacts…' });
-    const contacts = await fetchContactsForRouting(supabase, run.list_names, ctx);
+    const contacts = await timeStep('load_contacts', () =>
+        fetchContactsForRouting(supabase, run.list_names, ctx)
+    );
     ctx.log(`[Bucketing ${runId}] ${contacts.length} contacts to route`);
     ctx.progress({ phase: 'phase1b', step: 'contacts_loaded', current: contacts.length, total: contacts.length, note: `${contacts.length.toLocaleString()} contacts loaded` });
 
-    const { error: clearContactMapError } = await supabase
-        .from('bucket_contact_map')
-        .delete()
-        .eq('bucketing_run_id', runId);
-    if (clearContactMapError) throw new Error(`contact map cleanup failed: ${clearContactMapError.message}`);
-    const { error: clearAssignmentsError } = await supabase
-        .from('bucket_assignments')
-        .delete()
-        .eq('bucketing_run_id', runId);
-    if (clearAssignmentsError) throw new Error(`assignment cleanup failed: ${clearAssignmentsError.message}`);
+    await timeStep('clear_previous_assignments', async () => {
+        const { error: clearContactMapError } = await supabase
+            .from('bucket_contact_map')
+            .delete()
+            .eq('bucketing_run_id', runId);
+        if (clearContactMapError) throw new Error(`contact map cleanup failed: ${clearContactMapError.message}`);
+        const { error: clearAssignmentsError } = await supabase
+            .from('bucket_assignments')
+            .delete()
+            .eq('bucketing_run_id', runId);
+        if (clearAssignmentsError) throw new Error(`assignment cleanup failed: ${clearAssignmentsError.message}`);
+    });
 
     const assignedRows: ContactMapRow[] = [];
     const usableContacts: ContactRouteInput[] = [];
@@ -1630,15 +1735,17 @@ export async function runAssignment(
         else usableContacts.push(contact);
     }
     let pendingContacts: ContactRouteInput[] = usableContacts;
-    ctx.log(`[Bucketing ${runId}] usable contacts: ${usableContacts.length}; General before routing: ${assignedRows.length}`);
+    ctx.log(`[Bucketing ${runId}] usable contacts: ${usableContacts.length}; Disqualified before routing: ${assignedRows.length}`);
 
     // Step 2: selected-library high-confidence match, per contact.
     if (libraryBuckets.length > 0 && pendingContacts.length > 0) {
         await ctx.checkCancel();
         ctx.log(`[Bucketing ${runId}] step 2/5: library-first match against ${libraryBuckets.length} preferred buckets`, 'phase');
         ctx.progress({ phase: 'phase1b', step: 'library_match', note: `Matching against ${libraryBuckets.length} library buckets…` });
-        const libRes = await withHeartbeat('library-first match (Phase 1b)',
-            () => runContactLibraryFirstMatch(pendingContacts, libraryBuckets, sectorVocab, runId), ctx);
+        const libRes = await timeStep('library_first_match', () =>
+            withHeartbeat('library-first match (Phase 1b)',
+                () => runContactLibraryFirstMatch(pendingContacts, libraryBuckets, sectorVocab, runId), ctx)
+        );
         totalCost += libRes.costUsd;
         assignedRows.push(...libRes.autoAssigned);
         pendingContacts = libRes.pending;
@@ -1652,10 +1759,12 @@ export async function runAssignment(
         await ctx.checkCancel();
         ctx.log(`[Bucketing ${runId}] step 3/5: strict embedding pre-filter`, 'phase');
         ctx.progress({ phase: 'phase1b', step: 'embedding_prefilter', note: `Embedding pre-filter on ${pendingContacts.length.toLocaleString()} contacts…` });
-        const embedRes = await withHeartbeat(
-            `contact embedding pre-filter (${pendingContacts.length} contacts)`,
-            () => runContactEmbeddingPrefilter(pendingContacts, leaves, sectorVocab, runId),
-            ctx
+        const embedRes = await timeStep('embedding_prefilter', () =>
+            withHeartbeat(
+                `contact embedding pre-filter (${pendingContacts.length} contacts)`,
+                () => runContactEmbeddingPrefilter(pendingContacts, leaves, sectorVocab, runId),
+                ctx
+            )
         );
         totalCost += embedRes.costUsd;
         assignedRows.push(...embedRes.autoAssigned);
@@ -1667,7 +1776,9 @@ export async function runAssignment(
     await ctx.checkCancel();
     ctx.log(`[Bucketing ${runId}] step 4/5: routing LLM matching`, 'phase');
     ctx.progress({ phase: 'phase1b', step: 'llm_routing', current: 0, total: pendingContacts.length, note: `LLM routing on ${pendingContacts.length.toLocaleString()} contacts…` });
-    const llmRes = await runContactMatchingLLM(pendingContacts, leaves, sectorVocab, runId, ctx);
+    const llmRes = await timeStep('llm_routing', () =>
+        runContactMatchingLLM(pendingContacts, leaves, sectorVocab, runId, ctx)
+    );
     totalCost += llmRes.costUsd;
     assignedRows.push(...llmRes.rows);
     ctx.log(`[Bucketing ${runId}] LLM routed ${llmRes.rows.length}, total contact rows ${assignedRows.length}, cost so far $${totalCost.toFixed(4)}`);
@@ -1729,16 +1840,22 @@ export async function runAssignment(
         }
     }
 
-    let rolledRows = computeContactRollup(assignedRows, Number(run.min_volume || 0), Number(run.bucket_budget || 30));
+    let rolledRows = await timeStep('rollup', async () =>
+        computeContactRollup(assignedRows, Number(run.min_volume || 0), Number(run.bucket_budget || 30))
+    );
 
     // Generic Audit — always runs after rollup. Pattern-recovers rows
     // from General by re-routing groups of ≥ min_volume/4 rows up the
     // chain to functional_core or identity buckets that already exist.
-    const auditRes = runGenericAudit(rolledRows, Number(run.min_volume || 0));
+    const auditRes = await timeStep('generic_audit', async () =>
+        runGenericAudit(rolledRows, Number(run.min_volume || 0))
+    );
     rolledRows = auditRes.rows;
     ctx.log(`[Bucketing ${runId}] Generic Audit: reclaimed ${auditRes.reclaimed} rows from General into ${auditRes.targets.length} target bucket(s)${auditRes.targets.length > 0 ? ` (${auditRes.targets.slice(0, 3).map(t => `${t.bucket}+${t.count}`).join(', ')}${auditRes.targets.length > 3 ? '…' : ''})` : ''}`, 'phase');
 
-    await writeContactMapAndAssignments(supabase, runId, rolledRows);
+    await timeStep('write_contact_map_and_assignments', () =>
+        writeContactMapAndAssignments(supabase, runId, rolledRows)
+    );
 
     const assignedCount = rolledRows.length;
     const coverageSummary = buildCoverageSummary(contacts, rolledRows);
@@ -1759,8 +1876,18 @@ export async function runAssignment(
     }).eq('id', runId);
 
     for (const warning of qualityWarnings) ctx.log(`[Bucketing ${runId}] warning: ${warning}`, 'warn');
-    ctx.log(`[Bucketing ${runId}] DONE — ${assignedCount.toLocaleString()} contacts assigned, total cost $${totalCost.toFixed(4)}`, 'phase');
-    ctx.progress({ phase: 'phase1b', step: 'done', current: assignedCount, total: contacts.length, note: `Assigned ${assignedCount.toLocaleString()} contacts — total cost $${totalCost.toFixed(4)}` });
+
+    // Final summary: every step's elapsed seconds in one line so a future
+    // slow run is debuggable from the log alone.
+    const totalRunMs = Date.now() - runStart;
+    const sortedTimings = [...timings].sort((a, b) => b.ms - a.ms);
+    ctx.log(
+        `[Bucketing ${runId}] step timings (slowest first): ` +
+        sortedTimings.map(t => `${t.step}=${(t.ms / 1000).toFixed(1)}s`).join(', '),
+        'phase'
+    );
+    ctx.log(`[Bucketing ${runId}] DONE — ${assignedCount.toLocaleString()} contacts assigned in ${(totalRunMs / 1000).toFixed(1)}s, total cost $${totalCost.toFixed(4)}`, 'phase');
+    ctx.progress({ phase: 'phase1b', step: 'done', current: assignedCount, total: contacts.length, note: `Assigned ${assignedCount.toLocaleString()} contacts in ${(totalRunMs / 1000).toFixed(1)}s — total cost $${totalCost.toFixed(4)}` });
 }
 
 function getUnclassifiableReason(contact: ContactRouteInput): string | null {
