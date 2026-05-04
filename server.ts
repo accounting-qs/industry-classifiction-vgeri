@@ -2086,11 +2086,13 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts', async (req, res) => {
 
         // Page contacts (keyset) for this run's selected lists. Order by
         // contact_id matches the existing Phase 1b chunk pattern.
+        // .range() (not .limit()) — PostgREST default db-max-rows cap is
+        // 1000, so .limit(2000) would silently return 1000 rows.
         let cq: any = supabase.from('contacts')
             .select('contact_id,email,first_name,last_name,company_name,company_website,industry,lead_list_name')
             .in('lead_list_name', listNames)
             .order('contact_id', { ascending: true })
-            .limit(limit);
+            .range(0, limit - 1);
         if (cursor) cq = cq.gt('contact_id', cursor);
         const { data: contacts, error: cErr } = await cq;
         if (cErr) return res.status(500).json({ error: cErr.message });
@@ -2172,6 +2174,157 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts', async (req, res) => {
         res.json({ data, next_cursor: nextCursor, has_more: hasMore });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// Streaming CSV variant of the per-contact taxonomy export. Single GET
+// returns the entire CSV — server pages internally and writes each row to
+// the response stream, so the browser shows native download progress and
+// the client never holds the full payload in memory. Use this for large
+// runs (e.g. 50k+ contacts); the JSON endpoint above is still useful for
+// in-app preview / pagination.
+const TAXONOMY_CSV_COLUMNS = [
+    'contact_id', 'email', 'first_name', 'last_name',
+    'company_name', 'company_website', 'lead_list_name',
+    'industry', 'enrichment_status', 'enrichment_classification',
+    'enrichment_confidence', 'enrichment_reasoning', 'enrichment_error',
+    'primary_identity', 'functional_core', 'functional_specialization',
+    'characteristic', 'sector_core', 'sector', 'sector_focus',
+    'canonical_classification', 'bucket_name', 'taxonomy_source',
+    'identity_confidence', 'characteristic_confidence', 'sector_confidence',
+    'confidence', 'is_generic', 'is_disqualified', 'llm_reason',
+] as const;
+
+// (csvEscape helper defined earlier in the file — reused here.)
+
+app.get('/api/bucketing/runs/:id/taxonomy-contacts.csv', async (req, res) => {
+    const id = req.params.id;
+    const PAGE_SIZE = 2000;
+
+    try {
+        const { data: run, error: runErr } = await supabase
+            .from('bucketing_runs').select('name,list_names').eq('id', id).single();
+        if (runErr || !run) return res.status(404).json({ error: runErr?.message || 'Run not found' });
+        const listNames: string[] = Array.isArray(run.list_names) ? run.list_names : [];
+
+        // Pull the taxonomy map ONCE up-front (small per-run table) so we
+        // don't refetch it for every page.
+        const { data: mapRows, error: mErr } = await supabase
+            .from('bucket_industry_map')
+            .select('industry_string,primary_identity,functional_core,functional_specialization,characteristic,sector_core,sector,sector_focus,bucket_name,canonical_classification,source,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason')
+            .eq('bucketing_run_id', id)
+            .range(0, 49999);
+        if (mErr) return res.status(500).json({ error: mErr.message });
+        const taxonomyByIndustry = new Map<string, any>();
+        for (const row of (mapRows || []) as any[]) taxonomyByIndustry.set(row.industry_string, row);
+
+        // Set headers BEFORE writing any body so the browser shows a
+        // download dialog with progress instead of trying to render text.
+        const safeName = (run.name || 'bucketing').replace(/[^a-z0-9-_]+/gi, '_');
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}_phase1a_taxonomy.csv"`);
+        res.setHeader('Cache-Control', 'no-store');
+
+        // Header row
+        res.write(TAXONOMY_CSV_COLUMNS.join(',') + '\n');
+
+        if (listNames.length === 0) { res.end(); return; }
+
+        let cursor: string | null = null;
+        let written = 0;
+        while (true) {
+            let cq: any = supabase.from('contacts')
+                .select('contact_id,email,first_name,last_name,company_name,company_website,industry,lead_list_name')
+                .in('lead_list_name', listNames)
+                .order('contact_id', { ascending: true })
+                .range(0, PAGE_SIZE - 1);
+            if (cursor) cq = cq.gt('contact_id', cursor);
+            const { data: contacts, error: cErr } = await cq;
+            if (cErr) {
+                // Mid-stream error: log on server and append a CSV comment
+                // line so the user can see something went wrong without us
+                // breaking the already-downloaded portion of the file.
+                console.error(`[taxonomy-csv] page failed at cursor=${cursor}:`, cErr.message);
+                res.write(`# ERROR: ${cErr.message.replace(/\n/g, ' ')}\n`);
+                break;
+            }
+            const page = (contacts || []) as any[];
+            if (page.length === 0) break;
+
+            // Hydrate enrichments for this page.
+            const ids = page.map(r => r.contact_id);
+            const enrichmentMap = new Map<string, any>();
+            for (let i = 0; i < ids.length; i += 200) {
+                const slice = ids.slice(i, i + 200);
+                const { data: edata, error: eErr } = await supabase
+                    .from('enrichments')
+                    .select('contact_id,status,classification,confidence,reasoning,error_message')
+                    .in('contact_id', slice);
+                if (eErr) {
+                    console.error(`[taxonomy-csv] enrichment fetch failed:`, eErr.message);
+                    res.write(`# ERROR: enrichment fetch failed: ${eErr.message.replace(/\n/g, ' ')}\n`);
+                    res.end();
+                    return;
+                }
+                for (const e of (edata || []) as any[]) enrichmentMap.set(e.contact_id, e);
+            }
+
+            for (const c of page) {
+                const enr = enrichmentMap.get(c.contact_id) || null;
+                const industryKey = (enr?.classification || c.industry || '').trim() || null;
+                const tax = industryKey ? taxonomyByIndustry.get(industryKey) : null;
+                const row: Record<string, any> = {
+                    contact_id: c.contact_id,
+                    email: c.email,
+                    first_name: c.first_name,
+                    last_name: c.last_name,
+                    company_name: c.company_name,
+                    company_website: c.company_website,
+                    lead_list_name: c.lead_list_name,
+                    industry: c.industry,
+                    enrichment_status: enr?.status || null,
+                    enrichment_classification: enr?.classification || null,
+                    enrichment_confidence: enr?.confidence ?? null,
+                    enrichment_reasoning: enr?.reasoning || null,
+                    enrichment_error: enr?.error_message || null,
+                    primary_identity: tax?.primary_identity || null,
+                    functional_core: tax?.functional_core || null,
+                    functional_specialization: tax?.functional_specialization || null,
+                    characteristic: tax?.characteristic || null,
+                    sector_core: tax?.sector_core || null,
+                    sector: tax?.sector || null,
+                    sector_focus: tax?.sector_focus || null,
+                    canonical_classification: tax?.canonical_classification || null,
+                    bucket_name: tax?.bucket_name || null,
+                    taxonomy_source: tax?.source || null,
+                    identity_confidence: tax?.identity_confidence ?? null,
+                    characteristic_confidence: tax?.characteristic_confidence ?? null,
+                    sector_confidence: tax?.sector_confidence ?? null,
+                    confidence: tax?.confidence ?? null,
+                    is_generic: tax?.is_generic ?? null,
+                    is_disqualified: tax?.is_disqualified ?? null,
+                    llm_reason: tax?.llm_reason || null,
+                };
+                res.write(TAXONOMY_CSV_COLUMNS.map(col => csvEscape(row[col])).join(',') + '\n');
+            }
+
+            written += page.length;
+            cursor = page[page.length - 1].contact_id;
+            if (page.length < PAGE_SIZE) break;
+        }
+
+        console.log(`[taxonomy-csv] run ${id}: streamed ${written} contacts`);
+        res.end();
+    } catch (err: any) {
+        // If we already started writing, we can't switch to JSON — append a
+        // comment line and end. If headers haven't been sent yet, fall back
+        // to a JSON error.
+        if (res.headersSent) {
+            res.write(`# ERROR: ${(err.message || String(err)).replace(/\n/g, ' ')}\n`);
+            res.end();
+        } else {
+            res.status(500).json({ error: err.message });
+        }
     }
 });
 

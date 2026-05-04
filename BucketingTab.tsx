@@ -701,41 +701,15 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
     setKept(s);
   };
 
-  const [exporting, setExporting] = useState(false);
-  const exportTaxonomyCsv = async () => {
-    setExporting(true);
+  const exportTaxonomyCsv = () => {
+    // Hits the server-side streaming endpoint — single GET, browser shows
+    // native download progress, no client-side memory usage. Beats the
+    // previous client-side paginate-then-Papa.unparse approach which froze
+    // the tab for ~45s on 46k contacts.
     onError(null);
-    try {
-      const PAGE = 1000;
-      const rows: any[] = [];
-      let cursor: string | null = null;
-      // Loop until the server signals has_more=false. Server uses keyset
-      // pagination on contact_id so the cursor is the last contact_id of the
-      // previous page.
-      while (true) {
-        const url = `/api/bucketing/runs/${encodeURIComponent(run.id)}/taxonomy-contacts?limit=${PAGE}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
-        const res = await fetch(url);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
-        rows.push(...(data.data || []));
-        if (!data.has_more) break;
-        cursor = data.next_cursor;
-        if (!cursor) break;
-      }
-      const csv = Papa.unparse(rows);
-      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${run.name.replace(/[^a-z0-9-_]+/gi, '_')}_phase1a_taxonomy.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (e: any) {
-      onError(e.message);
-    } finally {
-      setExporting(false);
-    }
+    window.location.href = `/api/bucketing/runs/${encodeURIComponent(run.id)}/taxonomy-contacts.csv`;
   };
+  const exporting = false;
 
   const apply = async (alsoAssign: boolean) => {
     setBusy(alsoAssign ? 'assigning' : 'saving');
