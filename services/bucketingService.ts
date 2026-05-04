@@ -137,9 +137,7 @@ interface VocabRow {
     industry: string;
     n: number;
     enrichment_status?: string | null;   // completed | scrape_error | unenriched | failed | pending
-    avg_conf: number;
     sample_companies: string[] | null;
-    sample_reasoning: string[] | null;
 }
 
 interface TaxonomyEntry {
