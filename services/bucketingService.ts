@@ -1900,9 +1900,18 @@ export async function runAssignment(
     let totalLoaded = 0;
     let totalUsable = 0;
     let totalDqEarly = 0;
+    let phase1aJoined = 0;
     let libraryMatched = 0;
     let embeddingMatched = 0;
     let llmRouted = 0;
+
+    // Load Phase 1a's per-industry-string taxonomy once and reuse it for
+    // every chunk. The JOIN-first step below short-circuits the LLM for any
+    // contact whose enriched classification text is already in the map —
+    // typically 90%+ of usable contacts, since the vocab IS the deduped
+    // set of classification strings. Cuts Phase 1b LLM cost by ~40x.
+    const taxonomyMap = await fetchPhase1aTaxonomyMap(supabase, runId, ctx);
+    ctx.log(`[Bucketing ${runId}] Phase 1a taxonomy: ${taxonomyMap.size.toLocaleString()} mapped industry strings ready for JOIN-first lookup`);
 
     await timeStep('streaming_route_all_chunks', async () => {
         while (true) {
@@ -1929,6 +1938,30 @@ export async function runAssignment(
             totalUsable += usableInChunk.length;
 
             let pending: ContactRouteInput[] = usableInChunk;
+
+            // JOIN-first: short-circuit using Phase 1a's per-industry-string
+            // tag. If the contact's enriched classification text is already
+            // in taxonomyMap, copy that tag straight onto the contact and
+            // skip every downstream matcher (library / embedding / LLM).
+            // Empty-tag rows (very rare — taxonomy edits dropped the spec
+            // since 1a wrote the map) fall through to the cascade.
+            if (pending.length > 0 && taxonomyMap.size > 0) {
+                const stillPending: ContactRouteInput[] = [];
+                for (const c of pending) {
+                    const industryKey = (c.classification || c.industry || '').trim();
+                    const tax = industryKey ? taxonomyMap.get(industryKey) : null;
+                    const usable = tax && (
+                        tax.is_disqualified || tax.primary_identity || tax.functional_specialization
+                    );
+                    if (usable) {
+                        assignedRows.push(makeJoinedContactRow(runId, c, tax));
+                        phase1aJoined++;
+                    } else {
+                        stillPending.push(c);
+                    }
+                }
+                pending = stillPending;
+            }
 
             // Library match (per chunk).
             if (libraryBuckets.length > 0 && pending.length > 0) {
@@ -1980,7 +2013,7 @@ export async function runAssignment(
                 phase: 'phase1b',
                 step: 'streaming_route',
                 current: totalLoaded,
-                note: `Routed ${assignedRows.length.toLocaleString()} contacts (chunk ${chunkNum}, library=${libraryMatched}, embed=${embeddingMatched}, llm=${llmRouted}, dq=${totalDqEarly})`
+                note: `Routed ${assignedRows.length.toLocaleString()} contacts (chunk ${chunkNum}, phase1a=${phase1aJoined}, library=${libraryMatched}, embed=${embeddingMatched}, llm=${llmRouted}, dq=${totalDqEarly})`
             });
 
             if (!chunk.hasMore) break;
@@ -1990,7 +2023,7 @@ export async function runAssignment(
     ctx.log(
         `[Bucketing ${runId}] streaming complete — ${totalLoaded.toLocaleString()} loaded, ` +
         `${totalUsable.toLocaleString()} usable, ${totalDqEarly.toLocaleString()} early-DQ; ` +
-        `library=${libraryMatched}, embed=${embeddingMatched}, llm=${llmRouted}, $${totalCost.toFixed(4)}`,
+        `phase1a=${phase1aJoined}, library=${libraryMatched}, embed=${embeddingMatched}, llm=${llmRouted}, $${totalCost.toFixed(4)}`,
         'phase'
     );
     ctx.progress({
@@ -2159,6 +2192,61 @@ function preRollupName(row: Pick<ContactMapRow, 'sector_focus' | 'functional_spe
     if (row.functional_specialization) return row.functional_specialization;
     if (row.primary_identity) return row.primary_identity;
     return RESERVED_GENERAL;
+}
+
+// Pre-loads Phase 1a's per-industry-string taxonomy into memory. Used
+// by Phase 1b's JOIN-first step so the LLM is skipped for any contact
+// whose enriched classification text was already analysed in 1a — the
+// expected fast path, since Phase 1a's vocab IS the deduped set of
+// classification strings appearing in the selected lists.
+async function fetchPhase1aTaxonomyMap(
+    supabase: SupabaseClient,
+    runId: string,
+    ctx: BucketingCtx
+): Promise<Map<string, any>> {
+    const map = new Map<string, any>();
+    const { data, error } = await supabase
+        .from('bucket_industry_map')
+        .select('industry_string,primary_identity,functional_core,functional_specialization,characteristic,sector_core,sector,sector_focus,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,source')
+        .eq('bucketing_run_id', runId)
+        .range(0, 49999);
+    if (error) {
+        ctx.log(`[Bucketing ${runId}] failed to load Phase 1a taxonomy map: ${error.message}`, 'error');
+        return map;
+    }
+    for (const row of (data || []) as any[]) {
+        if (row.industry_string) map.set(row.industry_string, row);
+    }
+    return map;
+}
+
+// Mirror of makeMatchedContactRow, but copies Phase 1a's per-string tag
+// straight onto the contact with source='phase1a_taxonomy'. Disqualified
+// rows in 1a become DQ contacts here without re-querying the LLM.
+function makeJoinedContactRow(
+    runId: string,
+    contact: ContactRouteInput,
+    tax: any
+): ContactMapRow {
+    return makeMatchedContactRow(runId, contact, {
+        primary_identity: tax.primary_identity || '',
+        functional_core: tax.functional_core || '',
+        functional_specialization: tax.functional_specialization || '',
+        sector_core: tax.sector_core || '',
+        sector_focus: tax.sector_focus || tax.sector || '',
+        source: 'phase1a_taxonomy',
+        confidence: Number(tax.confidence) || 0,
+        identity_confidence: Number(tax.identity_confidence) || 0,
+        characteristic_confidence: Number(tax.characteristic_confidence) || 0,
+        sector_confidence: Number(tax.sector_confidence) || 0,
+        leaf_score: Number(tax.confidence) || 0,
+        ancestor_score: Number(tax.identity_confidence) || 0,
+        root_score: Number(tax.identity_confidence) || 0,
+        is_generic: !!tax.is_generic,
+        is_disqualified: !!tax.is_disqualified,
+        general_reason: tax.is_disqualified ? REASON.DISQUALIFIED_BY_LLM : null,
+        reasons: { phase1a_source: tax.source, llm_reason: tax.llm_reason || null }
+    });
 }
 
 function makeGeneralContactRow(
