@@ -98,7 +98,7 @@ export function BucketingTab({ importLists }: {
 
   const openRun = (id: string) => { setActiveRunId(id); setView('detail'); };
 
-  const startNew = async (payload: { name: string; list_names: string[]; min_volume: number; bucket_budget: number; preferred_library_ids: string[]; apply_identity_dq_cascade: boolean }) => {
+  const startNew = async (payload: { name: string; list_names: string[]; apply_identity_dq_cascade: boolean }) => {
     setLoading(true);
     setError(null);
     try {
@@ -194,7 +194,6 @@ export function BucketingTab({ importLists }: {
         {view === 'setup' && (
           <BucketingSetup
             importLists={importLists}
-            library={library}
             onCancel={() => setView('index')}
             onStart={startNew}
             loading={loading}
@@ -212,6 +211,7 @@ export function BucketingTab({ importLists }: {
         {view === 'detail' && activeRun && (
           <BucketingDetail
             run={activeRun}
+            library={library}
             bucketCounts={bucketCounts}
             sectorMix={sectorMix}
             generalBreakdown={generalBreakdown}
@@ -309,31 +309,14 @@ function BucketingStatusBadge({ status }: { status: string }) {
 
 // ───── SETUP VIEW ──────────────────────────────────────────────────
 
-function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
+function BucketingSetup({ importLists, onCancel, onStart, loading }: {
   importLists: { name: string; contact_count: number; enriched_count?: number }[];
-  library: LibraryBucket[];
   onCancel: () => void;
-  onStart: (p: { name: string; list_names: string[]; min_volume: number; bucket_budget: number; preferred_library_ids: string[]; apply_identity_dq_cascade: boolean }) => void;
+  onStart: (p: { name: string; list_names: string[]; apply_identity_dq_cascade: boolean }) => void;
   loading: boolean;
 }) {
   const [name, setName] = useState('');
   const [selectedLists, setSelectedLists] = useState<Set<string>>(new Set());
-  const [minVolume, setMinVolume] = useState(1000);
-  const [bucketBudget, setBucketBudget] = useState(30);
-  // Default ON — pre-select every non-archived library bucket. Phase 1b's
-  // library_first match short-circuits the LLM for any contact whose
-  // industry maps to one of these buckets, so consistent-by-default is the
-  // right call on a curated library. The user can untick individual ones
-  // (e.g. campaign-specific buckets that don't fit this run).
-  const [selectedLib, setSelectedLib] = useState<Set<string>>(new Set());
-  const libInitialized = useRef(false);
-  useEffect(() => {
-    if (libInitialized.current) return;
-    if (!Array.isArray(library) || library.length === 0) return;
-    setSelectedLib(new Set(library.filter(b => !b.archived).map(b => b.id)));
-    libInitialized.current = true;
-  }, [library]);
-  const [showLib, setShowLib] = useState(false);
   // Default OFF — trust Sonnet's per-row is_disqualified decision instead of
   // auto-DQ'ing every contact whose identity is library-flagged [DQ].
   const [applyIdentityDqCascade, setApplyIdentityDqCascade] = useState(false);
@@ -342,11 +325,6 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
     const s = new Set(selectedLists);
     s.has(n) ? s.delete(n) : s.add(n);
     setSelectedLists(s);
-  };
-  const toggleLib = (id: string) => {
-    const s = new Set(selectedLib);
-    s.has(id) ? s.delete(id) : s.add(id);
-    setSelectedLib(s);
   };
 
   const totalSelected = importLists.filter(l => selectedLists.has(l.name)).reduce((s, l) => s + (l.enriched_count || 0), 0);
@@ -395,117 +373,8 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
         )}
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div>
-          <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">
-            Minimum bucket volume
-          </label>
-          <div className="flex flex-wrap items-center gap-2 mb-2">
-            {[
-              { label: 'Loose', value: 200 },
-              { label: 'Balanced', value: 500 },
-              { label: 'Strict', value: 1000 }
-            ].map(p => (
-              <button
-                key={p.value}
-                type="button"
-                onClick={() => setMinVolume(p.value)}
-                className={`px-3 py-1.5 rounded-md text-xs font-bold border transition ${
-                  minVolume === p.value
-                    ? 'bg-[#3ecf8e] text-black border-[#3ecf8e]'
-                    : 'bg-[#1c1c1c] text-gray-300 border-[#2e2e2e] hover:bg-[#2e2e2e]'
-                }`}
-              >
-                {p.label} ({p.value})
-              </button>
-            ))}
-            <span className="text-[10px] text-gray-500 italic ml-1">or custom:</span>
-            <input
-              type="number"
-              min={0}
-              value={minVolume}
-              onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
-              className="w-24 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
-            />
-          </div>
-          <p className="text-[10px] text-gray-500 italic mt-1">
-            Combos / specializations / identities below this roll up. 5 fallback levels: combo → sector_core+spec → spec → functional_core → identity → General.
-          </p>
-        </div>
-        <div>
-          <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">
-            Bucket budget (max campaign buckets)
-          </label>
-          <input
-            type="number"
-            min={5}
-            max={100}
-            value={bucketBudget}
-            onChange={e => setBucketBudget(Math.max(5, Math.min(100, parseInt(e.target.value || '30', 10))))}
-            className="w-32 px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-sm text-white focus:outline-none focus:border-[#3ecf8e]"
-          />
-          <p className="text-[10px] text-gray-500 italic mt-1">
-            If more campaign buckets clear the threshold, the smallest are rolled up further until this cap is met. Typical: 25–35.
-          </p>
-        </div>
-      </div>
-
-      <div>
-        <div className="flex items-center justify-between flex-wrap gap-2">
-          <button
-            onClick={() => setShowLib(s => !s)}
-            className="text-[11px] text-gray-400 hover:text-white flex items-center gap-1"
-          >
-            <BookMarked className="w-3 h-3" />
-            {showLib ? 'Hide' : 'Reuse'} library buckets ({selectedLib.size}/{library.length} selected)
-          </button>
-          {library.length > 0 && (
-            <div className="flex gap-1">
-              <button
-                onClick={() => setSelectedLib(new Set(library.filter(b => !b.archived).map(b => b.id)))}
-                className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-200 hover:bg-[#3e3e3e]"
-                title="Re-select every non-archived library bucket"
-              >
-                Select all
-              </button>
-              <button
-                onClick={() => setSelectedLib(new Set())}
-                disabled={selectedLib.size === 0}
-                className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-200 hover:bg-[#3e3e3e] disabled:opacity-40"
-              >
-                Select none
-              </button>
-            </div>
-          )}
-        </div>
-        {showLib && (
-          <div className="mt-2 border border-[#2e2e2e] rounded max-h-48 overflow-y-auto custom-scrollbar">
-            {library.length === 0 ? (
-              <div className="text-xs text-gray-500 italic px-3 py-2">No saved library buckets yet. After completing a run, save useful buckets to reuse here.</div>
-            ) : library.map(b => {
-              const isSel = selectedLib.has(b.id);
-              return (
-                <button
-                  key={b.id}
-                  onClick={() => toggleLib(b.id)}
-                  className={`w-full flex items-start justify-between px-3 py-2 text-left text-xs border-b border-[#2e2e2e] last:border-b-0 transition-colors ${isSel ? 'bg-[#3ecf8e]/10' : 'hover:bg-white/[0.02]'}`}
-                >
-                  <span className="flex items-start gap-2 flex-1 min-w-0">
-                    <input type="checkbox" checked={isSel} onChange={() => {}} className="w-3 h-3 mt-0.5" />
-                    <span className="min-w-0">
-                      <span className={`font-medium block ${isSel ? 'text-[#3ecf8e]' : 'text-gray-200'}`}>
-                        {b.functional_specialization || b.bucket_name}
-                      </span>
-                      <span className="text-[10px] text-gray-500 truncate block">
-                        under {b.primary_identity || b.direct_ancestor || '—'} · used {b.times_used}×
-                      </span>
-                    </span>
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        )}
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-3 text-[11px] text-gray-400">
+        <span className="text-gray-300 font-bold">Bucket sizing &amp; library reuse</span> are set on the next screen, after Phase 1a proposes a taxonomy — that way you size against the actual specializations Sonnet found.
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-3">
@@ -533,9 +402,6 @@ function BucketingSetup({ importLists, library, onCancel, onStart, loading }: {
           onClick={() => onStart({
             name: name.trim(),
             list_names: Array.from(selectedLists),
-            min_volume: minVolume,
-            bucket_budget: bucketBudget,
-            preferred_library_ids: Array.from(selectedLib),
             apply_identity_dq_cascade: applyIdentityDqCascade
           })}
           disabled={!canStart}
@@ -746,8 +612,9 @@ function formatDuration(seconds: number): string {
   return `${h}h ${m % 60}m`;
 }
 
-function BucketingDetail({ run, bucketCounts, sectorMix, generalBreakdown, onRefresh, onError, onLibrarySaved }: {
+function BucketingDetail({ run, library, bucketCounts, sectorMix, generalBreakdown, onRefresh, onError, onLibrarySaved }: {
   run: BucketingRun;
+  library: LibraryBucket[];
   bucketCounts: any[];
   sectorMix: any[];
   generalBreakdown: any[];
@@ -777,15 +644,16 @@ function BucketingDetail({ run, bucketCounts, sectorMix, generalBreakdown, onRef
     return <BucketingProgressPanel run={run} title="Phase 1b — Matching contacts to buckets" onError={onError} />;
   }
   if (run.status === 'taxonomy_ready') {
-    return <BucketingReview run={run} bucketCounts={bucketCounts} onRefresh={onRefresh} onError={onError} />;
+    return <BucketingReview run={run} library={library} bucketCounts={bucketCounts} onRefresh={onRefresh} onError={onError} />;
   }
   return <BucketingResults run={run} bucketCounts={bucketCounts} sectorMix={sectorMix} generalBreakdown={generalBreakdown} onError={onError} onLibrarySaved={onLibrarySaved} />;
 }
 
 // ───── REVIEW VIEW ──────────────────────────────────────────────
 
-function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
+function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
   run: BucketingRun;
+  library: LibraryBucket[];
   bucketCounts: any[];
   onRefresh: () => void;
   onError: (msg: string | null) => void;
@@ -803,6 +671,29 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
   const [bucketBudget, setBucketBudget] = useState<number>(run.bucket_budget || 30);
   const [busy, setBusy] = useState<'none' | 'saving' | 'assigning'>('none');
   const [showPatterns, setShowPatterns] = useState(false);
+  // Library selection moved here from Setup. Default ON — pre-select every
+  // non-archived library bucket the first time this Review screen renders;
+  // Phase 1b's library_first match short-circuits the LLM for any contact
+  // whose industry maps to one of these. The user can untick individual ones
+  // before clicking Apply & Assign. We treat an empty saved value as "not
+  // yet decided" and re-default on mount, matching the Setup-screen UX.
+  const [selectedLib, setSelectedLib] = useState<Set<string>>(new Set());
+  const libInitialized = useRef(false);
+  useEffect(() => {
+    if (libInitialized.current) return;
+    if (!Array.isArray(library) || library.length === 0) return;
+    const saved = Array.isArray(run.preferred_library_ids) ? run.preferred_library_ids : [];
+    setSelectedLib(saved.length > 0
+      ? new Set(saved)
+      : new Set(library.filter(b => !b.archived).map(b => b.id)));
+    libInitialized.current = true;
+  }, [library, run.preferred_library_ids]);
+  const [showLib, setShowLib] = useState(false);
+  const toggleLib = (id: string) => {
+    const s = new Set(selectedLib);
+    s.has(id) ? s.delete(id) : s.add(id);
+    setSelectedLib(s);
+  };
 
   const toggle = (name: string) => {
     const s = new Set(kept);
@@ -822,7 +713,8 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
             rename: renames,
             add: adds,
             min_volume: minVolume,
-            bucket_budget: bucketBudget
+            bucket_budget: bucketBudget,
+            preferred_library_ids: Array.from(selectedLib)
         })
       });
       if (!res.ok) {
@@ -924,6 +816,67 @@ function BucketingReview({ run, bucketCounts, onRefresh, onError }: {
                 </button>
               </div>
             ))}
+          </div>
+        )}
+      </div>
+
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <button
+            onClick={() => setShowLib(s => !s)}
+            className="text-[11px] text-gray-400 hover:text-white flex items-center gap-1"
+          >
+            <BookMarked className="w-3 h-3" />
+            {showLib ? 'Hide' : 'Reuse'} library buckets ({selectedLib.size}/{library.length} selected)
+          </button>
+          {library.length > 0 && (
+            <div className="flex gap-1">
+              <button
+                onClick={() => setSelectedLib(new Set(library.filter(b => !b.archived).map(b => b.id)))}
+                className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-200 hover:bg-[#3e3e3e]"
+                title="Re-select every non-archived library bucket"
+              >
+                Select all
+              </button>
+              <button
+                onClick={() => setSelectedLib(new Set())}
+                disabled={selectedLib.size === 0}
+                className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-200 hover:bg-[#3e3e3e] disabled:opacity-40"
+              >
+                Select none
+              </button>
+            </div>
+          )}
+        </div>
+        <p className="text-[10px] text-gray-500 italic mt-1">
+          Selected library buckets short-circuit the Phase 1b LLM via embedding match — keeping a curated set selected is the cheapest way to bucket overlapping lists.
+        </p>
+        {showLib && (
+          <div className="mt-2 border border-[#2e2e2e] rounded max-h-48 overflow-y-auto custom-scrollbar">
+            {library.length === 0 ? (
+              <div className="text-xs text-gray-500 italic px-3 py-2">No saved library buckets yet. After completing a run, save useful buckets to reuse here.</div>
+            ) : library.map(b => {
+              const isSel = selectedLib.has(b.id);
+              return (
+                <button
+                  key={b.id}
+                  onClick={() => toggleLib(b.id)}
+                  className={`w-full flex items-start justify-between px-3 py-2 text-left text-xs border-b border-[#2e2e2e] last:border-b-0 transition-colors ${isSel ? 'bg-[#3ecf8e]/10' : 'hover:bg-white/[0.02]'}`}
+                >
+                  <span className="flex items-start gap-2 flex-1 min-w-0">
+                    <input type="checkbox" checked={isSel} onChange={() => {}} className="w-3 h-3 mt-0.5" />
+                    <span className="min-w-0">
+                      <span className={`font-medium block ${isSel ? 'text-[#3ecf8e]' : 'text-gray-200'}`}>
+                        {b.functional_specialization || b.bucket_name}
+                      </span>
+                      <span className="text-[10px] text-gray-500 truncate block">
+                        under {b.primary_identity || b.direct_ancestor || '—'} · used {b.times_used}×
+                      </span>
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
           </div>
         )}
       </div>
