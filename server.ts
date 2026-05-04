@@ -2126,10 +2126,12 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts', async (req, res) => {
 
         const data = page.map(c => {
             const enr = enrichmentMap.get(c.contact_id) || null;
-            // contacts.industry is the key Phase 1a / 1b actually join on; if
-            // it's empty fall back to enrichments.classification so the export
-            // still surfaces a row even when the join would miss.
-            const industryKey = c.industry || enr?.classification || null;
+            // bucket_industry_map.industry_string was populated from
+            // enrichments.classification by the vocab RPC, so we MUST prefer
+            // it as the join key. Falling back to contacts.industry only
+            // when there's no enrichment classification — matches the same
+            // precedence Phase 1b's JOIN-first step uses.
+            const industryKey = (enr?.classification || c.industry || '').trim() || null;
             const tax = industryKey ? taxonomyByIndustry.get(industryKey) : null;
             return {
                 contact_id: c.contact_id,
