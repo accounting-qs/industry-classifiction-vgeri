@@ -84,7 +84,7 @@ export function BucketingTab({ importLists }: {
     // to a Resume click). Stop polling once we land on a terminal stable
     // state the user is reviewing.
     if (activeRun.status === 'completed' || activeRun.status === 'failed' || activeRun.status === 'taxonomy_ready') return;
-    const t = setInterval(fetchActive, 1500);
+    const t = setInterval(fetchActive, 60000);
     return () => clearInterval(t);
   }, [activeRunId, activeRun?.status, fetchActive]);
 
@@ -92,7 +92,7 @@ export function BucketingTab({ importLists }: {
     if (view !== 'index') return;
     const hasInflight = runs.some(r => r.status === 'taxonomy_pending' || r.status === 'assigning');
     if (!hasInflight) return;
-    const t = setInterval(refreshRuns, 4000);
+    const t = setInterval(refreshRuns, 60000);
     return () => clearInterval(t);
   }, [view, runs, refreshRuns]);
 
@@ -554,7 +554,7 @@ function BucketingProgressPanel({ run, title, onError }: {
       } catch { /* swallow polling errors */ }
     };
     tick();
-    const t = setInterval(tick, 1500);
+    const t = setInterval(tick, 60000);
     return () => { cancelled = true; clearInterval(t); };
   }, [run.id, sinceId]);
 
