@@ -1802,18 +1802,22 @@ async function consolidateCharacteristicsViaLLM(
         })
         .sort((a, b) => b.count - a.count);
 
-    // Group by identity for the prompt — LLM merges within each group.
+    // Group by identity. Each identity becomes its own LLM call run in
+    // parallel — splitting 350+ inputs across 15-20 small calls instead of
+    // one massive one. This fixes two failure modes the previous one-shot
+    // call hit:
+    //   1. Output token cap (4k tokens couldn't fit 200+ merge entries →
+    //      response truncated mid-JSON → parse failed → 0 merges).
+    //   2. Single point of failure — one bad batch killed all consolidation.
+    // Per-identity batches are 5-50 entries each, fitting comfortably in
+    // 8k output tokens. pLimit(5) caps concurrency to stay under rate limits.
     const byIdent = new Map<string, { name: string; count: number }[]>();
     for (const e of entries) {
         if (!byIdent.has(e.identity)) byIdent.set(e.identity, []);
         byIdent.get(e.identity)!.push({ name: e.characteristic, count: e.count });
     }
-    const promptBody = Array.from(byIdent.entries()).map(([identity, list]) => {
-        const lines = list.map(l => `  - "${l.name}" (${l.count}×)`).join('\n');
-        return `Identity: ${identity || '(none)'}\n${lines}`;
-    }).join('\n\n');
 
-    const systemPrompt = `You consolidate a long list of B2B characteristic proposals into a small, reusable canonical set. Each characteristic is a sub-type within a primary identity.
+    const systemPrompt = `You consolidate a list of B2B characteristic proposals into a small, reusable canonical set. Each characteristic is a sub-type within a primary identity.
 
 GOAL: collapse near-duplicate / overly narrow entries within the same identity. TARGET: 3–6 characteristics per identity, TOTAL 50–80 across the whole list. If the input has more than 80 distinct characteristics, you MUST merge aggressively. Be RUTHLESS — leaving variants separate is the failure mode, merging too much is rare.
 
@@ -1938,62 +1942,113 @@ OUTPUT (strict JSON, key MUST be "merges"):
 }
 Only include entries where from != to (or where to="" to drop). Be ruthless — if the input has 200+ characteristics, expect to output 150+ merges.`;
 
-    const userPrompt = `Consolidate these proposed-new characteristics:\n\n${promptBody}`;
+    // Per-identity LLM call. Each call gets a small input (5-50 chars under
+    // ONE identity) and produces small output (3-30 merges). Failures in
+    // one identity don't kill the whole consolidation.
+    const consolidateOneIdentity = async (
+        identity: string,
+        list: { name: string; count: number }[]
+    ): Promise<{ map: Map<string, string>; costUsd: number; error?: string }> => {
+        const inputBody = list.map(l => `  - "${l.name}" (${l.count}×)`).join('\n');
+        const userPrompt = `Identity to consolidate: ${identity || '(none)'}\n\nCharacteristics under this identity (apply REQUIRED MERGE PATTERNS, LOW-COUNT MERGE, and IDENTITY-BLEED rules from the system prompt):\n\n${inputBody}`;
 
-    let costUsd = 0;
-    let mergeCount = 0;
-    const mergeMap = new Map<string, string>();
-
-    try {
         const isAnthropic = model.startsWith('claude-');
         let text = '';
-        if (isAnthropic) {
-            const anthropic = await getAnthropic(supabase);
-            if (!anthropic) throw new Error('Anthropic API key not configured');
-            const resp = await anthropic.messages.create({
-                model,
-                max_tokens: 4000,
-                system: systemPrompt,
-                messages: [{ role: 'user', content: userPrompt }]
-            }, { timeout: TAXONOMY_TIMEOUT_MS });
-            const usage: any = (resp as any).usage || {};
-            costUsd = computeAnthropicCost(model, usage.input_tokens || 0, usage.output_tokens || 0);
-            text = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
-        } else {
-            const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({
+        let cost = 0;
+        try {
+            if (isAnthropic) {
+                const anthropic = await getAnthropic(supabase);
+                if (!anthropic) throw new Error('Anthropic API key not configured');
+                const resp = await anthropic.messages.create({
                     model,
-                    max_tokens: 4000,
-                    response_format: { type: 'json_object' },
-                    messages: [
-                        { role: 'system', content: systemPrompt },
-                        { role: 'user', content: userPrompt }
-                    ]
-                }),
-                signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
-            });
-            if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
-            const json: any = await resp.json();
-            const usage = json.usage || {};
-            costUsd = computeOpenAICost(model, usage.prompt_tokens || 0, 0, usage.completion_tokens || 0);
-            text = json.choices?.[0]?.message?.content || '';
-        }
-
-        const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-        const cleaned = (fence ? fence[1] : text).trim();
-        const parsed = JSON.parse(cleaned);
-        const merges = Array.isArray(parsed.merges) ? parsed.merges : [];
-        for (const m of merges) {
-            if (typeof m?.from === 'string' && typeof m?.to === 'string' && m.from !== m.to) {
-                mergeMap.set(m.from, m.to);
+                    max_tokens: 8000,
+                    system: systemPrompt,
+                    messages: [{ role: 'user', content: userPrompt }]
+                }, { timeout: TAXONOMY_TIMEOUT_MS });
+                const usage: any = (resp as any).usage || {};
+                cost = computeAnthropicCost(model, usage.input_tokens || 0, usage.output_tokens || 0);
+                text = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
+            } else {
+                const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model,
+                        max_tokens: 8000,
+                        response_format: { type: 'json_object' },
+                        messages: [
+                            { role: 'system', content: systemPrompt },
+                            { role: 'user', content: userPrompt }
+                        ]
+                    }),
+                    signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+                });
+                if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
+                const json: any = await resp.json();
+                const usage = json.usage || {};
+                cost = computeOpenAICost(model, usage.prompt_tokens || 0, 0, usage.completion_tokens || 0);
+                text = json.choices?.[0]?.message?.content || '';
             }
+
+            // Parse — try strict JSON first, fall back to regex repair on
+            // truncation. Truncation produces output like `{"merges":[{...},{...},{"f` →
+            // regex pulls out the well-formed entries before the cutoff.
+            const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+            const cleaned = (fence ? fence[1] : text).trim();
+            const out = new Map<string, string>();
+            try {
+                const parsed = JSON.parse(cleaned);
+                const merges = Array.isArray(parsed.merges) ? parsed.merges : [];
+                for (const m of merges) {
+                    if (typeof m?.from === 'string' && typeof m?.to === 'string' && m.from !== m.to) {
+                        out.set(m.from, m.to);
+                    }
+                }
+            } catch {
+                // JSON repair: extract complete {"from": "...", "to": "..."} objects.
+                const re = /\{\s*"from"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"to"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
+                let m: RegExpExecArray | null;
+                let recovered = 0;
+                while ((m = re.exec(cleaned)) !== null) {
+                    const from = m[1].replace(/\\(.)/g, '$1');
+                    const to = m[2].replace(/\\(.)/g, '$1');
+                    if (from !== to) { out.set(from, to); recovered++; }
+                }
+                if (recovered === 0) throw new Error(`unrecoverable parse failure (${cleaned.length} chars)`);
+                ctx.log(`[Bucketing ${runId}] [${identity}] consolidation JSON truncated — recovered ${recovered} merges via regex`, 'warn');
+            }
+            return { map: out, costUsd: cost };
+        } catch (err: any) {
+            return { map: new Map(), costUsd: cost, error: err.message };
         }
-        mergeCount = mergeMap.size;
-    } catch (err: any) {
-        ctx.log(`[Bucketing ${runId}] characteristic consolidation LLM call failed (non-fatal): ${err.message}`, 'warn');
-        return { merges: 0, costUsd };
+    };
+
+    // Run identities with >= 5 entries in parallel. Identities with < 5 don't
+    // need consolidation (already small enough).
+    const limit = pLimit(5);
+    const candidates = Array.from(byIdent.entries()).filter(([_, list]) => list.length >= 5);
+    if (candidates.length === 0) {
+        ctx.log(`[Bucketing ${runId}] characteristic consolidation: no identities with >= 5 entries to consolidate`);
+        return { merges: 0, costUsd: 0 };
+    }
+
+    let totalCost = 0;
+    let totalErrors = 0;
+    const mergeMap = new Map<string, string>();
+
+    await Promise.all(candidates.map(([identity, list]) => limit(async () => {
+        const r = await consolidateOneIdentity(identity, list);
+        totalCost += r.costUsd;
+        if (r.error) {
+            totalErrors++;
+            ctx.log(`[Bucketing ${runId}] [${identity}] consolidation failed: ${r.error}`, 'warn');
+            return;
+        }
+        for (const [from, to] of r.map) mergeMap.set(from, to);
+    })));
+
+    if (totalErrors > 0) {
+        ctx.log(`[Bucketing ${runId}] characteristic consolidation: ${totalErrors}/${candidates.length} identities failed (non-fatal — others applied)`);
     }
 
     // Apply the mapping in-place. An empty string target means "drop to null"
@@ -2005,7 +2060,7 @@ Only include entries where from != to (or where to="" to drop). Be ruthless — 
             t.characteristic = target.trim() ? target : null;
         }
     }
-    return { merges: mergeCount, costUsd };
+    return { merges: mergeMap.size, costUsd: totalCost };
 }
 
 // Sector-specific consolidation. Same shape as the characteristic version
