@@ -2123,14 +2123,24 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts', async (req, res) => {
         // (one row per distinct industry_string — typically 2–5k for 100k
         // contacts) so refetching it per page is cheap and keeps the
         // endpoint stateless.
-        const { data: mapRows, error: mErr } = await supabase
-            .from('bucket_industry_map')
-            .select('industry_string,primary_identity,characteristic,sector,bucket_name,canonical_classification,source,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,reasons')
-            .eq('bucketing_run_id', id)
-            .range(0, 49999);
-        if (mErr) return res.status(500).json({ error: mErr.message });
+        // Paginate at PostgREST's 1000-row hard cap. A single .range(0, 49999)
+        // would silently return only 1000 rows on runs with >1k industries.
         const taxonomyByIndustry = new Map<string, any>();
-        for (const row of (mapRows || []) as any[]) taxonomyByIndustry.set(row.industry_string, row);
+        let mOff = 0;
+        const MPAGE = 1000;
+        while (true) {
+            const { data: mapRows, error: mErr } = await supabase
+                .from('bucket_industry_map')
+                .select('industry_string,primary_identity,characteristic,sector,bucket_name,canonical_classification,source,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,reasons')
+                .eq('bucketing_run_id', id)
+                .range(mOff, mOff + MPAGE - 1);
+            if (mErr) return res.status(500).json({ error: mErr.message });
+            const rows = (mapRows || []) as any[];
+            for (const row of rows) taxonomyByIndustry.set(row.industry_string, row);
+            if (rows.length < MPAGE) break;
+            mOff += MPAGE;
+            if (mOff > 200_000) break;
+        }
 
         const data = page.map(c => {
             const enr = enrichmentMap.get(c.contact_id) || null;
@@ -2209,15 +2219,24 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts.csv', async (req, res) => {
         const listNames: string[] = Array.isArray(run.list_names) ? run.list_names : [];
 
         // Pull the taxonomy map ONCE up-front (small per-run table) so we
-        // don't refetch it for every page.
-        const { data: mapRows, error: mErr } = await supabase
-            .from('bucket_industry_map')
-            .select('industry_string,primary_identity,characteristic,sector,bucket_name,canonical_classification,source,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason')
-            .eq('bucketing_run_id', id)
-            .range(0, 49999);
-        if (mErr) return res.status(500).json({ error: mErr.message });
+        // don't refetch it for every page. Paginated at PostgREST's 1000-row
+        // hard cap so runs with >1k industries aren't truncated.
         const taxonomyByIndustry = new Map<string, any>();
-        for (const row of (mapRows || []) as any[]) taxonomyByIndustry.set(row.industry_string, row);
+        let mOff = 0;
+        const MPAGE = 1000;
+        while (true) {
+            const { data: mapRows, error: mErr } = await supabase
+                .from('bucket_industry_map')
+                .select('industry_string,primary_identity,characteristic,sector,bucket_name,canonical_classification,source,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason')
+                .eq('bucketing_run_id', id)
+                .range(mOff, mOff + MPAGE - 1);
+            if (mErr) return res.status(500).json({ error: mErr.message });
+            const rows = (mapRows || []) as any[];
+            for (const row of rows) taxonomyByIndustry.set(row.industry_string, row);
+            if (rows.length < MPAGE) break;
+            mOff += MPAGE;
+            if (mOff > 200_000) break;
+        }
 
         // Set headers BEFORE writing any body so the browser shows a
         // download dialog with progress instead of trying to render text.

@@ -1931,17 +1931,29 @@ async function fetchPhase1aTaxonomyMap(
     ctx: BucketingCtx
 ): Promise<Map<string, any>> {
     const map = new Map<string, any>();
-    const { data, error } = await supabase
-        .from('bucket_industry_map')
-        .select('industry_string,primary_identity,characteristic,sector,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,source')
-        .eq('bucketing_run_id', runId)
-        .range(0, 49999);
-    if (error) {
-        ctx.log(`[Bucketing ${runId}] failed to load Phase 1a taxonomy map: ${error.message}`, 'error');
-        return map;
-    }
-    for (const row of (data || []) as any[]) {
-        if (row.industry_string) map.set(row.industry_string, row);
+    // Paginate at PostgREST's 1000-row hard cap. A single .range(0, 49999)
+    // would silently return only 1000 rows, so runs with >1k distinct
+    // industry strings would have most contacts miss the JOIN-first lookup
+    // and waste LLM cycles in Phase 1b.
+    const PAGE = 1000;
+    let offset = 0;
+    while (true) {
+        const { data, error } = await supabase
+            .from('bucket_industry_map')
+            .select('industry_string,primary_identity,characteristic,sector,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,source')
+            .eq('bucketing_run_id', runId)
+            .range(offset, offset + PAGE - 1);
+        if (error) {
+            ctx.log(`[Bucketing ${runId}] failed to load Phase 1a taxonomy map (offset=${offset}): ${error.message}`, 'error');
+            return map;
+        }
+        const rows = (data || []) as any[];
+        for (const row of rows) {
+            if (row.industry_string) map.set(row.industry_string, row);
+        }
+        if (rows.length < PAGE) break;
+        offset += PAGE;
+        if (offset > 200_000) break; // hard ceiling — bucket_industry_map should never have this many rows for one run
     }
     return map;
 }
