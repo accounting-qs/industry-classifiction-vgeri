@@ -370,7 +370,12 @@ async function fetchFullVocabulary(
     }, ctx);
 }
 
-const CONTACT_PAGE_SIZE = 2000;
+// 1000 (not 2000) so the page size never exceeds Supabase's default
+// PostgREST db.maxRows cap of 1000. With pageSize=2000, .range(0, 1999)
+// silently returned 1000 rows and hasMore (page.length === pageSize)
+// evaluated false → loop exited after the first chunk, capping every run
+// at 1k contacts no matter how many were selected.
+const CONTACT_PAGE_SIZE = 1000;
 // 200 UUIDs × ~37 chars ≈ 7,400-char URL — under PostgREST's 8KB request-line
 // cap. Same constraint that broke list deletion at 1,000 IDs. Don't raise
 // this without moving the IN list into a server-side RPC.
@@ -1158,7 +1163,35 @@ async function tagIndustries(
                 text = json.choices?.[0]?.message?.content || '';
             }
             const parsed = parseTaggingJson(text, batch);
-            for (const t of parsed) taggings.push(t);
+            // An empty parse means the LLM produced JSON we couldn't extract
+            // taggings from (wrong key, missing items, malformed shape). Treat
+            // it as a failed batch so (a) catastrophic-failure detection kicks
+            // in if every batch is empty, and (b) we still emit needs_qa rows
+            // so the contacts aren't silently lost.
+            if (parsed.length === 0) {
+                batchesFailed++;
+                if (!firstError) firstError = `LLM returned a valid JSON shape but no parseable taggings. Sample: ${text.slice(0, 200)}`;
+                ctx.log(`[Bucketing ${runId}] tagging batch parsed to 0 results (${batch.length} industries) — output: ${text.slice(0, 200)}`, 'warn');
+                for (const v of batch) {
+                    taggings.push({
+                        industry: v.industry,
+                        identity: null,
+                        is_new_identity: false,
+                        characteristic: null,
+                        is_new_characteristic: false,
+                        sector: null,
+                        is_new_sector: false,
+                        is_disqualified: false,
+                        identity_confidence: 0,
+                        characteristic_confidence: 0,
+                        sector_confidence: 0,
+                        confidence: 0,
+                        reason: `parse_empty: ${text.slice(0, 100)}`
+                    });
+                }
+            } else {
+                for (const t of parsed) taggings.push(t);
+            }
         } catch (err: any) {
             batchesFailed++;
             if (!firstError) firstError = err.message || String(err);
@@ -1263,7 +1296,11 @@ CONFIDENCE SCORING (per tag, 1-10):
 - <6 means: this specific tag is a guess; downstream code may ignore it.
 - If you return null for a tag (e.g. no sector applicable), set its confidence to 1.
 
-OUTPUT FORMAT — return ONLY valid JSON, no prose:
+OUTPUT FORMAT (STRICT) — return ONLY valid JSON, no prose, no markdown:
+The top-level object MUST use the key "results" (not "industries", not "taggings",
+not "output" — exactly "results"). Each item's "id" MUST match the input "id"
+(integer). Return one item per input industry, in the same order:
+
 {
   "results": [
     {
@@ -1303,9 +1340,36 @@ function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
     catch { throw new Error(`tagging response is not valid JSON: ${txt.slice(0, 200)}`); }
 
     const out: IndustryTagging[] = [];
-    const arr = Array.isArray(parsed) ? parsed : (parsed.results || []);
-    for (const item of arr) {
-        const idx = typeof item.id === 'number' ? item.id : -1;
+    // Find the array of results — be lenient about the wrapping key. gpt-4.1-mini
+    // in json_object mode often echoes back the user prompt's key (`industries`)
+    // instead of the prompt-specified `results`. We accept either by scanning
+    // the parsed object's top-level values for the first array of items that
+    // look like taggings (have `id`, `identity`, or `characteristic`).
+    let arr: any[] = [];
+    if (Array.isArray(parsed)) {
+        arr = parsed;
+    } else if (parsed && typeof parsed === 'object') {
+        // Preferred keys first; then any array value found at top level.
+        const preferred = ['results', 'industries', 'taggings', 'output', 'data'];
+        for (const k of preferred) {
+            if (Array.isArray(parsed[k])) { arr = parsed[k]; break; }
+        }
+        if (arr.length === 0) {
+            for (const k of Object.keys(parsed)) {
+                if (Array.isArray(parsed[k]) && parsed[k].length > 0) { arr = parsed[k]; break; }
+            }
+        }
+    }
+    for (let i = 0; i < arr.length; i++) {
+        const item = arr[i];
+        // Accept item.id as number, numeric string, or fall back to position.
+        // gpt-4.1-mini sometimes returns ids as strings ("0", "1") or omits
+        // them entirely; positional fallback recovers what would otherwise
+        // be silently dropped.
+        let idx = -1;
+        if (typeof item.id === 'number') idx = item.id;
+        else if (typeof item.id === 'string' && /^\d+$/.test(item.id)) idx = parseInt(item.id, 10);
+        else idx = i;
         if (idx < 0 || idx >= batch.length) continue;
         const v = batch[idx];
         // Per-tag confidences with back-compat: if the tagger returns the
