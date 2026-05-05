@@ -24,6 +24,18 @@ const RESERVED_GENERAL = 'General';
 // Recognize legacy names too, in case a run was created before v2.3.
 const RESERVED_NAMES = new Set(['general', 'generic', 'disqualified', 'other']);
 
+// Hover tooltips for the 3 taxonomy column headers on the AI-proposed
+// additions panel. Plain strings — rendered via the browser's native
+// title= tooltip on the column label + ⓘ icon.
+const TAXONOMY_LAYER_HELP = {
+  identities:
+    'IDENTITY (Layer 1) — what kind of company this IS at its core. The top-level business model. Examples: Agency, Consulting & Advisory, Software & SaaS, Manufacturing & Industrial, Real Estate, Healthcare Operator, Financial Services. Aim for ~10–15 in a typical run.',
+  characteristics:
+    'CHARACTERISTIC (Layer 2) — the specific functional sub-type within the identity. Narrows what kind of {identity} the company is. Examples: under Agency → "SEO Agency" / "Performance Marketing Agency"; under Software & SaaS → "FinTech SaaS" / "Vertical SaaS"; under Financial Services → "Private Equity Firm" / "Wealth Management". ~3–8 per identity.',
+  sectors:
+    'SECTOR (Layer 3) — the vertical the company SERVES, if explicitly stated. Independent of identity — a "Marketing Agency for Healthcare" has identity=Agency + sector=Healthcare (not identity=Healthcare). Often blank. Examples: Healthcare, Real Estate, Government, Energy & Utilities, Financial Services.'
+} as const;
+
 export function BucketingTab({ importLists }: {
   importLists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number }[]
 }) {
@@ -1825,10 +1837,16 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
           const sel = selected[kind];
           const allSelected = items.length > 0 && sel.size === items.length;
           const someSelected = sel.size > 0;
+          // Layer-explanation tooltips. Native title= attribute so the
+          // browser's built-in tooltip handles hover (no extra deps).
+          const tooltip = TAXONOMY_LAYER_HELP[kind];
           return (
             <div key={kind}>
               <div className="flex flex-wrap items-center justify-between gap-1 mb-1.5">
-                <label className="flex items-center gap-1.5 text-[10px] font-bold text-gray-400 uppercase cursor-pointer select-none">
+                <label
+                  className="flex items-center gap-1.5 text-[10px] font-bold text-gray-400 uppercase cursor-pointer select-none"
+                  title={tooltip}
+                >
                   <input
                     type="checkbox"
                     checked={allSelected}
@@ -1837,7 +1855,12 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
                     disabled={items.length === 0}
                     className="w-3 h-3 accent-[#3ecf8e]"
                   />
-                  {kind} ({items.length})
+                  <span>{kind} ({items.length})</span>
+                  <span
+                    className="text-gray-600 hover:text-amber-400 text-[11px] leading-none"
+                    title={tooltip}
+                    aria-label={`What is ${kind}?`}
+                  >ⓘ</span>
                 </label>
                 {items.length > 0 && (
                   <div className="flex gap-1">
