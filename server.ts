@@ -8,7 +8,6 @@ import path from 'path';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import crypto from 'crypto';
-import os from 'os';
 import zlib from 'zlib';
 import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
@@ -2380,12 +2379,17 @@ const ASSIGNMENT_CSV_COLUMNS = [
     'phase1a_llm_reason', 'bucket_reason', 'general_reason', 'reasons',
 ] as const;
 
-const CSV_TMP_DIR = path.join(os.tmpdir(), 'bucketing-csv');
-const CSV_STORAGE_BUCKET = 'bucketing-csv';
+// Local disk under EXPORTS_DIR — same pattern as the Phase 0 list export
+// (/api/export-list/*). Render keeps EXPORTS_DIR on its persistent disk so
+// files survive restarts; cleanup TTL is enforced by the hourly cron.
+// This sidesteps the Supabase Storage RLS path entirely (the storage
+// bucket needed explicit policies AND a service_role JWT to upload — the
+// local-disk pattern needs neither).
+const CSV_FILES_DIR = path.join(EXPORTS_DIR, 'bucketing-csv');
 const CSV_PAGE_SIZE = 2000;
 
-async function ensureCsvTmpDir() {
-    await fsp.mkdir(CSV_TMP_DIR, { recursive: true });
+async function ensureCsvFilesDir() {
+    await fsp.mkdir(CSV_FILES_DIR, { recursive: true });
 }
 
 function jsonOrEmpty(v: any): string {
@@ -2406,12 +2410,12 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
     const startedAt = new Date().toISOString();
     await updateCsvJob(jobId, { status: 'running', started_at: startedAt });
 
-    const tmpPath = path.join(CSV_TMP_DIR, `${jobId}.csv.gz`);
+    const filePath = path.join(CSV_FILES_DIR, `${jobId}.csv.gz`);
     let totalRows = 0;
     let rowsWritten = 0;
 
     try {
-        await ensureCsvTmpDir();
+        await ensureCsvFilesDir();
 
         const { data: run, error: runErr } = await supabase
             .from('bucketing_runs').select('name,list_names').eq('id', runId).single();
@@ -2454,7 +2458,7 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
         // page by page. zlib's createGzip is a Transform stream — pipe it
         // into a file write stream so we never hold the full 30 MB in RAM.
         const gzip = zlib.createGzip({ level: 6 });
-        const fileStream = fs.createWriteStream(tmpPath);
+        const fileStream = fs.createWriteStream(filePath);
         gzip.pipe(fileStream);
         const pipelineDone = new Promise<void>((resolve, reject) => {
             fileStream.on('finish', () => resolve());
@@ -2576,41 +2580,24 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
             if (page.length < CSV_PAGE_SIZE) break;
         }
 
-        // Flush + close the gzip pipeline before reading the file.
+        // Flush + close the gzip pipeline.
         gzip.end();
         await pipelineDone;
 
-        const stat = await fsp.stat(tmpPath);
-        const fileBuf = await fsp.readFile(tmpPath);
+        const stat = await fsp.stat(filePath);
 
-        const safeName = (run.name || 'bucketing').replace(/[^a-z0-9-_]+/gi, '_');
-        const storagePath = `${jobId}/${safeName}_full_assignments.csv.gz`;
-
-        const { error: upErr } = await supabase.storage
-            .from(CSV_STORAGE_BUCKET)
-            .upload(storagePath, fileBuf, {
-                contentType: 'application/gzip',
-                upsert: true,
-                cacheControl: '3600'
-            });
-        if (upErr) throw new Error(`storage upload failed: ${upErr.message}`);
-
-        const { data: signed, error: sErr } = await supabase.storage
-            .from(CSV_STORAGE_BUCKET)
-            .createSignedUrl(storagePath, 86400); // 24 h
-        if (sErr || !signed?.signedUrl) throw new Error(`signed URL failed: ${sErr?.message || 'no url'}`);
-
+        // Mark ready. download_url is a server-relative path to the
+        // streaming download endpoint below — same pattern as the Phase 0
+        // /api/export-list/download route. storage_path keeps the local
+        // file path so the cleanup cron can unlink it.
         await updateCsvJob(jobId, {
             status: 'ready',
             progress_rows: rowsWritten,
             file_size_bytes: stat.size,
-            storage_path: storagePath,
-            download_url: signed.signedUrl,
+            storage_path: filePath,
+            download_url: `/api/bucketing/csv-jobs/${jobId}/download`,
             completed_at: new Date().toISOString()
         });
-
-        // Local temp file no longer needed — storage has the canonical copy.
-        await fsp.unlink(tmpPath).catch(() => {});
 
         console.log(`[CSV-job ${jobId}] ready: ${rowsWritten} rows, ${(stat.size / 1024 / 1024).toFixed(1)} MB gz`);
     } catch (err: any) {
@@ -2621,7 +2608,7 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
             error_message: (err.message || String(err)).slice(0, 1000),
             completed_at: new Date().toISOString()
         });
-        await fsp.unlink(tmpPath).catch(() => {});
+        await fsp.unlink(filePath).catch(() => {});
     }
 }
 
@@ -2637,8 +2624,15 @@ async function cleanupExpiredCsvJobs() {
             .lt('expires_at', nowIso);
         const rows = (expired || []) as { id: string; storage_path: string | null }[];
         for (const r of rows) {
+            // storage_path holds the local filesystem path (the column name
+            // is a leftover from the earlier Supabase Storage iteration —
+            // kept for schema stability).
             if (r.storage_path) {
-                await supabase.storage.from(CSV_STORAGE_BUCKET).remove([r.storage_path]).catch(() => {});
+                await fsp.unlink(r.storage_path).catch(() => {});
+            } else {
+                // Fallback: derive the path from the job id (covers older
+                // rows that completed before storage_path was populated).
+                await fsp.unlink(path.join(CSV_FILES_DIR, `${r.id}.csv.gz`)).catch(() => {});
             }
             await supabase.from('bucketing_csv_jobs').delete().eq('id', r.id);
         }
@@ -2705,6 +2699,45 @@ app.get('/api/bucketing/csv-jobs/:jobId', async (req, res) => {
         res.json({ job });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// GET — stream the prepared CSV.gz to the client. Same pattern as the
+// Phase 0 list export's /api/export-list/download — read from local disk
+// and pipe to the response. Browser downloads it as a file due to the
+// Content-Disposition header. The Content-Encoding: gzip header lets the
+// browser auto-decompress for users who click "open in spreadsheet" — but
+// because of the .csv.gz filename, most clients will save it gzipped.
+app.get('/api/bucketing/csv-jobs/:jobId/download', async (req, res) => {
+    const jobId = req.params.jobId;
+    try {
+        const { data: job, error } = await supabase
+            .from('bucketing_csv_jobs')
+            .select('id,bucketing_run_id,status,storage_path,file_size_bytes')
+            .eq('id', jobId).single();
+        if (error || !job) return res.status(404).json({ error: error?.message || 'Job not found' });
+        if (job.status !== 'ready') return res.status(409).json({ error: `Job not ready (status=${job.status})` });
+
+        const filePath = job.storage_path || path.join(CSV_FILES_DIR, `${jobId}.csv.gz`);
+        if (!fs.existsSync(filePath)) {
+            return res.status(410).json({ error: 'Export file no longer exists (expired or cleaned up)' });
+        }
+
+        // Pull the run name for a friendlier filename. Best-effort — fall
+        // back to the job id if the run lookup fails.
+        let safeName = jobId;
+        try {
+            const { data: run } = await supabase
+                .from('bucketing_runs').select('name').eq('id', job.bucketing_run_id).single();
+            if (run?.name) safeName = String(run.name).replace(/[^a-z0-9-_]+/gi, '_');
+        } catch { /* ignore — fall back to jobId */ }
+
+        res.setHeader('Content-Type', 'application/gzip');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}_full_assignments.csv.gz"`);
+        if (job.file_size_bytes) res.setHeader('Content-Length', String(job.file_size_bytes));
+        fs.createReadStream(filePath).pipe(res);
+    } catch (err: any) {
+        if (!res.headersSent) res.status(500).json({ error: err.message });
     }
 });
 
