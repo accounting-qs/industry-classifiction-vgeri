@@ -919,12 +919,33 @@ export async function runTaxonomyProposal(
             ctx.log(`[Bucketing ${runId}] LLM sector consolidation: merged ${secConsol.merges} variant names, $${secConsol.costUsd.toFixed(4)}`);
         }
 
+        // LLM semantic consolidation of proposed-new identities. Smaller
+        // input than chars/sectors (typically 5-25 entries) so a single call
+        // suffices. Catches semantic duplicates the normalizer misses ("Real
+        // Estate Services" → "Real Estate") and merges proposals INTO existing
+        // library identities. No-op when proposed-new count < 6.
+        const idConsol = await consolidateIdentitiesViaLLM(
+            supabase, phase1aModel, tagResult.taggings, snapshot, runId, ctx
+        );
+        if (idConsol.merges > 0) {
+            totalCost += idConsol.costUsd;
+            ctx.log(`[Bucketing ${runId}] LLM identity consolidation: merged ${idConsol.merges} variant names, $${idConsol.costUsd.toFixed(4)}`);
+        }
+
+        // Drop singleton new-identity proposals (count < 3) — these would
+        // never clear min_volume anyway and bloat the library across runs.
+        // Runs AFTER LLM identity consolidation so any near-duplicate that
+        // could've merged into a higher-count peer has already been merged.
+        const singletonDrop = dropSingletonNewIdentities(
+            tagResult.taggings, snapshot, runId, ctx
+        );
+
         // Re-run the cheap normalizer-based dedup so any new identical names
         // produced by the LLM merges collapse into one canonical.
-        if (charConsol.merges + secConsol.merges > 0) {
+        if (charConsol.merges + secConsol.merges + idConsol.merges + singletonDrop.dropped > 0) {
             const reMerges = consolidateTaggings(tagResult.taggings, snapshot);
-            if (reMerges.characteristicMerges + reMerges.sectorMerges > 0) {
-                ctx.log(`[Bucketing ${runId}] post-LLM normalizer pass: collapsed ${reMerges.characteristicMerges} more characteristic + ${reMerges.sectorMerges} more sector variants`);
+            if (reMerges.identityMerges + reMerges.characteristicMerges + reMerges.sectorMerges > 0) {
+                ctx.log(`[Bucketing ${runId}] post-LLM normalizer pass: collapsed ${reMerges.identityMerges} more identity + ${reMerges.characteristicMerges} more characteristic + ${reMerges.sectorMerges} more sector variants`);
             }
         }
 
@@ -1750,6 +1771,13 @@ function normalizeTaxonomyName(name: string): string {
             }
         }
     }
+    // Strip trailing plural 's' so "Associations" / "Investments" / "Resources"
+    // collapse with their singular forms in the dedup key. Skip 'ss' (SaaS,
+    // Business) and 'ics' (Analytics, Diagnostics — singular nouns that look
+    // plural). Length floor of 5 protects 3-4 letter acronyms / short names.
+    if (s.length >= 5 && s.endsWith('s') && !s.endsWith('ss') && !s.endsWith('ics')) {
+        s = s.slice(0, -1).trim();
+    }
     return s;
 }
 
@@ -2211,6 +2239,202 @@ Only include entries where from != to (or where to is "" to drop). Be aggressive
         }
     }
     return { merges: mergeCount, costUsd };
+}
+
+// LLM semantic consolidation of proposed-new IDENTITIES (Layer 1 — top-level
+// business model). Smaller input than characteristics (typically 5–25
+// proposals), so a single LLM call is sufficient. The library list is
+// included in the prompt so the LLM can merge proposals INTO existing
+// canonical names rather than fork variants. Identity is the cascade root,
+// so this is conservative: high-count proposals stay separate unless an
+// obvious canonical equivalent exists; low-count proposals (< 5) are
+// aggressively merged or dropped.
+async function consolidateIdentitiesViaLLM(
+    supabase: SupabaseClient,
+    model: string,
+    taggings: IndustryTagging[],
+    snapshot: TaxonomySnapshot,
+    runId: string,
+    ctx: BucketingCtx
+): Promise<{ merges: number; costUsd: number }> {
+    const libraryNames = new Set(snapshot.identities.map(i => i.name));
+
+    const counts = new Map<string, number>();
+    for (const t of taggings) {
+        const i = t.identity;
+        if (!i) continue;
+        if (libraryNames.has(i)) continue;
+        counts.set(i, (counts.get(i) || 0) + 1);
+    }
+    if (counts.size < 6) {
+        ctx.log(`[Bucketing ${runId}] identity consolidation skipped (${counts.size} proposed-new < 6 threshold)`);
+        return { merges: 0, costUsd: 0 };
+    }
+
+    const entries = Array.from(counts.entries())
+        .map(([identity, count]) => ({ identity, count }))
+        .sort((a, b) => b.count - a.count);
+    const promptBody = entries.map(e => `  - "${e.identity}" (${e.count}×)`).join('\n');
+    const libraryList = Array.from(libraryNames).sort().map(n => `  - "${n}"`).join('\n');
+
+    const systemPrompt = `You consolidate B2B IDENTITY proposals (Layer 1 — the company's top-level business model) into the canonical set.
+
+GOAL: collapse near-duplicates and merge proposals INTO existing library identities wherever possible. TARGET: 10–15 identities total across the library + final proposals.
+
+EXISTING LIBRARY IDENTITIES (prefer merging proposals INTO these names verbatim):
+${libraryList || '  (library is empty — fall back to canonical list below)'}
+
+CANONICAL IDENTITIES (use these names verbatim — do NOT invent variants):
+  Agency · Software & SaaS · Financial Services · Real Estate · Consulting & Advisory ·
+  Field Services & Maintenance · Manufacturing & Industrial · Construction & Engineering ·
+  Non-Profit & Association · Healthcare Operator · Education Operator ·
+  Accounting & Tax · Legal Services · Staffing & Recruiting · Energy & Utilities ·
+  IT Services · Hospitality & Travel · Media & Entertainment · Government Contractor ·
+  Logistics & Transportation · Retail · Insurance Services
+
+REQUIRED MERGE PATTERNS:
+  Plural / singular variants → singular form ("Non-Profit & Associations" → "Non-Profit & Association")
+  Vertical-specific identity names → the generic identity:
+    "Healthcare Services" / "Medical Services" → Healthcare Operator
+    "Real Estate Services" / "Real Estate Investment & Development" → Real Estate
+    "Insurance" / "Insurance Brokerage" / "Insurance Carrier" → Insurance Services
+    "Holding Company" / "Investment Holding Company" → Financial Services (if investment-focused)
+    "Marketplace Platform" / "Online Marketplace" → Software & SaaS
+    "Mining Resources" / "Mining Company" / "Mining" → Manufacturing & Industrial
+    "Agriculture" / "Agribusiness" / "Farming" → Manufacturing & Industrial
+    "Field Services" / "Field Services and Maintenance" → Field Services & Maintenance
+
+MAP TO BLANK (these inputs are NOT valid identities — set to ""):
+  Specialty Services · Professional Services · B2B · Subscription Service · Other ·
+  Multi-industry · General Services · Service Provider · Conglomerate ·
+  Holding Company (when pure passive holding with no clear business)
+
+RULES:
+- Use the canonical / library name verbatim (no paraphrasing).
+- When the input could fit multiple canonicals, pick the closest existing LIBRARY name first; fall back to the canonical list otherwise.
+- Identity is the top of the cascade — be CONSERVATIVE with high-count proposals (≥10×). Only merge them if there is an obvious canonical / library equivalent. Real new business models do exist.
+- Low-count proposals (< 5×) should aggressively merge or drop to "" — they will never earn their own bucket.
+
+OUTPUT (strict JSON, key MUST be "merges"):
+{
+  "merges": [
+    { "from": "<original identity name verbatim>", "to": "<canonical / library name OR empty string \\"\\" to drop>" },
+    ...
+  ]
+}
+Only include entries where from != to (or where to is "" to drop).`;
+
+    const userPrompt = `Consolidate these proposed-new identities (existing library names listed in system prompt — prefer merging INTO those):\n\n${promptBody}`;
+
+    let costUsd = 0;
+    let mergeCount = 0;
+    const mergeMap = new Map<string, string>();
+
+    try {
+        const isAnthropic = model.startsWith('claude-');
+        let text = '';
+        if (isAnthropic) {
+            const anthropic = await getAnthropic(supabase);
+            if (!anthropic) throw new Error('Anthropic API key not configured');
+            const resp = await anthropic.messages.create({
+                model,
+                max_tokens: 3000,
+                system: systemPrompt,
+                messages: [{ role: 'user', content: userPrompt }]
+            }, { timeout: TAXONOMY_TIMEOUT_MS });
+            const usage: any = (resp as any).usage || {};
+            costUsd = computeAnthropicCost(model, usage.input_tokens || 0, usage.output_tokens || 0);
+            text = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
+        } else {
+            const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model,
+                    max_tokens: 3000,
+                    response_format: { type: 'json_object' },
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt }
+                    ]
+                }),
+                signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+            });
+            if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
+            const json: any = await resp.json();
+            const usage = json.usage || {};
+            costUsd = computeOpenAICost(model, usage.prompt_tokens || 0, 0, usage.completion_tokens || 0);
+            text = json.choices?.[0]?.message?.content || '';
+        }
+
+        const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+        const cleaned = (fence ? fence[1] : text).trim();
+        const parsed = JSON.parse(cleaned);
+        const merges = Array.isArray(parsed.merges) ? parsed.merges : [];
+        for (const m of merges) {
+            if (typeof m?.from === 'string' && typeof m?.to === 'string' && m.from !== m.to) {
+                mergeMap.set(m.from, m.to);
+            }
+        }
+        mergeCount = mergeMap.size;
+    } catch (err: any) {
+        ctx.log(`[Bucketing ${runId}] identity consolidation LLM call failed (non-fatal): ${err.message}`, 'warn');
+        return { merges: 0, costUsd };
+    }
+
+    // Apply: empty target = drop identity (and its child characteristic, since
+    // characteristic is parented to identity — orphaned characteristics from
+    // a dropped identity rarely make sense). Sector is independent and stays.
+    for (const t of taggings) {
+        if (t.identity && mergeMap.has(t.identity)) {
+            const target = mergeMap.get(t.identity) || '';
+            if (target.trim()) {
+                t.identity = target;
+            } else {
+                t.identity = null;
+                t.characteristic = null;
+            }
+        }
+    }
+    return { merges: mergeCount, costUsd };
+}
+
+// Deterministic post-pass: any proposed-new identity with count < 3 gets
+// dropped (the row's identity + characteristic become null and the contact
+// rolls up to General via the cascade). Singletons fragment the library
+// without earning a viable bucket — at min_volume, a 1× identity has no
+// chance of clearing the floor. Runs AFTER the LLM consolidation pass so
+// any near-duplicate that could've been merged has already been merged.
+function dropSingletonNewIdentities(
+    taggings: IndustryTagging[],
+    snapshot: TaxonomySnapshot,
+    runId: string,
+    ctx: BucketingCtx
+): { dropped: number; rerouted: number } {
+    const libraryNames = new Set(snapshot.identities.map(i => i.name));
+    const counts = new Map<string, number>();
+    for (const t of taggings) {
+        const i = t.identity;
+        if (!i) continue;
+        if (libraryNames.has(i)) continue;
+        counts.set(i, (counts.get(i) || 0) + 1);
+    }
+    const singletons = new Set<string>();
+    for (const [name, count] of counts) {
+        if (count < 3) singletons.add(name);
+    }
+    if (singletons.size === 0) return { dropped: 0, rerouted: 0 };
+
+    let rerouted = 0;
+    for (const t of taggings) {
+        if (t.identity && singletons.has(t.identity)) {
+            t.identity = null;
+            t.characteristic = null;
+            rerouted++;
+        }
+    }
+    ctx.log(`[Bucketing ${runId}] dropped ${singletons.size} singleton new-identity proposals (count < 3) → re-routed ${rerouted} rows to General`);
+    return { dropped: singletons.size, rerouted };
 }
 
 // ────────────────────────────────────────────────────────────────────
