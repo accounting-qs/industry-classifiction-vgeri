@@ -356,17 +356,28 @@ async function fetchFullVocabulary(
     ctx?: BucketingCtx
 ): Promise<VocabRow[]> {
     return withHeartbeat('vocabulary fetch', async () => {
-        // .range() is required to bypass PostgREST's default db-max-rows
-        // (1000) on RPC responses — without it the function-level LIMIT
-        // doesn't matter, the response gets truncated at 1000 rows.
-        const { data, error } = await supabase
-            .rpc('get_industry_vocabulary', {
-                p_list_names: listNames,
-                p_limit: VOCAB_HARD_LIMIT
-            })
-            .range(0, VOCAB_HARD_LIMIT - 1);
-        if (error) throw new Error(`vocabulary fetch failed: ${error.message}`);
-        return (data || []) as VocabRow[];
+        // Paginate at PostgREST's 1000-row hard cap. Even with .range(),
+        // RPC responses get truncated at db.maxRows. A single .range(0, 9999)
+        // would return only the first 1000 distinct industries — a 9k-contact
+        // list with ~3k distinct strings would silently lose the long tail.
+        // Each page re-executes the function (PostgREST function-call
+        // semantics), so we cap at 10 pages × 1000 rows = 10k strings.
+        const PAGE = 1000;
+        const all: VocabRow[] = [];
+        for (let offset = 0; offset < VOCAB_HARD_LIMIT; offset += PAGE) {
+            const { data, error } = await supabase
+                .rpc('get_industry_vocabulary', {
+                    p_list_names: listNames,
+                    p_limit: VOCAB_HARD_LIMIT
+                })
+                .range(offset, offset + PAGE - 1);
+            if (error) throw new Error(`vocabulary fetch failed at offset ${offset}: ${error.message}`);
+            const page = (data || []) as VocabRow[];
+            all.push(...page);
+            ctx?.log(`[Bucketing] vocabulary page offset=${offset} got ${page.length} rows (total ${all.length})`);
+            if (page.length < PAGE) break;
+        }
+        return all;
     }, ctx);
 }
 
