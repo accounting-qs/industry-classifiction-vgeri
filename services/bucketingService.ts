@@ -1845,11 +1845,26 @@ async function consolidateCharacteristicsViaLLM(
         byIdent.get(e.identity)!.push({ name: e.characteristic, count: e.count });
     }
 
+    // Library characteristics indexed by parent_identity. Each per-identity
+    // chunk surfaces its slice as "EXISTING LIBRARY CHARACTERISTICS UNDER
+    // THIS IDENTITY" so the LLM merges proposals INTO library entries first
+    // (the user's curated taxonomy is the source of truth and must never be
+    // removed or renamed by the consolidator).
+    const libraryByIdentity = new Map<string, string[]>();
+    for (const c of snapshot.characteristics) {
+        const parent = c.parent_identity || '';
+        if (!libraryByIdentity.has(parent)) libraryByIdentity.set(parent, []);
+        libraryByIdentity.get(parent)!.push(c.name);
+    }
+
     const systemPrompt = `You consolidate a list of B2B characteristic proposals into a small, reusable canonical set. Each characteristic is a sub-type within a primary identity.
 
 GOAL: collapse near-duplicate / overly narrow entries within the same identity. TARGET: 3–6 characteristics per identity, TOTAL 50–80 across the whole list. If the input has more than 80 distinct characteristics, you MUST merge aggressively. Be RUTHLESS — leaving variants separate is the failure mode, merging too much is rare.
 
-CANONICAL CHARACTERISTICS BY IDENTITY (use these names verbatim — do NOT invent variants):
+LIBRARY PRIORITY (CRITICAL):
+The user prompt for each identity may include a section "EXISTING LIBRARY CHARACTERISTICS UNDER THIS IDENTITY". Those names are the user's curated taxonomy and are the source of truth — they MUST be your first choice as merge targets. ALWAYS prefer merging proposals INTO a library entry over inventing or picking a canonical from the lists below. NEVER remove or rename a library entry. Only fall back to the canonical lists below when no library entry under the same identity is even loosely applicable.
+
+CANONICAL CHARACTERISTICS BY IDENTITY (fallback when no library match exists — use these names verbatim wherever applicable):
 
 Agency: SEO Agency · Performance Marketing Agency · Creative Agency · Branding Agency · PR Agency · Event Management Agency · Talent Management Agency · Manufacturers' Representative
 Software & SaaS: FinTech SaaS · Vertical SaaS · MarTech SaaS · HR SaaS · CRM / Sales Software · Cybersecurity Software · Custom Software Development · Game Development
@@ -1978,7 +1993,11 @@ Only include entries where from != to (or where to="" to drop). Be ruthless — 
         list: { name: string; count: number }[]
     ): Promise<{ map: Map<string, string>; costUsd: number; error?: string }> => {
         const inputBody = list.map(l => `  - "${l.name}" (${l.count}×)`).join('\n');
-        const userPrompt = `Identity to consolidate: ${identity || '(none)'}\n\nCharacteristics under this identity (apply REQUIRED MERGE PATTERNS, LOW-COUNT MERGE, and IDENTITY-BLEED rules from the system prompt):\n\n${inputBody}`;
+        const libUnderId = (libraryByIdentity.get(identity) || []).slice().sort();
+        const libBlock = libUnderId.length > 0
+            ? `\n\nEXISTING LIBRARY CHARACTERISTICS UNDER THIS IDENTITY (source of truth — always prefer these as merge targets, NEVER remove or rename):\n${libUnderId.map(n => `  - "${n}"`).join('\n')}`
+            : '\n\n(No library characteristics exist yet under this identity — use canonical fallback list from system prompt.)';
+        const userPrompt = `Identity to consolidate: ${identity || '(none)'}${libBlock}\n\nProposed-new characteristics under this identity (apply LIBRARY PRIORITY rule from system prompt, then REQUIRED MERGE PATTERNS, LOW-COUNT MERGE, and IDENTITY-BLEED rules):\n\n${inputBody}`;
 
         const isAnthropic = model.startsWith('claude-');
         let text = '';
@@ -2124,12 +2143,16 @@ async function consolidateSectorsViaLLM(
         .map(([sector, count]) => ({ sector, count }))
         .sort((a, b) => b.count - a.count);
     const promptBody = entries.map(e => `  - "${e.sector}" (${e.count}×)`).join('\n');
+    const libraryList = Array.from(libraryNames).sort().map(n => `  - "${n}"`).join('\n');
 
     const systemPrompt = `You consolidate a list of B2B SECTOR proposals (Layer 3 — vertical the company SERVES) into a smaller canonical set. Sectors should be broad served verticals — not the company's own identity, not narrow niches.
 
 GOAL: collapse near-duplicates and identity-bleed. TARGET: 10–20 sectors total.
 
-CANONICAL SECTORS (use these names verbatim wherever applicable):
+EXISTING LIBRARY SECTORS (the user's curated taxonomy — ALWAYS prefer merging proposals INTO these names verbatim before falling back to the canonical list. These are the source of truth and must NEVER be removed or renamed):
+${libraryList || '  (library is empty — fall back to canonical list below)'}
+
+CANONICAL SECTORS (fallback when no library match exists — use these names verbatim wherever applicable):
   Healthcare · Real Estate · Government · Education · Energy & Utilities ·
   Financial Services · Manufacturing · Hospitality & Travel · Technology & Software ·
   Non-Profit & Social Impact · Legal · Retail · Media & Entertainment ·
