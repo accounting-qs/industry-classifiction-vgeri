@@ -1125,6 +1125,72 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
   const [savingLibrary, setSavingLibrary] = useState(false);
   const [librarySelection, setLibrarySelection] = useState<Set<string>>(new Set());
 
+  // ── Async full-CSV export ───────────────────────────────────────────
+  // Job lifecycle: pending → running → ready (or failed). The UI polls
+  // every 2 s while a job is in flight and shows the latest job for this
+  // run (within 24 h) as a download link so the user can re-grab it
+  // without re-running the export.
+  type CsvJob = {
+    id: string;
+    status: 'pending' | 'running' | 'ready' | 'failed';
+    progress_rows: number;
+    total_rows: number | null;
+    download_url: string | null;
+    file_size_bytes: number | null;
+    error_message: string | null;
+    created_at: string;
+    completed_at: string | null;
+    expires_at: string;
+  };
+  const [csvJob, setCsvJob] = useState<CsvJob | null>(null);
+  const [csvJobLoading, setCsvJobLoading] = useState(false);
+  const csvPollRef = useRef<number | null>(null);
+
+  const fetchLatestCsvJob = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/csv-jobs`);
+      const data = await res.json();
+      if (!res.ok) return;
+      const latest = (data.jobs || [])[0] || null;
+      setCsvJob(latest);
+    } catch {
+      // silent — surfacing this in the UI would be noise on a polling loop
+    }
+  }, [run.id]);
+
+  useEffect(() => { fetchLatestCsvJob(); }, [fetchLatestCsvJob]);
+
+  // Poll while a job is in-flight; stop once it lands on ready/failed.
+  useEffect(() => {
+    if (csvPollRef.current) { window.clearInterval(csvPollRef.current); csvPollRef.current = null; }
+    if (!csvJob || (csvJob.status !== 'pending' && csvJob.status !== 'running')) return;
+    csvPollRef.current = window.setInterval(async () => {
+      try {
+        const res = await fetch(`/api/bucketing/csv-jobs/${csvJob.id}`);
+        const data = await res.json();
+        if (res.ok && data.job) setCsvJob(data.job);
+      } catch { /* keep polling */ }
+    }, 2000);
+    return () => {
+      if (csvPollRef.current) { window.clearInterval(csvPollRef.current); csvPollRef.current = null; }
+    };
+  }, [csvJob?.id, csvJob?.status]);
+
+  const startCsvJob = async () => {
+    setCsvJobLoading(true);
+    onError(null);
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/csv-jobs`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+      setCsvJob(data.job);
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setCsvJobLoading(false);
+    }
+  };
+
   const sorted = [...bucketCounts].sort((a, b) => Number(b.contact_count) - Number(a.contact_count));
   const total = sorted.reduce((s, b) => s + Number(b.contact_count), 0);
   const max = sorted.length > 0 ? Number(sorted[0].contact_count) : 1;
@@ -1316,6 +1382,81 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
           </div>
         </div>
       )}
+
+      {/* Async full-CSV export — Phase 1b assignments × enrichments × Phase 1a tags */}
+      <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div className="flex-1 min-w-0">
+            <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">
+              Full CSV export (all contacts × bucket assignments)
+            </div>
+            <div className="text-[11px] text-gray-400">
+              Streams every contact with its enrichment, taxonomy (identity / characteristic / sector), final bucket, and bucketing reasoning. Built async + gzipped — link expires after 24 hours.
+            </div>
+          </div>
+          {(!csvJob || csvJob.status === 'failed' || csvJob.status === 'ready') && (
+            <button
+              onClick={startCsvJob}
+              disabled={csvJobLoading}
+              className="px-3 py-1.5 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1 shrink-0"
+            >
+              {csvJobLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+              {csvJob?.status === 'ready' ? 'Re-export' : csvJob?.status === 'failed' ? 'Retry export' : 'Generate full CSV'}
+            </button>
+          )}
+        </div>
+
+        {csvJob && (csvJob.status === 'pending' || csvJob.status === 'running') && (() => {
+          const total = csvJob.total_rows || 0;
+          const done = csvJob.progress_rows || 0;
+          const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : null;
+          return (
+            <div className="mt-3">
+              <div className="flex items-center justify-between text-[11px] font-mono mb-1">
+                <span className="text-gray-300">
+                  {csvJob.status === 'pending' ? 'Queued…' : 'Streaming rows…'}
+                </span>
+                <span className="text-gray-400">
+                  {done.toLocaleString()}{total > 0 ? ` / ${total.toLocaleString()}` : ''}{pct !== null ? ` · ${pct}%` : ''}
+                </span>
+              </div>
+              <div className="h-1.5 bg-[#1c1c1c] rounded overflow-hidden">
+                <div
+                  className="h-full bg-[#3ecf8e] transition-all"
+                  style={{ width: pct !== null ? `${pct}%` : '15%' }}
+                />
+              </div>
+            </div>
+          );
+        })()}
+
+        {csvJob && csvJob.status === 'ready' && csvJob.download_url && (() => {
+          const sizeMb = csvJob.file_size_bytes ? (csvJob.file_size_bytes / 1024 / 1024).toFixed(1) : null;
+          const expiresAt = new Date(csvJob.expires_at);
+          const expiresHrs = Math.max(0, Math.round((expiresAt.getTime() - Date.now()) / 3_600_000));
+          return (
+            <div className="mt-3 flex items-center justify-between gap-3 flex-wrap">
+              <div className="text-[11px] text-gray-400">
+                Ready · {csvJob.progress_rows.toLocaleString()} rows{sizeMb ? ` · ${sizeMb} MB gzipped` : ''} · expires in ~{expiresHrs}h
+              </div>
+              <a
+                href={csvJob.download_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="px-3 py-1.5 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] flex items-center gap-1 shrink-0"
+              >
+                <Download className="w-3 h-3" /> Download CSV (.gz)
+              </a>
+            </div>
+          );
+        })()}
+
+        {csvJob && csvJob.status === 'failed' && (
+          <div className="mt-3 text-[11px] text-amber-300">
+            Export failed: {csvJob.error_message || 'unknown error'}
+          </div>
+        )}
+      </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
         <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest">

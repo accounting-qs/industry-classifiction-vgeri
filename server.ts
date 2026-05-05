@@ -8,6 +8,8 @@ import path from 'path';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import crypto from 'crypto';
+import os from 'os';
+import zlib from 'zlib';
 import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { db } from './services/supabaseClient';
@@ -2341,6 +2343,385 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts.csv', async (req, res) => {
         } else {
             res.status(500).json({ error: err.message });
         }
+    }
+});
+
+// ────────────────────────────────────────────────────────────────────
+// ASYNC CSV EXPORT — Phase 1b assignments × enrichments × Phase 1a tags
+//
+// At 200k–300k contacts, the synchronous /taxonomy-contacts.csv endpoint
+// runs longer than typical browser/proxy timeouts. This async flow
+// queues a job, runs the export in a background worker, gzips the
+// output, uploads to the 'bucketing-csv' Supabase storage bucket, and
+// returns a 24-hour signed download URL.
+// ────────────────────────────────────────────────────────────────────
+
+// Full per-contact column set including Phase 1b assignment fields
+// (bucket_name, source, rollup_level) plus the bucketing reasons.
+const ASSIGNMENT_CSV_COLUMNS = [
+    // Contact basics
+    'contact_id', 'email', 'first_name', 'last_name',
+    'company_name', 'company_website', 'lead_list_name',
+    // Raw + enrichment
+    'industry', 'enrichment_status', 'enrichment_classification',
+    'enrichment_confidence', 'enrichment_reasoning',
+    // Final taxonomy (from bucket_assignments — Phase 1b output)
+    'primary_identity', 'characteristic', 'sector',
+    'canonical_classification',
+    // Final bucket + rollup metadata
+    'bucket_name', 'pre_rollup_bucket_name', 'rollup_level',
+    'assignment_source',
+    // Confidence
+    'identity_confidence', 'characteristic_confidence', 'sector_confidence',
+    'confidence',
+    // Flags
+    'is_disqualified', 'is_generic',
+    // Reasoning (Phase 1a tag reason + Phase 1b bucket reason + general fallback reason)
+    'phase1a_llm_reason', 'bucket_reason', 'general_reason', 'reasons',
+] as const;
+
+const CSV_TMP_DIR = path.join(os.tmpdir(), 'bucketing-csv');
+const CSV_STORAGE_BUCKET = 'bucketing-csv';
+const CSV_PAGE_SIZE = 2000;
+
+async function ensureCsvTmpDir() {
+    await fsp.mkdir(CSV_TMP_DIR, { recursive: true });
+}
+
+function jsonOrEmpty(v: any): string {
+    if (v === null || v === undefined) return '';
+    if (typeof v === 'string') return v;
+    try { return JSON.stringify(v); } catch { return ''; }
+}
+
+async function updateCsvJob(jobId: string, patch: Record<string, any>) {
+    await supabase.from('bucketing_csv_jobs').update(patch).eq('id', jobId);
+}
+
+// Background worker. Runs once per job, no resumability — if the
+// process restarts mid-export the job stays in 'running' state until
+// the cleanup cron flips it to 'failed' (rows older than 30 min with
+// status='running' and no recent progress update).
+async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
+    const startedAt = new Date().toISOString();
+    await updateCsvJob(jobId, { status: 'running', started_at: startedAt });
+
+    const tmpPath = path.join(CSV_TMP_DIR, `${jobId}.csv.gz`);
+    let totalRows = 0;
+    let rowsWritten = 0;
+
+    try {
+        await ensureCsvTmpDir();
+
+        const { data: run, error: runErr } = await supabase
+            .from('bucketing_runs').select('name,list_names').eq('id', runId).single();
+        if (runErr || !run) throw new Error(`Run not found: ${runErr?.message || 'missing'}`);
+        const listNames: string[] = Array.isArray(run.list_names) ? run.list_names : [];
+        if (listNames.length === 0) throw new Error('Run has no list_names — nothing to export');
+
+        // Total row count for progress UI. COUNT(*) is exact + cheap with the
+        // lead_list_name index. Cap-aware: if the count call itself fails we
+        // still proceed (the worker writes whatever it can stream).
+        const { count: totalCount } = await supabase
+            .from('contacts')
+            .select('contact_id', { count: 'exact', head: true })
+            .in('lead_list_name', listNames);
+        totalRows = Number(totalCount || 0);
+        await updateCsvJob(jobId, { total_rows: totalRows });
+
+        // Pre-fetch the per-industry Phase 1a taxonomy map (small — one row
+        // per distinct industry, max ~10k). Used only for phase1a_llm_reason
+        // since the rest of the taxonomy is denormalized onto bucket_assignments.
+        const phase1aReasonByIndustry = new Map<string, string>();
+        {
+            const MPAGE = 1000;
+            for (let mOff = 0; mOff < 200_000; mOff += MPAGE) {
+                const { data: mapRows, error: mErr } = await supabase
+                    .from('bucket_industry_map')
+                    .select('industry_string,llm_reason')
+                    .eq('bucketing_run_id', runId)
+                    .range(mOff, mOff + MPAGE - 1);
+                if (mErr) throw new Error(`bucket_industry_map fetch failed at offset ${mOff}: ${mErr.message}`);
+                const rows = (mapRows || []) as any[];
+                for (const r of rows) {
+                    if (r.llm_reason) phase1aReasonByIndustry.set(r.industry_string, r.llm_reason);
+                }
+                if (rows.length < MPAGE) break;
+            }
+        }
+
+        // Open gzip-into-file pipeline. Write the header first, then stream
+        // page by page. zlib's createGzip is a Transform stream — pipe it
+        // into a file write stream so we never hold the full 30 MB in RAM.
+        const gzip = zlib.createGzip({ level: 6 });
+        const fileStream = fs.createWriteStream(tmpPath);
+        gzip.pipe(fileStream);
+        const pipelineDone = new Promise<void>((resolve, reject) => {
+            fileStream.on('finish', () => resolve());
+            fileStream.on('error', reject);
+            gzip.on('error', reject);
+        });
+
+        const writeLine = (s: string): Promise<void> => new Promise((resolve, reject) => {
+            if (gzip.write(s)) resolve();
+            else gzip.once('drain', () => resolve());
+            gzip.once('error', reject);
+        });
+
+        await writeLine(ASSIGNMENT_CSV_COLUMNS.join(',') + '\n');
+
+        let cursor: string | null = null;
+        let pageNum = 0;
+        let lastProgressUpdate = Date.now();
+
+        while (true) {
+            pageNum++;
+            let cq: any = supabase
+                .from('contacts')
+                .select('contact_id,email,first_name,last_name,company_name,company_website,industry,lead_list_name')
+                .in('lead_list_name', listNames)
+                .order('contact_id', { ascending: true })
+                .range(0, CSV_PAGE_SIZE - 1);
+            if (cursor) cq = cq.gt('contact_id', cursor);
+            const { data: contacts, error: cErr } = await cq;
+            if (cErr) throw new Error(`contacts page ${pageNum} failed at cursor=${cursor}: ${cErr.message}`);
+            const page = (contacts || []) as any[];
+            if (page.length === 0) break;
+
+            const ids = page.map(r => r.contact_id);
+
+            // Hydrate enrichments. Chunk the IN list to stay under the
+            // PostgREST URL-length cap (200 IDs × ~37 chars ≈ 7 KB).
+            const enrichmentMap = new Map<string, any>();
+            for (let i = 0; i < ids.length; i += 200) {
+                const slice = ids.slice(i, i + 200);
+                const { data: edata, error: eErr } = await supabase
+                    .from('enrichments')
+                    .select('contact_id,status,classification,confidence,reasoning')
+                    .in('contact_id', slice);
+                if (eErr) throw new Error(`enrichments page ${pageNum} failed: ${eErr.message}`);
+                for (const e of (edata || []) as any[]) enrichmentMap.set(e.contact_id, e);
+            }
+
+            // Hydrate Phase 1b assignments for this page (filtered by run_id).
+            const assignmentMap = new Map<string, any>();
+            for (let i = 0; i < ids.length; i += 200) {
+                const slice = ids.slice(i, i + 200);
+                const { data: adata, error: aErr } = await supabase
+                    .from('bucket_assignments')
+                    .select(
+                        'contact_id,bucket_name,source,confidence,' +
+                        'primary_identity,characteristic,sector,' +
+                        'pre_rollup_bucket_name,rollup_level,' +
+                        'general_reason,reasons,is_generic,is_disqualified,' +
+                        'canonical_classification,bucket_reason,' +
+                        'identity_confidence,characteristic_confidence,sector_confidence'
+                    )
+                    .eq('bucketing_run_id', runId)
+                    .in('contact_id', slice);
+                if (aErr) throw new Error(`bucket_assignments page ${pageNum} failed: ${aErr.message}`);
+                for (const a of (adata || []) as any[]) assignmentMap.set(a.contact_id, a);
+            }
+
+            for (const c of page) {
+                const enr = enrichmentMap.get(c.contact_id) || null;
+                const asg = assignmentMap.get(c.contact_id) || null;
+                const industryKey = (enr?.classification || c.industry || '').trim();
+                const phase1aReason = industryKey ? (phase1aReasonByIndustry.get(industryKey) || null) : null;
+                const row: Record<string, any> = {
+                    contact_id: c.contact_id,
+                    email: c.email,
+                    first_name: c.first_name,
+                    last_name: c.last_name,
+                    company_name: c.company_name,
+                    company_website: c.company_website,
+                    lead_list_name: c.lead_list_name,
+                    industry: c.industry,
+                    enrichment_status: enr?.status || null,
+                    enrichment_classification: enr?.classification || null,
+                    enrichment_confidence: enr?.confidence ?? null,
+                    enrichment_reasoning: enr?.reasoning || null,
+                    primary_identity: asg?.primary_identity || null,
+                    characteristic: asg?.characteristic || null,
+                    sector: asg?.sector || null,
+                    canonical_classification: asg?.canonical_classification || null,
+                    bucket_name: asg?.bucket_name || null,
+                    pre_rollup_bucket_name: asg?.pre_rollup_bucket_name || null,
+                    rollup_level: asg?.rollup_level || null,
+                    assignment_source: asg?.source || null,
+                    identity_confidence: asg?.identity_confidence ?? null,
+                    characteristic_confidence: asg?.characteristic_confidence ?? null,
+                    sector_confidence: asg?.sector_confidence ?? null,
+                    confidence: asg?.confidence ?? null,
+                    is_disqualified: asg?.is_disqualified ?? null,
+                    is_generic: asg?.is_generic ?? null,
+                    phase1a_llm_reason: phase1aReason,
+                    bucket_reason: asg?.bucket_reason || null,
+                    general_reason: asg?.general_reason || null,
+                    reasons: jsonOrEmpty(asg?.reasons),
+                };
+                await writeLine(ASSIGNMENT_CSV_COLUMNS.map(col => csvEscape(row[col])).join(',') + '\n');
+                rowsWritten++;
+            }
+
+            cursor = page[page.length - 1].contact_id;
+
+            // Update progress at most every 2 s to avoid hammering the DB
+            // with one UPDATE per page on very small pages.
+            if (Date.now() - lastProgressUpdate > 2000) {
+                await updateCsvJob(jobId, { progress_rows: rowsWritten });
+                lastProgressUpdate = Date.now();
+            }
+
+            if (page.length < CSV_PAGE_SIZE) break;
+        }
+
+        // Flush + close the gzip pipeline before reading the file.
+        gzip.end();
+        await pipelineDone;
+
+        const stat = await fsp.stat(tmpPath);
+        const fileBuf = await fsp.readFile(tmpPath);
+
+        const safeName = (run.name || 'bucketing').replace(/[^a-z0-9-_]+/gi, '_');
+        const storagePath = `${jobId}/${safeName}_full_assignments.csv.gz`;
+
+        const { error: upErr } = await supabase.storage
+            .from(CSV_STORAGE_BUCKET)
+            .upload(storagePath, fileBuf, {
+                contentType: 'application/gzip',
+                upsert: true,
+                cacheControl: '3600'
+            });
+        if (upErr) throw new Error(`storage upload failed: ${upErr.message}`);
+
+        const { data: signed, error: sErr } = await supabase.storage
+            .from(CSV_STORAGE_BUCKET)
+            .createSignedUrl(storagePath, 86400); // 24 h
+        if (sErr || !signed?.signedUrl) throw new Error(`signed URL failed: ${sErr?.message || 'no url'}`);
+
+        await updateCsvJob(jobId, {
+            status: 'ready',
+            progress_rows: rowsWritten,
+            file_size_bytes: stat.size,
+            storage_path: storagePath,
+            download_url: signed.signedUrl,
+            completed_at: new Date().toISOString()
+        });
+
+        // Local temp file no longer needed — storage has the canonical copy.
+        await fsp.unlink(tmpPath).catch(() => {});
+
+        console.log(`[CSV-job ${jobId}] ready: ${rowsWritten} rows, ${(stat.size / 1024 / 1024).toFixed(1)} MB gz`);
+    } catch (err: any) {
+        console.error(`[CSV-job ${jobId}] failed:`, err);
+        await updateCsvJob(jobId, {
+            status: 'failed',
+            progress_rows: rowsWritten,
+            error_message: (err.message || String(err)).slice(0, 1000),
+            completed_at: new Date().toISOString()
+        });
+        await fsp.unlink(tmpPath).catch(() => {});
+    }
+}
+
+// Cleanup cron — runs hourly. Removes expired job rows and their
+// storage objects. Also fails any 'running' jobs that haven't logged
+// progress in 30+ minutes (likely a server restart killed the worker).
+async function cleanupExpiredCsvJobs() {
+    try {
+        const nowIso = new Date().toISOString();
+        const { data: expired } = await supabase
+            .from('bucketing_csv_jobs')
+            .select('id,storage_path')
+            .lt('expires_at', nowIso);
+        const rows = (expired || []) as { id: string; storage_path: string | null }[];
+        for (const r of rows) {
+            if (r.storage_path) {
+                await supabase.storage.from(CSV_STORAGE_BUCKET).remove([r.storage_path]).catch(() => {});
+            }
+            await supabase.from('bucketing_csv_jobs').delete().eq('id', r.id);
+        }
+        if (rows.length > 0) console.log(`[CSV-cleanup] removed ${rows.length} expired job(s)`);
+
+        // Stale-running detection: status='running' AND started_at < now()-30min.
+        const staleCutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+        const { data: stale } = await supabase
+            .from('bucketing_csv_jobs')
+            .select('id')
+            .eq('status', 'running')
+            .lt('started_at', staleCutoff);
+        for (const r of (stale || []) as { id: string }[]) {
+            await updateCsvJob(r.id, {
+                status: 'failed',
+                error_message: 'Worker stalled (process restart?) — please re-export.',
+                completed_at: new Date().toISOString()
+            });
+            console.log(`[CSV-cleanup] marked stale running job ${r.id} as failed`);
+        }
+    } catch (err: any) {
+        console.error('[CSV-cleanup] error:', err.message || err);
+    }
+}
+
+// Hourly cleanup. Run once on boot too, so a server restart immediately
+// clears anything that became stale during downtime.
+setInterval(cleanupExpiredCsvJobs, 60 * 60 * 1000);
+cleanupExpiredCsvJobs().catch(() => {});
+
+// POST — kick off a new export job.
+app.post('/api/bucketing/runs/:id/csv-jobs', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const { data: run, error: rErr } = await supabase
+            .from('bucketing_runs').select('id,status').eq('id', id).single();
+        if (rErr || !run) return res.status(404).json({ error: rErr?.message || 'Run not found' });
+        if (run.status !== 'completed') {
+            return res.status(400).json({ error: `Cannot export: run status is "${run.status}" (need "completed")` });
+        }
+        const { data: job, error: jErr } = await supabase
+            .from('bucketing_csv_jobs')
+            .insert({ bucketing_run_id: id, status: 'pending' })
+            .select('*').single();
+        if (jErr || !job) return res.status(500).json({ error: jErr?.message || 'Failed to create job' });
+
+        runCsvExportJob(job.id, id).catch(err => {
+            console.error(`[CSV-job ${job.id}] uncaught:`, err);
+        });
+
+        res.status(202).json({ job });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET — poll a job's status (UI polls every ~2s).
+app.get('/api/bucketing/csv-jobs/:jobId', async (req, res) => {
+    try {
+        const { data: job, error } = await supabase
+            .from('bucketing_csv_jobs')
+            .select('*').eq('id', req.params.jobId).single();
+        if (error || !job) return res.status(404).json({ error: error?.message || 'Job not found' });
+        res.json({ job });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET — list recent jobs for a run (so the UI can show "previous export
+// is still valid, here's its download link" instead of forcing a re-run).
+app.get('/api/bucketing/runs/:id/csv-jobs', async (req, res) => {
+    try {
+        const { data: jobs, error } = await supabase
+            .from('bucketing_csv_jobs')
+            .select('*')
+            .eq('bucketing_run_id', req.params.id)
+            .order('created_at', { ascending: false })
+            .limit(10);
+        if (error) return res.status(500).json({ error: error.message });
+        res.json({ jobs: jobs || [] });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
     }
 });
 
