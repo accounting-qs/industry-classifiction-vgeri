@@ -1332,13 +1332,89 @@ For each industry text the user provides, return three independent tags. The thr
 
 GRANULARITY RULES (critical — controls bucket reusability):
 
-Identity is a top-level business-model category. Aim for ~10–15 meaningfully distinct identities total in a typical B2B vocab — not ~30+. Examples of the RIGHT level: "Agency", "Consulting & Advisory", "Software & SaaS", "Manufacturing & Industrial", "Financial Services", "Healthcare Operator", "Real Estate", "Government Contractor". Examples of TOO NARROW (forbidden): "Subscription Service" (a billing model, not an identity), "Logistics & Supply Chain Services" (collapse with "Logistics & Transportation"), "Telecommunications" + "Telecommunications Services" (same identity, pick one).
+== IDENTITY (Layer 1) ==
+What kind of company this IS at its core — its primary business model or main company type. Target: ~10–20 identities in a typical run.
 
-Characteristic is the company's primary functional sub-type within its identity. Aim for characteristics that ≥10 companies in a typical vocab would share. Examples of the RIGHT level: "SEO Agency", "FinTech SaaS", "Private Equity Firm", "B2B Field Services / Maintenance", "Equipment Rental / Leasing". Examples of TOO NARROW (forbidden): "Solar Panel Installation Services" (use existing "Field Services / Maintenance" or "Renewable Energy Services" if present), "B2B SaaS for Mortgage Lending Customer Engagement" (use "FinTech SaaS"), "Custom Residential Storage System Design" (use "B2B Field Services / Maintenance" or "Custom Manufacturing").
+RIGHT level (use names like these verbatim where applicable):
+  Agency · Consulting & Advisory · Software & SaaS · Manufacturing & Industrial ·
+  Real Estate · Healthcare Operator · Financial Services · Non-Profit & Association ·
+  Education Operator · Field Services · Government Contractor · Distribution & Wholesale ·
+  Energy & Utilities · Transportation & Logistics · Staffing & Recruiting ·
+  Legal Services · Accounting & Tax · Insurance · Hospitality & Travel ·
+  Telecommunications · Media & Publishing · Consumer & Retail [DQ]
 
-Sector is the SERVED VERTICAL. Aim for ~15–25 broad verticals — not 50+. Examples of the RIGHT level: "Healthcare", "Real Estate", "Government", "Energy & Utilities", "Financial Services", "Manufacturing", "Education", "Hospitality / Travel". Examples of TOO NARROW (forbidden): "Renewable Energy" (use "Energy & Utilities"), "Solar Energy" (same), "Affordable Housing" (use "Real Estate" or "Non-Profit & Social Impact"), "Political / Business" (not a vertical at all — drop).
+TOO NARROW (forbidden — collapse to a broader identity):
+  "Subscription Service" (a billing model, not an identity)
+  "Logistics & Supply Chain Services" → "Transportation & Logistics"
+  "Telecommunications" + "Telecommunications Services" (same — pick one)
 
-When tempted to propose a new entry, ask: "would this entry be useful for labelling 10+ contacts across DIFFERENT companies in a typical run?" If no — pick the closest existing entry instead. "A bit more specific" is NOT a reason to fork. The bar to set is_new_*=true is HIGH: only do it when no existing entry is even loosely applicable AND the new entry would meet the granularity rules above.
+== CHARACTERISTIC (Layer 2) — most common over-segmentation source ==
+The specific functional sub-type within the chosen Identity. Target: ~3–8 characteristics per identity. Total characteristics across the whole run: 40–100 unless you have a strong reason to exceed.
+
+RIGHT level (examples by identity):
+  Agency: SEO Agency · Performance Marketing Agency · Creative Agency · PR Agency · Branding Agency
+  Software & SaaS: FinTech SaaS · Vertical SaaS · CRM / Sales Software · MarTech SaaS · HR SaaS
+  Financial Services: Wealth Management · Private Equity · Venture Capital · Investment Banking · M&A Advisory · Insurance Brokerage · Lending / Credit
+  Real Estate: Brokerage · Property Management · Real Estate Development · Real Estate Investment
+  Consulting & Advisory: Business Consulting · Management Consulting · Financial Advisory · HR Consulting · IT Consulting
+
+DO NOT create a new characteristic unless ALL of these are true:
+  1. It can apply to multiple companies, not just one.
+  2. It is meaningfully different from existing characteristics under the same identity.
+  3. It is useful for segmentation, personalization, filtering, or campaign strategy.
+  4. It is not just a rewording or slightly narrower version of an existing characteristic.
+  5. It does not mix in served verticals — those belong in Sector.
+  6. It does not describe a tiny niche unless that niche appears repeatedly and is commercially useful.
+
+Before adding a new characteristic, ALWAYS check whether it should be merged into an existing broader characteristic. Examples of merges you MUST apply:
+  "Financial Advisory Services" → Financial Advisory
+  "Investment Advisory" → Financial Advisory  (or Investment Management depending on context)
+  "Investment & Development" → Real Estate Investment  (or Real Estate Development)
+  "Residential Brokerage" → Brokerage
+  "Real Estate Brokerage" → Brokerage
+  "Wealth Management Firm" → Wealth Management
+  "Private Equity Firm" → Private Equity
+  "Venture Capital Firm" → Venture Capital
+  "Managed IT Services and Cybersecurity" → Managed IT Services
+  "FinTech Software Company" → FinTech SaaS
+
+Quality check before finalizing a characteristic. Ask:
+  1. Is this characteristic reusable across multiple companies?
+  2. Is it meaningfully distinct from existing options?
+  3. Would a marketer or sales operator actually use this distinction?
+  4. Could this be merged into a broader label without losing important value?
+  5. Is this actually a sector instead of a characteristic?
+Only keep the characteristic if the answers support keeping it. When in doubt, merge into a broader existing characteristic instead of creating a new one.
+
+== SECTOR (Layer 3) ==
+The vertical the company SERVES, only when explicitly stated. Independent of identity. Target: ~15–25 broad verticals.
+
+Examples (use these names verbatim where applicable):
+  Healthcare · Real Estate · Government · Education · Energy & Utilities ·
+  Financial Services · Manufacturing · Hospitality / Travel · Technology & Software ·
+  Non-Profit & Social Impact · Legal · Retail · Media & Entertainment ·
+  Life Sciences & Biotech · Transportation & Logistics · Construction & Infrastructure ·
+  Agriculture · Telecommunications · Multi-industry
+
+Sector should OFTEN be blank. Do not infer a sector just because the company belongs to an industry. Sector means the vertical SERVED, not the company's own identity.
+
+  ✓ Marketing agency for healthcare companies → identity=Agency, characteristic=Performance Marketing Agency, sector=Healthcare
+  ✓ SaaS platform for real estate investors → identity=Software & SaaS, characteristic=Vertical SaaS, sector=Real Estate
+  ✓ Wealth management firm (no vertical mentioned) → identity=Financial Services, characteristic=Wealth Management, sector=blank
+
+TOO NARROW sectors (forbidden — collapse to broader):
+  "Renewable Energy" / "Solar Energy" → Energy & Utilities
+  "Affordable Housing" → Real Estate (or Non-Profit & Social Impact)
+  "Political / Business" → drop (not a vertical)
+
+== WHEN IN DOUBT ==
+- Keep Identity broad and stable.
+- Keep Characteristics controlled and reusable.
+- Keep Sector only for explicitly served markets.
+- Prefer merging over creating new categories.
+- Avoid one-off characteristics, near-duplicates, plural/singular variants.
+- Use the EXACT spelling of the canonical names above so different batches converge.
+The bar to set is_new_*=true is HIGH: only do it when no existing or canonical name is even loosely applicable AND the new entry passes the quality checks above.
 
 CLASSIFICATION RULES (critical):
 - Classify by core business identity FIRST, sector served SECOND. A PE firm focused on healthcare is identity=Financial Services, NOT Healthcare.
@@ -1690,16 +1766,45 @@ async function consolidateCharacteristicsViaLLM(
 
     const systemPrompt = `You consolidate a long list of B2B characteristic proposals into a smaller, reusable set. Each characteristic is a sub-type within a primary identity.
 
-Goal: merge semantically near-duplicate / overly narrow entries within the same identity into a smaller canonical set. Aim for ~3-8 characteristics per identity (not 30-50).
+GOAL: collapse near-duplicate / overly narrow entries within the same identity. TARGET: 3–8 characteristics per identity, total 40–100 across the whole list. If the input has more than 100 distinct characteristics, you MUST merge aggressively.
 
-Rules:
+CANONICAL EXAMPLES BY IDENTITY (prefer these names verbatim):
+  Agency: SEO Agency · Performance Marketing Agency · Creative Agency · PR Agency · Branding Agency
+  Software & SaaS: FinTech SaaS · Vertical SaaS · CRM / Sales Software · MarTech SaaS · HR SaaS
+  Financial Services: Wealth Management · Private Equity · Venture Capital · Investment Banking · M&A Advisory · Insurance Brokerage · Lending / Credit
+  Real Estate: Brokerage · Property Management · Real Estate Development · Real Estate Investment
+  Consulting & Advisory: Business Consulting · Management Consulting · Financial Advisory · HR Consulting · IT Consulting
+  Field Services: Field Services & Maintenance · Equipment Rental & Leasing · Janitorial / Cleaning Services
+  Manufacturing & Industrial: B2B Product Manufacturer · Industrial Equipment · Custom Manufacturing
+  Healthcare Operator: Medical Clinic / Hospital · Dental Practice · Specialty Practice
+
+REQUIRED MERGE PATTERNS (apply these whenever you see them):
+  "Financial Advisory Services" / "Financial Advisory Firm" → Financial Advisory
+  "Investment Advisory" → Financial Advisory  (or Investment Management depending on context)
+  "Investment & Development" → Real Estate Investment  (or Real Estate Development)
+  "Residential Brokerage" / "Real Estate Brokerage" / "Commercial Brokerage" → Brokerage
+  "Wealth Management Firm" → Wealth Management
+  "Private Equity Firm" → Private Equity
+  "Venture Capital Firm" / "Venture Capital Fund" → Venture Capital
+  "Managed IT Services and Cybersecurity" / "Cloud Managed Services" → Managed IT Services
+  "FinTech Software Company" / "FinTech SaaS Platform" → FinTech SaaS
+  "B2B SaaS for {Vertical}" → Vertical SaaS
+  "Solar Panel Installation Services" / "HVAC Repair Services" / "Plumbing Services" → Field Services & Maintenance
+  Plural / singular variants → singular ("Insurance Brokerages" → Insurance Brokerage)
+  Suffixes like "Services" / "Solutions" / "Group" / "Firm" → drop unless required for meaning
+
+QUALITY CHECK before keeping a name as-is. Ask:
+  1. Is this characteristic reusable across multiple companies?
+  2. Is it meaningfully distinct from existing options under the same identity?
+  3. Would a marketer or sales operator actually use this distinction?
+  4. Could this be merged into a broader label without losing important value?
+  5. Is this actually a sector (vertical served) instead of a characteristic? If yes, merge into a generic equivalent (e.g. "Healthcare Marketing Agency" → "Performance Marketing Agency", since "Healthcare" belongs in the Sector field).
+Only keep the name if the answers support it. When in doubt, merge.
+
+HARD RULES:
 - Merge ONLY within the same identity. Never propose merging "FinTech SaaS" (Software & SaaS) with "FinTech Investment" (Financial Services).
-- Pick the canonical name with care. Prefer: shortest readable name > most-frequent variant > broadest meaning. Examples:
-  - "Wealth Management" + "Investment Advisory" + "Wealth & Investment Advisory" → "Wealth Management"
-  - "Solar Panel Installation Services" + "HVAC Repair Services" + "Plumbing Repair Services" → "Field Services & Maintenance" (broader, more reusable)
-  - "B2B SaaS for Mortgage Lending" + "B2B SaaS for Real Estate" → "Vertical SaaS"
-- DO NOT merge things that are genuinely different sub-types ("SEO Agency" ≠ "PR Agency", keep separate).
-- Keep it conservative — when in doubt, leave separate.
+- "SEO Agency" ≠ "PR Agency" — genuinely different sub-types stay separate.
+- Vertical-specific names ("Healthcare CRM SaaS", "Restaurant POS Software") merge into the generic ("Vertical SaaS"). The vertical belongs in the Sector field, not the characteristic name.
 
 OUTPUT (strict JSON, key MUST be "merges"):
 {
@@ -1708,7 +1813,7 @@ OUTPUT (strict JSON, key MUST be "merges"):
     ...
   ]
 }
-Only include entries you're merging (where from != to). Omit entries that should stay as-is.`;
+Only include entries where from != to. Omit entries that should stay as-is. Be aggressive — if the input has 200+ characteristics, expect to output 100+ merges.`;
 
     const userPrompt = `Consolidate these proposed-new characteristics:\n\n${promptBody}`;
 
