@@ -945,6 +945,11 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
             className="w-28 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
           />
           <p className="text-[10px] text-gray-500 italic mt-1">Combos below this fall to characteristic; characteristics below to identity; identities below to General.</p>
+          {(run.total_contacts || 0) > 30000 && (
+            <p className="text-[10px] text-amber-400 italic mt-1">
+              ↑ For lists this size ({(run.total_contacts || 0).toLocaleString()} contacts), try min_volume = 250–500 to keep buckets meaningful and avoid 100+ small specs.
+            </p>
+          )}
         </div>
         <div>
           <span className="block text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Bucket budget</span>

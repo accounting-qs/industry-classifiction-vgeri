@@ -874,6 +874,18 @@ export async function runTaxonomyProposal(
         const charSet = new Set(snapshot.characteristics.map(c => c.name));
         const sectorSet = new Set(snapshot.sectors.map(s => s.name));
         const dqIdentities = new Set(snapshot.identities.filter(i => i.is_disqualified).map(i => i.name));
+        // Fuzzy dedup: normalize each existing canonical name once so we can
+        // catch near-duplicates the LLM proposes ("Telecommunications" vs
+        // "Telecommunications Services", "agency" vs "Agency", etc.). When a
+        // proposed-new tag normalizes to an existing entry, we rewrite the
+        // tag to the canonical name AND flip is_new_*=false so the library
+        // doesn't grow with bloat.
+        const identityCanonical = new Map<string, string>();
+        for (const i of snapshot.identities) identityCanonical.set(normalizeTaxonomyName(i.name), i.name);
+        const charCanonical = new Map<string, string>();
+        for (const c of snapshot.characteristics) charCanonical.set(normalizeTaxonomyName(c.name), c.name);
+        const sectorCanonical = new Map<string, string>();
+        for (const s of snapshot.sectors) sectorCanonical.set(normalizeTaxonomyName(s.name), s.name);
         // Identity-DQ cascade is OFF by default — we trust the tagger's per-row
         // is_disqualified judgment. Set apply_identity_dq_cascade=true on
         // the run to restore the old auto-DQ behavior for [DQ]-flagged
@@ -898,6 +910,18 @@ export async function runTaxonomyProposal(
             // surface these soft-DQ borderlines.
             const dqDowngraded = !!t.is_disqualified && idConf < PHASE1A_DQ_FLOOR;
 
+            // Fuzzy-dedup: if the LLM's tag normalizes to an existing canonical
+            // entry, rewrite the tag to that canonical name and clear is_new_*.
+            const idCanonical = t.identity ? (identityCanonical.get(normalizeTaxonomyName(t.identity)) || null) : null;
+            const chCanonical = t.characteristic ? (charCanonical.get(normalizeTaxonomyName(t.characteristic)) || null) : null;
+            const secCanonical = t.sector ? (sectorCanonical.get(normalizeTaxonomyName(t.sector)) || null) : null;
+            const tIdentity = idCanonical || t.identity;
+            const tCharacteristic = chCanonical || t.characteristic;
+            const tSector = secCanonical || t.sector;
+            const tIsNewIdentity = !!t.is_new_identity && !idCanonical && !identitySet.has(tIdentity || '');
+            const tIsNewCharacteristic = !!t.is_new_characteristic && !chCanonical && !charSet.has(tCharacteristic || '');
+            const tIsNewSector = !!t.is_new_sector && !secCanonical && !sectorSet.has(tSector || '');
+
             // Pre-rollup name: characteristic preferred → identity → fallback.
             // The actual final bucket_name is rewritten by the volume rollup
             // in Phase 1b. Disqualified is terminal — never rolled up.
@@ -906,10 +930,10 @@ export async function runTaxonomyProposal(
                 preBucket = RESERVED_DISQUALIFIED;
             } else if (lowConf) {
                 preBucket = RESERVED_GENERAL;
-            } else if (t.characteristic) {
-                preBucket = t.characteristic;
-            } else if (t.identity) {
-                preBucket = t.identity;
+            } else if (tCharacteristic) {
+                preBucket = tCharacteristic;
+            } else if (tIdentity) {
+                preBucket = tIdentity;
             } else {
                 preBucket = RESERVED_GENERAL;
             }
@@ -918,8 +942,8 @@ export async function runTaxonomyProposal(
             // narrowest available fields. Used for the CSV export.
             const canonical = isDisqualified
                 ? 'Disqualified'
-                : (t.sector && t.characteristic ? `${t.sector} ${t.characteristic}`
-                    : (t.characteristic || t.identity || 'Generic'));
+                : (tSector && tCharacteristic ? `${tSector} ${tCharacteristic}`
+                    : (tCharacteristic || tIdentity || 'Generic'));
 
             preMapRows.push({
                 bucketing_run_id: runId,
@@ -931,12 +955,12 @@ export async function runTaxonomyProposal(
                 identity_confidence: Number(((t.identity_confidence || 0) / 10).toFixed(2)),
                 characteristic_confidence: Number(((t.characteristic_confidence || 0) / 10).toFixed(2)),
                 sector_confidence: Number(((t.sector_confidence || 0) / 10).toFixed(2)),
-                primary_identity: t.identity,
-                characteristic: t.characteristic,
-                sector: t.sector,
-                is_new_identity: t.is_new_identity && !identitySet.has(t.identity || ''),
-                is_new_characteristic: t.is_new_characteristic && !charSet.has(t.characteristic || ''),
-                is_new_sector: t.is_new_sector && !sectorSet.has(t.sector || ''),
+                primary_identity: tIdentity,
+                characteristic: tCharacteristic,
+                sector: tSector,
+                is_new_identity: tIsNewIdentity,
+                is_new_characteristic: tIsNewCharacteristic,
+                is_new_sector: tIsNewSector,
                 is_disqualified: isDisqualified,
                 is_generic: false,
                 needs_qa: lowConf || dqDowngraded,
@@ -1273,11 +1297,21 @@ function buildTaggingSystemPrompt(s: TaxonomySnapshot): string {
 
 For each industry text the user provides, return three independent tags. The three tags form a layered truth model: identity is broadest, sector is narrowest.
 
-1. **Identity** (REQUIRED) — what kind of company is it at its core? Pick from the IDENTITY library below. If nothing fits well, propose a new identity name and set is_new_identity=true. Identities marked [DQ] are *historically* disqualified for B2B outreach; treat the marker as a strong hint, not a hard rule (see DISQUALIFICATION RULES).
+1. **Identity** (REQUIRED) — what kind of company is it at its core? Pick from the IDENTITY library below. Strongly prefer the closest existing entry. Only propose a new identity (is_new_identity=true) when no library entry is even loosely applicable AND the new identity satisfies the GRANULARITY RULES below. Identities marked [DQ] are *historically* disqualified for B2B outreach; treat the marker as a strong hint, not a hard rule (see DISQUALIFICATION RULES).
 
-2. **Characteristic** (optional) — the specific subtype inside the identity. Pick from the CHARACTERISTICS library below; the parent_identity must match the identity you chose. If nothing fits well, propose a new one and set is_new_characteristic=true. If no characteristic applies, return null.
+2. **Characteristic** (optional) — the company's primary functional sub-type within its identity. Pick from the CHARACTERISTICS library below; the parent_identity must match the identity you chose. Strongly prefer the closest existing entry. Only propose a new characteristic (is_new_characteristic=true) when no library entry is even loosely applicable AND the new entry satisfies the GRANULARITY RULES below. If no characteristic applies, return null.
 
-3. **Sector** (optional) — the specific vertical the company serves. Pick from the SECTOR library below. Sector is independent of identity (a "Marketing Agency serving Healthcare" has identity=Agency, sector=Healthcare / Medical). If the company doesn't have a clear served sector, return null. If nothing fits, propose new and set is_new_sector=true.
+3. **Sector** (optional) — the specific vertical the company serves. Pick from the SECTOR library below. Sector is independent of identity (a "Marketing Agency serving Healthcare" has identity=Agency, sector=Healthcare / Medical). Strongly prefer the closest existing entry. Only propose a new sector (is_new_sector=true) when no library entry covers the served vertical AND the new entry satisfies the GRANULARITY RULES below. If the company doesn't have a clear served sector, return null.
+
+GRANULARITY RULES (critical — controls bucket reusability):
+
+Identity is a top-level business-model category. Aim for ~10–15 meaningfully distinct identities total in a typical B2B vocab — not ~30+. Examples of the RIGHT level: "Agency", "Consulting & Advisory", "Software & SaaS", "Manufacturing & Industrial", "Financial Services", "Healthcare Operator", "Real Estate", "Government Contractor". Examples of TOO NARROW (forbidden): "Subscription Service" (a billing model, not an identity), "Logistics & Supply Chain Services" (collapse with "Logistics & Transportation"), "Telecommunications" + "Telecommunications Services" (same identity, pick one).
+
+Characteristic is the company's primary functional sub-type within its identity. Aim for characteristics that ≥10 companies in a typical vocab would share. Examples of the RIGHT level: "SEO Agency", "FinTech SaaS", "Private Equity Firm", "B2B Field Services / Maintenance", "Equipment Rental / Leasing". Examples of TOO NARROW (forbidden): "Solar Panel Installation Services" (use existing "Field Services / Maintenance" or "Renewable Energy Services" if present), "B2B SaaS for Mortgage Lending Customer Engagement" (use "FinTech SaaS"), "Custom Residential Storage System Design" (use "B2B Field Services / Maintenance" or "Custom Manufacturing").
+
+Sector is the SERVED VERTICAL. Aim for ~15–25 broad verticals — not 50+. Examples of the RIGHT level: "Healthcare", "Real Estate", "Government", "Energy & Utilities", "Financial Services", "Manufacturing", "Education", "Hospitality / Travel". Examples of TOO NARROW (forbidden): "Renewable Energy" (use "Energy & Utilities"), "Solar Energy" (same), "Affordable Housing" (use "Real Estate" or "Non-Profit & Social Impact"), "Political / Business" (not a vertical at all — drop).
+
+When tempted to propose a new entry, ask: "would this entry be useful for labelling 10+ contacts across DIFFERENT companies in a typical run?" If no — pick the closest existing entry instead. "A bit more specific" is NOT a reason to fork. The bar to set is_new_*=true is HIGH: only do it when no existing entry is even loosely applicable AND the new entry would meet the granularity rules above.
 
 CLASSIFICATION RULES (critical):
 - Classify by core business identity FIRST, sector served SECOND. A PE firm focused on healthcare is identity=Financial Services, NOT Healthcare.
@@ -1413,6 +1447,40 @@ function nz(v: any): string | null {
     if (v === null || v === undefined) return null;
     const s = String(v).trim();
     return s.length > 0 ? s : null;
+}
+
+// Normalizer for taxonomy entry names — used in fuzzy dedup so the LLM's
+// "Telecommunications Services" / "telecommunications" / "TELECOM SERVICES"
+// all collapse to the same key as the library's "Telecommunications". We
+// lowercase, collapse whitespace, strip a small set of generic trailing
+// nouns + corporate suffixes that the LLM tends to add or omit. This is a
+// pragmatic dedup, NOT a semantic merge — entries with genuinely different
+// meanings (e.g. "Marketing Agency" vs "Marketing Services") will normalize
+// to different strings and stay separate.
+function normalizeTaxonomyName(name: string): string {
+    if (!name) return '';
+    let s = String(name).toLowerCase().trim();
+    // Strip parenthesized notes like "(under Tech)" the LLM occasionally adds.
+    s = s.replace(/\s*\([^)]*\)\s*$/g, '').trim();
+    // Collapse whitespace + ampersand variants.
+    s = s.replace(/\s*&\s*/g, ' and ').replace(/\s+/g, ' ');
+    // Strip trailing generic / corporate suffixes (only at the end).
+    const trailingSuffixes = [
+        ' services', ' solutions', ' group', ' inc', ' inc.', ' llc', ' ltd',
+        ' co.', ' company', ' corp', ' corp.', ' corporation'
+    ];
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const suf of trailingSuffixes) {
+            if (s.endsWith(suf)) {
+                s = s.slice(0, -suf.length).trim();
+                changed = true;
+                break;
+            }
+        }
+    }
+    return s;
 }
 
 // ────────────────────────────────────────────────────────────────────
