@@ -869,6 +869,15 @@ export async function runTaxonomyProposal(
         totalCost += tagResult.costUsd;
         ctx.log(`[Bucketing ${runId}] tagging: ${tagResult.taggings.length} results, $${tagResult.costUsd.toFixed(4)}, model=${tagResult.modelUsed}`);
 
+        // Post-batch consolidation: collapse near-duplicate tags across the
+        // 40-concurrent batches that don't see each other's output. Critical
+        // when the library is small/empty — without this, a single concept
+        // shows up under 4-5 spelling variants in the AI-PROPOSED panel.
+        const merges = consolidateTaggings(tagResult.taggings, snapshot);
+        if (merges.identityMerges + merges.characteristicMerges + merges.sectorMerges > 0) {
+            ctx.log(`[Bucketing ${runId}] post-batch dedup: collapsed ${merges.identityMerges} identity / ${merges.characteristicMerges} characteristic / ${merges.sectorMerges} sector duplicate variants`);
+        }
+
         // ── Build map rows from taggings ─────────────────────────────
         const identitySet = new Set(snapshot.identities.map(i => i.name));
         const charSet = new Set(snapshot.characteristics.map(c => c.name));
@@ -1372,7 +1381,41 @@ ${idLines}
 ${chLines}
 
 == SECTOR LIBRARY ==
-${secLines}`;
+${secLines}
+
+== IMPLICIT BASELINE (use when the libraries above are sparse) ==
+When no library entry is even loosely applicable, prefer one of these
+common B2B identities / sectors before inventing a brand-new one. They
+are the most common categories across B2B vocabularies. Use the EXACT
+spelling shown:
+
+Common identities (pick the closest):
+  Agency · Consulting & Advisory · Software & SaaS · IT Services ·
+  Financial Services · Healthcare Operator · Healthcare Services ·
+  Real Estate · Manufacturing & Industrial · Construction & Engineering ·
+  Field Services & Maintenance · Equipment Rental & Leasing ·
+  Distribution & Wholesale · Energy & Utilities ·
+  Transportation & Logistics · Telecommunications · Media & Publishing ·
+  Education Operator · Government Contractor · Non-Profit & Associations ·
+  Legal Services · Accounting & Tax · Staffing & Recruiting ·
+  Insurance · Hospitality & Travel · Consumer & Retail [DQ]
+
+Common sectors (pick the closest, leave blank if none):
+  Healthcare · Real Estate · Government · Education · Energy & Utilities ·
+  Financial Services · Manufacturing · Hospitality / Travel ·
+  Technology & Software · Non-Profit & Social Impact · Legal · Retail ·
+  Media & Entertainment · Life Sciences & Biotech · Transportation & Logistics ·
+  Construction & Infrastructure · Agriculture · Telecommunications ·
+  Multi-industry
+
+Treat this baseline like a soft library. CRITICAL: use the EXACT spelling
+shown above so different batches converge on the same canonical name —
+don't paraphrase ("Construction & Engineering" not "Construction and
+Engineering Services" or "Construction Services"; "Software & SaaS" not
+"Software Services" or "B2B SaaS"). Set is_new_*=true on any baseline entry
+that isn't in the actual library above (the user can promote it after the
+run). Only invent a brand-new name when even the baseline doesn't loosely
+cover the company.`;
 }
 
 function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
@@ -1449,6 +1492,85 @@ function nz(v: any): string | null {
     return s.length > 0 ? s : null;
 }
 
+// Post-batch dedup: collapse near-duplicate identity / characteristic /
+// sector tags WITHIN a single run's taggings array. Phase 1a runs in
+// 40-concurrent batches that don't see each other's output, so the same
+// concept can show up under 4-5 spelling variants ("Field Services /
+// Maintenance" + "B2B Field Services / Maintenance" + "Field Services &
+// Maintenance"). The per-row library-dedup already handles the case where
+// one variant exists in the snapshot library — this handles the case where
+// the LIBRARY IS EMPTY (or the variants only appear in the LLM output).
+//
+// For each layer, group all proposed tags by normalized name. For each
+// normalized group, pick a canonical name: existing library entry > most
+// frequent variant > shortest. Then rewrite every tagging in-place.
+function consolidateTaggings(taggings: IndustryTagging[], snapshot: TaxonomySnapshot): {
+    identityMerges: number;
+    characteristicMerges: number;
+    sectorMerges: number;
+} {
+    const buildCanonical = (
+        existing: string[],
+        getter: (t: IndustryTagging) => string | null
+    ): { canonical: Map<string, string>; merges: number } => {
+        const counts = new Map<string, Map<string, number>>(); // normalized → name → count
+        // Existing library entries are always canonical for their normalized key.
+        for (const e of existing) {
+            const norm = normalizeTaxonomyName(e);
+            if (!norm) continue;
+            if (!counts.has(norm)) counts.set(norm, new Map());
+            counts.get(norm)!.set(e, Number.MAX_SAFE_INTEGER);
+        }
+        for (const t of taggings) {
+            const v = getter(t);
+            if (!v) continue;
+            const norm = normalizeTaxonomyName(v);
+            if (!norm) continue;
+            if (!counts.has(norm)) counts.set(norm, new Map());
+            const m = counts.get(norm)!;
+            m.set(v, (m.get(v) || 0) + 1);
+        }
+        const canonical = new Map<string, string>();
+        let merges = 0;
+        for (const [norm, names] of counts) {
+            const sorted = Array.from(names.entries()).sort((a, b) => {
+                if (a[1] !== b[1]) return b[1] - a[1]; // by count desc
+                return a[0].length - b[0].length;       // shorter wins ties
+            });
+            canonical.set(norm, sorted[0][0]);
+            if (names.size > 1) merges += names.size - 1;
+        }
+        return { canonical, merges };
+    };
+
+    const id = buildCanonical(snapshot.identities.map(i => i.name), t => t.identity);
+    const ch = buildCanonical(snapshot.characteristics.map(c => c.name), t => t.characteristic);
+    const sec = buildCanonical(snapshot.sectors.map(s => s.name), t => t.sector);
+
+    for (const t of taggings) {
+        if (t.identity) {
+            const norm = normalizeTaxonomyName(t.identity);
+            const can = id.canonical.get(norm);
+            if (can) t.identity = can;
+        }
+        if (t.characteristic) {
+            const norm = normalizeTaxonomyName(t.characteristic);
+            const can = ch.canonical.get(norm);
+            if (can) t.characteristic = can;
+        }
+        if (t.sector) {
+            const norm = normalizeTaxonomyName(t.sector);
+            const can = sec.canonical.get(norm);
+            if (can) t.sector = can;
+        }
+    }
+    return {
+        identityMerges: id.merges,
+        characteristicMerges: ch.merges,
+        sectorMerges: sec.merges
+    };
+}
+
 // Normalizer for taxonomy entry names — used in fuzzy dedup so the LLM's
 // "Telecommunications Services" / "telecommunications" / "TELECOM SERVICES"
 // all collapse to the same key as the library's "Telecommunications". We
@@ -1462,12 +1584,17 @@ function normalizeTaxonomyName(name: string): string {
     let s = String(name).toLowerCase().trim();
     // Strip parenthesized notes like "(under Tech)" the LLM occasionally adds.
     s = s.replace(/\s*\([^)]*\)\s*$/g, '').trim();
-    // Collapse whitespace + ampersand variants.
-    s = s.replace(/\s*&\s*/g, ' and ').replace(/\s+/g, ' ');
+    // Strip leading "B2B " — the LLM sprinkles this for emphasis and it's
+    // never semantically meaningful at the identity / characteristic level.
+    s = s.replace(/^b2b\s+/i, '').trim();
+    // Collapse delimiter + connector variants so "Field Services / Maintenance"
+    // and "Field Services & Maintenance" and "Field Services and Maintenance"
+    // all normalize to the same string.
+    s = s.replace(/\s*\/\s*/g, ' and ').replace(/\s*&\s*/g, ' and ').replace(/\s+/g, ' ');
     // Strip trailing generic / corporate suffixes (only at the end).
     const trailingSuffixes = [
         ' services', ' solutions', ' group', ' inc', ' inc.', ' llc', ' ltd',
-        ' co.', ' company', ' corp', ' corp.', ' corporation'
+        ' co.', ' company', ' corp', ' corp.', ' corporation', ' firm'
     ];
     let changed = true;
     while (changed) {
