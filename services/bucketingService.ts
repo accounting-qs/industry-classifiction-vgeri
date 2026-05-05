@@ -878,6 +878,24 @@ export async function runTaxonomyProposal(
             ctx.log(`[Bucketing ${runId}] post-batch dedup: collapsed ${merges.identityMerges} identity / ${merges.characteristicMerges} characteristic / ${merges.sectorMerges} sector duplicate variants`);
         }
 
+        // LLM semantic consolidation of proposed-new characteristics. Catches
+        // semantic duplicates the normalizer misses — "Wealth Management" +
+        // "Investment Advisory" + "Wealth & Investment Advisory" → one name.
+        // No-op when proposed-new count < 60 (small runs don't need it).
+        const charConsol = await consolidateCharacteristicsViaLLM(
+            supabase, phase1aModel, tagResult.taggings, snapshot, runId, ctx
+        );
+        if (charConsol.merges > 0) {
+            totalCost += charConsol.costUsd;
+            ctx.log(`[Bucketing ${runId}] LLM characteristic consolidation: merged ${charConsol.merges} variant names, $${charConsol.costUsd.toFixed(4)}`);
+            // Re-run the cheap normalizer-based dedup so any new identical
+            // names produced by the LLM merge collapse into one canonical.
+            const reMerges = consolidateTaggings(tagResult.taggings, snapshot);
+            if (reMerges.characteristicMerges > 0) {
+                ctx.log(`[Bucketing ${runId}] post-LLM normalizer pass: collapsed ${reMerges.characteristicMerges} more characteristic variants`);
+            }
+        }
+
         // ── Build map rows from taggings ─────────────────────────────
         const identitySet = new Set(snapshot.identities.map(i => i.name));
         const charSet = new Set(snapshot.characteristics.map(c => c.name));
@@ -1608,6 +1626,155 @@ function normalizeTaxonomyName(name: string): string {
         }
     }
     return s;
+}
+
+// LLM-based semantic consolidation of proposed-new characteristics. Runs
+// AFTER consolidateTaggings (which only catches normalized-name matches).
+// The LLM merges semantically similar entries the normalizer can't catch
+// ("Wealth Management" + "Investment Advisory" + "Wealth & Investment
+// Advisory" → all collapse to "Wealth Management"). Skipped when there
+// are < 60 proposed-new characteristics — for small runs it's not worth
+// the extra LLM call.
+//
+// Input: the taggings array + the library snapshot.
+// Output: how many characteristic names were merged. Mutates `taggings`
+// in-place to use the canonical name from each merge group.
+async function consolidateCharacteristicsViaLLM(
+    supabase: SupabaseClient,
+    model: string,
+    taggings: IndustryTagging[],
+    snapshot: TaxonomySnapshot,
+    runId: string,
+    ctx: BucketingCtx
+): Promise<{ merges: number; costUsd: number }> {
+    const libraryNames = new Set(snapshot.characteristics.map(c => c.name));
+
+    // Count distinct proposed-new characteristic occurrences, grouped with
+    // their parent identity (so the LLM only merges WITHIN the same identity
+    // — "FinTech SaaS" under Software & SaaS shouldn't merge with "FinTech
+    // Investment" under Financial Services).
+    const counts = new Map<string, { count: number; identity: string }>();
+    for (const t of taggings) {
+        const c = t.characteristic;
+        if (!c) continue;
+        if (libraryNames.has(c)) continue;            // skip library-canonical
+        const key = `${t.identity || ''}::${c}`;
+        const cur = counts.get(key);
+        if (cur) cur.count++;
+        else counts.set(key, { count: 1, identity: t.identity || '' });
+    }
+    if (counts.size < 60) {
+        ctx.log(`[Bucketing ${runId}] characteristic consolidation skipped (${counts.size} proposed-new < 60 threshold)`);
+        return { merges: 0, costUsd: 0 };
+    }
+
+    // Sort by count descending — we want to give the LLM stable, frequent
+    // names first since those are more likely to "win" as canonical.
+    const entries = Array.from(counts.entries())
+        .map(([key, v]) => {
+            const [identity, characteristic] = key.split('::');
+            return { identity, characteristic, count: v.count };
+        })
+        .sort((a, b) => b.count - a.count);
+
+    // Group by identity for the prompt — LLM merges within each group.
+    const byIdent = new Map<string, { name: string; count: number }[]>();
+    for (const e of entries) {
+        if (!byIdent.has(e.identity)) byIdent.set(e.identity, []);
+        byIdent.get(e.identity)!.push({ name: e.characteristic, count: e.count });
+    }
+    const promptBody = Array.from(byIdent.entries()).map(([identity, list]) => {
+        const lines = list.map(l => `  - "${l.name}" (${l.count}×)`).join('\n');
+        return `Identity: ${identity || '(none)'}\n${lines}`;
+    }).join('\n\n');
+
+    const systemPrompt = `You consolidate a long list of B2B characteristic proposals into a smaller, reusable set. Each characteristic is a sub-type within a primary identity.
+
+Goal: merge semantically near-duplicate / overly narrow entries within the same identity into a smaller canonical set. Aim for ~3-8 characteristics per identity (not 30-50).
+
+Rules:
+- Merge ONLY within the same identity. Never propose merging "FinTech SaaS" (Software & SaaS) with "FinTech Investment" (Financial Services).
+- Pick the canonical name with care. Prefer: shortest readable name > most-frequent variant > broadest meaning. Examples:
+  - "Wealth Management" + "Investment Advisory" + "Wealth & Investment Advisory" → "Wealth Management"
+  - "Solar Panel Installation Services" + "HVAC Repair Services" + "Plumbing Repair Services" → "Field Services & Maintenance" (broader, more reusable)
+  - "B2B SaaS for Mortgage Lending" + "B2B SaaS for Real Estate" → "Vertical SaaS"
+- DO NOT merge things that are genuinely different sub-types ("SEO Agency" ≠ "PR Agency", keep separate).
+- Keep it conservative — when in doubt, leave separate.
+
+OUTPUT (strict JSON, key MUST be "merges"):
+{
+  "merges": [
+    { "from": "<original characteristic name verbatim>", "to": "<canonical name>" },
+    ...
+  ]
+}
+Only include entries you're merging (where from != to). Omit entries that should stay as-is.`;
+
+    const userPrompt = `Consolidate these proposed-new characteristics:\n\n${promptBody}`;
+
+    let costUsd = 0;
+    let mergeCount = 0;
+    const mergeMap = new Map<string, string>();
+
+    try {
+        const isAnthropic = model.startsWith('claude-');
+        let text = '';
+        if (isAnthropic) {
+            const anthropic = await getAnthropic(supabase);
+            if (!anthropic) throw new Error('Anthropic API key not configured');
+            const resp = await anthropic.messages.create({
+                model,
+                max_tokens: 4000,
+                system: systemPrompt,
+                messages: [{ role: 'user', content: userPrompt }]
+            }, { timeout: TAXONOMY_TIMEOUT_MS });
+            const usage: any = (resp as any).usage || {};
+            costUsd = computeAnthropicCost(model, usage.input_tokens || 0, usage.output_tokens || 0);
+            text = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
+        } else {
+            const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model,
+                    max_tokens: 4000,
+                    response_format: { type: 'json_object' },
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt }
+                    ]
+                }),
+                signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+            });
+            if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
+            const json: any = await resp.json();
+            const usage = json.usage || {};
+            costUsd = computeOpenAICost(model, usage.prompt_tokens || 0, 0, usage.completion_tokens || 0);
+            text = json.choices?.[0]?.message?.content || '';
+        }
+
+        const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+        const cleaned = (fence ? fence[1] : text).trim();
+        const parsed = JSON.parse(cleaned);
+        const merges = Array.isArray(parsed.merges) ? parsed.merges : [];
+        for (const m of merges) {
+            if (typeof m?.from === 'string' && typeof m?.to === 'string' && m.from !== m.to) {
+                mergeMap.set(m.from, m.to);
+            }
+        }
+        mergeCount = mergeMap.size;
+    } catch (err: any) {
+        ctx.log(`[Bucketing ${runId}] characteristic consolidation LLM call failed (non-fatal): ${err.message}`, 'warn');
+        return { merges: 0, costUsd };
+    }
+
+    // Apply the mapping in-place.
+    for (const t of taggings) {
+        if (t.characteristic && mergeMap.has(t.characteristic)) {
+            t.characteristic = mergeMap.get(t.characteristic) || t.characteristic;
+        }
+    }
+    return { merges: mergeCount, costUsd };
 }
 
 // ────────────────────────────────────────────────────────────────────
