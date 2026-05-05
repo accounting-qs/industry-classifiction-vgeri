@@ -888,11 +888,27 @@ export async function runTaxonomyProposal(
         if (charConsol.merges > 0) {
             totalCost += charConsol.costUsd;
             ctx.log(`[Bucketing ${runId}] LLM characteristic consolidation: merged ${charConsol.merges} variant names, $${charConsol.costUsd.toFixed(4)}`);
-            // Re-run the cheap normalizer-based dedup so any new identical
-            // names produced by the LLM merge collapse into one canonical.
+        }
+
+        // LLM semantic consolidation of proposed-new sectors. Same pattern,
+        // sector-tailored prompt — catches Sports / Sports & Athletics / Esports
+        // → "Media & Entertainment" and drops identity-bleed entries like
+        // "Marketing / Advertising" / "Insurance" / "IT Services" to BLANK.
+        // No-op when proposed-new count < 15.
+        const secConsol = await consolidateSectorsViaLLM(
+            supabase, phase1aModel, tagResult.taggings, snapshot, runId, ctx
+        );
+        if (secConsol.merges > 0) {
+            totalCost += secConsol.costUsd;
+            ctx.log(`[Bucketing ${runId}] LLM sector consolidation: merged ${secConsol.merges} variant names, $${secConsol.costUsd.toFixed(4)}`);
+        }
+
+        // Re-run the cheap normalizer-based dedup so any new identical names
+        // produced by the LLM merges collapse into one canonical.
+        if (charConsol.merges + secConsol.merges > 0) {
             const reMerges = consolidateTaggings(tagResult.taggings, snapshot);
-            if (reMerges.characteristicMerges > 0) {
-                ctx.log(`[Bucketing ${runId}] post-LLM normalizer pass: collapsed ${reMerges.characteristicMerges} more characteristic variants`);
+            if (reMerges.characteristicMerges + reMerges.sectorMerges > 0) {
+                ctx.log(`[Bucketing ${runId}] post-LLM normalizer pass: collapsed ${reMerges.characteristicMerges} more characteristic + ${reMerges.sectorMerges} more sector variants`);
             }
         }
 
@@ -1387,25 +1403,42 @@ Quality check before finalizing a characteristic. Ask:
 Only keep the characteristic if the answers support keeping it. When in doubt, merge into a broader existing characteristic instead of creating a new one.
 
 == SECTOR (Layer 3) ==
-The vertical the company SERVES, only when explicitly stated. Independent of identity. Target: ~15–25 broad verticals.
+The vertical the company SERVES, only when EXPLICITLY stated in the input. Independent of identity. Target: 10–20 sectors total in a typical run.
 
-Examples (use these names verbatim where applicable):
+DEFAULT IS BLANK. Sector should be blank for most contacts. Only fill it when the input text explicitly states the vertical the company serves (not the company's own industry).
+
+Pick from these CANONICAL sectors verbatim — do NOT invent variants:
   Healthcare · Real Estate · Government · Education · Energy & Utilities ·
-  Financial Services · Manufacturing · Hospitality / Travel · Technology & Software ·
+  Financial Services · Manufacturing · Hospitality & Travel · Technology & Software ·
   Non-Profit & Social Impact · Legal · Retail · Media & Entertainment ·
   Life Sciences & Biotech · Transportation & Logistics · Construction & Infrastructure ·
-  Agriculture · Telecommunications · Multi-industry
+  Agriculture · Telecommunications · Aerospace & Defense · Multi-industry
 
-Sector should OFTEN be blank. Do not infer a sector just because the company belongs to an industry. Sector means the vertical SERVED, not the company's own identity.
+If the served vertical doesn't fit any of the above, prefer BLANK over inventing a new sector. Only set is_new_sector=true when the input EXPLICITLY mentions a vertical that genuinely doesn't fit any canonical sector AND that vertical would apply to ≥10 companies in a typical B2B run.
 
+REQUIRED MERGES (apply these whenever you see a candidate sector that matches):
+  Sports / Athletics / Sports & Entertainment / Esports → Media & Entertainment
+  Recreational / Leisure / Recreation & Outdoor → Hospitality & Travel
+  Gaming / Gambling → Media & Entertainment
+  Food Technology / Food & Beverage / Restaurant → Food & Beverage  (use this name)
+  Renewable Energy / Solar Energy / Oil & Gas / Utilities → Energy & Utilities
+  Healthcare / Medical / Pharma / Biotech → Healthcare  (or Life Sciences & Biotech if pharma/biotech-specific)
+  Affordable Housing / Housing / Property → Real Estate
+  Aviation / Defense / Aerospace → Aerospace & Defense
+  Construction / Infrastructure → Construction & Infrastructure
+  Insurance → Financial Services  (insurance is a Financial Services sub-vertical)
+  Environmental / Climate → Non-Profit & Social Impact  (or Energy & Utilities if energy-focused)
+
+DO NOT use as a sector (these are identities or non-verticals — return BLANK instead):
+  Marketing · Advertising · IT Services · Professional Services · Consulting ·
+  Corporate · B2B · Small Business · Subscription · Holding Company
+
+Examples:
   ✓ Marketing agency for healthcare companies → identity=Agency, characteristic=Performance Marketing Agency, sector=Healthcare
   ✓ SaaS platform for real estate investors → identity=Software & SaaS, characteristic=Vertical SaaS, sector=Real Estate
-  ✓ Wealth management firm (no vertical mentioned) → identity=Financial Services, characteristic=Wealth Management, sector=blank
-
-TOO NARROW sectors (forbidden — collapse to broader):
-  "Renewable Energy" / "Solar Energy" → Energy & Utilities
-  "Affordable Housing" → Real Estate (or Non-Profit & Social Impact)
-  "Political / Business" → drop (not a vertical)
+  ✓ Wealth management firm (no vertical mentioned) → identity=Financial Services, characteristic=Wealth Management, sector=BLANK
+  ✓ "Influencer marketing agency" (no vertical) → sector=BLANK, NOT "Marketing & Advertising"
+  ✓ Hedge fund (multi-strategy) → sector=BLANK, NOT "Multi-industry" unless the text explicitly says it
 
 == WHEN IN DOUBT ==
 - Keep Identity broad and stable.
@@ -1877,6 +1910,156 @@ Only include entries where from != to. Omit entries that should stay as-is. Be a
     for (const t of taggings) {
         if (t.characteristic && mergeMap.has(t.characteristic)) {
             t.characteristic = mergeMap.get(t.characteristic) || t.characteristic;
+        }
+    }
+    return { merges: mergeCount, costUsd };
+}
+
+// Sector-specific consolidation. Same shape as the characteristic version
+// but with sector-tailored merge rules and a more aggressive "drop or merge
+// to BLANK" instruction. Sectors fragment heavily across batches because
+// the LLM invents niche verticals (Sports / Sports & Athletics / Esports)
+// that should all collapse to broader buckets, AND sometimes mis-classifies
+// identities as sectors ("Marketing / Advertising", "Insurance", "IT
+// Services"). The merge rules drop those entirely (set to "" / blank).
+async function consolidateSectorsViaLLM(
+    supabase: SupabaseClient,
+    model: string,
+    taggings: IndustryTagging[],
+    snapshot: TaxonomySnapshot,
+    runId: string,
+    ctx: BucketingCtx
+): Promise<{ merges: number; costUsd: number }> {
+    const libraryNames = new Set(snapshot.sectors.map(s => s.name));
+
+    const counts = new Map<string, number>();
+    for (const t of taggings) {
+        const s = t.sector;
+        if (!s) continue;
+        if (libraryNames.has(s)) continue;
+        counts.set(s, (counts.get(s) || 0) + 1);
+    }
+    if (counts.size < 15) {
+        ctx.log(`[Bucketing ${runId}] sector consolidation skipped (${counts.size} proposed-new < 15 threshold)`);
+        return { merges: 0, costUsd: 0 };
+    }
+
+    const entries = Array.from(counts.entries())
+        .map(([sector, count]) => ({ sector, count }))
+        .sort((a, b) => b.count - a.count);
+    const promptBody = entries.map(e => `  - "${e.sector}" (${e.count}×)`).join('\n');
+
+    const systemPrompt = `You consolidate a list of B2B SECTOR proposals (Layer 3 — vertical the company SERVES) into a smaller canonical set. Sectors should be broad served verticals — not the company's own identity, not narrow niches.
+
+GOAL: collapse near-duplicates and identity-bleed. TARGET: 10–20 sectors total.
+
+CANONICAL SECTORS (use these names verbatim wherever applicable):
+  Healthcare · Real Estate · Government · Education · Energy & Utilities ·
+  Financial Services · Manufacturing · Hospitality & Travel · Technology & Software ·
+  Non-Profit & Social Impact · Legal · Retail · Media & Entertainment ·
+  Life Sciences & Biotech · Transportation & Logistics · Construction & Infrastructure ·
+  Agriculture · Telecommunications · Aerospace & Defense · Multi-industry
+
+REQUIRED MERGE PATTERNS (apply whenever you see one of these inputs):
+  Sports / Athletics / Sports & Entertainment / Sports & Athletics / Esports → Media & Entertainment
+  Recreational / Recreation & Outdoor / Leisure / Recreational & Leisure → Hospitality & Travel
+  Gaming / Gambling → Media & Entertainment
+  Food Technology / Food & Beverage / Restaurant → Food & Beverage
+  Renewable Energy / Solar Energy / Oil & Gas / Utilities → Energy & Utilities
+  Pharma / Biotech → Life Sciences & Biotech
+  Medical → Healthcare
+  Affordable Housing / Housing / Property → Real Estate
+  Aviation / Defense / Aerospace → Aerospace & Defense
+  Construction → Construction & Infrastructure
+  Insurance → Financial Services
+  Environmental / Climate → Non-Profit & Social Impact (or Energy & Utilities if energy-focused)
+  Plural / singular variants → singular ("Healthcare Services" → Healthcare)
+
+MAP TO BLANK (these inputs are NOT sectors — set to ""):
+  Marketing · Advertising · Marketing / Advertising · Marketing & Sales ·
+  IT Services · Technology Services · Professional Services · Consulting ·
+  Corporate · B2B · Small Business · Subscription · Holding Company ·
+  Multi-industry (only when there is no specific vertical — leave blank)
+These are identity / generic labels, not verticals served. The contact's identity already captures them.
+
+RULES:
+- Use the canonical name verbatim (no paraphrasing).
+- When the input could fit multiple canonicals, pick the broadest reasonable match.
+- Keep the proposed-new set as small as possible — when in doubt, merge or drop to blank.
+
+OUTPUT (strict JSON, key MUST be "merges"):
+{
+  "merges": [
+    { "from": "<original sector name verbatim>", "to": "<canonical name OR empty string \\"\\" to drop>" },
+    ...
+  ]
+}
+Only include entries where from != to (or where to is "" to drop). Be aggressive — 50+ proposed sectors should reduce to ~10–20 canonical.`;
+
+    const userPrompt = `Consolidate these proposed-new sectors:\n\n${promptBody}`;
+
+    let costUsd = 0;
+    let mergeCount = 0;
+    const mergeMap = new Map<string, string>();
+
+    try {
+        const isAnthropic = model.startsWith('claude-');
+        let text = '';
+        if (isAnthropic) {
+            const anthropic = await getAnthropic(supabase);
+            if (!anthropic) throw new Error('Anthropic API key not configured');
+            const resp = await anthropic.messages.create({
+                model,
+                max_tokens: 3000,
+                system: systemPrompt,
+                messages: [{ role: 'user', content: userPrompt }]
+            }, { timeout: TAXONOMY_TIMEOUT_MS });
+            const usage: any = (resp as any).usage || {};
+            costUsd = computeAnthropicCost(model, usage.input_tokens || 0, usage.output_tokens || 0);
+            text = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
+        } else {
+            const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model,
+                    max_tokens: 3000,
+                    response_format: { type: 'json_object' },
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt }
+                    ]
+                }),
+                signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+            });
+            if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
+            const json: any = await resp.json();
+            const usage = json.usage || {};
+            costUsd = computeOpenAICost(model, usage.prompt_tokens || 0, 0, usage.completion_tokens || 0);
+            text = json.choices?.[0]?.message?.content || '';
+        }
+
+        const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+        const cleaned = (fence ? fence[1] : text).trim();
+        const parsed = JSON.parse(cleaned);
+        const merges = Array.isArray(parsed.merges) ? parsed.merges : [];
+        for (const m of merges) {
+            if (typeof m?.from === 'string' && typeof m?.to === 'string' && m.from !== m.to) {
+                // Allow merge target of "" — means "drop this sector to blank"
+                mergeMap.set(m.from, m.to);
+            }
+        }
+        mergeCount = mergeMap.size;
+    } catch (err: any) {
+        ctx.log(`[Bucketing ${runId}] sector consolidation LLM call failed (non-fatal): ${err.message}`, 'warn');
+        return { merges: 0, costUsd };
+    }
+
+    // Apply the mapping in-place. An empty string target means "drop to null".
+    for (const t of taggings) {
+        if (t.sector && mergeMap.has(t.sector)) {
+            const target = mergeMap.get(t.sector) || '';
+            t.sector = target.trim() ? target : null;
         }
     }
     return { merges: mergeCount, costUsd };
