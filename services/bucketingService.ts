@@ -882,12 +882,28 @@ export async function runTaxonomyProposal(
         // semantic duplicates the normalizer misses — "Wealth Management" +
         // "Investment Advisory" + "Wealth & Investment Advisory" → one name.
         // No-op when proposed-new count < 60 (small runs don't need it).
-        const charConsol = await consolidateCharacteristicsViaLLM(
-            supabase, phase1aModel, tagResult.taggings, snapshot, runId, ctx
-        );
+        //
+        // Multi-pass: each pass merges what it can; subsequent passes catch
+        // chains the first missed (e.g. "Investment Research" → "Investment
+        // Advisory" → "Investment Management"). Stops early when a pass
+        // finds < 5 merges (diminishing returns) or after 3 passes max.
+        let totalCharMerges = 0;
+        let totalCharCost = 0;
+        for (let pass = 1; pass <= 3; pass++) {
+            const r = await consolidateCharacteristicsViaLLM(
+                supabase, phase1aModel, tagResult.taggings, snapshot, runId, ctx
+            );
+            totalCharMerges += r.merges;
+            totalCharCost += r.costUsd;
+            if (r.merges > 0) {
+                ctx.log(`[Bucketing ${runId}] LLM characteristic consolidation pass ${pass}: merged ${r.merges} variant names, $${r.costUsd.toFixed(4)}`);
+            }
+            if (r.merges < 5) break;  // diminishing returns
+        }
+        const charConsol = { merges: totalCharMerges, costUsd: totalCharCost };
         if (charConsol.merges > 0) {
             totalCost += charConsol.costUsd;
-            ctx.log(`[Bucketing ${runId}] LLM characteristic consolidation: merged ${charConsol.merges} variant names, $${charConsol.costUsd.toFixed(4)}`);
+            ctx.log(`[Bucketing ${runId}] LLM characteristic consolidation TOTAL: ${charConsol.merges} merges, $${charConsol.costUsd.toFixed(4)}`);
         }
 
         // LLM semantic consolidation of proposed-new sectors. Same pattern,
@@ -1797,56 +1813,130 @@ async function consolidateCharacteristicsViaLLM(
         return `Identity: ${identity || '(none)'}\n${lines}`;
     }).join('\n\n');
 
-    const systemPrompt = `You consolidate a long list of B2B characteristic proposals into a smaller, reusable set. Each characteristic is a sub-type within a primary identity.
+    const systemPrompt = `You consolidate a long list of B2B characteristic proposals into a small, reusable canonical set. Each characteristic is a sub-type within a primary identity.
 
-GOAL: collapse near-duplicate / overly narrow entries within the same identity. TARGET: 3–8 characteristics per identity, total 40–100 across the whole list. If the input has more than 100 distinct characteristics, you MUST merge aggressively.
+GOAL: collapse near-duplicate / overly narrow entries within the same identity. TARGET: 3–6 characteristics per identity, TOTAL 50–80 across the whole list. If the input has more than 80 distinct characteristics, you MUST merge aggressively. Be RUTHLESS — leaving variants separate is the failure mode, merging too much is rare.
 
-CANONICAL EXAMPLES BY IDENTITY (prefer these names verbatim):
-  Agency: SEO Agency · Performance Marketing Agency · Creative Agency · PR Agency · Branding Agency
-  Software & SaaS: FinTech SaaS · Vertical SaaS · CRM / Sales Software · MarTech SaaS · HR SaaS
-  Financial Services: Wealth Management · Private Equity · Venture Capital · Investment Banking · M&A Advisory · Insurance Brokerage · Lending / Credit
-  Real Estate: Brokerage · Property Management · Real Estate Development · Real Estate Investment
-  Consulting & Advisory: Business Consulting · Management Consulting · Financial Advisory · HR Consulting · IT Consulting
-  Field Services: Field Services & Maintenance · Equipment Rental & Leasing · Janitorial / Cleaning Services
-  Manufacturing & Industrial: B2B Product Manufacturer · Industrial Equipment · Custom Manufacturing
-  Healthcare Operator: Medical Clinic / Hospital · Dental Practice · Specialty Practice
+CANONICAL CHARACTERISTICS BY IDENTITY (use these names verbatim — do NOT invent variants):
 
-REQUIRED MERGE PATTERNS (apply these whenever you see them):
-  "Financial Advisory Services" / "Financial Advisory Firm" → Financial Advisory
-  "Investment Advisory" → Financial Advisory  (or Investment Management depending on context)
-  "Investment & Development" → Real Estate Investment  (or Real Estate Development)
-  "Residential Brokerage" / "Real Estate Brokerage" / "Commercial Brokerage" → Brokerage
-  "Wealth Management Firm" → Wealth Management
-  "Private Equity Firm" → Private Equity
+Agency: SEO Agency · Performance Marketing Agency · Creative Agency · Branding Agency · PR Agency · Event Management Agency · Talent Management Agency · Manufacturers' Representative
+Software & SaaS: FinTech SaaS · Vertical SaaS · MarTech SaaS · HR SaaS · CRM / Sales Software · Cybersecurity Software · Custom Software Development · Game Development
+Financial Services: Investment Management · Wealth Management · Private Equity · Venture Capital · Investment Banking · M&A Advisory · Insurance Brokerage · Lending / Credit · Banking · Brokerage · Family Office · Hedge Fund
+Real Estate: Brokerage · Property Management · Real Estate Development · Real Estate Investment · Mortgage Brokerage
+Consulting & Advisory: Business Consulting · Management Consulting · IT Consulting · Engineering Consulting · Strategy Consulting · Financial Advisory · HR Consulting · Specialty Consulting
+Field Services: Field Services & Maintenance · Equipment Rental & Leasing · IT Asset Disposition · Inspection Services
+Manufacturing & Industrial: B2B Product Manufacturer · Custom Manufacturing · Industrial Equipment · Contract Manufacturing
+Construction & Engineering: General Contracting · Construction Management · Civil Engineering · Electrical Contracting · Custom Home Builder
+Non-Profit & Association: Foundation · Trade Association · Non-Profit Organization · Advocacy Organization · Religious Organization
+Healthcare Operator: Medical Clinic / Hospital · Dental Practice · Specialty Practice
+Education Operator: K-12 School · Higher Education · Vocational Training
+Accounting & Tax: Accounting Services · Tax Advisory · Outsourced Accounting
+Legal Services: Corporate Law · Family Law · Tax Law · Intellectual Property Law · Litigation · Estate Planning Law
+Staffing & Recruiting: Executive Search · Technology Staffing · Healthcare Staffing
+Energy & Utilities: Renewable Energy Services · Energy Project Development · Utility Services
+IT Services: Managed IT Services · Cybersecurity Services · IT Consulting
+
+REQUIRED MERGE PATTERNS — APPLY EVERY ONE OF THESE (these are observed in real runs):
+
+— Investment / Wealth Management cluster:
+  "Investment Advisory" / "Investment Research" / "Investment Research & Advisory" / "Investment" / "Alternative Investment Management" / "Registered Investment Advisory" / "Investment Management Firm" → Investment Management
+  "Wealth Management Firm" / "Private Wealth Management" → Wealth Management
+  "Asset Management" → Investment Management  (or Wealth Management if HNW-focused)
+
+— Banking cluster (all → Banking):
+  "Community Banking" / "Retail Banking" / "Commercial Banking" / "Credit Union" → Banking
+
+— PE/VC firm-suffix cleanup:
+  "Private Equity Firm" / "Private Equity Fund" → Private Equity
   "Venture Capital Firm" / "Venture Capital Fund" → Venture Capital
-  "Managed IT Services and Cybersecurity" / "Cloud Managed Services" → Managed IT Services
-  "FinTech Software Company" / "FinTech SaaS Platform" → FinTech SaaS
-  "B2B SaaS for {Vertical}" → Vertical SaaS
-  "Solar Panel Installation Services" / "HVAC Repair Services" / "Plumbing Services" → Field Services & Maintenance
-  Plural / singular variants → singular ("Insurance Brokerages" → Insurance Brokerage)
-  Suffixes like "Services" / "Solutions" / "Group" / "Firm" → drop unless required for meaning
+  "Hedge Fund Firm" → Hedge Fund
+
+— Foundation / Non-Profit cluster (collapse aggressively):
+  "Foundation / Grantmaking" / "Educational Foundation" / "Education Foundation" / "Community Development Foundation" / "Philanthropic Foundation" / "Scholarship Foundation" / "Grantmaking Organization" → Foundation
+  "Non-Profit" / "Non-Profit & Association" / "Service Organization" / "Volunteer Organization" / "Educational Nonprofit" / "Community Organization" / "Community Services" / "Social Impact Organization" → Non-Profit Organization
+  "Membership Organization" / "Membership Association" / "Industry Association" / "Professional Association" / "Professional Membership Association" / "Association Management" → Trade Association  (or Professional Association if member-leaning)
+  "Advocacy" / "Health Advocacy" / "Education & Outreach" → Advocacy Organization
+  "Youth Organization" / "Religious Organization" / "Family Support Services" / "Social Services" / "Think Tank" / "Community Development" / "Community Development Foundation" / "Fundraising" / "Research Funding" / "Leadership Development" → choose closest of [Foundation, Non-Profit Organization, Advocacy Organization, Religious Organization]
+
+— Construction cluster:
+  "General Contractor" / "Construction Services" / "Commercial Construction" / "Custom Residential Construction" / "Residential Construction" / "Heavy Civil Construction" / "Construction & Engineering" / "Design-Build Services" / "Electrical and Communication Infrastructure Construction Services" → General Contracting
+  "Custom Home Builder" stays separate (residential luxury niche, has distinct outreach)
+  "Civil Engineering" / "Engineering Services" / "Infrastructure Development" / "Energy Infrastructure Development" / "Project Developer" → Civil Engineering
+  "Electrical Contracting" stays separate
+
+— Field Services cluster (HUGE collapse — all the one-off service variants):
+  "HVAC Services" / "HVAC Contractor" / "Solar Installation Services" / "Solar Installation & Services" / "Energy Systems Installation Services" / "Installation Services" / "Maintenance Services" / "Equipment Repair" / "Equipment Maintenance Services" / "Equipment Sales and Services" / "Facilities Management" / "Facility Maintenance Services" / "Roof Management Services" / "Home Remodeling Services" / "Lawn Care Services" / "Repair Services" / "Print Management Services" / "Environmental Services" / "Flooring Installation Services" / "Elevator Maintenance Services" / "On-Demand Services" / "IT Hardware Support and Maintenance" / "Catering Services" / "Construction Services" → Field Services & Maintenance
+  "Inspection Services" / "Industrial Inspection Services" / "Trade Show Exhibit Services" → Inspection Services  (or Field Services & Maintenance if ambiguous)
+  "Equipment Rental & Maintenance Services" → Equipment Rental & Leasing
+  "IT Asset Disposition Services" → IT Asset Disposition
+
+— Marketing / Creative Agency cluster:
+  "Direct Marketing Agency" / "Direct Mail Agency" / "Out-of-Home Advertising Agency" / "Advertising Agency" / "Media Buying Agency" / "Full Service Marketing Agency" / "Full-Service Marketing Agency" / "Sports Marketing Agency" / "Athlete Marketing Agency" → Performance Marketing Agency
+  "Public Relations Agency" → PR Agency
+  "Experiential Marketing Agency" / "Event Marketing Agency" / "Event Production Agency" / "Event Planning Agency" → Event Management Agency
+  "Casting Agency" / "Literary Agency" / "Talent Agency" → Talent Management Agency
+  "Sales Agency" / "Manufacturers' Representative" / "Manufacturer Sales Representation Agency" → Manufacturers' Representative
+  "Brand Strategy Consulting" / "Personal Branding Consulting" → Branding Agency
+  "Photography & Video Production Services" / "Direct Mail Agency" → Creative Agency
+  "Matchmaking Agency" → Specialty Agency  (or drop to null if count ≤ 2)
+
+— Consulting cluster (the long tail — collapse to ~6 canonical):
+  "Strategy Consulting" / "Innovation Consulting" / "Government Consulting" / "Government Relations Consulting" / "Political Consulting" / "Risk Management Consulting" / "Procurement Consulting" / "Sustainability Consulting" / "Healthcare Consulting" / "Education Consulting" / "Regulatory Consulting" / "Architectural Consulting" / "Architecture & Design Consulting" / "Interior Design" / "Design Consulting" / "Community Engagement Consulting" / "Event Management Consulting" / "Non-Profit & Social Impact Consulting" / "Fundraising Consulting" / "Market Research" / "Market Research Consulting" / "Real Estate Advisory" / "Capital Advisory" / "Strategic Advisory" / "Philanthropic Advisory" / "Employee Benefits Consulting" / "Legal Consulting" / "Tax Consulting" → choose closest of [Business Consulting, Management Consulting, Engineering Consulting, IT Consulting, Strategy Consulting, Specialty Consulting]
+  "Environmental Consulting" stays separate
+
+— Tax / Accounting cluster:
+  "Accounting & Tax" / "Accounting" / "Outsourced Accounting Services" / "Specialized Accounting Services" → Accounting Services  (or Outsourced Accounting if explicitly outsourced)
+  "Tax Advisory" / "Tax Consulting" / "Tax Consulting & Planning" / "Tax Accounting" / "Tax Preparation" / "Tax Preparation & Consulting" → Tax Advisory
+
+— Legal cluster:
+  "Business Law" / "Business / Corporate Law Firm" / "Contract Law Services" → Corporate Law
+  "Estate Planning" / "Estate Planning & Probate" → Estate Planning Law
+  "Entertainment Law" → Intellectual Property Law  (or Specialty Legal)
+  "Legal Aid" → drop to null  (rarely a useful B2B segment)
+
+— Software / SaaS one-offs:
+  "Field Services Software" / "Energy Management Software" / "Industrial Safety Software" / "Compliance Software" / "Media & Publishing SaaS" / "Financial Services SaaS" / "Industrial Software" → Vertical SaaS
+  "Enterprise Software" → CRM / Sales Software  (or Vertical SaaS depending on context)
+  "Professional Networking Platform" / "Online Media Platform" → Vertical SaaS  (or drop to null)
+
+— Manufacturing one-offs:
+  "Industrial Equipment Manufacturing" / "Industrial Manufacturing" / "Manufacturing" / "Specialty Chemicals Manufacturer" / "Medical Equipment Manufacturer" / "Custom Vehicle Manufacturing" / "Bioenergy Manufacturing" / "Industrial Gas Production" / "Precision Manufacturing" → choose closest of [B2B Product Manufacturer, Custom Manufacturing, Industrial Equipment]
+
+— Generic suffix cleanup (apply universally):
+  Strip trailing "Firm" / "Services" / "Solutions" / "Group" / "Inc" / "LLC" / "Corp" unless removing the suffix changes meaning
+  Plural → singular ("Insurance Brokerages" → Insurance Brokerage)
+  "B2B " prefix → strip ("B2B SaaS" → SaaS context-dependent)
+
+LOW-COUNT MERGE RULE (count ≤ 2):
+Any characteristic appearing only 1–2 times in the input list MUST be either:
+  (a) merged into the closest broader sibling characteristic under the same identity (preferred), OR
+  (b) dropped to null if no reasonable sibling exists (output {"from": "<name>", "to": ""})
+Low-count entries fragment the bucket count without earning their own viable bucket — a 1× characteristic will roll up to identity-only at min_volume anyway.
+
+IDENTITY-BLEED RULE (CRITICAL):
+If the characteristic name IS an identity name (e.g. "Healthcare Operator" used as a characteristic, "Field Services & Maintenance" used as a characteristic, "Consulting & Advisory" used as a characteristic, "Legal Services" used as a characteristic, "Non-Profit & Association" used as a characteristic, "Hospitality & Travel" used as a characteristic, "Energy & Utilities" used as a characteristic, "Staffing & Recruiting" used as a characteristic, "Operator" used as a characteristic), drop it to null with {"from": "<name>", "to": ""}. The contact will roll up to identity-only via the cascade. Identity names should never appear as characteristics.
 
 QUALITY CHECK before keeping a name as-is. Ask:
-  1. Is this characteristic reusable across multiple companies?
+  1. Is this characteristic reusable across multiple companies (≥3 ideally)?
   2. Is it meaningfully distinct from existing options under the same identity?
-  3. Would a marketer or sales operator actually use this distinction?
+  3. Would a marketer or sales operator actually use this distinction in a campaign?
   4. Could this be merged into a broader label without losing important value?
-  5. Is this actually a sector (vertical served) instead of a characteristic? If yes, merge into a generic equivalent (e.g. "Healthcare Marketing Agency" → "Performance Marketing Agency", since "Healthcare" belongs in the Sector field).
-Only keep the name if the answers support it. When in doubt, merge.
+  5. Is this actually a sector (vertical served) instead of a characteristic?
+Only keep the name if the answers support it. When in doubt, MERGE.
 
 HARD RULES:
-- Merge ONLY within the same identity. Never propose merging "FinTech SaaS" (Software & SaaS) with "FinTech Investment" (Financial Services).
+- Merge ONLY within the same identity. Never cross-identity.
 - "SEO Agency" ≠ "PR Agency" — genuinely different sub-types stay separate.
-- Vertical-specific names ("Healthcare CRM SaaS", "Restaurant POS Software") merge into the generic ("Vertical SaaS"). The vertical belongs in the Sector field, not the characteristic name.
+- Vertical-specific names ("Healthcare CRM SaaS", "Restaurant POS Software") merge into the generic ("Vertical SaaS").
 
 OUTPUT (strict JSON, key MUST be "merges"):
 {
   "merges": [
-    { "from": "<original characteristic name verbatim>", "to": "<canonical name>" },
+    { "from": "<original characteristic name verbatim>", "to": "<canonical name OR empty string \\"\\" to drop>" },
     ...
   ]
 }
-Only include entries where from != to. Omit entries that should stay as-is. Be aggressive — if the input has 200+ characteristics, expect to output 100+ merges.`;
+Only include entries where from != to (or where to="" to drop). Be ruthless — if the input has 200+ characteristics, expect to output 150+ merges.`;
 
     const userPrompt = `Consolidate these proposed-new characteristics:\n\n${promptBody}`;
 
@@ -1906,10 +1996,13 @@ Only include entries where from != to. Omit entries that should stay as-is. Be a
         return { merges: 0, costUsd };
     }
 
-    // Apply the mapping in-place.
+    // Apply the mapping in-place. An empty string target means "drop to null"
+    // — used by LOW-COUNT MERGE and IDENTITY-BLEED rules. The contact will
+    // then roll up to identity-only via the cascade.
     for (const t of taggings) {
         if (t.characteristic && mergeMap.has(t.characteristic)) {
-            t.characteristic = mergeMap.get(t.characteristic) || t.characteristic;
+            const target = mergeMap.get(t.characteristic) || '';
+            t.characteristic = target.trim() ? target : null;
         }
     }
     return { merges: mergeCount, costUsd };
