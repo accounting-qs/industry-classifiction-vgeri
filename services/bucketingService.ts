@@ -852,15 +852,21 @@ export async function runTaxonomyProposal(
     let totalCost = 0;
     const preMapRows: any[] = [];
 
-    // ── Disqualified passthrough ─────────────────────────────────────
+    // ── General passthrough (failed enrichment / scrape error / no data) ─
+    // Disqualified is reserved for LLM-confident "not our ICP" verdicts —
+    // contacts we successfully enriched + classified, where the taxonomy
+    // tells us they're out of scope. Failed enrichment / scrape errors
+    // are a data-quality problem, not a fit problem; they belong in
+    // General so the user sees them as "couldn't classify" rather than
+    // "we deliberately excluded them".
     for (const v of dqVocab) {
         const reason = v.enrichment_status || 'unknown';
         preMapRows.push({
             bucketing_run_id: runId,
             industry_string: v.industry,
             raw_industry: v.industry,
-            bucket_name: RESERVED_DISQUALIFIED,
-            source: 'disqualified_passthrough',
+            bucket_name: RESERVED_GENERAL,
+            source: 'general_passthrough',
             confidence: 0,
             primary_identity: null,
             characteristic: null,
@@ -868,10 +874,10 @@ export async function runTaxonomyProposal(
             is_new_identity: false,
             is_new_characteristic: false,
             is_new_sector: false,
-            is_disqualified: true,
-            is_generic: false,
+            is_disqualified: false,
+            is_generic: true,
             needs_qa: false,
-            canonical_classification: 'Disqualified',
+            canonical_classification: 'General',
             llm_reason: `enrichment_status=${reason}`,
         });
     }
@@ -4111,10 +4117,15 @@ function makeGeneralContactRow(
     contact: ContactRouteInput,
     reason: string
 ): ContactMapRow {
-    // Unclassifiable rows (failed enrichment, missing industry, scrape errors)
-    // route to the dedicated Disqualified bucket — separate from General so
-    // outreach exports can exclude them by default while still being able to
-    // see why each contact landed there.
+    // Unclassifiable rows (failed enrichment, missing industry, scrape
+    // errors) route to General — NOT Disqualified. Disqualified is
+    // reserved for LLM-confident "not our ICP" verdicts where we did
+    // successfully enrich + classify the contact and the taxonomy says
+    // they're out of scope. Failed enrichment is a data-quality issue,
+    // not a fit issue; the contact still belongs in the universe with
+    // a "couldn't classify" reason so outreach can still pick them up
+    // with a generic message if desired. is_generic=true marks them
+    // for the General Breakdown panel.
     return {
         bucketing_run_id: runId,
         contact_id: contact.contact_id,
@@ -4124,10 +4135,10 @@ function makeGeneralContactRow(
         sector: '',
         assigned_bucket_name: null,
         assigned_bucket_primary_identity: null,
-        canonical_classification: 'Disqualified',
+        canonical_classification: 'General',
         bucket_reason: `Unclassifiable: ${reason}`,
-        pre_rollup_bucket_name: RESERVED_DISQUALIFIED,
-        bucket_name: RESERVED_DISQUALIFIED,
+        pre_rollup_bucket_name: RESERVED_GENERAL,
+        bucket_name: RESERVED_GENERAL,
         identity_confidence: 0,
         characteristic_confidence: 0,
         sector_confidence: 0,
@@ -4137,8 +4148,8 @@ function makeGeneralContactRow(
         leaf_score: 0,
         ancestor_score: 0,
         root_score: 0,
-        is_generic: false,
-        is_disqualified: true,
+        is_generic: true,
+        is_disqualified: false,
         general_reason: reason,
         reasons: {
             general_reason: reason,
