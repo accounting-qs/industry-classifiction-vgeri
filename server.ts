@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { db } from './services/supabaseClient';
 import { JobProcessor } from './services/jobProcessor';
-import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, recalculateTaxonomyWithLibrary, finalizeTaxonomyAgainstLibrary, BucketingCancelledError } from './services/bucketingService';
+import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, recalculateTaxonomyWithLibrary, finalizeTaxonomyAgainstLibrary, runBucketAssignment, BucketingCancelledError } from './services/bucketingService';
 import {
     listLibrary,
     upsertLibraryBucket,
@@ -1977,6 +1977,84 @@ app.post('/api/bucketing/runs/:id/finalize-taxonomy', async (req, res) => {
         res.json({ ok: true, ...result });
     } catch (err: any) {
         res.status(400).json({ error: err.message });
+    }
+});
+
+// Bucket Assignment: separate from taxonomy tagging. For each Phase 1a
+// row, the LLM picks a bucket from bucket_library or proposes a new one
+// with a primary_identity. Writes assigned_bucket_name +
+// assigned_bucket_primary_identity + is_new_bucket back to
+// bucket_industry_map. Synchronous; cost scales with the number of
+// distinct industries (typically a few cents per thousand).
+app.post('/api/bucketing/runs/:id/assign-buckets', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const result = await runBucketAssignment(supabase, id, buildBucketingCtx(id));
+        res.json({ ok: true, ...result });
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+// Returns the unique AI-proposed buckets that aren't yet in
+// bucket_library (is_new_bucket=true rows from this run), grouped for
+// the AI-Proposed Buckets panel. Counts how many industries propose
+// each bucket so the user can prioritize accepts.
+app.get('/api/bucketing/runs/:id/proposed-buckets', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const all: any[] = [];
+        const PAGE = 1000;
+        for (let off = 0; off < 200_000; off += PAGE) {
+            const { data, error } = await supabase
+                .from('bucket_industry_map')
+                .select('industry_string,assigned_bucket_name,assigned_bucket_primary_identity,bucket_assignment_reason,bucket_assignment_confidence')
+                .eq('bucketing_run_id', id)
+                .eq('is_new_bucket', true)
+                .range(off, off + PAGE - 1);
+            if (error) return res.status(500).json({ error: error.message });
+            const rows = (data || []) as any[];
+            all.push(...rows);
+            if (rows.length < PAGE) break;
+        }
+        // Group by (bucket_name, primary_identity); count industries +
+        // collect a couple of sample industry strings for the panel hint.
+        const byKey = new Map<string, { name: string; parent: string; count: number; samples: string[]; reasons: string[] }>();
+        for (const r of all) {
+            if (!r.assigned_bucket_name) continue;
+            const key = `${r.assigned_bucket_primary_identity || ''}::${r.assigned_bucket_name}`;
+            if (!byKey.has(key)) {
+                byKey.set(key, {
+                    name: r.assigned_bucket_name,
+                    parent: r.assigned_bucket_primary_identity || '',
+                    count: 0,
+                    samples: [],
+                    reasons: []
+                });
+            }
+            const ent = byKey.get(key)!;
+            ent.count++;
+            if (ent.samples.length < 3 && r.industry_string) ent.samples.push(r.industry_string);
+            if (ent.reasons.length < 1 && r.bucket_assignment_reason) ent.reasons.push(r.bucket_assignment_reason);
+        }
+        const buckets = Array.from(byKey.values())
+            .sort((a, b) => b.count - a.count);
+        res.json({ buckets });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Per-bucket contact counts (using assigned_bucket_name) for the new
+// Discovered Buckets panel. Mirrors get_bucket_map_counts but groups
+// by the assignment, not by the synthesized rollup.
+app.get('/api/bucketing/runs/:id/discovered-buckets', async (req, res) => {
+    try {
+        const { data, error } = await supabase.rpc('get_assigned_bucket_counts', { p_run_id: req.params.id });
+        if (error) return res.status(500).json({ error: error.message });
+        res.json({ buckets: data || [] });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
     }
 });
 

@@ -769,6 +769,98 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
       setFinalizing(false);
     }
   }, [run.id, onRefresh, onError]);
+
+  // Bucket Assignment: separate from taxonomy. After taxonomy is finalized,
+  // run an LLM pass that maps each industry → a bucket from bucket_library
+  // (or proposes a new bucket with primary_identity). Output goes into
+  // bucket_industry_map.assigned_bucket_*; computeContactRollup picks it
+  // up automatically with min_volume gating.
+  const [assigningBuckets, setAssigningBuckets] = useState(false);
+  const [lastBucketAssign, setLastBucketAssign] = useState<{ at: Date; matched: number; proposed: number; nullified: number; failed: number } | null>(null);
+  const [bucketProposals, setBucketProposals] = useState<{ name: string; parent: string; count: number; samples: string[]; reasons: string[] }[]>([]);
+  const [discoveredBuckets, setDiscoveredBuckets] = useState<{ assigned_bucket_name: string; assigned_bucket_primary_identity: string; is_new_bucket: boolean; contact_count: number }[]>([]);
+
+  const refreshBucketPanels = useCallback(async () => {
+    try {
+      const [pRes, dRes] = await Promise.all([
+        fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/proposed-buckets`).then(r => r.json()),
+        fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/discovered-buckets`).then(r => r.json())
+      ]);
+      setBucketProposals(Array.isArray(pRes.buckets) ? pRes.buckets : []);
+      setDiscoveredBuckets(Array.isArray(dRes.buckets) ? dRes.buckets : []);
+    } catch { /* silent — surfacing here would be noise */ }
+  }, [run.id]);
+
+  useEffect(() => { refreshBucketPanels(); }, [refreshBucketPanels]);
+
+  const triggerBucketAssign = useCallback(async () => {
+    setAssigningBuckets(true);
+    onError(null);
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/assign-buckets`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Bucket assignment failed (${res.status})`);
+      setLastBucketAssign({
+        at: new Date(),
+        matched: data.matched || 0,
+        proposed: data.proposed || 0,
+        nullified: data.nullified || 0,
+        failed: data.failed || 0
+      });
+      await refreshBucketPanels();
+      onRefresh();
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setAssigningBuckets(false);
+    }
+  }, [run.id, refreshBucketPanels, onRefresh, onError]);
+
+  const acceptProposedBucket = async (name: string, parent: string) => {
+    onError(null);
+    try {
+      const res = await fetch('/api/bucketing/library', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ characteristic: name, primary_identity: parent })
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Failed (${res.status})`);
+      }
+    } catch (e: any) { onError(e.message); }
+  };
+
+  const acceptAllProposedBuckets = async () => {
+    if (bucketProposals.length === 0) return;
+    if (!confirm(`Accept all ${bucketProposals.length} proposed bucket(s) into bucket_library, then re-run bucket assignment?`)) return;
+    setAssigningBuckets(true);
+    onError(null);
+    try {
+      for (const p of bucketProposals) {
+        await acceptProposedBucket(p.name, p.parent);
+      }
+      // Re-run bucket assignment so newly-accepted entries flip from
+      // is_new_bucket=true to false, and the library list now contains
+      // them as canonical merge targets for any remaining proposals.
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/assign-buckets`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Re-assign failed (${res.status})`);
+      setLastBucketAssign({
+        at: new Date(),
+        matched: data.matched || 0,
+        proposed: data.proposed || 0,
+        nullified: data.nullified || 0,
+        failed: data.failed || 0
+      });
+      await refreshBucketPanels();
+      onRefresh();
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setAssigningBuckets(false);
+    }
+  };
   const sourceBuckets = run.taxonomy_final?.buckets || run.taxonomy_proposal?.buckets || [];
   const primaryIdentities = (run.taxonomy_final?.primary_identities || run.taxonomy_proposal?.primary_identities) || [];
   const observedPatterns = (run.taxonomy_final?.observed_patterns || run.taxonomy_proposal?.observed_patterns) || [];
@@ -888,6 +980,134 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
         lastFinalize={lastFinalize}
       />
       <Phase1aQAQueuePanel runId={run.id} onError={onError} />
+
+      {/* ── Bucket Assignment (separates taxonomy from final campaign buckets) ── */}
+      <div className="border border-[#3ecf8e]/30 rounded-xl bg-[#3ecf8e]/5 p-4">
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div className="flex-1 min-w-0">
+            <div className="text-[10px] font-bold text-[#3ecf8e] uppercase tracking-widest mb-1">
+              Bucket Assignment — map taxonomy to campaign buckets
+            </div>
+            <div className="text-[11px] text-gray-400">
+              Asks the LLM to pick a bucket from <span className="text-gray-300">bucket_library</span> for every Phase 1a-tagged industry, or propose a new bucket if nothing fits. After this runs, Phase 1b uses these buckets directly (with min_volume gating). Run AFTER Finalize Taxonomy.
+            </div>
+            {lastBucketAssign && (
+              <div className="text-[10px] text-gray-500 mt-1.5 font-mono">
+                Last assignment {lastBucketAssign.at.toLocaleTimeString()} · {lastBucketAssign.matched} matched library, {lastBucketAssign.proposed} new proposals, {lastBucketAssign.nullified} → General{lastBucketAssign.failed > 0 ? `, ${lastBucketAssign.failed} batch failures` : ''}
+              </div>
+            )}
+          </div>
+          <button
+            onClick={triggerBucketAssign}
+            disabled={assigningBuckets || finalizing || recalcing}
+            className="shrink-0 px-3 py-1.5 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1"
+          >
+            {assigningBuckets ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+            {assigningBuckets ? 'Assigning…' : 'Run Bucket Assignment'}
+          </button>
+        </div>
+
+        {bucketProposals.length > 0 && (
+          <div className="mt-4 pt-3 border-t border-[#3ecf8e]/20">
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <span className="text-[10px] font-bold text-amber-400 uppercase tracking-widest">
+                AI-proposed buckets ({bucketProposals.length})
+              </span>
+              <button
+                onClick={acceptAllProposedBuckets}
+                disabled={assigningBuckets}
+                className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-200 border border-amber-500/40 hover:bg-amber-500/30 disabled:opacity-50"
+              >
+                Accept all + re-assign
+              </button>
+            </div>
+            <p className="text-[11px] text-gray-400 mb-2">
+              Buckets the LLM proposed because nothing in your library fit. Accepting one adds it to <span className="text-gray-300">bucket_library</span> and re-runs assignment so other industries can merge into it.
+            </p>
+            <ul className="space-y-1 max-h-72 overflow-y-auto pr-1">
+              {bucketProposals.map(p => (
+                <li
+                  key={`${p.parent}::${p.name}`}
+                  className="flex items-center gap-2 text-[11px] bg-[#1c1c1c] border border-[#2e2e2e] rounded px-2 py-1.5"
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="font-bold text-white truncate" title={p.name}>{p.name}</div>
+                    <div className="text-[10px] text-gray-500 truncate">
+                      {p.count}× under {p.parent || '(no parent)'} · ex: {p.samples.slice(0, 2).join(' · ')}
+                    </div>
+                  </div>
+                  <button
+                    onClick={async () => {
+                      await acceptProposedBucket(p.name, p.parent);
+                      await triggerBucketAssign();
+                    }}
+                    disabled={assigningBuckets}
+                    className="shrink-0 px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
+                  >
+                    Accept
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+
+      {discoveredBuckets.length > 0 && (() => {
+        const byIdentity = new Map<string, typeof discoveredBuckets>();
+        for (const b of discoveredBuckets) {
+          const key = b.assigned_bucket_primary_identity || '(no identity)';
+          if (!byIdentity.has(key)) byIdentity.set(key, []);
+          byIdentity.get(key)!.push(b);
+        }
+        return (
+          <div className="border border-[#3ecf8e]/30 rounded-xl bg-[#0e0e0e]">
+            <div className="px-4 py-3 border-b border-[#3ecf8e]/20 text-[10px] font-bold text-[#3ecf8e] uppercase tracking-widest flex items-center justify-between gap-3 flex-wrap">
+              <span>Discovered buckets (after assignment, grouped by primary identity)</span>
+              <span className="text-gray-600 normal-case tracking-normal font-normal">
+                Min_volume gates these; small buckets roll up to identity → General.
+              </span>
+            </div>
+            <div className="divide-y divide-[#2e2e2e]">
+              {Array.from(byIdentity.entries()).map(([ident, items]) => {
+                const total = items.reduce((s, b) => s + Number(b.contact_count || 0), 0);
+                return (
+                  <div key={ident} className="py-3">
+                    <div className="px-4 pb-2 flex items-center gap-2 flex-wrap">
+                      <span className="text-[9px] font-bold uppercase tracking-widest text-purple-400 bg-purple-500/10 border border-purple-500/30 px-1.5 py-0.5 rounded">Primary Identity</span>
+                      <span className="text-sm font-bold text-white">{ident}</span>
+                      <span className="text-[10px] font-mono text-gray-500">{total.toLocaleString()} contacts</span>
+                    </div>
+                    <div className="pl-4 border-l-2 border-[#2e2e2e] ml-4 divide-y divide-[#2e2e2e]/40">
+                      {items.sort((a, b) => Number(b.contact_count) - Number(a.contact_count)).map(b => {
+                        const cnt = Number(b.contact_count || 0);
+                        const willRollUp = cnt > 0 && cnt < minVolume;
+                        return (
+                          <div key={b.assigned_bucket_name} className="py-2 pl-4 pr-3">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500">↳ Bucket</span>
+                              <span className="font-bold text-white">{b.assigned_bucket_name}</span>
+                              {b.is_new_bucket && (
+                                <span className="text-[9px] font-bold text-amber-400 bg-amber-500/10 border border-amber-500/30 px-1.5 py-0.5 rounded">AI-proposed</span>
+                              )}
+                              <span className="text-[10px] font-mono text-gray-400">{cnt.toLocaleString()} contacts</span>
+                              {willRollUp && (
+                                <span className="text-[10px] font-bold text-blue-400 bg-blue-500/10 border border-blue-500/30 px-2 py-0.5 rounded">
+                                  Below threshold → identity "{ident}"
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
         <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between gap-3 flex-wrap">
@@ -1078,8 +1298,8 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
           </button>
           <button
             onClick={() => apply(true)}
-            disabled={busy !== 'none' || kept.size === 0 || recalcing || finalizing}
-            title={recalcing ? 'Recalculation in progress…' : finalizing ? 'Finalize in progress…' : ''}
+            disabled={busy !== 'none' || kept.size === 0 || recalcing || finalizing || assigningBuckets}
+            title={recalcing ? 'Recalculation in progress…' : finalizing ? 'Finalize in progress…' : assigningBuckets ? 'Bucket assignment in progress…' : ''}
             className="px-4 py-2 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1"
           >
             {busy === 'assigning' ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}

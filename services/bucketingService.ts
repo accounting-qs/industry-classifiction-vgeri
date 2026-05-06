@@ -293,6 +293,12 @@ interface ContactMapRow {
     primary_identity: string;
     characteristic: string;
     sector: string;
+    // Bucket Assignment output (Phase 1a sub-step). When the user has run
+    // bucket assignment, this is the LLM's pick from bucket_library (or a
+    // proposed new bucket). Phase 1b's rollup prefers these over the
+    // synthesized combo→characteristic→identity name when present.
+    assigned_bucket_name: string | null;
+    assigned_bucket_primary_identity: string | null;
     canonical_classification: string;
     bucket_reason: string;
     pre_rollup_bucket_name: string;
@@ -1811,6 +1817,384 @@ export async function finalizeTaxonomyAgainstLibrary(
     ctx.log(`[Finalize ${runId}] done — ${candidates.length} orphans processed: ${rerouted} re-routed to library, ${nullified} → null/General, ${failed} batch failures (kept original tag), $${costUsd.toFixed(4)}`, 'phase');
 
     return { candidates: candidates.length, rerouted, nullified, failed, costUsd };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// BUCKET ASSIGNMENT — map every taxonomy-tagged industry to a bucket
+//
+// User's mental model: taxonomy (identity / characteristic / sector)
+// classifies WHAT the contact is, with no size limits. Buckets are the
+// FINAL campaign segments — fewer in number, with min_volume gating
+// at this step. They live in bucket_library and grow over time as the
+// LLM proposes new ones for industries that don't fit.
+//
+// This pass takes every Phase 1a-tagged row and asks an LLM:
+//   "Given this industry text + (identity, characteristic, sector),
+//    pick the closest bucket from bucket_library, or propose a new
+//    bucket (with primary_identity) if nothing fits."
+//
+// Output: bucket_industry_map gets assigned_bucket_name +
+// assigned_bucket_primary_identity + is_new_bucket. The accept/recalc/
+// finalize cycle is intentionally identical to the taxonomy flow:
+//   • Accept a proposed bucket → create the bucket_library entry
+//   • Recalc → re-run, library grows, more orphans get matched
+//   • Finalize → re-tag remaining orphans library-only or null
+// ────────────────────────────────────────────────────────────────────
+
+interface BucketLibraryEntry {
+    id: string;
+    bucket_name: string;
+    primary_identity: string | null;
+    description: string | null;
+    archived: boolean;
+}
+
+async function loadBucketLibrarySnapshot(supabase: SupabaseClient): Promise<BucketLibraryEntry[]> {
+    const { data, error } = await supabase
+        .from('bucket_library')
+        .select('id,bucket_name,primary_identity,description,archived')
+        .eq('archived', false)
+        .order('bucket_name');
+    if (error) throw new Error(`bucket_library load failed: ${error.message}`);
+    return (data || []) as BucketLibraryEntry[];
+}
+
+interface BucketDecision {
+    industry: string;
+    bucket_name: string | null;          // null = no library fit AND no new proposal worth making
+    primary_identity: string | null;     // required when bucket_name != null
+    is_new: boolean;
+    confidence: number;                  // 0-10
+    reason: string;
+}
+
+function buildBucketAssignmentPrompt(
+    bucketLibrary: BucketLibraryEntry[],
+    snapshot: TaxonomySnapshot
+): string {
+    // Group library buckets by their primary_identity for the prompt — gives
+    // the LLM a clean "buckets under each identity" structure that lines up
+    // with how the taxonomy is shaped. Unassigned library entries are listed
+    // last under (no parent identity).
+    const byIdentity = new Map<string, BucketLibraryEntry[]>();
+    for (const b of bucketLibrary) {
+        const key = b.primary_identity || '(unassigned)';
+        if (!byIdentity.has(key)) byIdentity.set(key, []);
+        byIdentity.get(key)!.push(b);
+    }
+    const libBlock = Array.from(byIdentity.entries()).map(([ident, entries]) => {
+        const lines = entries.map(e => `    - "${e.bucket_name}"${e.description ? ` — ${e.description}` : ''}`).join('\n');
+        return `  Identity: ${ident}\n${lines}`;
+    }).join('\n\n');
+
+    const idNames = snapshot.identities.map(i => `"${i.name}"`).join(', ');
+
+    return `You assign B2B contacts to CAMPAIGN BUCKETS. Buckets are coarser than the per-contact taxonomy — they're the actual outreach segments a marketer would run.
+
+For each industry the user provides, you receive the taxonomy tags from the prior pass: identity, characteristic, sector. Use them to pick the closest bucket from the BUCKET LIBRARY below — or propose a new bucket if nothing in the library fits.
+
+BUCKET LIBRARY (curated by the user — prefer these whenever applicable):
+
+${libBlock || '  (library is empty — every assignment will be a new proposal)'}
+
+VALID PRIMARY IDENTITIES (use one of these for any new bucket proposal):
+${idNames || '(none — taxonomy library is empty)'}
+
+RULES:
+1. PREFER LIBRARY: if any library bucket is even loosely applicable, pick it (verbatim). The library is the source of truth — only propose new buckets when nothing reasonable fits.
+2. NEW PROPOSALS: when proposing a new bucket, set is_new=true. The bucket_name should be marketer-friendly (e.g. "FinTech / Financial Software", "Renewable Energy Services" — not too narrow, not generic). Required fields: bucket_name AND primary_identity (must be one from the VALID PRIMARY IDENTITIES list).
+3. NULL: if the contact's taxonomy is too vague to bucket meaningfully (e.g. identity=null, or generic catch-all), set bucket_name=null. The contact will route to General.
+4. CONSISTENCY: when two industries share the same identity + characteristic, they should usually get the same bucket. Don't fork unless the difference is meaningful for outreach.
+5. Confidence 1-10: 10 = obvious fit, 7 = good fit, 5 = forced match, 3 = stretch. Use the score honestly.
+
+OUTPUT (strict JSON, key MUST be "results"):
+{
+  "results": [
+    {
+      "id": <integer matching the input>,
+      "bucket_name": "<library entry verbatim, OR new bucket name, OR null>",
+      "primary_identity": "<identity from VALID list>",
+      "is_new": <true | false>,
+      "confidence": <1-10>,
+      "reason": "<one short sentence — why this bucket>"
+    },
+    ...
+  ]
+}
+
+Do not include any other fields. One result per input.`;
+}
+
+const BUCKET_BATCH_SIZE = 10;
+const BUCKET_CONCURRENCY = 30;
+
+export async function runBucketAssignment(
+    supabase: SupabaseClient,
+    runId: string,
+    ctx: BucketingCtx
+): Promise<{
+    candidates: number;
+    matched: number;
+    proposed: number;
+    nullified: number;
+    failed: number;
+    costUsd: number;
+}> {
+    const { data: run, error: runErr } = await supabase
+        .from('bucketing_runs').select('*').eq('id', runId).single();
+    if (runErr || !run) throw new Error(`Run not found: ${runErr?.message}`);
+    if (run.status !== 'taxonomy_ready' && run.status !== 'completed') {
+        throw new Error(`Cannot assign buckets from status "${run.status}" — run must be in taxonomy_ready or completed`);
+    }
+
+    const phase1aModel = (run.taxonomy_model as string) || 'gpt-4.1-mini';
+    const isAnthropic = phase1aModel.startsWith('claude-');
+    const anthropic = isAnthropic ? await getAnthropic(supabase) : null;
+    if (isAnthropic && !anthropic) {
+        throw new Error('Anthropic API key not configured.');
+    }
+
+    const [snapshot, bucketLib] = await Promise.all([
+        loadTaxonomySnapshot(supabase),
+        loadBucketLibrarySnapshot(supabase)
+    ]);
+    ctx.log(`[BucketAssign ${runId}] library: ${bucketLib.length} buckets, taxonomy: ${snapshot.identities.length} identities`);
+
+    // Pull every Phase 1a row, paginated.
+    const allRows: any[] = [];
+    {
+        const PAGE = 1000;
+        for (let off = 0; off < 200_000; off += PAGE) {
+            const { data, error } = await supabase
+                .from('bucket_industry_map')
+                .select('industry_string,primary_identity,characteristic,sector,is_disqualified,source')
+                .eq('bucketing_run_id', runId)
+                .range(off, off + PAGE - 1);
+            if (error) throw new Error(`bucket_industry_map fetch failed at offset ${off}: ${error.message}`);
+            const rows = (data || []) as any[];
+            allRows.push(...rows);
+            if (rows.length < PAGE) break;
+        }
+    }
+    // Skip disqualified passthrough rows (no taxonomy on them) and rows the
+    // tagger already disqualified (they route to Disqualified, not a bucket).
+    const candidates = allRows.filter(r => r.source === 'llm_phase1a' && !r.is_disqualified);
+    ctx.log(`[BucketAssign ${runId}] ${candidates.length} taxonomy-tagged rows to bucket-assign (skipping ${allRows.length - candidates.length} disqualified / passthrough)`);
+
+    if (candidates.length === 0) {
+        return { candidates: 0, matched: 0, proposed: 0, nullified: 0, failed: 0, costUsd: 0 };
+    }
+
+    const libByName = new Map<string, BucketLibraryEntry>();
+    for (const b of bucketLib) libByName.set(b.bucket_name, b);
+    const validIdentityNames = new Set(snapshot.identities.map(i => i.name));
+
+    const systemPrompt = buildBucketAssignmentPrompt(bucketLib, snapshot);
+
+    const limit = pLimit(BUCKET_CONCURRENCY);
+    const batches: any[][] = [];
+    for (let i = 0; i < candidates.length; i += BUCKET_BATCH_SIZE) {
+        batches.push(candidates.slice(i, i + BUCKET_BATCH_SIZE));
+    }
+
+    let totalIn = 0;
+    let totalOut = 0;
+    let totalCachedIn = 0;
+    let done = 0;
+    let batchesFailed = 0;
+    const decisions: BucketDecision[] = [];
+
+    await Promise.all(batches.map((batch) => limit(async () => {
+        await ctx.checkCancel();
+        const userPrompt = JSON.stringify({
+            industries: batch.map((r, i) => ({
+                id: i,
+                industry: r.industry_string,
+                identity: r.primary_identity,
+                characteristic: r.characteristic,
+                sector: r.sector
+            }))
+        });
+        try {
+            let text = '';
+            if (isAnthropic) {
+                const resp = await anthropic!.messages.create({
+                    model: phase1aModel,
+                    max_tokens: 2500,
+                    system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+                    messages: [{ role: 'user', content: userPrompt }]
+                }, { timeout: TAXONOMY_TIMEOUT_MS });
+                const usage: any = (resp as any).usage || {};
+                totalIn += usage.input_tokens || 0;
+                totalOut += usage.output_tokens || 0;
+                totalCachedIn += usage.cache_read_input_tokens || 0;
+                text = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
+            } else {
+                const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: phase1aModel,
+                        max_tokens: 2500,
+                        response_format: { type: 'json_object' },
+                        messages: [
+                            { role: 'system', content: systemPrompt },
+                            { role: 'user', content: userPrompt }
+                        ]
+                    }),
+                    signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+                });
+                if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
+                const json: any = await resp.json();
+                const usage = json.usage || {};
+                const cached = usage.prompt_tokens_details?.cached_tokens || 0;
+                totalIn += (usage.prompt_tokens || 0);
+                totalCachedIn += cached;
+                totalOut += usage.completion_tokens || 0;
+                text = json.choices?.[0]?.message?.content || '';
+            }
+
+            // Parse — tolerant of the same key variations as the Phase 1a tagger.
+            const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+            const cleaned = (fence ? fence[1] : text).trim();
+            const parsed = JSON.parse(cleaned);
+            let arr: any[] = [];
+            if (Array.isArray(parsed)) arr = parsed;
+            else if (parsed && typeof parsed === 'object') {
+                for (const k of ['results', 'industries', 'assignments', 'output', 'data']) {
+                    if (Array.isArray(parsed[k])) { arr = parsed[k]; break; }
+                }
+                if (arr.length === 0) {
+                    for (const k of Object.keys(parsed)) {
+                        if (Array.isArray(parsed[k]) && parsed[k].length > 0) { arr = parsed[k]; break; }
+                    }
+                }
+            }
+            for (let i = 0; i < arr.length; i++) {
+                const item = arr[i];
+                let idx = -1;
+                if (typeof item.id === 'number') idx = item.id;
+                else if (typeof item.id === 'string' && /^\d+$/.test(item.id)) idx = parseInt(item.id, 10);
+                else idx = i;
+                if (idx < 0 || idx >= batch.length) continue;
+                const v = batch[idx];
+                const rawName = typeof item.bucket_name === 'string' ? item.bucket_name.trim() : '';
+                const rawIdent = typeof item.primary_identity === 'string' ? item.primary_identity.trim() : '';
+                decisions.push({
+                    industry: v.industry_string,
+                    bucket_name: rawName || null,
+                    primary_identity: rawIdent || null,
+                    is_new: !!item.is_new,
+                    confidence: typeof item.confidence === 'number' ? item.confidence : 0,
+                    reason: typeof item.reason === 'string' ? item.reason.slice(0, 500) : ''
+                });
+            }
+        } catch (err: any) {
+            batchesFailed++;
+            ctx.log(`[BucketAssign ${runId}] batch error (${batch.length} industries): ${err.message}`, 'error');
+        }
+        done += batch.length;
+        if (done % (BUCKET_BATCH_SIZE * 5) === 0 || done === candidates.length) {
+            ctx.progress({
+                phase: 'phase1a', step: 'bucket_assign',
+                current: done, total: candidates.length,
+                note: `Bucket-assigned ${done}/${candidates.length} industries…`
+            });
+        }
+    })));
+
+    if (batchesFailed > batches.length / 2) {
+        throw new Error(`Bucket assignment failed for >50% of batches (${batchesFailed}/${batches.length}). Check API key + rate limits.`);
+    }
+
+    const costUsd = isAnthropic
+        ? computeAnthropicCost(phase1aModel, totalIn - totalCachedIn, totalOut)
+        : computeOpenAICost(phase1aModel, totalIn - totalCachedIn, totalCachedIn, totalOut);
+
+    // Apply: enforce library + identity validity, count outcomes, build updates.
+    const decisionByIndustry = new Map<string, BucketDecision>();
+    for (const d of decisions) decisionByIndustry.set(d.industry, d);
+
+    let matched = 0;
+    let proposed = 0;
+    let nullified = 0;
+    let failed = 0;
+    const updates: any[] = [];
+
+    for (const row of candidates) {
+        const d = decisionByIndustry.get(row.industry_string);
+        if (!d) {
+            // LLM failed for this row — leave it without a bucket assignment;
+            // it'll fall back to the legacy rollup at Phase 1b time.
+            failed++;
+            continue;
+        }
+
+        let bucketName: string | null = d.bucket_name;
+        let primaryIdent: string | null = d.primary_identity;
+        let isNew = d.is_new;
+
+        if (bucketName) {
+            // Library-existing? Use library's primary_identity as canonical
+            // (defends against the LLM hallucinating a different parent
+            // identity for an existing entry).
+            const lib = libByName.get(bucketName);
+            if (lib) {
+                isNew = false;
+                primaryIdent = lib.primary_identity || primaryIdent;
+            } else {
+                // It's a new proposal — must have a valid primary_identity
+                // from the taxonomy library. If the LLM set is_new=false
+                // for a name not in the library, treat it as a proposal.
+                isNew = true;
+                if (!primaryIdent || !validIdentityNames.has(primaryIdent)) {
+                    // Reject — invalid parent identity; route to General.
+                    bucketName = null;
+                    primaryIdent = null;
+                    isNew = false;
+                }
+            }
+        }
+
+        if (!bucketName) nullified++;
+        else if (isNew) proposed++;
+        else matched++;
+
+        updates.push({
+            bucketing_run_id: runId,
+            industry_string: row.industry_string,
+            // NOT NULL columns echoed through (PG validates on INSERT path
+            // before the ON CONFLICT redirect — same gotcha as recalc/finalize).
+            source: 'llm_phase1a',
+            raw_industry: row.industry_string,
+            bucket_name: row.bucket_name || RESERVED_GENERAL,
+            // New bucket-assignment fields
+            assigned_bucket_id: (bucketName && !isNew && libByName.get(bucketName)?.id) || null,
+            assigned_bucket_name: bucketName,
+            assigned_bucket_primary_identity: primaryIdent,
+            is_new_bucket: isNew,
+            bucket_assignment_reason: d.reason || null,
+            bucket_assignment_confidence: Number((((d.confidence || 0) / 10)).toFixed(2))
+        });
+    }
+
+    for (let i = 0; i < updates.length; i += 1000) {
+        const chunk = updates.slice(i, i + 1000);
+        const { error } = await supabase.from('bucket_industry_map')
+            .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
+        if (error) throw new Error(`bucket-assign upsert failed: ${error.message}`);
+    }
+
+    await supabase.from('bucketing_runs').update({
+        cost_usd: (Number(run.cost_usd) || 0) + costUsd
+    }).eq('id', runId);
+
+    ctx.log(`[BucketAssign ${runId}] done — ${matched} matched library, ${proposed} new proposals, ${nullified} → General, ${failed} batch failures, $${costUsd.toFixed(4)}`, 'phase');
+
+    return {
+        candidates: candidates.length,
+        matched, proposed, nullified, failed, costUsd
+    };
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -3646,7 +4030,7 @@ async function fetchPhase1aTaxonomyMap(
     while (true) {
         const { data, error } = await supabase
             .from('bucket_industry_map')
-            .select('industry_string,primary_identity,characteristic,sector,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,source')
+            .select('industry_string,primary_identity,characteristic,sector,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,source,assigned_bucket_name,assigned_bucket_primary_identity')
             .eq('bucketing_run_id', runId)
             .range(offset, offset + PAGE - 1);
         if (error) {
@@ -3687,7 +4071,11 @@ function makeJoinedContactRow(
         is_generic: !!tax.is_generic,
         is_disqualified: !!tax.is_disqualified,
         general_reason: tax.is_disqualified ? REASON.DISQUALIFIED_BY_LLM : null,
-        reasons: { phase1a_source: tax.source, llm_reason: tax.llm_reason || null }
+        reasons: { phase1a_source: tax.source, llm_reason: tax.llm_reason || null },
+        // Carry the bucket-assignment output through to the contact row so
+        // computeContactRollup can prefer it over the synthesized cascade.
+        assigned_bucket_name: tax.assigned_bucket_name || null,
+        assigned_bucket_primary_identity: tax.assigned_bucket_primary_identity || null
     });
 }
 
@@ -3707,6 +4095,8 @@ function makeGeneralContactRow(
         primary_identity: '',
         characteristic: '',
         sector: '',
+        assigned_bucket_name: null,
+        assigned_bucket_primary_identity: null,
         canonical_classification: 'Disqualified',
         bucket_reason: `Unclassifiable: ${reason}`,
         pre_rollup_bucket_name: RESERVED_DISQUALIFIED,
@@ -3750,6 +4140,10 @@ function makeMatchedContactRow(
         is_disqualified?: boolean;
         general_reason?: string | null;
         reasons?: Record<string, any>;
+        // Bucket-assignment output (when present, computeContactRollup
+        // uses these instead of the synthesized combo→identity cascade).
+        assigned_bucket_name?: string | null;
+        assigned_bucket_primary_identity?: string | null;
     }
 ): ContactMapRow {
     const canonical = params.is_disqualified
@@ -3765,6 +4159,8 @@ function makeMatchedContactRow(
         primary_identity: params.primary_identity,
         characteristic: params.characteristic,
         sector: params.sector,
+        assigned_bucket_name: params.assigned_bucket_name ?? null,
+        assigned_bucket_primary_identity: params.assigned_bucket_primary_identity ?? null,
         canonical_classification: canonical,
         bucket_reason: '',
         pre_rollup_bucket_name: RESERVED_GENERAL,
@@ -3857,6 +4253,14 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
     // → identity → General. The two intermediate "core" layers (functional_
     // core, sector_core) were dropped in v5 — they were rollup-only fallback
     // buckets that added complexity without sharpening segmentation.
+    //
+    // v6 BUCKET ASSIGNMENT: when assigned_bucket_name is populated (the
+    // user ran the bucket-assignment step), it takes precedence over the
+    // combo/characteristic layers. The cascade simplifies to:
+    //   assigned_bucket → primary_identity → General
+    // Min_volume still gates: if an assigned bucket has < min_volume
+    // contacts, those contacts roll up to its primary_identity.
+    const assignedBucketCounts = new Map<string, number>();
     const comboCounts = new Map<string, number>();
     const characteristicCounts = new Map<string, number>();
     const identityCounts = new Map<string, number>();
@@ -3865,6 +4269,9 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
         const row = rows[i];
         if (row.is_generic || row.is_disqualified) continue;
         const eff = effective[i];
+        if (row.assigned_bucket_name) {
+            assignedBucketCounts.set(row.assigned_bucket_name, (assignedBucketCounts.get(row.assigned_bucket_name) || 0) + 1);
+        }
         if (eff.characteristic) {
             characteristicCounts.set(eff.characteristic, (characteristicCounts.get(eff.characteristic) || 0) + 1);
             if (eff.sector && eff.sector !== 'Multi-industry') {
@@ -3894,6 +4301,20 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
             next.rollup_level = 'general';
             next.general_reason = next.general_reason || REASON.LOW_OVERALL_CONFIDENCE;
             next.bucket_reason = next.bucket_reason || 'Inviteable but insufficient classification evidence';
+        } else if (next.assigned_bucket_name
+            && (assignedBucketCounts.get(next.assigned_bucket_name) || 0) >= minVolume) {
+            // v6 path: bucket-assignment step decided the bucket; min_volume met.
+            next.bucket_name = next.assigned_bucket_name;
+            next.rollup_level = 'characteristic'; // bucket-assignment lives at characteristic-equivalent layer
+            next.general_reason = REASON.SPECIALIZATION_THRESHOLD_MET;
+            next.bucket_reason = `Bucket assignment cleared ${minVolume}-lead threshold${maskedSuffix}`;
+        } else if (next.assigned_bucket_name && eff.primary_identity
+            && (identityCounts.get(eff.primary_identity) || 0) >= minVolume) {
+            // v6 fallback: assigned bucket too small → roll up to its primary_identity.
+            next.bucket_name = eff.primary_identity;
+            next.rollup_level = 'identity';
+            next.general_reason = REASON.IDENTITY_THRESHOLD_MET;
+            next.bucket_reason = `Assigned bucket "${next.assigned_bucket_name}" below ${minVolume}-lead threshold — rolled up to identity${maskedSuffix}`;
         } else if (eff.characteristic && eff.sector && eff.sector !== 'Multi-industry'
             && (comboCounts.get(`${eff.sector} ${eff.characteristic}`) || 0) >= minVolume) {
             next.bucket_name = `${eff.sector} ${eff.characteristic}`;

@@ -27,6 +27,9 @@ const REQUIRED_SCHEMA: Record<string, string[]> = {
         'needs_qa', 'raw_industry', 'llm_reason',
         'canonical_classification',
         'identity_confidence', 'characteristic_confidence', 'sector_confidence',
+        // v6 bucket-assignment columns (20260513)
+        'assigned_bucket_name', 'assigned_bucket_primary_identity',
+        'is_new_bucket', 'bucket_assignment_reason', 'bucket_assignment_confidence',
     ],
     // Final per-contact assignments (Phase 1b writes here).
     bucket_assignments: [
