@@ -1724,11 +1724,28 @@ async function purgeBucketingRunData(runId: string, opts: { keepPhase1a?: boolea
     }
 }
 
+// Per-run AbortController. /cancel calls .abort() on this in addition to
+// flipping cancel_requested in the DB — that lets in-flight LLM fetches
+// die in milliseconds instead of waiting up to 90 s for their own
+// timeouts. We re-use the controller across calls to buildBucketingCtx
+// for the same run so resume / re-trigger paths share the abort signal.
+const runAbortControllers = new Map<string, AbortController>();
+
+function getOrCreateRunAbortController(runId: string): AbortController {
+    let ac = runAbortControllers.get(runId);
+    if (!ac || ac.signal.aborted) {
+        ac = new AbortController();
+        runAbortControllers.set(runId, ac);
+    }
+    return ac;
+}
+
 function buildBucketingCtx(runId: string) {
     let lastWrite = 0;
     let pending: any = null;
     const startTime = Date.now();
     const phaseStartedAt = new Map<string, number>();
+    const ac = getOrCreateRunAbortController(runId);
 
     const flush = async () => {
         if (!pending) return;
@@ -1769,14 +1786,22 @@ function buildBucketingCtx(runId: string) {
             lastWrite = now;
             flush();
         },
-        // Polled at every phase boundary. If the user clicked Stop,
-        // bucketing_runs.cancel_requested = true and we throw so the
-        // service unwinds cleanly.
+        // Polled at every phase boundary. Two paths to cancel:
+        //   1. The in-process AbortController was already triggered by
+        //      /cancel — instant, no DB round-trip.
+        //   2. cancel_requested flipped in the DB (covers cross-process
+        //      cancels, e.g. server restart between request and check).
+        // Either way, throw BucketingCancelledError so the service unwinds.
         checkCancel: async () => {
+            if (ac.signal.aborted) throw new BucketingCancelledError();
             const { data } = await supabase
                 .from('bucketing_runs').select('cancel_requested').eq('id', runId).single();
-            if (data?.cancel_requested) throw new BucketingCancelledError();
-        }
+            if (data?.cancel_requested) {
+                if (!ac.signal.aborted) ac.abort();
+                throw new BucketingCancelledError();
+            }
+        },
+        abortSignal: ac.signal
     };
 }
 
@@ -2058,21 +2083,54 @@ app.get('/api/bucketing/runs/:id/discovered-buckets', async (req, res) => {
     }
 });
 
-// Stop / cancel a running bucketing job. Sets cancel_requested=true; the
-// service polls this flag at every phase boundary and unwinds cleanly,
-// landing the run at status='cancelled' with error_message='Cancelled by user'.
+// Stop / cancel a running bucketing job.
+//
+// First click: flip cancel_requested + fire the per-run AbortController
+// so any in-flight LLM fetches abort in milliseconds. The worker's next
+// checkCancel throws BucketingCancelledError → the run lands at
+// status='cancelled'.
+//
+// Second click (force): if the run is still 'taxonomy_pending' /
+// 'assigning' AND cancel_requested has been true for >2 minutes, the
+// worker is stuck (process dead, network black-hole, etc.) — flip
+// status='cancelled' directly so the user can move on.
 app.post('/api/bucketing/runs/:id/cancel', async (req, res) => {
     const id = req.params.id;
     try {
         const { data: run } = await supabase
-            .from('bucketing_runs').select('status').eq('id', id).single();
+            .from('bucketing_runs').select('status,cancel_requested,progress').eq('id', id).single();
         if (!run) return res.status(404).json({ error: 'Run not found' });
         if (run.status !== 'taxonomy_pending' && run.status !== 'assigning') {
             return res.status(400).json({ error: `Cannot cancel from status: ${run.status}` });
         }
+
+        // Force-cancel path: cancel_requested has been set for >2 min and
+        // status hasn't moved off 'assigning' / 'taxonomy_pending' → worker
+        // is stuck. Flip status directly so the UI unblocks.
+        const updatedAt = run.progress?.updated_at ? new Date(run.progress.updated_at).getTime() : 0;
+        const stallSeconds = updatedAt > 0 ? (Date.now() - updatedAt) / 1000 : 0;
+        const forced = !!run.cancel_requested && stallSeconds > 120;
+
+        if (forced) {
+            await supabase.from('bucketing_runs').update({
+                status: 'cancelled',
+                cancel_requested: false,
+                error_message: 'Force-cancelled by user (worker appeared stuck — no progress for >2 min)'
+            }).eq('id', id);
+            // Also abort any AbortController that may still be hanging around
+            // — cheap insurance even if the worker is already dead.
+            runAbortControllers.get(id)?.abort();
+            runAbortControllers.delete(id);
+            return res.json({ ok: true, forced: true });
+        }
+
         await supabase.from('bucketing_runs')
             .update({ cancel_requested: true })
             .eq('id', id);
+        // Fire the in-process abort so in-flight fetches die immediately.
+        // Without this the worker waits up to 90 s for the next OpenAI
+        // timeout before the cancel takes effect.
+        runAbortControllers.get(id)?.abort();
         res.json({ ok: true });
     } catch (err: any) {
         res.status(500).json({ error: err.message });

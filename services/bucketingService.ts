@@ -118,6 +118,13 @@ export interface BucketingCtx {
     log(msg: string, level?: 'info' | 'warn' | 'error' | 'phase'): void;
     progress(p: ProgressUpdate): void;
     checkCancel(): Promise<void>;
+    // AbortSignal that fires the moment the user clicks Stop (the
+    // /cancel endpoint calls .abort() on the per-run AbortController).
+    // LLM call sites pass this to fetch() so in-flight requests die in
+    // milliseconds instead of waiting up to 90 s for the timeout. The
+    // signal is also wired into checkCancel() — if the signal is already
+    // aborted, checkCancel throws without a DB round-trip.
+    abortSignal: AbortSignal;
 }
 
 export class BucketingCancelledError extends Error {
@@ -4962,9 +4969,25 @@ async function runContactMatchingLLM(
 
     await Promise.all(batches.map(batch => limit(async () => {
         if (ctx) { try { await ctx.checkCancel(); } catch { return; } }
-        const { results, costUsd } = await classifyContactBatch(
-            batch, bucketReferenceJson, sectorVocab, validSpecNames, validIdentityNames
-        );
+        // Bail out cheaply if the run was already aborted while we were
+        // waiting in the pLimit queue — saves an LLM round-trip per
+        // queued batch when the user clicks Stop.
+        if (ctx?.abortSignal?.aborted) return;
+        let results: MatchChain[]; let costUsd: number;
+        try {
+            ({ results, costUsd } = await classifyContactBatch(
+                batch, bucketReferenceJson, sectorVocab, validSpecNames, validIdentityNames,
+                ctx?.abortSignal
+            ));
+        } catch (err: any) {
+            // AbortError when the run is cancelled — propagate as
+            // BucketingCancelledError so the run lands at status='cancelled',
+            // not status='failed'. Any other error is a real failure.
+            if (ctx?.abortSignal?.aborted || err?.name === 'AbortError') {
+                throw new BucketingCancelledError();
+            }
+            throw err;
+        }
         totalCost += costUsd;
         completedBatches++;
         if (ctx) {
@@ -5023,7 +5046,8 @@ async function classifyContactBatch(
     bucketReferenceJson: string,
     sectorVocab: string[],
     validSpecNames: Set<string>,
-    validIdentityNames: Set<string>
+    validIdentityNames: Set<string>,
+    runAbortSignal?: AbortSignal
 ): Promise<{ results: MatchChain[]; costUsd: number }> {
     const systemPrompt = `${PROJECT_CONTEXT}
 
@@ -5123,8 +5147,17 @@ Each assignment object:
     };
 
     const callOnce = async () => {
+        // Combined abort: timeout (90 s) OR the run's cancel signal
+        // OR an explicit abort via .abort() on this controller. The
+        // run-cancel listener is added with { once: true } so it
+        // doesn't leak across batches on long runs.
         const controller = new AbortController();
         const t = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
+        const onRunAbort = () => controller.abort();
+        if (runAbortSignal) {
+            if (runAbortSignal.aborted) controller.abort();
+            else runAbortSignal.addEventListener('abort', onRunAbort, { once: true });
+        }
         try {
             const res = await fetch('https://api.openai.com/v1/chat/completions', {
                 method: 'POST',
@@ -5157,12 +5190,19 @@ Each assignment object:
             return { assignments: parsed.assignments as MatchChain[], costUsd };
         } finally {
             clearTimeout(t);
+            if (runAbortSignal) runAbortSignal.removeEventListener('abort', onRunAbort);
         }
     };
 
     let result;
     try { result = await callOnce(); }
-    catch { result = await callOnce(); }
+    catch (e: any) {
+        // Don't retry if the user clicked Stop — surface the cancel
+        // immediately so the run unwinds. Without this, the bare retry
+        // would queue another LLM call after the user explicitly stopped.
+        if (runAbortSignal?.aborted || e?.name === 'AbortError') throw e;
+        result = await callOnce();
+    }
 
     let { assignments, costUsd } = result;
     const drift = assignments.some(a =>
