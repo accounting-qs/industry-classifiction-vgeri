@@ -2577,8 +2577,42 @@ function jsonOrEmpty(v: any): string {
     try { return JSON.stringify(v); } catch { return ''; }
 }
 
+const nonEmptyText = (v: unknown): string | null => {
+    if (v === null || v === undefined) return null;
+    const s = String(v).trim();
+    return s ? s : null;
+};
+
+const firstText = (...values: unknown[]): string | null => {
+    for (const v of values) {
+        const s = nonEmptyText(v);
+        if (s) return s;
+    }
+    return null;
+};
+
 async function updateCsvJob(jobId: string, patch: Record<string, any>) {
     await supabase.from('bucketing_csv_jobs').update(patch).eq('id', jobId);
+}
+
+async function loadPhase1aTaxonomyForCsv(runId: string): Promise<Map<string, any>> {
+    const out = new Map<string, any>();
+    const PAGE = 1000;
+    for (let offset = 0; offset <= 200_000; offset += PAGE) {
+        const { data, error } = await supabase
+            .from('bucket_industry_map')
+            .select('industry_string,primary_identity,characteristic,sector,canonical_classification,bucket_name,source,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_disqualified,is_generic,llm_reason')
+            .eq('bucketing_run_id', runId)
+            .range(offset, offset + PAGE - 1);
+        if (error) throw new Error(`phase1a taxonomy preload failed at offset ${offset}: ${error.message}`);
+        const rows = (data || []) as any[];
+        for (const row of rows) {
+            const key = nonEmptyText(row.industry_string);
+            if (key) out.set(key, row);
+        }
+        if (rows.length < PAGE) break;
+    }
+    return out;
 }
 
 // Background worker. Runs once per job, no resumability — if the
@@ -2611,6 +2645,11 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
             .in('lead_list_name', listNames);
         totalRows = Number(totalCount || 0);
         await updateCsvJob(jobId, { total_rows: totalRows });
+
+        // Preload Phase 1a taxonomy once. The SQL RPC also coalesces these
+        // fields, but this server-side fallback makes exports correct while
+        // a deploy is ahead of the Supabase migration.
+        const phase1aByIndustry = await loadPhase1aTaxonomyForCsv(runId);
 
         // Open gzip-into-file pipeline. Write the header first, then stream
         // page by page. zlib's createGzip is a Transform stream — pipe it
@@ -2655,6 +2694,8 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
             if (page.length === 0) break;
 
             for (const r of page) {
+                const industryKey = firstText(r.enrichment_classification, r.industry);
+                const phase1a = industryKey ? phase1aByIndustry.get(industryKey) : null;
                 const row: Record<string, any> = {
                     contact_id:                r.contact_id,
                     email:                     r.email,
@@ -2668,24 +2709,27 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
                     enrichment_classification: r.enrichment_classification,
                     enrichment_confidence:     r.enrichment_confidence,
                     enrichment_reasoning:      r.enrichment_reasoning,
-                    primary_identity:          r.primary_identity,
-                    characteristic:            r.characteristic,
-                    sector:                    r.sector,
-                    canonical_classification:  r.canonical_classification,
+                    primary_identity:          firstText(r.primary_identity, phase1a?.primary_identity),
+                    characteristic:            firstText(r.characteristic, phase1a?.characteristic),
+                    sector:                    firstText(r.sector, phase1a?.sector),
+                    canonical_classification:  firstText(r.canonical_classification, phase1a?.canonical_classification),
                     bucket_name:               r.bucket_name,
-                    pre_rollup_bucket_name:    r.pre_rollup_bucket_name,
+                    pre_rollup_bucket_name:    firstText(r.pre_rollup_bucket_name, phase1a?.bucket_name),
                     rollup_level:              r.rollup_level,
-                    assignment_source:         r.assignment_source,
-                    identity_confidence:       r.identity_confidence,
-                    characteristic_confidence: r.characteristic_confidence,
-                    sector_confidence:         r.sector_confidence,
-                    confidence:                r.assignment_confidence,
-                    is_disqualified:           r.is_disqualified,
-                    is_generic:                r.is_generic,
-                    phase1a_llm_reason:        r.phase1a_llm_reason,
+                    assignment_source:         firstText(r.assignment_source, phase1a?.source),
+                    identity_confidence:       r.identity_confidence ?? phase1a?.identity_confidence,
+                    characteristic_confidence: r.characteristic_confidence ?? phase1a?.characteristic_confidence,
+                    sector_confidence:         r.sector_confidence ?? phase1a?.sector_confidence,
+                    confidence:                r.assignment_confidence ?? phase1a?.confidence,
+                    is_disqualified:           r.is_disqualified ?? phase1a?.is_disqualified,
+                    is_generic:                r.is_generic ?? phase1a?.is_generic,
+                    phase1a_llm_reason:        firstText(r.phase1a_llm_reason, phase1a?.llm_reason),
                     bucket_reason:             r.bucket_reason,
                     general_reason:            r.general_reason,
-                    reasons:                   jsonOrEmpty(r.reasons),
+                    reasons:                   jsonOrEmpty(r.reasons ?? (phase1a ? {
+                        phase1a_source: phase1a.source,
+                        llm_reason: phase1a.llm_reason || null
+                    } : null)),
                 };
                 await writeLine(ASSIGNMENT_CSV_COLUMNS.map(col => csvEscape(row[col])).join(',') + '\n');
                 rowsWritten++;

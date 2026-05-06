@@ -372,45 +372,102 @@ async function withHeartbeat<T>(
     }
 }
 
-// ─── single-shot vocabulary fetch ──────────────────────────────────
-// Pagination over .rpc().range() re-executed the full JOIN+GROUP+aggregate
-// on every page (PostgREST function-call semantics), causing multi-minute
-// hangs on 100k+ long-tail lists. The v2.6 RPC accepts an optional p_limit
-// and runs with statement_timeout=300s, so we fetch everything in ONE call.
+// ─── full Phase 1a vocabulary fetch ─────────────────────────────────
+// Phase 1a is the source of truth for the exportable taxonomy columns, so
+// "tagging complete" must mean every selected contact's classification key
+// has a bucket_industry_map row. The older SQL RPC path returned only the
+// top 10k distinct labels; on long-tail enriched lists that made the run
+// look complete while most contacts had no Phase 1a taxonomy to export.
 //
-// Cap at 10k distinct labels — covers any realistic list (the LLM only
-// looks at the top ~2500 anyway, and the long tail beyond 10k contributes
-// effectively nothing to discovery quality).
-const VOCAB_HARD_LIMIT = 10_000;
+// Build the vocabulary by streaming contacts + enrichments instead. This is
+// more round-trips than one aggregate RPC, but it is exact and cannot be
+// silently truncated by PostgREST's 1000-row function response cap.
+const VOCAB_HARD_LIMIT = Number(process.env.BUCKETING_VOCAB_HARD_LIMIT || 250_000);
+
+function vocabularyStatus(contact: ContactRouteInput): { industry: string; status: string } {
+    const classification = (contact.classification || '').trim();
+    const lower = classification.toLowerCase();
+    const industry = classification || 'Scrape Error';
+    if (!classification) return { industry, status: 'unenriched' };
+    if (lower.startsWith('scrape error') || lower.startsWith('site error')) {
+        return { industry, status: 'scrape_error' };
+    }
+    if (contact.enrichment_status === 'failed') return { industry, status: 'failed' };
+    if (contact.enrichment_status === 'completed') return { industry, status: 'completed' };
+    return { industry, status: 'pending' };
+}
+
+function completedBeats(status: string): boolean {
+    return (status || 'completed') === 'completed';
+}
 
 async function fetchFullVocabulary(
     supabase: SupabaseClient,
     listNames: string[],
-    ctx?: BucketingCtx
+    ctx?: BucketingCtx,
+    totalContacts?: number
 ): Promise<VocabRow[]> {
     return withHeartbeat('vocabulary fetch', async () => {
-        // Paginate at PostgREST's 1000-row hard cap. Even with .range(),
-        // RPC responses get truncated at db.maxRows. A single .range(0, 9999)
-        // would return only the first 1000 distinct industries — a 9k-contact
-        // list with ~3k distinct strings would silently lose the long tail.
-        // Each page re-executes the function (PostgREST function-call
-        // semantics), so we cap at 10 pages × 1000 rows = 10k strings.
-        const PAGE = 1000;
-        const all: VocabRow[] = [];
-        for (let offset = 0; offset < VOCAB_HARD_LIMIT; offset += PAGE) {
-            const { data, error } = await supabase
-                .rpc('get_industry_vocabulary', {
-                    p_list_names: listNames,
-                    p_limit: VOCAB_HARD_LIMIT
-                })
-                .range(offset, offset + PAGE - 1);
-            if (error) throw new Error(`vocabulary fetch failed at offset ${offset}: ${error.message}`);
-            const page = (data || []) as VocabRow[];
-            all.push(...page);
-            ctx?.log(`[Bucketing] vocabulary page offset=${offset} got ${page.length} rows (total ${all.length})`);
-            if (page.length < PAGE) break;
+        const byIndustry = new Map<string, VocabRow>();
+        let lastId: string | null = null;
+        let scanned = 0;
+        let pageNum = 0;
+
+        while (true) {
+            await ctx?.checkCancel();
+            pageNum++;
+            const chunk = await fetchContactsChunk(supabase, listNames, lastId, CONTACT_PAGE_SIZE, ctx);
+            if (chunk.rows.length === 0) break;
+            lastId = chunk.nextLastId;
+            scanned += chunk.rows.length;
+
+            for (const contact of chunk.rows) {
+                const { industry, status } = vocabularyStatus(contact);
+                const existing = byIndustry.get(industry);
+                if (!existing) {
+                    if (byIndustry.size >= VOCAB_HARD_LIMIT) {
+                        throw new Error(
+                            `Phase 1a vocabulary exceeds BUCKETING_VOCAB_HARD_LIMIT=${VOCAB_HARD_LIMIT.toLocaleString()} distinct classifications. ` +
+                            `Increase the limit or split the run; refusing to mark a partial taxonomy as complete.`
+                        );
+                    }
+                    byIndustry.set(industry, {
+                        industry,
+                        n: 1,
+                        enrichment_status: status,
+                        sample_companies: contact.company_name ? [contact.company_name] : []
+                    });
+                    continue;
+                }
+
+                existing.n = Number(existing.n || 0) + 1;
+                if (!completedBeats(existing.enrichment_status) && completedBeats(status)) {
+                    existing.enrichment_status = status;
+                }
+                if (contact.company_name && (existing.sample_companies || []).length < 3) {
+                    existing.sample_companies = [...(existing.sample_companies || []), contact.company_name];
+                }
+            }
+
+            if (pageNum % 10 === 0 || !chunk.hasMore) {
+                ctx?.log(
+                    `[Bucketing] vocabulary streamed ${scanned.toLocaleString()}${totalContacts ? `/${totalContacts.toLocaleString()}` : ''} contacts ` +
+                    `→ ${byIndustry.size.toLocaleString()} distinct classifications`
+                );
+            }
+            ctx?.progress({
+                phase: 'phase1a',
+                step: 'load_vocabulary',
+                current: scanned,
+                total: totalContacts,
+                note: `Loaded ${scanned.toLocaleString()}${totalContacts ? `/${totalContacts.toLocaleString()}` : ''} contacts; ${byIndustry.size.toLocaleString()} distinct classifications…`
+            });
+
+            if (!chunk.hasMore) break;
         }
-        return all;
+
+        return Array.from(byIndustry.values())
+            .sort((a, b) => Number(b.n || 0) - Number(a.n || 0));
     }, ctx);
 }
 
@@ -801,9 +858,9 @@ export async function runTaxonomyProposal(
         .from('bucketing_runs').select('*').eq('id', runId).single();
     if (runErr || !run) throw new Error(`Run not found: ${runErr?.message}`);
 
-    const vocabRows = await fetchFullVocabulary(supabase, run.list_names, ctx);
     const totalContacts = await countSelectedContacts(supabase, run.list_names);
-    ctx.log(`[Bucketing ${runId}] vocabulary: ${vocabRows.length} distinct (industry, status) rows over ${totalContacts.toLocaleString()} selected contacts`);
+    const vocabRows = await fetchFullVocabulary(supabase, run.list_names, ctx, totalContacts);
+    ctx.log(`[Bucketing ${runId}] vocabulary: ${vocabRows.length} distinct classification rows over ${totalContacts.toLocaleString()} selected contacts`);
 
     if (vocabRows.length === 0) {
         await supabase.from('bucketing_runs').update({
@@ -822,15 +879,11 @@ export async function runTaxonomyProposal(
     // unenriched, failed, pending) is a known-bad row and routes straight
     // to the Disqualified bucket without spending a token.
     //
-    // The vocab RPC groups by (industry, enrichment_status), so the same
-    // industry text can appear in two rows if some contacts enriched and
-    // others didn't (e.g. "Wealth Management Services" with 100 completed
-    // + 3 scrape_errors). bucket_industry_map's PK is (run_id, industry),
-    // so we MUST collapse to one row per industry before inserting —
-    // otherwise the upsert hits "ON CONFLICT DO UPDATE command cannot
-    // affect row a second time". A 'completed' row beats anything else
-    // because the LLM tagger has the best signal there; everything else
-    // collapses into a single Disqualified passthrough row.
+    // Keep the defensive collapse to one row per industry before inserting.
+    // The current streaming vocabulary builder already emits one row per
+    // classification key, but older/rebuilt callers may still hand us
+    // duplicate status rows. A completed row beats anything else because
+    // the LLM tagger has the best signal there.
     const byIndustry = new Map<string, VocabRow>();
     for (const v of vocabRows) {
         const cur = byIndustry.get(v.industry);
@@ -845,9 +898,16 @@ export async function runTaxonomyProposal(
         }
     }
     const dedupedVocab = Array.from(byIndustry.values());
+    const phase1aCoveredContacts = dedupedVocab.reduce((sum, row) => sum + Number(row.n || 0), 0);
     const completedVocab = dedupedVocab.filter(r => (r.enrichment_status || 'completed') === 'completed');
     const dqVocab = dedupedVocab.filter(r => (r.enrichment_status || 'completed') !== 'completed');
     ctx.log(`[Bucketing ${runId}] partition: ${completedVocab.length} taggable, ${dqVocab.length} → Disqualified (failed/missing/scrape_error)${vocabRows.length !== dedupedVocab.length ? ` — ${vocabRows.length - dedupedVocab.length} duplicate (industry, status) rows collapsed` : ''}`);
+    if (phase1aCoveredContacts !== totalContacts) {
+        ctx.log(
+            `[Bucketing ${runId}] Phase 1a coverage warning: vocabulary accounts for ${phase1aCoveredContacts.toLocaleString()}/${totalContacts.toLocaleString()} selected contacts`,
+            'warn'
+        );
+    }
 
     let totalCost = 0;
     const preMapRows: any[] = [];
@@ -1191,6 +1251,19 @@ export async function runTaxonomyProposal(
         // screen choice — don't overwrite it here.
         cost_usd: totalCost,
         total_contacts: totalContacts,
+        coverage_summary: {
+            phase1a_contacts: phase1aCoveredContacts,
+            selected_contacts: totalContacts,
+            phase1a_coverage_pct: totalContacts > 0
+                ? Number(((phase1aCoveredContacts / totalContacts) * 100).toFixed(2))
+                : 0,
+            distinct_classifications: finalRows.length,
+            taggable_classifications: completedVocab.length,
+            passthrough_classifications: dqVocab.length
+        },
+        quality_warnings: phase1aCoveredContacts === totalContacts ? [] : [
+            `Phase 1a taxonomy covers ${phase1aCoveredContacts.toLocaleString()} of ${totalContacts.toLocaleString()} selected contacts.`
+        ],
         status: 'taxonomy_ready',
         taxonomy_completed_at: new Date().toISOString()
     }).eq('id', runId);
