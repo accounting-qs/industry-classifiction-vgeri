@@ -65,11 +65,19 @@ STABLE
 SET statement_timeout TO '300s'
 AS $$
     -- Pull list_names once so we don't re-query bucketing_runs in the join.
+    --
+    -- Type-mismatch dance: contacts.contact_id is UUID, but
+    -- bucket_assignments.contact_id was declared TEXT in the original v1
+    -- bucketing migration. Cast the UUID side to TEXT for the join and
+    -- to TEXT for the returned column (worker treats it as a string).
+    -- p_after_id comes in as TEXT from the worker (PostgREST sends UUIDs
+    -- as strings), so we cast it to UUID to compare against the indexed
+    -- UUID column rather than slowing the comparison with both-side casts.
     WITH run AS (
         SELECT list_names FROM bucketing_runs WHERE id = p_run_id
     )
     SELECT
-        c.contact_id,
+        c.contact_id::TEXT AS contact_id,
         c.email,
         c.first_name,
         c.last_name,
@@ -103,7 +111,7 @@ AS $$
     LEFT JOIN enrichments e
            ON e.contact_id = c.contact_id
     LEFT JOIN bucket_assignments a
-           ON a.contact_id       = c.contact_id
+           ON a.contact_id       = c.contact_id::TEXT
           AND a.bucketing_run_id = p_run_id
     -- Phase 1a tag lookup: same join key Phase 1b uses, so the
     -- llm_reason hits even when contacts.industry diverges from the
@@ -112,7 +120,7 @@ AS $$
            ON m.bucketing_run_id = p_run_id
           AND m.industry_string  = COALESCE(NULLIF(TRIM(e.classification), ''), c.industry)
     WHERE c.lead_list_name = ANY((SELECT list_names FROM run))
-      AND (p_after_id IS NULL OR c.contact_id > p_after_id)
+      AND (p_after_id IS NULL OR c.contact_id > p_after_id::UUID)
     ORDER BY c.contact_id
     LIMIT p_limit;
 $$;
