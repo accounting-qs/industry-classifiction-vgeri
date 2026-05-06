@@ -64,8 +64,6 @@ LANGUAGE sql
 STABLE
 SET statement_timeout TO '300s'
 AS $$
-    -- Pull list_names once so we don't re-query bucketing_runs in the join.
-    --
     -- Type-mismatch dance: contacts.contact_id is UUID, but
     -- bucket_assignments.contact_id was declared TEXT in the original v1
     -- bucketing migration. Cast the UUID side to TEXT for the join and
@@ -73,9 +71,6 @@ AS $$
     -- p_after_id comes in as TEXT from the worker (PostgREST sends UUIDs
     -- as strings), so we cast it to UUID to compare against the indexed
     -- UUID column rather than slowing the comparison with both-side casts.
-    WITH run AS (
-        SELECT list_names FROM bucketing_runs WHERE id = p_run_id
-    )
     SELECT
         c.contact_id::TEXT AS contact_id,
         c.email,
@@ -119,7 +114,9 @@ AS $$
     LEFT JOIN bucket_industry_map m
            ON m.bucketing_run_id = p_run_id
           AND m.industry_string  = COALESCE(NULLIF(TRIM(e.classification), ''), c.industry)
-    WHERE c.lead_list_name = ANY((SELECT list_names FROM run))
+    WHERE c.lead_list_name = ANY(
+              SELECT UNNEST(list_names) FROM bucketing_runs WHERE id = p_run_id
+          )
       AND (p_after_id IS NULL OR c.contact_id > p_after_id::UUID)
     ORDER BY c.contact_id
     LIMIT p_limit;
