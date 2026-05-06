@@ -2381,7 +2381,12 @@ const TAXONOMY_CSV_COLUMNS = [
 
 app.get('/api/bucketing/runs/:id/taxonomy-contacts.csv', async (req, res) => {
     const id = req.params.id;
-    const PAGE_SIZE = 2000;
+    // 1000 (not 2000) to stay under PostgREST's default db.maxRows cap.
+    // With pageSize=2000, .range(0, 1999) silently returned 1000 rows
+    // and the page.length < PAGE_SIZE break exited after the first
+    // chunk — capping every export at 1k contacts. Same root cause as
+    // the Phase 1b CONTACT_PAGE_SIZE fix.
+    const PAGE_SIZE = 1000;
 
     try {
         const { data: run, error: runErr } = await supabase
@@ -2556,7 +2561,11 @@ const ASSIGNMENT_CSV_COLUMNS = [
 // bucket needed explicit policies AND a service_role JWT to upload — the
 // local-disk pattern needs neither).
 const CSV_FILES_DIR = path.join(EXPORTS_DIR, 'bucketing-csv');
-const CSV_PAGE_SIZE = 2000;
+// 1000 (not 2000) to stay under PostgREST's default db.maxRows cap.
+// .range(0, 1999) silently returns 1000 rows and the page.length <
+// CSV_PAGE_SIZE break exits after one chunk — capping every export
+// at 1k contacts. Same fix as the Phase 1b CONTACT_PAGE_SIZE bug.
+const CSV_PAGE_SIZE = 1000;
 
 async function ensureCsvFilesDir() {
     await fsp.mkdir(CSV_FILES_DIR, { recursive: true });
