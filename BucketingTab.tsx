@@ -145,6 +145,94 @@ export function BucketingTab({ importLists }: {
     }
   };
 
+  // Per-row CSV export state. Lives at the parent (App tab) level so a
+  // user can navigate away and back without losing in-flight job state.
+  // Each entry: 'pending' | 'running' (still generating) → 'ready'
+  // (auto-downloads) → cleared. 'failed' surfaces the error inline.
+  type RunCsvJobState = {
+    jobId: string;
+    status: 'pending' | 'running' | 'ready' | 'failed';
+    progressRows: number;
+    totalRows: number | null;
+    downloadUrl: string | null;
+    error: string | null;
+  };
+  const [runCsvJobs, setRunCsvJobs] = useState<Record<string, RunCsvJobState>>({});
+  const runCsvPollers = useRef<Record<string, number>>({});
+
+  // Stop a poller cleanly (used on completion + on unmount).
+  const stopRunCsvPoller = useCallback((runId: string) => {
+    const t = runCsvPollers.current[runId];
+    if (t) { window.clearInterval(t); delete runCsvPollers.current[runId]; }
+  }, []);
+
+  useEffect(() => () => {
+    // Cleanup all pollers on unmount.
+    for (const t of Object.values(runCsvPollers.current)) window.clearInterval(t as number);
+    runCsvPollers.current = {};
+  }, []);
+
+  const exportRunCsv = useCallback(async (runId: string) => {
+    setError(null);
+    setRunCsvJobs(prev => ({
+      ...prev,
+      [runId]: { jobId: '', status: 'pending', progressRows: 0, totalRows: null, downloadUrl: null, error: null }
+    }));
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/csv-jobs`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+      const job = data.job;
+      setRunCsvJobs(prev => ({
+        ...prev,
+        [runId]: { jobId: job.id, status: job.status, progressRows: 0, totalRows: null, downloadUrl: null, error: null }
+      }));
+      // Poll every 2 s until ready / failed. Auto-trigger download
+      // when ready by setting window.location.href to the (server-
+      // relative) download endpoint.
+      stopRunCsvPoller(runId);
+      runCsvPollers.current[runId] = window.setInterval(async () => {
+        try {
+          const r = await fetch(`/api/bucketing/csv-jobs/${job.id}`);
+          const d = await r.json();
+          if (!r.ok || !d.job) return;
+          const j = d.job;
+          setRunCsvJobs(prev => ({
+            ...prev,
+            [runId]: {
+              jobId: j.id,
+              status: j.status,
+              progressRows: Number(j.progress_rows || 0),
+              totalRows: j.total_rows ? Number(j.total_rows) : null,
+              downloadUrl: j.download_url || null,
+              error: j.error_message || null
+            }
+          }));
+          if (j.status === 'ready' && j.download_url) {
+            stopRunCsvPoller(runId);
+            // Trigger the browser download. Using a hidden <a> so it
+            // doesn't navigate away from the runs list.
+            const a = document.createElement('a');
+            a.href = j.download_url;
+            a.download = '';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+          } else if (j.status === 'failed') {
+            stopRunCsvPoller(runId);
+          }
+        } catch { /* keep polling */ }
+      }, 2000);
+    } catch (e: any) {
+      setError(e.message);
+      setRunCsvJobs(prev => {
+        const next = { ...prev };
+        delete next[runId];
+        return next;
+      });
+    }
+  }, [stopRunCsvPoller]);
+
   return (
     <div className="flex-1 overflow-y-auto custom-scrollbar p-6 bg-[#1c1c1c] text-[#ededed]">
       <div className="max-w-6xl mx-auto">
@@ -200,7 +288,13 @@ export function BucketingTab({ importLists }: {
         )}
 
         {view === 'index' && (
-          <BucketingIndex runs={runs} onOpen={openRun} onDelete={deleteRun} />
+          <BucketingIndex
+            runs={runs}
+            onOpen={openRun}
+            onDelete={deleteRun}
+            onExportCsv={exportRunCsv}
+            csvJobs={runCsvJobs}
+          />
         )}
 
         {view === 'setup' && (
@@ -239,11 +333,28 @@ export function BucketingTab({ importLists }: {
 
 // ───── INDEX VIEW ──────────────────────────────────────────────────
 
-function BucketingIndex({ runs, onOpen, onDelete }: {
+function BucketingIndex({ runs, onOpen, onDelete, onExportCsv, csvJobs }: {
   runs: BucketingRun[];
   onOpen: (id: string) => void;
   onDelete: (id: string) => void;
+  // Per-row CSV export trigger + live job state. Polled by the parent
+  // so navigation away/back preserves the in-flight job.
+  onExportCsv: (runId: string) => void;
+  csvJobs: Record<string, {
+    jobId: string;
+    status: 'pending' | 'running' | 'ready' | 'failed';
+    progressRows: number;
+    totalRows: number | null;
+    downloadUrl: string | null;
+    error: string | null;
+  }>;
 }) {
+  // Statuses that have at least Phase 1a output to export. taxonomy_pending
+  // (mid-tagging) and failed have nothing useful yet.
+  const exportable = (status: string) => status === 'taxonomy_ready'
+    || status === 'assigning'
+    || status === 'completed'
+    || status === 'cancelled';
   if (runs.length === 0) {
     return (
       <div className="border border-[#2e2e2e] rounded-xl p-12 text-center bg-[#0e0e0e]">
@@ -279,13 +390,61 @@ function BucketingIndex({ runs, onOpen, onDelete }: {
               <td className="px-5 py-3 text-right text-gray-400 font-mono">${(Number(r.cost_usd) || 0).toFixed(3)}</td>
               <td className="px-5 py-3 text-right text-gray-500">{new Date(r.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</td>
               <td className="px-5 py-3 text-right">
-                <button
-                  onClick={e => { e.stopPropagation(); onDelete(r.id); }}
-                  className="p-1.5 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-red-400 hover:border-red-500/40"
-                  title="Delete run"
-                >
-                  <Trash2 className="w-3 h-3" />
-                </button>
+                <div className="flex items-center justify-end gap-1">
+                  {exportable(r.status) && (() => {
+                    const job = csvJobs[r.id];
+                    const inFlight = job && (job.status === 'pending' || job.status === 'running');
+                    const ready = job?.status === 'ready';
+                    const failed = job?.status === 'failed';
+                    const pct = inFlight && job?.totalRows
+                      ? Math.min(100, Math.round((job.progressRows / job.totalRows) * 100))
+                      : null;
+                    const label = inFlight
+                      ? (pct !== null ? `${pct}%` : '…')
+                      : ready ? 'Re-download'
+                      : failed ? 'Retry CSV'
+                      : 'Download CSV';
+                    const title = inFlight
+                      ? `Generating: ${job.progressRows.toLocaleString()}${job.totalRows ? ` / ${job.totalRows.toLocaleString()}` : ''} rows`
+                      : ready ? 'Click to download again (file expires after 24 h)'
+                      : failed ? `Last attempt failed: ${job?.error || 'unknown error'} — click to retry`
+                      : 'Stream the full per-contact CSV (email, name, website, classification, taxonomy, bucket if assigned). Generates async + auto-downloads when ready.';
+                    return (
+                      <button
+                        onClick={e => {
+                          e.stopPropagation();
+                          if (ready && job?.downloadUrl) {
+                            const a = document.createElement('a');
+                            a.href = job.downloadUrl;
+                            a.download = '';
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+                          } else {
+                            onExportCsv(r.id);
+                          }
+                        }}
+                        disabled={!!inFlight}
+                        className={`px-2 py-1 rounded-md text-[10px] font-bold border flex items-center gap-1 ${ready
+                          ? 'bg-[#3ecf8e]/15 text-[#3ecf8e] border-[#3ecf8e]/40 hover:bg-[#3ecf8e]/25'
+                          : failed
+                            ? 'bg-amber-500/15 text-amber-300 border-amber-500/40 hover:bg-amber-500/25'
+                            : 'bg-[#1c1c1c] text-gray-300 border-[#2e2e2e] hover:text-white hover:border-gray-500'} disabled:opacity-70`}
+                        title={title}
+                      >
+                        {inFlight ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+                        {label}
+                      </button>
+                    );
+                  })()}
+                  <button
+                    onClick={e => { e.stopPropagation(); onDelete(r.id); }}
+                    className="p-1.5 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-red-400 hover:border-red-500/40"
+                    title="Delete run"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                </div>
               </td>
             </tr>
           ))}

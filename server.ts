@@ -2843,14 +2843,26 @@ setInterval(cleanupExpiredCsvJobs, 60 * 60 * 1000);
 cleanupExpiredCsvJobs().catch(() => {});
 
 // POST — kick off a new export job.
+//
+// Accepts any status that has at least Phase 1a output: taxonomy_ready
+// (tags written, no buckets yet), assigning (Phase 1b in progress —
+// partial assignments), completed (full data), cancelled (whatever was
+// done before the user stopped). The worker writes whatever's currently
+// in the per-contact tables, so partial-state exports are honest about
+// being partial — they just have NULL bucket_name on rows Phase 1b
+// hadn't reached yet.
+//
+// Rejects taxonomy_pending (no tags yet) and failed (data may be
+// inconsistent — let the user retry the run instead).
 app.post('/api/bucketing/runs/:id/csv-jobs', async (req, res) => {
     const id = req.params.id;
     try {
         const { data: run, error: rErr } = await supabase
             .from('bucketing_runs').select('id,status').eq('id', id).single();
         if (rErr || !run) return res.status(404).json({ error: rErr?.message || 'Run not found' });
-        if (run.status !== 'completed') {
-            return res.status(400).json({ error: `Cannot export: run status is "${run.status}" (need "completed")` });
+        const exportable = new Set(['taxonomy_ready', 'assigning', 'completed', 'cancelled']);
+        if (!exportable.has(run.status)) {
+            return res.status(400).json({ error: `Cannot export: run status is "${run.status}". Wait for taxonomy to finish, or pick a completed/cancelled run.` });
         }
         const { data: job, error: jErr } = await supabase
             .from('bucketing_csv_jobs')
