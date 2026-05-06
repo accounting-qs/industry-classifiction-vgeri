@@ -19,6 +19,9 @@ import {
     upsertLibraryBucket,
     archiveLibraryBucket,
     deleteLibraryBucket,
+    bulkDeleteLibraryBuckets,
+    renameLibraryBucket,
+    LibraryRenameConflictError,
     saveRunBucketsToLibrary,
     bulkImportLibraryFromText
 } from './services/bucketLibraryService';
@@ -2823,6 +2826,37 @@ app.delete('/api/bucketing/library/:id', async (req, res) => {
         await deleteLibraryBucket(supabase, req.params.id);
         res.json({ ok: true });
     } catch (err: any) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+// POST (not DELETE) so the request body travels reliably through every
+// proxy — DELETE-with-body is spec-iffy. Mirrors the existing
+// bulk-import endpoint shape.
+app.post('/api/bucketing/library/bulk-delete', async (req, res) => {
+    try {
+        const ids: string[] = Array.isArray((req.body || {}).ids) ? req.body.ids : [];
+        if (ids.length === 0) return res.status(400).json({ error: 'ids array required' });
+        const result = await bulkDeleteLibraryBuckets(supabase, ids);
+        res.json({ ok: true, ...result });
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+// Rename. 409 on duplicate name (LibraryRenameConflictError); 400 on
+// validation; 500 on anything else. Done as a separate endpoint instead
+// of folded into upsert so the UI can show inline duplicate-name errors
+// without hijacking the broader save flow.
+app.patch('/api/bucketing/library/:id/rename', async (req, res) => {
+    try {
+        const name = String((req.body || {}).name || '');
+        const updated = await renameLibraryBucket(supabase, req.params.id, name);
+        res.json({ ok: true, bucket: updated });
+    } catch (err: any) {
+        if (err instanceof LibraryRenameConflictError) {
+            return res.status(409).json({ error: err.message });
+        }
         res.status(400).json({ error: err.message });
     }
 });

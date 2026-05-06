@@ -102,6 +102,62 @@ export async function deleteLibraryBucket(
     if (error) throw new Error(`library delete failed: ${error.message}`);
 }
 
+// Bulk hard-delete. The FK on bucket_library_run_links cascades, so the
+// per-run usage history clears automatically. Historical run snapshots
+// (bucket_industry_map / bucket_assignments) are denormalized text and
+// stay untouched — those are point-in-time records of past runs.
+export async function bulkDeleteLibraryBuckets(
+    supabase: SupabaseClient,
+    ids: string[]
+): Promise<{ deleted: number }> {
+    const clean = (ids || []).filter(id => typeof id === 'string' && id.length > 0);
+    if (clean.length === 0) return { deleted: 0 };
+    const { error, count } = await supabase
+        .from('bucket_library')
+        .delete({ count: 'exact' })
+        .in('id', clean);
+    if (error) throw new Error(`library bulk delete failed: ${error.message}`);
+    return { deleted: count || 0 };
+}
+
+// Custom error so the route handler can map duplicate-name to HTTP 409
+// without inspecting the message string.
+export class LibraryRenameConflictError extends Error {
+    constructor(name: string) {
+        super(`A library bucket named "${name}" already exists`);
+        this.name = 'LibraryRenameConflictError';
+    }
+}
+
+export async function renameLibraryBucket(
+    supabase: SupabaseClient,
+    id: string,
+    newName: string
+): Promise<LibraryBucket> {
+    const trimmed = (newName || '').trim();
+    if (!trimmed) throw new Error('new name is required');
+
+    // Pre-check uniqueness so we can return a clean 409 instead of a raw
+    // Postgres unique-violation. Excludes the row being renamed so a
+    // no-op rename (same name) doesn't false-positive.
+    const { data: clash } = await supabase
+        .from('bucket_library')
+        .select('id')
+        .eq('bucket_name', trimmed)
+        .neq('id', id)
+        .maybeSingle();
+    if (clash) throw new LibraryRenameConflictError(trimmed);
+
+    const { data, error } = await supabase
+        .from('bucket_library')
+        .update({ bucket_name: trimmed, updated_at: new Date().toISOString() })
+        .eq('id', id)
+        .select()
+        .single();
+    if (error) throw new Error(`library rename failed: ${error.message}`);
+    return data as LibraryBucket;
+}
+
 /**
  * Bulk-import library buckets from a flexible newline+pipe format. Each
  * non-empty line is one bucket. Pipe separators define optional fields:

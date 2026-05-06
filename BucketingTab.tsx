@@ -1551,6 +1551,42 @@ function BucketingLibrary({ library, onRefresh, onError }: {
   const [editing, setEditing] = useState<LibraryBucket | null>(null);
   const [creating, setCreating] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+
+  // Drop selections that point to rows that no longer exist (e.g. after a
+  // bulk delete or external refresh). Without this, the toolbar's "N
+  // selected" count drifts from what's actually selectable in the table.
+  useEffect(() => {
+    setSelectedIds(prev => {
+      const live = new Set(library.map(b => b.id));
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (live.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [library]);
+
+  const allIds = library.map(b => b.id);
+  const allSelected = allIds.length > 0 && allIds.every(id => selectedIds.has(id));
+  const someSelected = selectedIds.size > 0 && !allSelected;
+
+  const toggleOne = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    setSelectedIds(prev => prev.size === allIds.length && allIds.every(id => prev.has(id))
+      ? new Set()
+      : new Set(allIds));
+  };
 
   const onArchive = async (id: string, archived: boolean) => {
     onError(null);
@@ -1584,6 +1620,31 @@ function BucketingLibrary({ library, onRefresh, onError }: {
     }
   };
 
+  const onBulkDelete = async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    if (!confirm(`Delete ${ids.length} library bucket${ids.length === 1 ? '' : 's'} permanently? This cannot be undone.`)) return;
+    setBulkDeleting(true);
+    onError(null);
+    try {
+      const res = await fetch('/api/bucketing/library/bulk-delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids })
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Failed (${res.status})`);
+      }
+      setSelectedIds(new Set());
+      onRefresh();
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setBulkDeleting(false);
+    }
+  };
+
   return (
     <div className="space-y-3">
       <div className="flex justify-end gap-2">
@@ -1600,6 +1661,29 @@ function BucketingLibrary({ library, onRefresh, onError }: {
           <Plus className="w-3 h-3" /> New library bucket
         </button>
       </div>
+      {selectedIds.size > 0 && (
+        <div className="flex items-center justify-between gap-3 px-4 py-2 rounded-xl border border-red-500/30 bg-red-500/5">
+          <span className="text-xs text-red-200 font-bold">
+            {selectedIds.size} bucket{selectedIds.size === 1 ? '' : 's'} selected
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              className="px-3 py-1.5 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e]"
+            >
+              Clear
+            </button>
+            <button
+              onClick={onBulkDelete}
+              disabled={bulkDeleting}
+              className="px-3 py-1.5 rounded text-[10px] font-bold bg-red-500/20 text-red-200 border border-red-500/40 hover:bg-red-500/30 disabled:opacity-50 flex items-center gap-1"
+            >
+              {bulkDeleting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+              Delete selected
+            </button>
+          </div>
+        </div>
+      )}
       {bulkOpen && (
         <LibraryBulkImport
           onCancel={() => setBulkOpen(false)}
@@ -1626,6 +1710,16 @@ function BucketingLibrary({ library, onRefresh, onError }: {
           <table className="w-full text-[11px]">
             <thead className="bg-[#0e0e0e]">
               <tr className="border-b border-[#2e2e2e] text-[9px] font-bold text-gray-500 uppercase tracking-wider">
+                <th className="px-3 py-3 text-left w-[34px]">
+                  <input
+                    type="checkbox"
+                    checked={allSelected}
+                    ref={el => { if (el) el.indeterminate = someSelected; }}
+                    onChange={toggleAll}
+                    className="w-3.5 h-3.5 align-middle"
+                    title={allSelected ? 'Clear all' : 'Select all'}
+                  />
+                </th>
                 <th className="px-5 py-3 text-left">Characteristic</th>
                 <th className="px-5 py-3 text-left">Primary identity</th>
                 <th className="px-5 py-3 text-right">Used</th>
@@ -1635,7 +1729,15 @@ function BucketingLibrary({ library, onRefresh, onError }: {
             </thead>
             <tbody className="divide-y divide-[#2e2e2e]">
               {library.map(b => (
-                <tr key={b.id} className={`hover:bg-white/[0.02] ${b.archived ? 'opacity-50' : ''}`}>
+                <tr key={b.id} className={`hover:bg-white/[0.02] ${b.archived ? 'opacity-50' : ''} ${selectedIds.has(b.id) ? 'bg-red-500/5' : ''}`}>
+                  <td className="px-3 py-3">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(b.id)}
+                      onChange={() => toggleOne(b.id)}
+                      className="w-3.5 h-3.5 align-middle"
+                    />
+                  </td>
                   <td className="px-5 py-3">
                     <div className="font-bold text-white">{b.characteristic || b.bucket_name}</div>
                     {b.description && <div className="text-[10px] text-gray-500 truncate max-w-md">{b.description}</div>}
@@ -1681,14 +1783,39 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
   const [exclude, setExclude] = useState((existing?.exclude_terms || []).join(', '));
   const [examples, setExamples] = useState((existing?.example_strings || []).join('\n'));
   const [busy, setBusy] = useState(false);
+  const [nameError, setNameError] = useState<string | null>(null);
+
+  const originalName = existing?.characteristic || existing?.bucket_name || '';
 
   const save = async () => {
     if (!spec.trim()) return;
     setBusy(true);
+    setNameError(null);
     onError(null);
     try {
+      const trimmedName = spec.trim();
+      // Rename first when the name changed on an existing bucket. The
+      // upsert path below is keyed on bucket_name — without a separate
+      // rename call it would either CREATE a second row (new name) or
+      // 409 on the unique index.
+      if (existing && trimmedName !== originalName) {
+        const renameRes = await fetch(`/api/bucketing/library/${encodeURIComponent(existing.id)}/rename`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: trimmedName })
+        });
+        if (!renameRes.ok) {
+          const data = await renameRes.json().catch(() => ({}));
+          if (renameRes.status === 409) {
+            setNameError(data.error || 'A bucket with this name already exists');
+            setBusy(false);
+            return;
+          }
+          throw new Error(data.error || `Rename failed (${renameRes.status})`);
+        }
+      }
       const payload = {
-        characteristic: spec.trim(),
+        characteristic: trimmedName,
         primary_identity: identity.trim(),
         description: desc.trim(),
         include_terms: include.split(',').map(s => s.trim()).filter(Boolean),
@@ -1716,9 +1843,11 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
     <div className="border border-[#3ecf8e]/30 rounded-xl bg-[#0e0e0e] p-4 space-y-3">
       <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{existing ? 'Edit' : 'New'} library bucket</div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-        <input value={spec} onChange={e => setSpec(e.target.value)} placeholder="Characteristic (Layer 2, unique)"
-          disabled={!!existing}
-          className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e] disabled:opacity-60" />
+        <div>
+          <input value={spec} onChange={e => { setSpec(e.target.value); if (nameError) setNameError(null); }} placeholder="Characteristic (Layer 2, unique)"
+            className={`w-full px-3 py-2 bg-[#1c1c1c] border rounded text-xs text-white placeholder-gray-600 focus:outline-none ${nameError ? 'border-red-500/60 focus:border-red-500' : 'border-[#2e2e2e] focus:border-[#3ecf8e]'}`} />
+          {nameError && <div className="text-[10px] text-red-300 mt-1">{nameError}</div>}
+        </div>
         <input value={identity} onChange={e => setIdentity(e.target.value)} placeholder="Primary identity (Layer 1)"
           className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e]" />
       </div>
