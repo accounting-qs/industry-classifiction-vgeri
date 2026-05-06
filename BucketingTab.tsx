@@ -739,6 +739,36 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
       setRecalcing(false);
     }
   }, [run.id, onRefresh, onError]);
+
+  // Finalize: re-tag every still-orphan row (is_new_*=true) against the
+  // library only — no new proposals. After this, the AI-Proposed panel
+  // empties out and every contact is library-bound or routes to General.
+  // Run BEFORE Apply & Assign once the user has decided which proposals
+  // to keep.
+  const [finalizing, setFinalizing] = useState(false);
+  const [lastFinalize, setLastFinalize] = useState<{ at: Date; rerouted: number; nullified: number; failed: number } | null>(null);
+
+  const triggerFinalize = useCallback(async () => {
+    if (!confirm('Re-tag all remaining AI-proposed entries against the library only? Anything that doesn\'t fit a library entry will route to General.')) return;
+    setFinalizing(true);
+    onError(null);
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/finalize-taxonomy`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Finalize failed (${res.status})`);
+      setLastFinalize({
+        at: new Date(),
+        rerouted: data.rerouted || 0,
+        nullified: data.nullified || 0,
+        failed: data.failed || 0
+      });
+      onRefresh();
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setFinalizing(false);
+    }
+  }, [run.id, onRefresh, onError]);
   const sourceBuckets = run.taxonomy_final?.buckets || run.taxonomy_proposal?.buckets || [];
   const primaryIdentities = (run.taxonomy_final?.primary_identities || run.taxonomy_proposal?.primary_identities) || [];
   const observedPatterns = (run.taxonomy_final?.observed_patterns || run.taxonomy_proposal?.observed_patterns) || [];
@@ -853,6 +883,9 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
         onError={onError}
         onAfterAcceptBatch={triggerRecalc}
         recalcing={recalcing}
+        onFinalize={triggerFinalize}
+        finalizing={finalizing}
+        lastFinalize={lastFinalize}
       />
       <Phase1aQAQueuePanel runId={run.id} onError={onError} />
 
@@ -867,7 +900,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
             )}
             <button
               onClick={triggerRecalc}
-              disabled={recalcing}
+              disabled={recalcing || finalizing}
               className="px-2 py-1 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e] disabled:opacity-50 normal-case tracking-normal flex items-center gap-1"
               title="Re-process this run against the current library: refresh is_new flags + re-run consolidation passes so accepted entries become canonical merge targets"
             >
@@ -1045,7 +1078,8 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
           </button>
           <button
             onClick={() => apply(true)}
-            disabled={busy !== 'none' || kept.size === 0}
+            disabled={busy !== 'none' || kept.size === 0 || recalcing || finalizing}
+            title={recalcing ? 'Recalculation in progress…' : finalizing ? 'Finalize in progress…' : ''}
             className="px-4 py-2 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1"
           >
             {busy === 'assigning' ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
@@ -2020,7 +2054,7 @@ function StatCard({ label, value, color }: { label: string; value: string; color
 
 type TaxKind = 'identities' | 'characteristics' | 'sectors';
 
-function Phase1aProposedTagsPanel({ runId, onError, onAfterAcceptBatch, recalcing }: {
+function Phase1aProposedTagsPanel({ runId, onError, onAfterAcceptBatch, recalcing, onFinalize, finalizing, lastFinalize }: {
   runId: string;
   onError: (m: string | null) => void;
   // Fires after each Accept-all / Apply-selected batch finishes. The
@@ -2031,6 +2065,12 @@ function Phase1aProposedTagsPanel({ runId, onError, onAfterAcceptBatch, recalcin
   // Surfaced to disable batch buttons while a parent-driven recalc is
   // in progress, so the user can't queue a second recalc on top.
   recalcing?: boolean;
+  // Finalize: re-tag every still-orphan row against the library only.
+  // Renders the button and surfaces the last-run summary inside this
+  // panel so the action lives next to the proposals it operates on.
+  onFinalize?: () => Promise<void> | void;
+  finalizing?: boolean;
+  lastFinalize?: { at: Date; rerouted: number; nullified: number; failed: number } | null;
 }) {
   const [proposed, setProposed] = useState<{ identities: any[]; characteristics: any[]; sectors: any[] } | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -2270,6 +2310,31 @@ function Phase1aProposedTagsPanel({ runId, onError, onAfterAcceptBatch, recalcin
           );
         })}
       </div>
+      {onFinalize && (
+        <div className="mt-4 pt-3 border-t border-amber-500/20 flex items-start justify-between gap-3 flex-wrap">
+          <div className="flex-1 min-w-0">
+            <div className="text-[11px] font-bold text-amber-200">
+              Finalize taxonomy — re-tag remaining proposals against the library only
+            </div>
+            <div className="text-[10px] text-gray-400 mt-0.5">
+              Forces every still-orphan tag to a library entry (or null → General). No new entries are proposed in this pass. Run this once you're done accepting AI suggestions, BEFORE Apply &amp; Assign.
+            </div>
+            {lastFinalize && (
+              <div className="text-[10px] text-gray-500 mt-1.5 font-mono">
+                Last finalize {lastFinalize.at.toLocaleTimeString()} · {lastFinalize.rerouted} → library, {lastFinalize.nullified} → General{lastFinalize.failed > 0 ? `, ${lastFinalize.failed} batch failures` : ''}
+              </div>
+            )}
+          </div>
+          <button
+            onClick={onFinalize}
+            disabled={!!finalizing || !!recalcing}
+            className="shrink-0 px-3 py-1.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-200 border border-amber-500/40 hover:bg-amber-500/30 disabled:opacity-50 flex items-center gap-1"
+          >
+            {finalizing ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
+            {finalizing ? 'Finalizing…' : 'Finalize taxonomy'}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

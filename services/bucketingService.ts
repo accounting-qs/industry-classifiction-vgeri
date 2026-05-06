@@ -1416,6 +1416,389 @@ export async function recalculateTaxonomyWithLibrary(
 }
 
 // ────────────────────────────────────────────────────────────────────
+// FINALIZE — re-tag remaining proposals against library only
+//
+// Once the user is done reviewing AI-proposed taxonomy additions, the
+// rows still flagged is_new_*=true are entries the user did NOT
+// accept (rejected, or simply ignored). Those tags are orphans —
+// they're the contact's tag but they're NOT in the library, so they
+// won't ever route through library_first lookup or appear in future
+// runs' canonical vocab. Finalize re-tags only those orphan rows
+// using a library-constrained LLM pass: no new proposals allowed,
+// pick the closest library entry or null. After finalize:
+//   • is_new_* is false on every row (no orphans left)
+//   • Phase 1b's library-first lookup hits everything
+//   • the AI-Proposed Additions panel goes empty
+//
+// One LLM call per batch of 8 industries; only the affected rows are
+// sent (typically 50-200 after a typical accept session). Uses the
+// same model + batch / concurrency settings as Phase 1a tagging.
+// ────────────────────────────────────────────────────────────────────
+
+function buildLibraryOnlyTaggingPrompt(s: TaxonomySnapshot): string {
+    const idLines = s.identities.map(i =>
+        `  - ${i.name}${i.is_disqualified ? ' [DQ]' : ''}: ${i.description || ''}`
+    ).join('\n');
+    const chLines = s.characteristics.map(c =>
+        `  - ${c.name} (under ${c.parent_identity}): ${c.description || ''}`
+    ).join('\n');
+    const secLines = s.sectors.map(sec =>
+        `  - ${sec.name}: ${sec.synonyms || sec.description || ''}`
+    ).join('\n');
+
+    return `You are FINALIZING tags for B2B contact industries that the prior tagging pass left as proposals (entries not in the curated library). Your job is to re-tag each industry using ONLY entries from the library below — or null if nothing fits.
+
+HARD CONSTRAINTS:
+- You MUST pick identity / characteristic / sector from the library lists below, EXACTLY as written (verbatim).
+- You MUST NOT invent new entries. Do NOT set is_new_identity / is_new_characteristic / is_new_sector to true. They will be ignored anyway.
+- If no library identity is even loosely applicable, return identity=null. The contact will route to General. This is acceptable.
+- characteristic and sector are independently optional — return null if no library entry fits.
+
+Library is the source of truth. The prior tagging pass over-proposed; this pass forces every row to library or null.
+
+CANONICAL TAXONOMY:
+
+== IDENTITY (Layer 1 — required when applicable) ==
+${idLines || '  (library is empty)'}
+
+== CHARACTERISTIC (Layer 2 — must be a child of the chosen identity, or null) ==
+${chLines || '  (library is empty)'}
+
+== SECTOR (Layer 3 — vertical served, or null) ==
+${secLines || '  (library is empty)'}
+
+INSTRUCTIONS PER INDUSTRY:
+1. Read the industry text.
+2. Identity: choose the closest library identity, or null if none reasonably applies.
+3. Characteristic: ONLY among entries whose parent_identity equals the identity you chose. Closest fit, or null.
+4. Sector: closest served vertical, or null.
+5. Confidence (1-10) per layer — be honest. If you're forcing a weak match, drop the score.
+6. is_disqualified: true ONLY if the chosen identity is marked [DQ] above AND identity_confidence ≥ 7.
+
+OUTPUT (strict JSON):
+{
+  "results": [
+    {
+      "id": <integer matching the input>,
+      "identity": "<library entry verbatim, or null>",
+      "characteristic": "<library entry verbatim, or null>",
+      "sector": "<library entry verbatim, or null>",
+      "is_disqualified": false,
+      "identity_confidence": <1-10>,
+      "characteristic_confidence": <1-10>,
+      "sector_confidence": <1-10>,
+      "reason": "<one short sentence — why this library entry, or why null>"
+    },
+    ...
+  ]
+}
+
+Return one entry per input industry. The id must match the input id. Do not include any other fields.`;
+}
+
+export async function finalizeTaxonomyAgainstLibrary(
+    supabase: SupabaseClient,
+    runId: string,
+    ctx: BucketingCtx
+): Promise<{
+    candidates: number;
+    rerouted: number;
+    nullified: number;
+    failed: number;
+    costUsd: number;
+}> {
+    const { data: run, error: runErr } = await supabase
+        .from('bucketing_runs').select('*').eq('id', runId).single();
+    if (runErr || !run) throw new Error(`Run not found: ${runErr?.message}`);
+    if (run.status !== 'taxonomy_ready' && run.status !== 'completed') {
+        throw new Error(`Cannot finalize from status "${run.status}" — run must be in taxonomy_ready or completed`);
+    }
+
+    const phase1aModel = (run.taxonomy_model as string) || 'gpt-4.1-mini';
+    const isAnthropic = phase1aModel.startsWith('claude-');
+    const anthropic = isAnthropic ? await getAnthropic(supabase) : null;
+    if (isAnthropic && !anthropic) {
+        throw new Error('Anthropic API key not configured. Add it on the Connectors page (saved as ANTHROPIC_API_KEY).');
+    }
+
+    const snapshot = await loadTaxonomySnapshot(supabase);
+    if (snapshot.identities.length === 0 && snapshot.characteristics.length === 0 && snapshot.sectors.length === 0) {
+        throw new Error('Library is empty — accept at least some AI-proposed entries before finalizing.');
+    }
+
+    // Pull every Phase 1a row, paginated. Filter to ones with at least one
+    // is_new flag — those are the orphans that never got accepted.
+    const allRows: any[] = [];
+    {
+        const PAGE = 1000;
+        for (let off = 0; off < 200_000; off += PAGE) {
+            const { data, error } = await supabase
+                .from('bucket_industry_map')
+                .select('*')
+                .eq('bucketing_run_id', runId)
+                .range(off, off + PAGE - 1);
+            if (error) throw new Error(`bucket_industry_map fetch failed at offset ${off}: ${error.message}`);
+            const rows = (data || []) as any[];
+            allRows.push(...rows);
+            if (rows.length < PAGE) break;
+        }
+    }
+    const candidates = allRows.filter(r =>
+        r.source === 'llm_phase1a' && (
+            r.is_new_identity || r.is_new_characteristic || r.is_new_sector
+        )
+    );
+    ctx.log(`[Finalize ${runId}] ${candidates.length} orphan row(s) to re-tag against library (${snapshot.identities.length} identities, ${snapshot.characteristics.length} characteristics, ${snapshot.sectors.length} sectors)`);
+
+    if (candidates.length === 0) {
+        return { candidates: 0, rerouted: 0, nullified: 0, failed: 0, costUsd: 0 };
+    }
+
+    const systemPrompt = buildLibraryOnlyTaggingPrompt(snapshot);
+
+    // Reconstruct VocabRow-shape input for the LLM. We don't have
+    // sample_companies in bucket_industry_map and don't need them — the
+    // industry string alone is the LLM's signal. n is unused downstream.
+    const vocab: VocabRow[] = candidates.map(r => ({
+        industry: r.industry_string,
+        n: 0,
+        enrichment_status: 'completed',
+        sample_companies: []
+    }));
+
+    const limit = pLimit(PHASE1A_CONCURRENCY);
+    const batches: VocabRow[][] = [];
+    for (let i = 0; i < vocab.length; i += PHASE1A_BATCH_SIZE) {
+        batches.push(vocab.slice(i, i + PHASE1A_BATCH_SIZE));
+    }
+
+    let totalIn = 0;
+    let totalOut = 0;
+    let totalCachedIn = 0;
+    let done = 0;
+    let batchesFailed = 0;
+    const taggings: IndustryTagging[] = [];
+
+    await Promise.all(batches.map((batch) => limit(async () => {
+        await ctx.checkCancel();
+        const userPrompt = JSON.stringify({
+            industries: batch.map((v, i) => ({ id: i, industry: v.industry }))
+        });
+        try {
+            let text = '';
+            if (isAnthropic) {
+                const resp = await anthropic!.messages.create({
+                    model: phase1aModel,
+                    max_tokens: 2000,
+                    system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+                    messages: [{ role: 'user', content: userPrompt }]
+                }, { timeout: TAXONOMY_TIMEOUT_MS });
+                const usage: any = (resp as any).usage || {};
+                totalIn += usage.input_tokens || 0;
+                totalOut += usage.output_tokens || 0;
+                totalCachedIn += usage.cache_read_input_tokens || 0;
+                text = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
+            } else {
+                const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: phase1aModel,
+                        max_tokens: 2000,
+                        response_format: { type: 'json_object' },
+                        messages: [
+                            { role: 'system', content: systemPrompt },
+                            { role: 'user', content: userPrompt }
+                        ]
+                    }),
+                    signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+                });
+                if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
+                const json: any = await resp.json();
+                const usage = json.usage || {};
+                const cached = usage.prompt_tokens_details?.cached_tokens || 0;
+                totalIn += (usage.prompt_tokens || 0);
+                totalCachedIn += cached;
+                totalOut += usage.completion_tokens || 0;
+                text = json.choices?.[0]?.message?.content || '';
+            }
+            const parsed = parseTaggingJson(text, batch);
+            for (const t of parsed) taggings.push(t);
+            if (parsed.length === 0) {
+                batchesFailed++;
+                ctx.log(`[Finalize ${runId}] batch parsed to 0 results (${batch.length} industries) — output: ${text.slice(0, 200)}`, 'warn');
+            }
+        } catch (err: any) {
+            batchesFailed++;
+            ctx.log(`[Finalize ${runId}] batch error (${batch.length} industries): ${err.message}`, 'error');
+        }
+        done += batch.length;
+        if (done % (PHASE1A_BATCH_SIZE * 5) === 0 || done === vocab.length) {
+            ctx.progress({
+                phase: 'phase1a', step: 'finalize',
+                current: done, total: vocab.length,
+                note: `Finalized ${done}/${vocab.length} orphan tags…`
+            });
+        }
+    })));
+
+    const costUsd = isAnthropic
+        ? computeAnthropicCost(phase1aModel, totalIn - totalCachedIn, totalOut)
+        : computeOpenAICost(phase1aModel, totalIn - totalCachedIn, totalCachedIn, totalOut);
+
+    // Apply: index the LLM output by industry string (parseTaggingJson preserves
+    // it) and walk the candidate rows. Always force is_new_*=false — the whole
+    // point of finalize is to retire the orphan flag.
+    const taggingByIndustry = new Map<string, IndustryTagging>();
+    for (const t of taggings) taggingByIndustry.set(t.industry, t);
+
+    const libIdentities = new Set(snapshot.identities.map(i => i.name));
+    const libChars = new Set(snapshot.characteristics.map(c => c.name));
+    const libSectors = new Set(snapshot.sectors.map(s => s.name));
+    const dqIdentities = new Set(snapshot.identities.filter(i => i.is_disqualified).map(i => i.name));
+
+    let rerouted = 0;
+    let nullified = 0;
+    let failed = 0;
+    const updates: any[] = [];
+
+    for (const row of candidates) {
+        const t = taggingByIndustry.get(row.industry_string);
+        if (!t) {
+            // The LLM batch failed for this row — leave the original tag in
+            // place but still scrub is_new_* so it disappears from the panel.
+            // (Better than nullifying and silently re-routing those contacts
+            // to General just because of a transient API blip.)
+            failed++;
+            updates.push({
+                bucketing_run_id: runId,
+                industry_string: row.industry_string,
+                is_new_identity: false,
+                is_new_characteristic: false,
+                is_new_sector: false
+            });
+            continue;
+        }
+
+        // Library-only enforcement: if the LLM hallucinated something not in
+        // the library (model drift), drop it to null.
+        const newIdentity = t.identity && libIdentities.has(t.identity) ? t.identity : null;
+        const newCharacteristic = t.characteristic && libChars.has(t.characteristic) ? t.characteristic : null;
+        const newSector = t.sector && libSectors.has(t.sector) ? t.sector : null;
+
+        // DQ propagation matches Phase 1a's logic.
+        const idConf = t.identity_confidence || 0;
+        const identityIsDq = !!(newIdentity && dqIdentities.has(newIdentity));
+        const isDisqualified = (!!t.is_disqualified || identityIsDq) && idConf >= PHASE1A_DQ_FLOOR;
+
+        const lowConf = (t.confidence || 0) < PHASE1A_QA_FLOOR;
+        let preBucket: string;
+        if (isDisqualified) preBucket = RESERVED_DISQUALIFIED;
+        else if (lowConf) preBucket = RESERVED_GENERAL;
+        else if (newCharacteristic) preBucket = newCharacteristic;
+        else if (newIdentity) preBucket = newIdentity;
+        else preBucket = RESERVED_GENERAL;
+
+        const canonical = isDisqualified
+            ? 'Disqualified'
+            : (newSector && newCharacteristic ? `${newSector} ${newCharacteristic}`
+                : (newCharacteristic || newIdentity || 'Generic'));
+
+        if (!newIdentity && !newCharacteristic && !newSector) nullified++;
+        else rerouted++;
+
+        updates.push({
+            bucketing_run_id: runId,
+            industry_string: row.industry_string,
+            primary_identity: newIdentity,
+            characteristic: newCharacteristic,
+            sector: newSector,
+            is_new_identity: false,
+            is_new_characteristic: false,
+            is_new_sector: false,
+            is_disqualified: isDisqualified,
+            identity_confidence: Number(((t.identity_confidence || 0) / 10).toFixed(2)),
+            characteristic_confidence: Number(((t.characteristic_confidence || 0) / 10).toFixed(2)),
+            sector_confidence: Number(((t.sector_confidence || 0) / 10).toFixed(2)),
+            confidence: Number(((t.confidence || 0) / 10).toFixed(2)),
+            bucket_name: preBucket,
+            canonical_classification: canonical,
+            llm_reason: t.reason || row.llm_reason
+        });
+    }
+
+    for (let i = 0; i < updates.length; i += 1000) {
+        const chunk = updates.slice(i, i + 1000);
+        const { error } = await supabase.from('bucket_industry_map')
+            .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
+        if (error) throw new Error(`finalize upsert failed: ${error.message}`);
+    }
+
+    // Re-synthesize taxonomy_proposal so the Review screen reflects the new
+    // shape (orphan rows now point at library entries or null).
+    const refreshedRows: any[] = [];
+    {
+        const PAGE = 1000;
+        for (let off = 0; off < 200_000; off += PAGE) {
+            const { data, error } = await supabase
+                .from('bucket_industry_map')
+                .select('industry_string,primary_identity,characteristic,sector')
+                .eq('bucketing_run_id', runId)
+                .range(off, off + PAGE - 1);
+            if (error) throw new Error(`bucket_industry_map re-fetch failed at offset ${off}: ${error.message}`);
+            const rows = (data || []) as any[];
+            refreshedRows.push(...rows);
+            if (rows.length < PAGE) break;
+        }
+    }
+    const usedIdentitySet = new Set<string>();
+    const usedCharByKey = new Map<string, { spec: string; identity: string; description: string }>();
+    const usedSectors = new Set<string>();
+    for (const r of refreshedRows) {
+        if (r.primary_identity) usedIdentitySet.add(r.primary_identity);
+        if (r.characteristic && r.primary_identity) {
+            const key = `${r.primary_identity}::${r.characteristic}`;
+            if (!usedCharByKey.has(key)) {
+                const charDesc = snapshot.characteristics.find(c => c.name === r.characteristic)?.description || '';
+                usedCharByKey.set(key, { spec: r.characteristic, identity: r.primary_identity, description: charDesc });
+            }
+        }
+        if (r.sector) usedSectors.add(r.sector);
+    }
+    const primaryIdentities = Array.from(usedIdentitySet).map(name => {
+        const ent = snapshot.identities.find(i => i.name === name);
+        return { name, description: ent?.description || '', identity_type: 'other', operator_required: false };
+    });
+    const buckets: DiscoveredBucket[] = [];
+    for (const c of usedCharByKey.values()) {
+        buckets.push({
+            characteristic: c.spec, primary_identity: c.identity, description: c.description,
+            identity_type: 'other', operator_required: false, priority_rank: 5,
+            include: [], exclude: [], example_strings: [],
+            strong_identity_signals: [], weak_sector_signals: [], disqualifying_signals: []
+        });
+    }
+    await supabase.from('bucketing_runs').update({
+        taxonomy_proposal: {
+            observed_patterns: [],
+            sector_vocabulary: Array.from(usedSectors),
+            primary_identities: primaryIdentities,
+            buckets
+        },
+        taxonomy_snapshot: {
+            identities: snapshot.identities,
+            characteristics: snapshot.characteristics,
+            sectors: snapshot.sectors
+        },
+        cost_usd: (Number(run.cost_usd) || 0) + costUsd
+    }).eq('id', runId);
+
+    ctx.log(`[Finalize ${runId}] done — ${candidates.length} orphans processed: ${rerouted} re-routed to library, ${nullified} → null/General, ${failed} batch failures (kept original tag), $${costUsd.toFixed(4)}`, 'phase');
+
+    return { candidates: candidates.length, rerouted, nullified, failed, costUsd };
+}
+
+// ────────────────────────────────────────────────────────────────────
 // PHASE 1A HELPERS — taxonomy snapshot + per-string tagging
 // ────────────────────────────────────────────────────────────────────
 

@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { db } from './services/supabaseClient';
 import { JobProcessor } from './services/jobProcessor';
-import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, recalculateTaxonomyWithLibrary, BucketingCancelledError } from './services/bucketingService';
+import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, recalculateTaxonomyWithLibrary, finalizeTaxonomyAgainstLibrary, BucketingCancelledError } from './services/bucketingService';
 import {
     listLibrary,
     upsertLibraryBucket,
@@ -1959,6 +1959,21 @@ app.post('/api/bucketing/runs/:id/recalculate', async (req, res) => {
     const id = req.params.id;
     try {
         const result = await recalculateTaxonomyWithLibrary(supabase, id, buildBucketingCtx(id));
+        res.json({ ok: true, ...result });
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+// Finalize: re-tag every still-orphan row (is_new_*=true) using a
+// library-constrained LLM pass. After this returns, no row is flagged
+// is_new_* anymore — every contact's tag is either a canonical library
+// entry or null (→ General). Synchronous; cost scales with number of
+// orphans, typically a few cents.
+app.post('/api/bucketing/runs/:id/finalize-taxonomy', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const result = await finalizeTaxonomyAgainstLibrary(supabase, id, buildBucketingCtx(id));
         res.json({ ok: true, ...result });
     } catch (err: any) {
         res.status(400).json({ error: err.message });
