@@ -1164,6 +1164,258 @@ export async function runTaxonomyProposal(
 }
 
 // ────────────────────────────────────────────────────────────────────
+// RECALC AGAINST UPDATED LIBRARY
+//
+// After the Review screen accepts AI-proposed identities/characteristics/
+// sectors, those entries land in the taxonomy_* library tables. The
+// existing bucket_industry_map rows still carry the original tag strings
+// (which is correct — accepting doesn't change names) but their
+// is_new_* flags are stale (now that the names ARE in the library) AND
+// the LLM consolidation passes haven't seen the new library entries as
+// merge targets. This helper:
+//
+//   1. Reloads the (now larger) library snapshot.
+//   2. Hydrates IndustryTagging[] from existing bucket_industry_map rows.
+//   3. Refreshes is_new_* flags by checking each tag against the live
+//      library (cheap, no LLM).
+//   4. Re-runs the cheap normalizer dedup + every LLM consolidation pass
+//      (characteristics / sectors / identities) so any STILL-proposed-new
+//      entries can merge INTO the now-canonical library names.
+//   5. Drops new-identity singletons (count < 3) — same rule as Phase 1a.
+//   6. Writes the updated tags back to bucket_industry_map and
+//      re-synthesizes taxonomy_proposal so the Review screen's
+//      Discovered Characteristics panel reflects the new shape.
+//
+// Intentionally does NOT re-tag any contact via LLM — the per-row tags
+// produced by Phase 1a are kept intact. Only consolidation/flag refresh.
+// ────────────────────────────────────────────────────────────────────
+
+export async function recalculateTaxonomyWithLibrary(
+    supabase: SupabaseClient,
+    runId: string,
+    ctx: BucketingCtx
+): Promise<{
+    updatedRows: number;
+    flagsRefreshed: number;
+    identityMerges: number;
+    characteristicMerges: number;
+    sectorMerges: number;
+    singletonsDropped: number;
+    costUsd: number;
+}> {
+    const { data: run, error: runErr } = await supabase
+        .from('bucketing_runs').select('*').eq('id', runId).single();
+    if (runErr || !run) throw new Error(`Run not found: ${runErr?.message}`);
+    if (run.status !== 'taxonomy_ready' && run.status !== 'completed') {
+        throw new Error(`Cannot recalculate from status "${run.status}" — run must be in taxonomy_ready or completed`);
+    }
+
+    const phase1aModel = (run.taxonomy_model as string) || 'gpt-4.1-mini';
+
+    const snapshot = await loadTaxonomySnapshot(supabase);
+    ctx.log(`[Recalc ${runId}] library snapshot: ${snapshot.identities.length} identities, ${snapshot.characteristics.length} characteristics, ${snapshot.sectors.length} sectors`);
+
+    // Pull every row in this run's bucket_industry_map. Paginate to dodge
+    // PostgREST's 1000-row hard cap (same trick the streaming CSV uses).
+    const allRows: any[] = [];
+    {
+        const PAGE = 1000;
+        for (let off = 0; off < 200_000; off += PAGE) {
+            const { data, error } = await supabase
+                .from('bucket_industry_map')
+                .select('*')
+                .eq('bucketing_run_id', runId)
+                .range(off, off + PAGE - 1);
+            if (error) throw new Error(`bucket_industry_map fetch failed at offset ${off}: ${error.message}`);
+            const rows = (data || []) as any[];
+            allRows.push(...rows);
+            if (rows.length < PAGE) break;
+        }
+    }
+    ctx.log(`[Recalc ${runId}] loaded ${allRows.length} bucket_industry_map rows`);
+
+    // Disqualified-passthrough rows (source != 'llm_phase1a') don't carry
+    // identity/characteristic/sector data — leave them untouched.
+    const llmRows = allRows.filter(r => r.source === 'llm_phase1a');
+
+    // Hydrate IndustryTagging[] from rows. Stored confidences are 0-1
+    // (Phase 1a rounded them); IndustryTagging uses 0-10 internally.
+    const taggings: IndustryTagging[] = llmRows.map(r => ({
+        industry: r.industry_string,
+        identity: r.primary_identity || null,
+        is_new_identity: !!r.is_new_identity,
+        characteristic: r.characteristic || null,
+        is_new_characteristic: !!r.is_new_characteristic,
+        sector: r.sector || null,
+        is_new_sector: !!r.is_new_sector,
+        is_disqualified: !!r.is_disqualified,
+        identity_confidence: Math.round((Number(r.identity_confidence) || 0) * 10),
+        characteristic_confidence: Math.round((Number(r.characteristic_confidence) || 0) * 10),
+        sector_confidence: Math.round((Number(r.sector_confidence) || 0) * 10),
+        confidence: Math.round((Number(r.confidence) || 0) * 10),
+        reason: r.llm_reason || ''
+    }));
+
+    const libIdentities = new Set(snapshot.identities.map(i => i.name));
+    const libChars = new Set(snapshot.characteristics.map(c => c.name));
+    const libSectors = new Set(snapshot.sectors.map(s => s.name));
+
+    // Snapshot the original is_new flags so we can count how many flipped.
+    const originalFlags = taggings.map(t => ({
+        ni: !!t.is_new_identity, nc: !!t.is_new_characteristic, ns: !!t.is_new_sector
+    }));
+
+    // Step 1 — refresh is_new_* against the now-current library.
+    for (const t of taggings) {
+        t.is_new_identity = !!t.is_new_identity && !libIdentities.has(t.identity || '');
+        t.is_new_characteristic = !!t.is_new_characteristic && !libChars.has(t.characteristic || '');
+        t.is_new_sector = !!t.is_new_sector && !libSectors.has(t.sector || '');
+    }
+
+    // Step 2 — cheap normalizer dedup. Catches plurals / casing the
+    // newly-accepted library entries can now collapse into.
+    consolidateTaggings(taggings, snapshot);
+
+    // Step 3 — LLM consolidation passes. Each is a no-op when the
+    // proposed-new pool is below its threshold, so subsequent recalcs
+    // (after the user has whittled the panel down) cost nothing.
+    let costUsd = 0;
+    let totalCharMerges = 0;
+    for (let pass = 1; pass <= 2; pass++) {
+        const r = await consolidateCharacteristicsViaLLM(supabase, phase1aModel, taggings, snapshot, runId, ctx);
+        totalCharMerges += r.merges;
+        costUsd += r.costUsd;
+        if (r.merges < 5) break;
+    }
+    const secConsol = await consolidateSectorsViaLLM(supabase, phase1aModel, taggings, snapshot, runId, ctx);
+    costUsd += secConsol.costUsd;
+    const idConsol = await consolidateIdentitiesViaLLM(supabase, phase1aModel, taggings, snapshot, runId, ctx);
+    costUsd += idConsol.costUsd;
+
+    // Step 4 — drop new-identity singletons (count < 3).
+    const singletonDrop = dropSingletonNewIdentities(taggings, snapshot, runId, ctx);
+
+    // Step 5 — re-run normalizer once more to catch any new collisions
+    // produced by the LLM consolidation merges.
+    consolidateTaggings(taggings, snapshot);
+
+    // Step 6 — final flag refresh after consolidation may have rewritten
+    // names INTO library canonicals.
+    let flagsRefreshed = 0;
+    for (let i = 0; i < taggings.length; i++) {
+        const t = taggings[i];
+        const newNi = !!t.is_new_identity && !libIdentities.has(t.identity || '');
+        const newNc = !!t.is_new_characteristic && !libChars.has(t.characteristic || '');
+        const newNs = !!t.is_new_sector && !libSectors.has(t.sector || '');
+        const orig = originalFlags[i];
+        if (newNi !== orig.ni || newNc !== orig.nc || newNs !== orig.ns) flagsRefreshed++;
+        t.is_new_identity = newNi;
+        t.is_new_characteristic = newNc;
+        t.is_new_sector = newNs;
+    }
+
+    // Step 7 — write updated rows back. Re-derive bucket_name +
+    // canonical_classification the same way runTaxonomyProposal did so
+    // the preview counts and downstream cascade stay in sync.
+    const updates: any[] = [];
+    for (const t of taggings) {
+        const lowConf = (t.confidence || 0) < PHASE1A_QA_FLOOR;
+        const idConf = t.identity_confidence || 0;
+        const dqByLLM = !!t.is_disqualified && idConf >= PHASE1A_DQ_FLOOR;
+        const isDisqualified = dqByLLM;
+
+        let preBucket: string;
+        if (isDisqualified) preBucket = RESERVED_DISQUALIFIED;
+        else if (lowConf) preBucket = RESERVED_GENERAL;
+        else if (t.characteristic) preBucket = t.characteristic;
+        else if (t.identity) preBucket = t.identity;
+        else preBucket = RESERVED_GENERAL;
+
+        const canonical = isDisqualified
+            ? 'Disqualified'
+            : (t.sector && t.characteristic ? `${t.sector} ${t.characteristic}`
+                : (t.characteristic || t.identity || 'Generic'));
+
+        updates.push({
+            bucketing_run_id: runId,
+            industry_string: t.industry,
+            primary_identity: t.identity,
+            characteristic: t.characteristic,
+            sector: t.sector,
+            is_new_identity: t.is_new_identity,
+            is_new_characteristic: t.is_new_characteristic,
+            is_new_sector: t.is_new_sector,
+            is_disqualified: isDisqualified,
+            bucket_name: preBucket,
+            canonical_classification: canonical
+        });
+    }
+
+    for (let i = 0; i < updates.length; i += 1000) {
+        const chunk = updates.slice(i, i + 1000);
+        const { error } = await supabase.from('bucket_industry_map')
+            .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
+        if (error) throw new Error(`recalc upsert failed: ${error.message}`);
+    }
+
+    // Step 8 — re-synthesize taxonomy_proposal from the freshly-written
+    // rows. Mirrors the synthesis at the end of runTaxonomyProposal.
+    const usedIdentitySet = new Set<string>();
+    const usedCharByKey = new Map<string, { spec: string; identity: string; description: string }>();
+    const usedSectors = new Set<string>();
+    for (const r of updates) {
+        if (r.primary_identity) usedIdentitySet.add(r.primary_identity);
+        if (r.characteristic && r.primary_identity) {
+            const key = `${r.primary_identity}::${r.characteristic}`;
+            if (!usedCharByKey.has(key)) {
+                const charDesc = snapshot.characteristics.find(c => c.name === r.characteristic)?.description || '';
+                usedCharByKey.set(key, { spec: r.characteristic, identity: r.primary_identity, description: charDesc });
+            }
+        }
+        if (r.sector) usedSectors.add(r.sector);
+    }
+    const primaryIdentities = Array.from(usedIdentitySet).map(name => {
+        const ent = snapshot.identities.find(i => i.name === name);
+        return { name, description: ent?.description || '', identity_type: 'other', operator_required: false };
+    });
+    const buckets: DiscoveredBucket[] = [];
+    for (const c of usedCharByKey.values()) {
+        buckets.push({
+            characteristic: c.spec, primary_identity: c.identity, description: c.description,
+            identity_type: 'other', operator_required: false, priority_rank: 5,
+            include: [], exclude: [], example_strings: [],
+            strong_identity_signals: [], weak_sector_signals: [], disqualifying_signals: []
+        });
+    }
+    await supabase.from('bucketing_runs').update({
+        taxonomy_proposal: {
+            observed_patterns: [],
+            sector_vocabulary: Array.from(usedSectors),
+            primary_identities: primaryIdentities,
+            buckets
+        },
+        taxonomy_snapshot: {
+            identities: snapshot.identities,
+            characteristics: snapshot.characteristics,
+            sectors: snapshot.sectors
+        },
+        cost_usd: (Number(run.cost_usd) || 0) + costUsd
+    }).eq('id', runId);
+
+    ctx.log(`[Recalc ${runId}] done — ${updates.length} rows updated, ${flagsRefreshed} is_new flags flipped, char merges=${totalCharMerges}, sector merges=${secConsol.merges}, identity merges=${idConsol.merges}, singletons dropped=${singletonDrop.dropped}, cost $${costUsd.toFixed(4)}`, 'phase');
+
+    return {
+        updatedRows: updates.length,
+        flagsRefreshed,
+        identityMerges: idConsol.merges,
+        characteristicMerges: totalCharMerges,
+        sectorMerges: secConsol.merges,
+        singletonsDropped: singletonDrop.dropped,
+        costUsd
+    };
+}
+
+// ────────────────────────────────────────────────────────────────────
 // PHASE 1A HELPERS — taxonomy snapshot + per-string tagging
 // ────────────────────────────────────────────────────────────────────
 

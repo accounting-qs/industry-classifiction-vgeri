@@ -713,6 +713,32 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
   onRefresh: () => void;
   onError: (msg: string | null) => void;
 }) {
+  // Recalc triggers a re-pass against the now-current library: refreshes
+  // is_new_* flags on every Phase 1a row + re-runs the LLM consolidation
+  // passes so STILL-proposed-new entries can merge INTO newly-accepted
+  // library entries. Auto-fires after each Accept-all / Apply-selected
+  // batch in Phase1aProposedTagsPanel; also exposed as a manual button
+  // next to the Discovered Characteristics header (covers the case where
+  // the user edited the library outside this run).
+  const [recalcing, setRecalcing] = useState(false);
+  const [lastRecalc, setLastRecalc] = useState<{ at: Date; merges: number } | null>(null);
+
+  const triggerRecalc = useCallback(async () => {
+    setRecalcing(true);
+    onError(null);
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/recalculate`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Recalc failed (${res.status})`);
+      const totalMerges = (data.identityMerges || 0) + (data.characteristicMerges || 0) + (data.sectorMerges || 0);
+      setLastRecalc({ at: new Date(), merges: totalMerges });
+      onRefresh();
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setRecalcing(false);
+    }
+  }, [run.id, onRefresh, onError]);
   const sourceBuckets = run.taxonomy_final?.buckets || run.taxonomy_proposal?.buckets || [];
   const primaryIdentities = (run.taxonomy_final?.primary_identities || run.taxonomy_proposal?.primary_identities) || [];
   const observedPatterns = (run.taxonomy_final?.observed_patterns || run.taxonomy_proposal?.observed_patterns) || [];
@@ -822,15 +848,36 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
         )}
       </div>
 
-      <Phase1aProposedTagsPanel runId={run.id} onError={onError} />
+      <Phase1aProposedTagsPanel
+        runId={run.id}
+        onError={onError}
+        onAfterAcceptBatch={triggerRecalc}
+        recalcing={recalcing}
+      />
       <Phase1aQAQueuePanel runId={run.id} onError={onError} />
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
-        <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between">
+        <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between gap-3 flex-wrap">
           <span>Discovered characteristics (grouped by primary identity)</span>
-          <span className="text-gray-600 normal-case tracking-normal font-normal">
-            Phase 1b counts decide the campaign bucket: combo → characteristic → identity → General.
-          </span>
+          <div className="flex items-center gap-3">
+            {lastRecalc && (
+              <span className="text-[10px] text-gray-500 normal-case tracking-normal font-normal">
+                Last recalc: {lastRecalc.at.toLocaleTimeString()} · {lastRecalc.merges} merges
+              </span>
+            )}
+            <button
+              onClick={triggerRecalc}
+              disabled={recalcing}
+              className="px-2 py-1 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e] disabled:opacity-50 normal-case tracking-normal flex items-center gap-1"
+              title="Re-process this run against the current library: refresh is_new flags + re-run consolidation passes so accepted entries become canonical merge targets"
+            >
+              {recalcing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
+              {recalcing ? 'Recalculating…' : 'Recalculate'}
+            </button>
+          </div>
+        </div>
+        <div className="px-4 py-2 border-b border-[#2e2e2e] text-[10px] text-gray-600 normal-case tracking-normal">
+          Phase 1b counts decide the campaign bucket: combo → characteristic → identity → General.
         </div>
         <BucketChainList
           buckets={sourceBuckets}
@@ -1973,7 +2020,18 @@ function StatCard({ label, value, color }: { label: string; value: string; color
 
 type TaxKind = 'identities' | 'characteristics' | 'sectors';
 
-function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: (m: string | null) => void }) {
+function Phase1aProposedTagsPanel({ runId, onError, onAfterAcceptBatch, recalcing }: {
+  runId: string;
+  onError: (m: string | null) => void;
+  // Fires after each Accept-all / Apply-selected batch finishes. The
+  // parent (BucketingReview) uses it to trigger recalculateTaxonomyWith
+  // Library and refresh the Discovered Characteristics counts. Optional
+  // because the panel is also reused without recalc semantics.
+  onAfterAcceptBatch?: () => Promise<void> | void;
+  // Surfaced to disable batch buttons while a parent-driven recalc is
+  // in progress, so the user can't queue a second recalc on top.
+  recalcing?: boolean;
+}) {
   const [proposed, setProposed] = useState<{ identities: any[]; characteristics: any[]; sectors: any[] } | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [busyAllKind, setBusyAllKind] = useState<string | null>(null);
@@ -2059,6 +2117,13 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
     if (firstError) onError(`Some ${kind} couldn't be added: ${firstError}`);
     setSelected(prev => ({ ...prev, [kind]: new Set() }));
     await refresh();
+    // Auto-recalc after every batch — refreshes is_new flags + may
+    // merge other proposed-new entries into the just-accepted ones.
+    // The parent re-fetches bucketCounts so the Discovered
+    // Characteristics panel shows the new shape.
+    if (onAfterAcceptBatch) {
+      try { await onAfterAcceptBatch(); } catch { /* parent surfaces the error */ }
+    }
   };
 
   const acceptAll = (kind: TaxKind) => proposed && applyBatch(kind, proposed[kind]);
@@ -2095,11 +2160,19 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
 
   return (
     <div className="border border-amber-500/30 rounded-xl bg-amber-500/5 p-4">
-      <div className="text-[10px] font-bold text-amber-400 uppercase tracking-widest mb-2">
-        AI-proposed taxonomy additions ({total})
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <div className="text-[10px] font-bold text-amber-400 uppercase tracking-widest">
+          AI-proposed taxonomy additions ({total})
+        </div>
+        {recalcing && (
+          <div className="flex items-center gap-1.5 text-[10px] text-amber-200/70">
+            <Loader2 className="w-3 h-3 animate-spin" />
+            <span>Recalculating taxonomy with updated library…</span>
+          </div>
+        )}
       </div>
       <p className="text-[11px] text-gray-400 mb-3">
-        The tagger proposed entries that aren't in the library. Tick the ones you want to keep and click "Apply selected", or use "Accept all" / individual "Accept" buttons. Rejecting just means leaving them unchecked — they're already used in this run regardless.
+        The tagger proposed entries that aren't in the library. Tick the ones you want to keep and click "Apply selected", or use "Accept all" / individual "Accept" buttons. Accepted entries are saved to the library AND the run is automatically recalculated so other proposed entries can merge into them.
       </p>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {(['identities','characteristics','sectors'] as const).map(kind => {
@@ -2136,7 +2209,7 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
                   <div className="flex gap-1">
                     <button
                       onClick={() => applySelected(kind)}
-                      disabled={busyAllKind !== null || sel.size === 0}
+                      disabled={busyAllKind !== null || sel.size === 0 || !!recalcing}
                       className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-30"
                       title={`Add only the checked ${kind} to the library`}
                     >
@@ -2146,7 +2219,7 @@ function Phase1aProposedTagsPanel({ runId, onError }: { runId: string; onError: 
                     </button>
                     <button
                       onClick={() => acceptAll(kind)}
-                      disabled={busyAllKind !== null}
+                      disabled={busyAllKind !== null || !!recalcing}
                       className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-200 hover:bg-[#3e3e3e] disabled:opacity-50"
                       title={`Add every proposed ${kind.slice(0, -1)} to the library`}
                     >

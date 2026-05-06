@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { db } from './services/supabaseClient';
 import { JobProcessor } from './services/jobProcessor';
-import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, BucketingCancelledError } from './services/bucketingService';
+import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, recalculateTaxonomyWithLibrary, BucketingCancelledError } from './services/bucketingService';
 import {
     listLibrary,
     upsertLibraryBucket,
@@ -1946,6 +1946,22 @@ app.post('/api/bucketing/runs/:id/assign', async (req, res) => {
         res.status(202).json({ ok: true, id });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// Recalculate the run's taxonomy against the now-current library. Triggered
+// from the Review screen after the user accepts AI-proposed taxonomy
+// additions (manually or via Apply selected / Accept all). Synchronous
+// because the caller polls for refresh anyway — typically 5-30 s depending
+// on how many proposed-new entries remain. Returns the merge stats so the
+// UI can surface "5 characteristic merges, 1 identity dropped" feedback.
+app.post('/api/bucketing/runs/:id/recalculate', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const result = await recalculateTaxonomyWithLibrary(supabase, id, buildBucketingCtx(id));
+        res.json({ ok: true, ...result });
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
     }
 });
 
