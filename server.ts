@@ -2842,6 +2842,58 @@ async function cleanupExpiredCsvJobs() {
 setInterval(cleanupExpiredCsvJobs, 60 * 60 * 1000);
 cleanupExpiredCsvJobs().catch(() => {});
 
+// Watchdog for stuck bucketing runs.
+//
+// runTaxonomyProposal / runAssignment are dispatched fire-and-forget
+// from the route handler — they keep running after the HTTP response
+// returns, so closing the browser does NOT stop them. But if the
+// server itself dies mid-run (Render redeploy, OOM, scaling event),
+// the in-memory worker is gone while the DB row stays in 'assigning'
+// or 'taxonomy_pending' forever. The user sees a frozen progress
+// percentage with no clear way to recover.
+//
+// This watchdog scans for runs in those statuses where
+// progress.updated_at is older than STALE_AFTER_MS and flips them to
+// 'failed' with a recoverable error message — the existing Resume
+// button then re-triggers the worker. Runs on boot (catches anything
+// orphaned by the just-completed deploy) and every 5 min after.
+const STUCK_RUN_STALE_MS = 10 * 60 * 1000;
+
+async function watchdogStuckRuns() {
+    try {
+        const { data: runs } = await supabase
+            .from('bucketing_runs')
+            .select('id,status,progress,created_at')
+            .in('status', ['assigning', 'taxonomy_pending']);
+        const now = Date.now();
+        for (const run of (runs || []) as any[]) {
+            const updatedAtIso = run.progress?.updated_at || run.created_at;
+            const updatedAt = updatedAtIso ? new Date(updatedAtIso).getTime() : 0;
+            const stallMs = now - updatedAt;
+            if (stallMs < STUCK_RUN_STALE_MS) continue;
+            // Don't clobber a run that's still tracked by an in-memory
+            // controller — that worker is alive locally even if the DB
+            // progress is stale (e.g. mid-LLM-batch with a slow API).
+            const ac = runAbortControllers.get(run.id);
+            if (ac && !ac.signal.aborted) continue;
+
+            const stallMin = Math.round(stallMs / 60000);
+            await supabase.from('bucketing_runs').update({
+                status: 'failed',
+                cancel_requested: false,
+                error_message: `Worker stalled (${stallMin} min since last progress) — likely a server restart. Click Resume to continue.`
+            }).eq('id', run.id);
+            runAbortControllers.delete(run.id);
+            console.log(`[Watchdog] marked stuck run ${run.id} as failed (stall=${stallMin} min)`);
+        }
+    } catch (err: any) {
+        console.error('[Watchdog] error:', err.message || err);
+    }
+}
+
+setInterval(watchdogStuckRuns, 5 * 60 * 1000);
+watchdogStuckRuns().catch(() => {});
+
 // POST — kick off a new export job.
 //
 // Accepts any status that has at least Phase 1a output: taxonomy_ready
