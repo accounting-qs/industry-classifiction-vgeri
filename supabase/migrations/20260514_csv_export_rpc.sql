@@ -17,8 +17,8 @@
 --
 -- The bucket_industry_map JOIN uses the same COALESCE precedence as
 -- Phase 1b's lookup (enrichments.classification first, contacts.industry
--- as fallback) so phase1a_llm_reason populates correctly even when the
--- raw imported industry string differs from the AI-classified one.
+-- as fallback) so Phase 1a taxonomy is available even when the run has
+-- not produced bucket_assignments yet.
 --
 -- Idempotent: CREATE OR REPLACE.
 -- =====================================================================
@@ -66,60 +66,99 @@ SET statement_timeout TO '300s'
 AS $$
     -- Type-mismatch dance: contacts.contact_id is UUID, but
     -- bucket_assignments.contact_id was declared TEXT in the original v1
-    -- bucketing migration. Cast the UUID side to TEXT for the join and
-    -- to TEXT for the returned column (worker treats it as a string).
+    -- bucketing migration. Cast the UUID side to TEXT for the join.
     -- p_after_id comes in as TEXT from the worker (PostgREST sends UUIDs
     -- as strings), so we cast it to UUID to compare against the indexed
-    -- UUID column rather than slowing the comparison with both-side casts.
+    -- UUID column.
+    --
+    -- Page first, JOIN second:
+    -- The previous shape (one big SELECT with all 4 LEFT JOINs and a
+    -- LIMIT at the bottom) gave Postgres room to pick a hash-join plan
+    -- that built hash tables on the full bucket_assignments and
+    -- bucket_industry_map tables — work proportional to the WHOLE
+    -- dataset per page, not 1000 rows. ~15 min on a 370k run.
+    --
+    -- The CTE here forces the LIMIT to apply BEFORE the heavy joins:
+    -- contact_page is exactly 1000 rows of (contact basics + enrichment
+    -- + pre-computed industry_key), then the outer SELECT does just
+    -- 1000 PK probes against bucket_assignments and bucket_industry_map.
+    -- Should drop per-page time from ~2-3 s to <0.5 s.
+    WITH contact_page AS (
+        SELECT
+            c.contact_id,
+            c.email,
+            c.first_name,
+            c.last_name,
+            c.company_name,
+            c.company_website,
+            c.lead_list_name,
+            c.industry,
+            e.status         AS enrichment_status,
+            e.classification AS enrichment_classification,
+            e.confidence     AS enrichment_confidence,
+            e.reasoning      AS enrichment_reasoning,
+            -- Pre-compute the industry key once per row so the
+            -- bucket_industry_map join can use the (run_id, string) PK
+            -- instead of recomputing COALESCE on every probe.
+            COALESCE(NULLIF(TRIM(e.classification), ''), c.industry) AS industry_key
+        FROM contacts c
+        LEFT JOIN enrichments e
+               ON e.contact_id = c.contact_id
+        WHERE c.lead_list_name = ANY(
+                  SELECT UNNEST(list_names) FROM bucketing_runs WHERE id = p_run_id
+              )
+          AND (p_after_id IS NULL OR c.contact_id > p_after_id::UUID)
+        ORDER BY c.contact_id
+        LIMIT p_limit
+    )
     SELECT
-        c.contact_id::TEXT AS contact_id,
-        c.email,
-        c.first_name,
-        c.last_name,
-        c.company_name,
-        c.company_website,
-        c.lead_list_name,
-        c.industry,
-        e.status         AS enrichment_status,
-        e.classification AS enrichment_classification,
-        e.confidence     AS enrichment_confidence,
-        e.reasoning      AS enrichment_reasoning,
-        a.primary_identity,
-        a.characteristic,
-        a.sector,
-        a.canonical_classification,
+        cp.contact_id::TEXT AS contact_id,
+        cp.email,
+        cp.first_name,
+        cp.last_name,
+        cp.company_name,
+        cp.company_website,
+        cp.lead_list_name,
+        cp.industry,
+        cp.enrichment_status,
+        cp.enrichment_classification,
+        cp.enrichment_confidence,
+        cp.enrichment_reasoning,
+        COALESCE(NULLIF(a.primary_identity, ''), m.primary_identity) AS primary_identity,
+        COALESCE(NULLIF(a.characteristic, ''), m.characteristic) AS characteristic,
+        COALESCE(NULLIF(a.sector, ''), m.sector) AS sector,
+        COALESCE(NULLIF(a.canonical_classification, ''), m.canonical_classification) AS canonical_classification,
         a.bucket_name,
-        a.pre_rollup_bucket_name,
+        COALESCE(NULLIF(a.pre_rollup_bucket_name, ''), m.bucket_name) AS pre_rollup_bucket_name,
         a.rollup_level,
-        a.source         AS assignment_source,
-        a.identity_confidence,
-        a.characteristic_confidence,
-        a.sector_confidence,
-        a.confidence     AS assignment_confidence,
-        a.is_disqualified,
-        a.is_generic,
+        COALESCE(NULLIF(a.source, ''), m.source) AS assignment_source,
+        COALESCE(a.identity_confidence, m.identity_confidence) AS identity_confidence,
+        COALESCE(a.characteristic_confidence, m.characteristic_confidence) AS characteristic_confidence,
+        COALESCE(a.sector_confidence, m.sector_confidence) AS sector_confidence,
+        COALESCE(a.confidence, m.confidence) AS assignment_confidence,
+        COALESCE(a.is_disqualified, m.is_disqualified) AS is_disqualified,
+        COALESCE(a.is_generic, m.is_generic) AS is_generic,
         m.llm_reason     AS phase1a_llm_reason,
         a.bucket_reason,
         a.general_reason,
-        a.reasons
-    FROM contacts c
-    LEFT JOIN enrichments e
-           ON e.contact_id = c.contact_id
+        COALESCE(
+            a.reasons,
+            CASE
+                WHEN m.industry_string IS NULL THEN NULL
+                ELSE jsonb_build_object(
+                    'phase1a_source', m.source,
+                    'llm_reason', m.llm_reason
+                )
+            END
+        ) AS reasons
+    FROM contact_page cp
     LEFT JOIN bucket_assignments a
-           ON a.contact_id       = c.contact_id::TEXT
+           ON a.contact_id       = cp.contact_id::TEXT
           AND a.bucketing_run_id = p_run_id
-    -- Phase 1a tag lookup: same join key Phase 1b uses, so the
-    -- llm_reason hits even when contacts.industry diverges from the
-    -- enrichment classification.
     LEFT JOIN bucket_industry_map m
            ON m.bucketing_run_id = p_run_id
-          AND m.industry_string  = COALESCE(NULLIF(TRIM(e.classification), ''), c.industry)
-    WHERE c.lead_list_name = ANY(
-              SELECT UNNEST(list_names) FROM bucketing_runs WHERE id = p_run_id
-          )
-      AND (p_after_id IS NULL OR c.contact_id > p_after_id::UUID)
-    ORDER BY c.contact_id
-    LIMIT p_limit;
+          AND m.industry_string  = cp.industry_key
+    ORDER BY cp.contact_id;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.get_contact_export_page(UUID, TEXT, INTEGER)
