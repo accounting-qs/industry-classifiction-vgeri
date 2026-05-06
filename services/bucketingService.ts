@@ -127,6 +127,26 @@ export interface BucketingCtx {
     abortSignal: AbortSignal;
 }
 
+// Combine a fresh timeout signal with the run's cancel signal so a single
+// AbortSignal can be passed to fetch / Anthropic SDK and trigger on
+// EITHER condition. AbortSignal.any (Node 20.3+) is preferred; fallback
+// hand-combines via a controller for older runtimes.
+function combinedAbortSignal(timeoutMs: number, runSignal?: AbortSignal): AbortSignal {
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    if (!runSignal) return timeoutSignal;
+    if (typeof (AbortSignal as any).any === 'function') {
+        return (AbortSignal as any).any([timeoutSignal, runSignal]);
+    }
+    const ac = new AbortController();
+    const propagate = (sig: AbortSignal) => {
+        if (sig.aborted) { ac.abort((sig as any).reason); return; }
+        sig.addEventListener('abort', () => ac.abort((sig as any).reason), { once: true });
+    };
+    propagate(timeoutSignal);
+    propagate(runSignal);
+    return ac.signal;
+}
+
 export class BucketingCancelledError extends Error {
     constructor() { super('Cancelled by user'); this.name = 'BucketingCancelledError'; }
 }
@@ -1611,7 +1631,7 @@ export async function finalizeTaxonomyAgainstLibrary(
                     max_tokens: 2000,
                     system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
                     messages: [{ role: 'user', content: userPrompt }]
-                }, { timeout: TAXONOMY_TIMEOUT_MS });
+                }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
                 const usage: any = (resp as any).usage || {};
                 totalIn += usage.input_tokens || 0;
                 totalOut += usage.output_tokens || 0;
@@ -1630,7 +1650,7 @@ export async function finalizeTaxonomyAgainstLibrary(
                             { role: 'user', content: userPrompt }
                         ]
                     }),
-                    signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+                    signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal)
                 });
                 if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
                 const json: any = await resp.json();
@@ -2030,7 +2050,7 @@ export async function runBucketAssignment(
                     max_tokens: 2500,
                     system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
                     messages: [{ role: 'user', content: userPrompt }]
-                }, { timeout: TAXONOMY_TIMEOUT_MS });
+                }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
                 const usage: any = (resp as any).usage || {};
                 totalIn += usage.input_tokens || 0;
                 totalOut += usage.output_tokens || 0;
@@ -2049,7 +2069,7 @@ export async function runBucketAssignment(
                             { role: 'user', content: userPrompt }
                         ]
                     }),
-                    signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+                    signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal)
                 });
                 if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
                 const json: any = await resp.json();
@@ -2282,7 +2302,7 @@ async function tagIndustries(
                     max_tokens: 2000,
                     system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
                     messages: [{ role: 'user', content: userPrompt }]
-                }, { timeout: TAXONOMY_TIMEOUT_MS });
+                }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
                 const usage: any = (resp as any).usage || {};
                 totalIn += usage.input_tokens || 0;
                 totalOut += usage.output_tokens || 0;
@@ -2304,7 +2324,7 @@ async function tagIndustries(
                             { role: 'user', content: userPrompt }
                         ]
                     }),
-                    signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+                    signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal)
                 });
                 if (!resp.ok) {
                     const body = await resp.text();
@@ -3052,7 +3072,7 @@ Only include entries where from != to (or where to="" to drop). Be ruthless — 
                     max_tokens: 8000,
                     system: systemPrompt,
                     messages: [{ role: 'user', content: userPrompt }]
-                }, { timeout: TAXONOMY_TIMEOUT_MS });
+                }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
                 const usage: any = (resp as any).usage || {};
                 cost = computeAnthropicCost(model, usage.input_tokens || 0, usage.output_tokens || 0);
                 text = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
@@ -3069,7 +3089,7 @@ Only include entries where from != to (or where to="" to drop). Be ruthless — 
                             { role: 'user', content: userPrompt }
                         ]
                     }),
-                    signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+                    signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal)
                 });
                 if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
                 const json: any = await resp.json();
@@ -3253,7 +3273,7 @@ Only include entries where from != to (or where to is "" to drop). Be aggressive
                 max_tokens: 3000,
                 system: systemPrompt,
                 messages: [{ role: 'user', content: userPrompt }]
-            }, { timeout: TAXONOMY_TIMEOUT_MS });
+            }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
             const usage: any = (resp as any).usage || {};
             costUsd = computeAnthropicCost(model, usage.input_tokens || 0, usage.output_tokens || 0);
             text = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
@@ -3270,7 +3290,7 @@ Only include entries where from != to (or where to is "" to drop). Be aggressive
                         { role: 'user', content: userPrompt }
                     ]
                 }),
-                signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+                signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal)
             });
             if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
             const json: any = await resp.json();
@@ -3405,7 +3425,7 @@ Only include entries where from != to (or where to is "" to drop).`;
                 max_tokens: 3000,
                 system: systemPrompt,
                 messages: [{ role: 'user', content: userPrompt }]
-            }, { timeout: TAXONOMY_TIMEOUT_MS });
+            }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
             const usage: any = (resp as any).usage || {};
             costUsd = computeAnthropicCost(model, usage.input_tokens || 0, usage.output_tokens || 0);
             text = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
@@ -3422,7 +3442,7 @@ Only include entries where from != to (or where to is "" to drop).`;
                         { role: 'user', content: userPrompt }
                     ]
                 }),
-                signal: AbortSignal.timeout(TAXONOMY_TIMEOUT_MS)
+                signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal)
             });
             if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
             const json: any = await resp.json();
