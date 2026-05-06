@@ -1339,6 +1339,12 @@ export async function recalculateTaxonomyWithLibrary(
         updates.push({
             bucketing_run_id: runId,
             industry_string: t.industry,
+            // NOT NULL columns must be present even on update-via-upsert: PG
+            // validates the INSERT path before the ON CONFLICT redirect, so
+            // omitting source / raw_industry / bucket_name throws even when
+            // the row already exists.
+            source: 'llm_phase1a',
+            raw_industry: t.industry,
             primary_identity: t.identity,
             characteristic: t.characteristic,
             sector: t.sector,
@@ -1668,11 +1674,17 @@ export async function finalizeTaxonomyAgainstLibrary(
             // The LLM batch failed for this row — leave the original tag in
             // place but still scrub is_new_* so it disappears from the panel.
             // (Better than nullifying and silently re-routing those contacts
-            // to General just because of a transient API blip.)
+            // to General just because of a transient API blip.) Echo the
+            // original NOT NULL columns through so the upsert's INSERT
+            // pre-validation passes (PG checks NOT NULL before ON CONFLICT
+            // resolution, even when the row already exists).
             failed++;
             updates.push({
                 bucketing_run_id: runId,
                 industry_string: row.industry_string,
+                source: row.source || 'llm_phase1a',
+                raw_industry: row.raw_industry || row.industry_string,
+                bucket_name: row.bucket_name || RESERVED_GENERAL,
                 is_new_identity: false,
                 is_new_characteristic: false,
                 is_new_sector: false
@@ -1710,6 +1722,9 @@ export async function finalizeTaxonomyAgainstLibrary(
         updates.push({
             bucketing_run_id: runId,
             industry_string: row.industry_string,
+            // NOT NULL columns must be present even on update-via-upsert.
+            source: 'llm_phase1a',
+            raw_industry: row.raw_industry || row.industry_string,
             primary_identity: newIdentity,
             characteristic: newCharacteristic,
             sector: newSector,
