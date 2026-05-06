@@ -2673,38 +2673,43 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
 
             const ids = page.map(r => r.contact_id);
 
-            // Hydrate enrichments. Chunk the IN list to stay under the
-            // PostgREST URL-length cap (200 IDs × ~37 chars ≈ 7 KB).
+            // Hydrate enrichments + bucket_assignments. PostgREST URL-length
+            // cap forces 200 IDs/batch (200 × ~37 chars ≈ 7 KB), so a 1000-
+            // contact page needs 5 enrichment + 5 assignment round-trips.
+            // These are independent — fire all 10 in parallel via Promise.all
+            // so the per-page wall-clock is ~max(round-trip) instead of 10×
+            // sequential. Roughly 7× faster for the typical 700 ms / call.
             const enrichmentMap = new Map<string, any>();
-            for (let i = 0; i < ids.length; i += 200) {
-                const slice = ids.slice(i, i + 200);
-                const { data: edata, error: eErr } = await supabase
-                    .from('enrichments')
-                    .select('contact_id,status,classification,confidence,reasoning')
-                    .in('contact_id', slice);
-                if (eErr) throw new Error(`enrichments page ${pageNum} failed: ${eErr.message}`);
-                for (const e of (edata || []) as any[]) enrichmentMap.set(e.contact_id, e);
-            }
-
-            // Hydrate Phase 1b assignments for this page (filtered by run_id).
             const assignmentMap = new Map<string, any>();
+            const hydrateJobs: Promise<void>[] = [];
             for (let i = 0; i < ids.length; i += 200) {
                 const slice = ids.slice(i, i + 200);
-                const { data: adata, error: aErr } = await supabase
-                    .from('bucket_assignments')
-                    .select(
-                        'contact_id,bucket_name,source,confidence,' +
-                        'primary_identity,characteristic,sector,' +
-                        'pre_rollup_bucket_name,rollup_level,' +
-                        'general_reason,reasons,is_generic,is_disqualified,' +
-                        'canonical_classification,bucket_reason,' +
-                        'identity_confidence,characteristic_confidence,sector_confidence'
-                    )
-                    .eq('bucketing_run_id', runId)
-                    .in('contact_id', slice);
-                if (aErr) throw new Error(`bucket_assignments page ${pageNum} failed: ${aErr.message}`);
-                for (const a of (adata || []) as any[]) assignmentMap.set(a.contact_id, a);
+                hydrateJobs.push((async () => {
+                    const { data: edata, error: eErr } = await supabase
+                        .from('enrichments')
+                        .select('contact_id,status,classification,confidence,reasoning')
+                        .in('contact_id', slice);
+                    if (eErr) throw new Error(`enrichments page ${pageNum} failed: ${eErr.message}`);
+                    for (const e of (edata || []) as any[]) enrichmentMap.set(e.contact_id, e);
+                })());
+                hydrateJobs.push((async () => {
+                    const { data: adata, error: aErr } = await supabase
+                        .from('bucket_assignments')
+                        .select(
+                            'contact_id,bucket_name,source,confidence,' +
+                            'primary_identity,characteristic,sector,' +
+                            'pre_rollup_bucket_name,rollup_level,' +
+                            'general_reason,reasons,is_generic,is_disqualified,' +
+                            'canonical_classification,bucket_reason,' +
+                            'identity_confidence,characteristic_confidence,sector_confidence'
+                        )
+                        .eq('bucketing_run_id', runId)
+                        .in('contact_id', slice);
+                    if (aErr) throw new Error(`bucket_assignments page ${pageNum} failed: ${aErr.message}`);
+                    for (const a of (adata || []) as any[]) assignmentMap.set(a.contact_id, a);
+                })());
             }
+            await Promise.all(hydrateJobs);
 
             for (const c of page) {
                 const enr = enrichmentMap.get(c.contact_id) || null;
