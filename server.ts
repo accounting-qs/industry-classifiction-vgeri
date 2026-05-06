@@ -2612,27 +2612,6 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
         totalRows = Number(totalCount || 0);
         await updateCsvJob(jobId, { total_rows: totalRows });
 
-        // Pre-fetch the per-industry Phase 1a taxonomy map (small — one row
-        // per distinct industry, max ~10k). Used only for phase1a_llm_reason
-        // since the rest of the taxonomy is denormalized onto bucket_assignments.
-        const phase1aReasonByIndustry = new Map<string, string>();
-        {
-            const MPAGE = 1000;
-            for (let mOff = 0; mOff < 200_000; mOff += MPAGE) {
-                const { data: mapRows, error: mErr } = await supabase
-                    .from('bucket_industry_map')
-                    .select('industry_string,llm_reason')
-                    .eq('bucketing_run_id', runId)
-                    .range(mOff, mOff + MPAGE - 1);
-                if (mErr) throw new Error(`bucket_industry_map fetch failed at offset ${mOff}: ${mErr.message}`);
-                const rows = (mapRows || []) as any[];
-                for (const r of rows) {
-                    if (r.llm_reason) phase1aReasonByIndustry.set(r.industry_string, r.llm_reason);
-                }
-                if (rows.length < MPAGE) break;
-            }
-        }
-
         // Open gzip-into-file pipeline. Write the header first, then stream
         // page by page. zlib's createGzip is a Transform stream — pipe it
         // into a file write stream so we never hold the full 30 MB in RAM.
@@ -2653,100 +2632,60 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
 
         await writeLine(ASSIGNMENT_CSV_COLUMNS.join(',') + '\n');
 
+        // Single-RPC streaming. The get_contact_export_page RPC
+        // (20260514) joins contacts × enrichments × bucket_assignments ×
+        // bucket_industry_map in SQL and returns one fully-hydrated row
+        // per contact, so each page is ONE round-trip instead of 11.
+        // Keyset paginated via p_after_id; loop exits when a page comes
+        // back smaller than CSV_PAGE_SIZE.
         let cursor: string | null = null;
         let pageNum = 0;
         let lastProgressUpdate = Date.now();
 
         while (true) {
             pageNum++;
-            let cq: any = supabase
-                .from('contacts')
-                .select('contact_id,email,first_name,last_name,company_name,company_website,industry,lead_list_name')
-                .in('lead_list_name', listNames)
-                .order('contact_id', { ascending: true })
-                .range(0, CSV_PAGE_SIZE - 1);
-            if (cursor) cq = cq.gt('contact_id', cursor);
-            const { data: contacts, error: cErr } = await cq;
-            if (cErr) throw new Error(`contacts page ${pageNum} failed at cursor=${cursor}: ${cErr.message}`);
-            const page = (contacts || []) as any[];
+            const { data: pageData, error: pErr } = await supabase
+                .rpc('get_contact_export_page', {
+                    p_run_id:   runId,
+                    p_after_id: cursor,
+                    p_limit:    CSV_PAGE_SIZE
+                });
+            if (pErr) throw new Error(`export page ${pageNum} failed at cursor=${cursor}: ${pErr.message}`);
+            const page = (pageData || []) as any[];
             if (page.length === 0) break;
 
-            const ids = page.map(r => r.contact_id);
-
-            // Hydrate enrichments + bucket_assignments. PostgREST URL-length
-            // cap forces 200 IDs/batch (200 × ~37 chars ≈ 7 KB), so a 1000-
-            // contact page needs 5 enrichment + 5 assignment round-trips.
-            // These are independent — fire all 10 in parallel via Promise.all
-            // so the per-page wall-clock is ~max(round-trip) instead of 10×
-            // sequential. Roughly 7× faster for the typical 700 ms / call.
-            const enrichmentMap = new Map<string, any>();
-            const assignmentMap = new Map<string, any>();
-            const hydrateJobs: Promise<void>[] = [];
-            for (let i = 0; i < ids.length; i += 200) {
-                const slice = ids.slice(i, i + 200);
-                hydrateJobs.push((async () => {
-                    const { data: edata, error: eErr } = await supabase
-                        .from('enrichments')
-                        .select('contact_id,status,classification,confidence,reasoning')
-                        .in('contact_id', slice);
-                    if (eErr) throw new Error(`enrichments page ${pageNum} failed: ${eErr.message}`);
-                    for (const e of (edata || []) as any[]) enrichmentMap.set(e.contact_id, e);
-                })());
-                hydrateJobs.push((async () => {
-                    const { data: adata, error: aErr } = await supabase
-                        .from('bucket_assignments')
-                        .select(
-                            'contact_id,bucket_name,source,confidence,' +
-                            'primary_identity,characteristic,sector,' +
-                            'pre_rollup_bucket_name,rollup_level,' +
-                            'general_reason,reasons,is_generic,is_disqualified,' +
-                            'canonical_classification,bucket_reason,' +
-                            'identity_confidence,characteristic_confidence,sector_confidence'
-                        )
-                        .eq('bucketing_run_id', runId)
-                        .in('contact_id', slice);
-                    if (aErr) throw new Error(`bucket_assignments page ${pageNum} failed: ${aErr.message}`);
-                    for (const a of (adata || []) as any[]) assignmentMap.set(a.contact_id, a);
-                })());
-            }
-            await Promise.all(hydrateJobs);
-
-            for (const c of page) {
-                const enr = enrichmentMap.get(c.contact_id) || null;
-                const asg = assignmentMap.get(c.contact_id) || null;
-                const industryKey = (enr?.classification || c.industry || '').trim();
-                const phase1aReason = industryKey ? (phase1aReasonByIndustry.get(industryKey) || null) : null;
+            for (const r of page) {
                 const row: Record<string, any> = {
-                    contact_id: c.contact_id,
-                    email: c.email,
-                    first_name: c.first_name,
-                    last_name: c.last_name,
-                    company_name: c.company_name,
-                    company_website: c.company_website,
-                    lead_list_name: c.lead_list_name,
-                    industry: c.industry,
-                    enrichment_status: enr?.status || null,
-                    enrichment_classification: enr?.classification || null,
-                    enrichment_confidence: enr?.confidence ?? null,
-                    enrichment_reasoning: enr?.reasoning || null,
-                    primary_identity: asg?.primary_identity || null,
-                    characteristic: asg?.characteristic || null,
-                    sector: asg?.sector || null,
-                    canonical_classification: asg?.canonical_classification || null,
-                    bucket_name: asg?.bucket_name || null,
-                    pre_rollup_bucket_name: asg?.pre_rollup_bucket_name || null,
-                    rollup_level: asg?.rollup_level || null,
-                    assignment_source: asg?.source || null,
-                    identity_confidence: asg?.identity_confidence ?? null,
-                    characteristic_confidence: asg?.characteristic_confidence ?? null,
-                    sector_confidence: asg?.sector_confidence ?? null,
-                    confidence: asg?.confidence ?? null,
-                    is_disqualified: asg?.is_disqualified ?? null,
-                    is_generic: asg?.is_generic ?? null,
-                    phase1a_llm_reason: phase1aReason,
-                    bucket_reason: asg?.bucket_reason || null,
-                    general_reason: asg?.general_reason || null,
-                    reasons: jsonOrEmpty(asg?.reasons),
+                    contact_id:                r.contact_id,
+                    email:                     r.email,
+                    first_name:                r.first_name,
+                    last_name:                 r.last_name,
+                    company_name:              r.company_name,
+                    company_website:           r.company_website,
+                    lead_list_name:            r.lead_list_name,
+                    industry:                  r.industry,
+                    enrichment_status:         r.enrichment_status,
+                    enrichment_classification: r.enrichment_classification,
+                    enrichment_confidence:     r.enrichment_confidence,
+                    enrichment_reasoning:      r.enrichment_reasoning,
+                    primary_identity:          r.primary_identity,
+                    characteristic:            r.characteristic,
+                    sector:                    r.sector,
+                    canonical_classification:  r.canonical_classification,
+                    bucket_name:               r.bucket_name,
+                    pre_rollup_bucket_name:    r.pre_rollup_bucket_name,
+                    rollup_level:              r.rollup_level,
+                    assignment_source:         r.assignment_source,
+                    identity_confidence:       r.identity_confidence,
+                    characteristic_confidence: r.characteristic_confidence,
+                    sector_confidence:         r.sector_confidence,
+                    confidence:                r.assignment_confidence,
+                    is_disqualified:           r.is_disqualified,
+                    is_generic:                r.is_generic,
+                    phase1a_llm_reason:        r.phase1a_llm_reason,
+                    bucket_reason:             r.bucket_reason,
+                    general_reason:            r.general_reason,
+                    reasons:                   jsonOrEmpty(r.reasons),
                 };
                 await writeLine(ASSIGNMENT_CSV_COLUMNS.map(col => csvEscape(row[col])).join(',') + '\n');
                 rowsWritten++;
