@@ -1132,7 +1132,6 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
       <Phase1aProposedTagsPanel
         runId={run.id}
         onError={onError}
-        onAfterAcceptBatch={triggerRecalc}
         recalcing={recalcing}
         onFinalize={triggerFinalize}
         finalizing={finalizing}
@@ -2433,14 +2432,9 @@ function StatCard({ label, value, color }: { label: string; value: string; color
 
 type TaxKind = 'identities' | 'characteristics' | 'sectors';
 
-function Phase1aProposedTagsPanel({ runId, onError, onAfterAcceptBatch, recalcing, onFinalize, finalizing, lastFinalize }: {
+function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, finalizing, lastFinalize }: {
   runId: string;
   onError: (m: string | null) => void;
-  // Fires after each Accept-all / Apply-selected batch finishes. The
-  // parent (BucketingReview) uses it to trigger recalculateTaxonomyWith
-  // Library and refresh the Discovered Characteristics counts. Optional
-  // because the panel is also reused without recalc semantics.
-  onAfterAcceptBatch?: () => Promise<void> | void;
   // Surfaced to disable batch buttons while a parent-driven recalc is
   // in progress, so the user can't queue a second recalc on top.
   recalcing?: boolean;
@@ -2536,13 +2530,10 @@ function Phase1aProposedTagsPanel({ runId, onError, onAfterAcceptBatch, recalcin
     if (firstError) onError(`Some ${kind} couldn't be added: ${firstError}`);
     setSelected(prev => ({ ...prev, [kind]: new Set() }));
     await refresh();
-    // Auto-recalc after every batch — refreshes is_new flags + may
-    // merge other proposed-new entries into the just-accepted ones.
-    // The parent re-fetches bucketCounts so the Discovered
-    // Characteristics panel shows the new shape.
-    if (onAfterAcceptBatch) {
-      try { await onAfterAcceptBatch(); } catch { /* parent surfaces the error */ }
-    }
+    // No auto-recalc here — the user runs that explicitly via the
+    // Finalize button (or the manual Recalculate next to the Discovered
+    // Characteristics header). Auto-firing on every batch was burning
+    // LLM tokens for partial accepts.
   };
 
   const acceptAll = (kind: TaxKind) => proposed && applyBatch(kind, proposed[kind]);
