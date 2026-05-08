@@ -13,7 +13,8 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Layers, Loader2, AlertCircle, ArrowLeft, Plus, X, Trash2, Download,
-  Play, BookMarked, CheckCircle2, Edit3, Archive, Upload, Square, RotateCcw
+  Play, BookMarked, CheckCircle2, Edit3, Archive, Upload, Square, RotateCcw,
+  ChevronDown, ChevronRight
 } from 'lucide-react';
 import Papa from 'papaparse';
 import type { BucketingRun, BucketProposal, LibraryBucket } from './types';
@@ -882,6 +883,26 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
   const [recalcing, setRecalcing] = useState(false);
   const [lastRecalc, setLastRecalc] = useState<{ at: Date; merges: number } | null>(null);
 
+  // Collapse state for the two big "Discovered ..." panels — stored in
+  // localStorage so the preference survives page reloads. Default open
+  // (the panels are the main thing the user looks at on this screen).
+  const [discoveredBucketsOpen, setDiscoveredBucketsOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem('bucketing.discoveredBucketsOpen') !== '0'; }
+    catch { return true; }
+  });
+  const [discoveredSubIdentitiesOpen, setDiscoveredSubIdentitiesOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem('bucketing.discoveredSubIdentitiesOpen') !== '0'; }
+    catch { return true; }
+  });
+  const toggleDiscoveredBuckets = () => setDiscoveredBucketsOpen(v => {
+    try { localStorage.setItem('bucketing.discoveredBucketsOpen', v ? '0' : '1'); } catch {}
+    return !v;
+  });
+  const toggleDiscoveredSubIdentities = () => setDiscoveredSubIdentitiesOpen(v => {
+    try { localStorage.setItem('bucketing.discoveredSubIdentitiesOpen', v ? '0' : '1'); } catch {}
+    return !v;
+  });
+
   const triggerRecalc = useCallback(async () => {
     setRecalcing(true);
     onError(null);
@@ -1257,12 +1278,24 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
         return (
           <div className="border border-[#3ecf8e]/30 rounded-xl bg-[#0e0e0e]">
             <div className="px-4 py-3 border-b border-[#3ecf8e]/20 text-[10px] font-bold text-[#3ecf8e] uppercase tracking-widest flex items-center justify-between gap-3 flex-wrap">
-              <span>Discovered buckets (after assignment, grouped by primary identity)</span>
+              <button
+                type="button"
+                onClick={toggleDiscoveredBuckets}
+                className="flex items-center gap-2 hover:text-[#3ecf8e]/70 transition-colors text-left"
+                aria-expanded={discoveredBucketsOpen}
+              >
+                {discoveredBucketsOpen
+                  ? <ChevronDown className="w-3 h-3" />
+                  : <ChevronRight className="w-3 h-3" />}
+                <span>Discovered buckets (after assignment, grouped by primary identity)</span>
+              </button>
               <span className="text-gray-600 normal-case tracking-normal font-normal">
-                Min_volume gates these; small buckets roll up to identity → General.
+                {discoveredBucketsOpen
+                  ? 'Min_volume gates these; small buckets roll up to identity → General.'
+                  : `${byIdentity.size.toLocaleString()} ${byIdentity.size === 1 ? 'identity' : 'identities'} · click to expand`}
               </span>
             </div>
-            <div className="divide-y divide-[#2e2e2e]">
+            {discoveredBucketsOpen && <div className="divide-y divide-[#2e2e2e]">
               {Array.from(byIdentity.entries()).map(([ident, items]) => {
                 const total = items.reduce((s, b) => s + Number(b.contact_count || 0), 0);
                 return (
@@ -1298,14 +1331,24 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
                   </div>
                 );
               })}
-            </div>
+            </div>}
           </div>
         );
       })()}
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
         <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between gap-3 flex-wrap">
-          <span>Discovered sub-identities (grouped by primary identity)</span>
+          <button
+            type="button"
+            onClick={toggleDiscoveredSubIdentities}
+            className="flex items-center gap-2 hover:text-gray-300 transition-colors"
+            aria-expanded={discoveredSubIdentitiesOpen}
+          >
+            {discoveredSubIdentitiesOpen
+              ? <ChevronDown className="w-3 h-3" />
+              : <ChevronRight className="w-3 h-3" />}
+            <span>Discovered sub-identities (grouped by primary identity)</span>
+          </button>
           <div className="flex items-center gap-3">
             {lastRecalc && (
               <span className="text-[10px] text-gray-500 normal-case tracking-normal font-normal">
@@ -1323,19 +1366,23 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
             </button>
           </div>
         </div>
-        <div className="px-4 py-2 border-b border-[#2e2e2e] text-[10px] text-gray-600 normal-case tracking-normal">
-          Phase 1b counts decide the campaign bucket: combo → sub-identity → identity → General.
-        </div>
-        <BucketChainList
-          buckets={sourceBuckets}
-          identities={primaryIdentities}
-          kept={kept}
-          renames={renames}
-          countByBucket={new Map(bucketCounts.map(c => [c.bucket_name, Number(c.contact_count) || 0]))}
-          minVolume={minVolume}
-          onToggle={toggle}
-          onRename={(oldName, val) => setRenames({ ...renames, [oldName]: val })}
-        />
+        {discoveredSubIdentitiesOpen && (
+          <>
+            <div className="px-4 py-2 border-b border-[#2e2e2e] text-[10px] text-gray-600 normal-case tracking-normal">
+              Phase 1b counts decide the campaign bucket: combo → sub-identity → identity → General.
+            </div>
+            <BucketChainList
+              buckets={sourceBuckets}
+              identities={primaryIdentities}
+              kept={kept}
+              renames={renames}
+              countByBucket={new Map(bucketCounts.map(c => [c.bucket_name, Number(c.contact_count) || 0]))}
+              minVolume={minVolume}
+              onToggle={toggle}
+              onRename={(oldName, val) => setRenames({ ...renames, [oldName]: val })}
+            />
+          </>
+        )}
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
