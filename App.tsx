@@ -166,7 +166,7 @@ export default function App() {
   const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
   const [activeListFilter, setActiveListFilter] = useState<string | null>(null);
   const [contactsLoading, setContactsLoading] = useState(false);
-  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[]>([]);
+  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; bucketing_run_count?: number }[]>([]);
   const [listStatsSource, setListStatsSource] = useState<'rpc' | 'fallback'>('rpc');
   const [importListsLoading, setImportListsLoading] = useState(true);
   const [showListModal, setShowListModal] = useState(false);
@@ -961,7 +961,7 @@ function ImportedListsTable({
   onGoToImport,
   showAllListsRow = true,
 }: {
-  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[];
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; bucketing_run_count?: number }[];
   loading: boolean;
   statsSource: 'rpc' | 'fallback';
   activeListFilter: string | null;
@@ -1175,7 +1175,17 @@ function ImportedListsTable({
                         {l.name} <span className="text-[10px] text-red-400/70 font-normal">— delete failed: {deleteJob!.error || 'unknown error'}</span>
                       </span>
                     ) : (
-                      l.name
+                      <span className="inline-flex items-center gap-1.5">
+                        <span>{l.name}</span>
+                        {l.bucketed && (
+                          <span
+                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-[#3ecf8e]/15 text-[#3ecf8e] border border-[#3ecf8e]/30"
+                            title={`Used in ${l.bucketing_run_count || 1} bucketing run${(l.bucketing_run_count || 1) === 1 ? '' : 's'} — bucketed=${l.bucketing_run_count || 1}`}
+                          >
+                            <Layers className="w-2.5 h-2.5" /> Bucketed
+                          </span>
+                        )}
+                      </span>
                     )}
                   </td>
                   <td className="px-5 py-2.5 text-gray-400 text-right font-mono">{l.contact_count.toLocaleString()}</td>
@@ -1315,7 +1325,7 @@ function ListSelectorModal({
   onClearDeleteJob,
   onGoToImport,
 }: {
-  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[];
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; bucketing_run_count?: number }[];
   loading: boolean;
   statsSource: 'rpc' | 'fallback';
   activeListFilter: string | null;

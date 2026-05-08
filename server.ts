@@ -1043,13 +1043,39 @@ app.get('/api/import-lists', async (_req, res) => {
             }));
         }
 
+        // Per-list "has been used in a bucketing run" flag. Single SELECT
+        // over bucketing_runs.list_names + an in-memory Set lookup keeps
+        // this O(lists + runs) — far cheaper than a per-list query, and
+        // it auto-clears when a run is deleted (the next page load just
+        // doesn't see that row). We track count too so the UI can show
+        // "1 run" vs "3 runs" if the user wants that later.
+        const bucketedCountByList = new Map<string, number>();
+        try {
+            const { data: runRows } = await supabase
+                .from('bucketing_runs')
+                .select('list_names');
+            for (const row of (runRows || []) as { list_names: string[] | null }[]) {
+                for (const name of (row.list_names || [])) {
+                    bucketedCountByList.set(name, (bucketedCountByList.get(name) || 0) + 1);
+                }
+            }
+        } catch (err: any) {
+            // Soft-fail: if the bucketing_runs query errors (e.g. RLS
+            // hiccup), fall through with no flags rather than 500-ing
+            // the whole list page.
+            console.warn(`[import-lists] bucketed-flag query failed: ${err.message}`);
+        }
+
         const withCounts = lists.map((l: any) => {
             const s = statsByList.get(l.name) || { completed: 0, failed: 0, total: l.contact_count || 0 };
+            const bucketingRunCount = bucketedCountByList.get(l.name) || 0;
             return {
                 ...l,
                 enriched_count: s.completed,
                 failed_count: s.failed,
                 contact_count: s.total || l.contact_count || 0,
+                bucketed: bucketingRunCount > 0,
+                bucketing_run_count: bucketingRunCount,
             };
         });
         // Object response so we can send metadata (stats_source) alongside
