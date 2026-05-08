@@ -2649,7 +2649,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   };
 
   if (!proposed) return null;
-  const total = proposed.identities.length + proposed.sub_identitys.length + proposed.sectors.length;
+  const total = proposed.identities.length + proposed.sub_identities.length + proposed.sectors.length;
   if (total === 0) return null;
 
   return (
