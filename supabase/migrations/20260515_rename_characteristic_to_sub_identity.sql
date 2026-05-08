@@ -329,8 +329,15 @@ GRANT EXECUTE ON FUNCTION public.get_assigned_bucket_counts(UUID)
 --     columns. Returned column "sub_identity" replaces "characteristic"
 --     and "sub_identity_confidence" replaces "characteristic_confidence".
 --     Other behavior identical to the version in 20260514.
+--
+--     Postgres rejects CREATE OR REPLACE when a function's OUT parameter
+--     list changes (renamed columns count as a change), with the error
+--     "cannot change return type of existing function — Use DROP
+--     FUNCTION first." DROP-IF-EXISTS keeps the migration idempotent.
 
-CREATE OR REPLACE FUNCTION public.get_contact_export_page(
+DROP FUNCTION IF EXISTS public.get_contact_export_page(UUID, TEXT, INTEGER);
+
+CREATE FUNCTION public.get_contact_export_page(
     p_run_id   UUID,
     p_after_id TEXT    DEFAULT NULL,
     p_limit    INTEGER DEFAULT 1000
