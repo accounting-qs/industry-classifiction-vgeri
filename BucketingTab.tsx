@@ -1,13 +1,13 @@
 /**
- * Bucketing UI v5 — 3-layer model (identity → characteristic → sector) → campaign bucket.
+ * Bucketing UI v5 — 3-layer model (identity → sub-identity → sector) → campaign bucket.
  *
  * Five views:
  *   - Index    : past runs + library shortcut
  *   - Setup    : pick lists, name, min_volume, bucket_budget, optional library
- *   - Review   : Phase 1a proposal — observed patterns + characteristics grouped
+ *   - Review   : Phase 1a proposal — observed patterns + sub-identities grouped
  *                under primary identities, keep/drop/rename/add, threshold preview
  *   - Results  : Phase 1b assignments rolled up to campaign buckets, save-to-library
- *   - Library  : CRUD for reusable characteristics across runs
+ *   - Library  : CRUD for reusable sub-identities across runs
  */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
@@ -30,8 +30,8 @@ const RESERVED_NAMES = new Set(['general', 'generic', 'disqualified', 'other']);
 const TAXONOMY_LAYER_HELP = {
   identities:
     'IDENTITY (Layer 1) — what kind of company this IS at its core. The top-level business model. Examples: Agency, Consulting & Advisory, Software & SaaS, Manufacturing & Industrial, Real Estate, Healthcare Operator, Financial Services. Aim for ~10–15 in a typical run.',
-  characteristics:
-    'CHARACTERISTIC (Layer 2) — the specific functional sub-type within the identity. Narrows what kind of {identity} the company is. Examples: under Agency → "SEO Agency" / "Performance Marketing Agency"; under Software & SaaS → "FinTech SaaS" / "Vertical SaaS"; under Financial Services → "Private Equity Firm" / "Wealth Management". ~3–8 per identity.',
+  sub_identities:
+    'SUB-IDENTITY (Layer 2) — the specific functional sub-type within the identity. Narrows what kind of {identity} the company is. Examples: under Agency → "SEO Agency" / "Performance Marketing Agency"; under Software & SaaS → "FinTech SaaS" / "Vertical SaaS"; under Financial Services → "Private Equity Firm" / "Wealth Management". ~3–8 per identity.',
   sectors:
     'SECTOR (Layer 3) — the vertical the company SERVES, if explicitly stated. Independent of identity — a "Marketing Agency for Healthcare" has identity=Agency + sector=Healthcare (not identity=Healthcare). Often blank. Examples: Healthcare, Real Estate, Government, Energy & Utilities, Financial Services.'
 } as const;
@@ -242,7 +242,7 @@ export function BucketingTab({ importLists }: {
               <Layers className="w-5 h-5 text-[#3ecf8e]" /> Bucketing
             </h2>
             <p className="text-xs text-gray-500 mt-1">
-              Phase 1a discovers identities + characteristics. Phase 1b matches every contact (identity + characteristic + sector). Volume rollup combines into campaign buckets within your bucket budget.
+              Phase 1a discovers identities + sub-identities. Phase 1b matches every contact (identity + sub-identity + sector). Volume rollup combines into campaign buckets within your bucket budget.
             </p>
           </div>
           <div className="flex gap-2">
@@ -556,7 +556,7 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-3 text-[11px] text-gray-400">
-        <span className="text-gray-300 font-bold">Bucket sizing &amp; library reuse</span> are set on the next screen, after Phase 1a proposes a taxonomy — that way you size against the actual characteristics the tagger found.
+        <span className="text-gray-300 font-bold">Bucket sizing &amp; library reuse</span> are set on the next screen, after Phase 1a proposes a taxonomy — that way you size against the actual sub-identities the tagger found.
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-3">
@@ -877,7 +877,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
   // passes so STILL-proposed-new entries can merge INTO newly-accepted
   // library entries. Auto-fires after each Accept-all / Apply-selected
   // batch in Phase1aProposedTagsPanel; also exposed as a manual button
-  // next to the Discovered Characteristics header (covers the case where
+  // next to the Discovered Sub-Identities header (covers the case where
   // the user edited the library outside this run).
   const [recalcing, setRecalcing] = useState(false);
   const [lastRecalc, setLastRecalc] = useState<{ at: Date; merges: number } | null>(null);
@@ -889,7 +889,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
       const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/recalculate`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `Recalc failed (${res.status})`);
-      const totalMerges = (data.identityMerges || 0) + (data.characteristicMerges || 0) + (data.sectorMerges || 0);
+      const totalMerges = (data.identityMerges || 0) + (data.sub_identityMerges || 0) + (data.sectorMerges || 0);
       setLastRecalc({ at: new Date(), merges: totalMerges });
       onRefresh();
     } catch (e: any) {
@@ -1016,7 +1016,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
       const res = await fetch('/api/bucketing/library', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ characteristic: name, primary_identity: parent })
+        body: JSON.stringify({ sub_identity: name, primary_identity: parent })
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -1058,9 +1058,9 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
   const sourceBuckets = run.taxonomy_final?.buckets || run.taxonomy_proposal?.buckets || [];
   const primaryIdentities = (run.taxonomy_final?.primary_identities || run.taxonomy_proposal?.primary_identities) || [];
   const observedPatterns = (run.taxonomy_final?.observed_patterns || run.taxonomy_proposal?.observed_patterns) || [];
-  const [kept, setKept] = useState<Set<string>>(new Set(sourceBuckets.map(b => b.characteristic)));
+  const [kept, setKept] = useState<Set<string>>(new Set(sourceBuckets.map(b => b.sub_identity)));
   const [renames, setRenames] = useState<Record<string, string>>({});
-  const [adds, setAdds] = useState<{ characteristic: string; primary_identity: string; description: string }[]>([]);
+  const [adds, setAdds] = useState<{ sub_identity: string; primary_identity: string; description: string }[]>([]);
   const [newSpec, setNewSpec] = useState('');
   const [newDesc, setNewDesc] = useState('');
   const [newIdentity, setNewIdentity] = useState('');
@@ -1147,7 +1147,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
     <div className="space-y-4">
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
         <div className="text-xs text-gray-300">
-          <span className="font-bold text-white">{primaryIdentities.length}</span> primary identities · <span className="font-bold text-white">{sourceBuckets.length}</span> characteristics · <span className="font-bold text-white">{run.total_contacts?.toLocaleString() || '?'}</span> contacts
+          <span className="font-bold text-white">{primaryIdentities.length}</span> primary identities · <span className="font-bold text-white">{sourceBuckets.length}</span> sub-identities · <span className="font-bold text-white">{run.total_contacts?.toLocaleString() || '?'}</span> contacts
           {run.taxonomy_model && <span className="text-gray-500"> · model: {run.taxonomy_model}</span>}
         </div>
         {observedPatterns.length > 0 && (
@@ -1305,7 +1305,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
         <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between gap-3 flex-wrap">
-          <span>Discovered characteristics (grouped by primary identity)</span>
+          <span>Discovered sub-identities (grouped by primary identity)</span>
           <div className="flex items-center gap-3">
             {lastRecalc && (
               <span className="text-[10px] text-gray-500 normal-case tracking-normal font-normal">
@@ -1324,7 +1324,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
           </div>
         </div>
         <div className="px-4 py-2 border-b border-[#2e2e2e] text-[10px] text-gray-600 normal-case tracking-normal">
-          Phase 1b counts decide the campaign bucket: combo → characteristic → identity → General.
+          Phase 1b counts decide the campaign bucket: combo → sub-identity → identity → General.
         </div>
         <BucketChainList
           buckets={sourceBuckets}
@@ -1339,9 +1339,9 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
-        <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-3">Add custom characteristic</div>
+        <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-3">Add custom sub-identity</div>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-          <input value={newSpec} onChange={e => setNewSpec(e.target.value)} placeholder="Characteristic (Layer 2)"
+          <input value={newSpec} onChange={e => setNewSpec(e.target.value)} placeholder="Sub-Identity (Layer 2)"
             className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white placeholder-gray-600 focus:outline-none focus:border-[#3ecf8e]" />
           <select value={newIdentity} onChange={e => setNewIdentity(e.target.value)}
             className="px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]">
@@ -1355,7 +1355,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
           onClick={() => {
             if (!newSpec.trim() || !newIdentity.trim()) return;
             setAdds([...adds, {
-              characteristic: newSpec.trim(),
+              sub_identity: newSpec.trim(),
               primary_identity: newIdentity.trim(),
               description: newDesc.trim()
             }]);
@@ -1369,7 +1369,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
           <div className="mt-3 space-y-1">
             {adds.map((a, i) => (
               <div key={i} className="flex items-center justify-between px-3 py-1.5 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-gray-300">
-                <span><span className="font-bold text-white">{a.characteristic}</span> · under {a.primary_identity} — {a.description}</span>
+                <span><span className="font-bold text-white">{a.sub_identity}</span> · under {a.primary_identity} — {a.description}</span>
                 <button onClick={() => setAdds(adds.filter((_, j) => j !== i))} className="text-gray-500 hover:text-red-400">
                   <X className="w-3 h-3" />
                 </button>
@@ -1426,7 +1426,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
                     <input type="checkbox" checked={isSel} onChange={() => {}} className="w-3 h-3 mt-0.5" />
                     <span className="min-w-0">
                       <span className={`font-medium block ${isSel ? 'text-[#3ecf8e]' : 'text-gray-200'}`}>
-                        {b.characteristic || b.bucket_name}
+                        {b.bucket_name}
                       </span>
                       <span className="text-[10px] text-gray-500 truncate block">
                         under {b.primary_identity || b.direct_ancestor || '—'} · used {b.times_used}×
@@ -1450,7 +1450,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
             onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
             className="w-28 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
           />
-          <p className="text-[10px] text-gray-500 italic mt-1">Combos below this fall to characteristic; characteristics below to identity; identities below to General.</p>
+          <p className="text-[10px] text-gray-500 italic mt-1">Combos below this fall to sub-identity; sub-identities below to identity; identities below to General.</p>
           {(run.total_contacts || 0) > 30000 && (
             <p className="text-[10px] text-amber-400 italic mt-1">
               ↑ For lists this size ({(run.total_contacts || 0).toLocaleString()} contacts), try min_volume = 250–500 to keep buckets meaningful and avoid 100+ small specs.
@@ -1519,9 +1519,9 @@ function BucketChainList({
   onToggle: (name: string) => void;
   onRename: (oldName: string, val: string) => void;
 }) {
-  const displayName = (b: BucketProposal) => renames[b.characteristic] ?? b.characteristic;
+  const displayName = (b: BucketProposal) => renames[b.sub_identity] ?? b.sub_identity;
   const baseCountFor = (b: BucketProposal) =>
-    countByBucket.get(displayName(b)) ?? countByBucket.get(b.characteristic) ?? 0;
+    countByBucket.get(displayName(b)) ?? countByBucket.get(b.sub_identity) ?? 0;
 
   // Group specializations by primary_identity. Use the order of `identities`
   // when available, then any leftover identities in the proposal.
@@ -1541,7 +1541,7 @@ function BucketChainList({
       {orderedIdents.map(identName => {
         const specs = byIdent.get(identName) || [];
         const meta = identities.find(p => p.name === identName);
-        const identCount = specs.reduce((s, l) => s + (kept.has(l.characteristic) ? baseCountFor(l) : 0), 0);
+        const identCount = specs.reduce((s, l) => s + (kept.has(l.sub_identity) ? baseCountFor(l) : 0), 0);
         return (
           <div key={identName} className="py-3">
             <div className="px-4 pb-2 flex items-center gap-2 flex-wrap">
@@ -1555,19 +1555,19 @@ function BucketChainList({
             </div>
             <div className="pl-4 border-l-2 border-[#2e2e2e] ml-4 divide-y divide-[#2e2e2e]/40">
               {specs.map(b => {
-                const isKept = kept.has(b.characteristic);
+                const isKept = kept.has(b.sub_identity);
                 const count = baseCountFor(b);
                 const willRollUp = isKept && count > 0 && count < minVolume;
                 return (
-                  <div key={b.characteristic} className={`py-2 pl-4 pr-3 ${isKept ? '' : 'opacity-50'}`}>
+                  <div key={b.sub_identity} className={`py-2 pl-4 pr-3 ${isKept ? '' : 'opacity-50'}`}>
                     <div className="flex items-start gap-2">
-                      <input type="checkbox" checked={isKept} onChange={() => onToggle(b.characteristic)} className="mt-1.5 w-3.5 h-3.5 shrink-0" />
+                      <input type="checkbox" checked={isKept} onChange={() => onToggle(b.sub_identity)} className="mt-1.5 w-3.5 h-3.5 shrink-0" />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 mb-1 flex-wrap">
-                          <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 shrink-0">↳ Characteristic</span>
+                          <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 shrink-0">↳ Sub-Identity</span>
                           <input
                             value={displayName(b)}
-                            onChange={e => onRename(b.characteristic, e.target.value)}
+                            onChange={e => onRename(b.sub_identity, e.target.value)}
                             className="flex-1 min-w-[300px] bg-[#1c1c1c] border border-[#2e2e2e] rounded px-3 py-1.5 text-sm font-bold text-white focus:outline-none focus:border-[#3ecf8e]"
                           />
                           {b.library_match_id && (
@@ -1692,7 +1692,7 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
 
   const bucketsInRun = (run.taxonomy_final?.buckets || run.taxonomy_proposal?.buckets || []) as BucketProposal[];
   const identityNames = new Set(((run.taxonomy_final?.primary_identities || run.taxonomy_proposal?.primary_identities) || []).map(p => p.name));
-  const specNames = new Set(bucketsInRun.map(b => b.characteristic));
+  const specNames = new Set(bucketsInRun.map(b => b.sub_identity));
 
   const toggleLibSel = (name: string) => {
     const s = new Set(librarySelection);
@@ -1726,7 +1726,7 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
         classification_text: r.contacts?.industry,
         // 3-layer truth schema (v5)
         primary_identity: r.primary_identity || r.bucket_ancestor || '',
-        characteristic: r.characteristic || r.bucket_leaf || '',
+        sub_identity: r.sub_identity || r.bucket_leaf || '',
         sector: r.sector || '',
         canonical_classification: r.canonical_classification || '',
         // Routing decision
@@ -1740,7 +1740,7 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
         disqualified: r.is_disqualified,
         confidence_score: r.confidence,
         identity_confidence: r.identity_confidence,
-        characteristic_confidence: r.characteristic_confidence,
+        sub_identity_confidence: r.sub_identity_confidence,
         sector_confidence: r.sector_confidence,
         source: r.source,
       }));
@@ -1849,7 +1849,7 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
         <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
           <div className="flex items-center justify-between mb-3">
             <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">
-              Save proven characteristics to library ({librarySelection.size} selected)
+              Save proven sub-identities to library ({librarySelection.size} selected)
             </span>
             <button
               onClick={saveSelectedToLibrary}
@@ -1862,15 +1862,15 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
           </div>
           <div className="flex flex-wrap gap-1.5">
             {bucketsInRun.map(b => {
-              const sel = librarySelection.has(b.characteristic);
+              const sel = librarySelection.has(b.sub_identity);
               return (
                 <button
-                  key={b.characteristic}
-                  onClick={() => toggleLibSel(b.characteristic)}
+                  key={b.sub_identity}
+                  onClick={() => toggleLibSel(b.sub_identity)}
                   className={`px-2 py-1 rounded text-[10px] font-bold border transition-colors ${sel ? 'bg-[#3ecf8e]/15 text-[#3ecf8e] border-[#3ecf8e]/40' : 'bg-[#1c1c1c] text-gray-300 border-[#2e2e2e] hover:border-gray-500'}`}
                   title={`under ${b.primary_identity}`}
                 >
-                  {b.characteristic}
+                  {b.sub_identity}
                 </button>
               );
             })}
@@ -1886,7 +1886,7 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
               Full CSV export (all contacts × bucket assignments)
             </div>
             <div className="text-[11px] text-gray-400">
-              Streams every contact with its enrichment, taxonomy (identity / characteristic / sector), final bucket, and bucketing reasoning. Built async + gzipped — link expires after 24 hours.
+              Streams every contact with its enrichment, taxonomy (identity / sub-identity / sector), final bucket, and bucketing reasoning. Built async + gzipped — link expires after 24 hours.
             </div>
           </div>
           {(!csvJob || csvJob.status === 'failed' || csvJob.status === 'ready') && (
@@ -1964,13 +1964,13 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
             const barWidth = max > 0 ? (count / max) * 100 : 0;
             const name: string = b.bucket_name;
             const isGeneral = RESERVED_NAMES.has(name.toLowerCase());
-            // Bucket level: combo (sector + characteristic) > characteristic > identity > general
+            // Bucket level: combo (sector + sub-identity) > sub-identity > identity > general
             const isSpec = !isGeneral && specNames.has(name);
             const isIdentity = !isGeneral && identityNames.has(name) && !isSpec;
             const isCombo = !isSpec && !isIdentity && !isGeneral
                 && Array.from(specNames).some(s => name.endsWith(' ' + s));
-            const levelLabel = isCombo ? 'sector × characteristic'
-                : isSpec ? 'characteristic'
+            const levelLabel = isCombo ? 'sector × sub-identity'
+                : isSpec ? 'sub_identity'
                 : isIdentity ? 'identity (rolled up)'
                 : isGeneral ? 'general (catch-all)'
                 : 'rolled up';
@@ -2215,7 +2215,7 @@ function BucketingLibrary({ library, onRefresh, onError }: {
                     title={allSelected ? 'Clear all' : 'Select all'}
                   />
                 </th>
-                <th className="px-5 py-3 text-left">Characteristic</th>
+                <th className="px-5 py-3 text-left">Sub-Identity</th>
                 <th className="px-5 py-3 text-left">Primary identity</th>
                 <th className="px-5 py-3 text-right">Used</th>
                 <th className="px-5 py-3 text-right">Last used</th>
@@ -2234,7 +2234,7 @@ function BucketingLibrary({ library, onRefresh, onError }: {
                     />
                   </td>
                   <td className="px-5 py-3">
-                    <div className="font-bold text-white">{b.characteristic || b.bucket_name}</div>
+                    <div className="font-bold text-white">{b.bucket_name}</div>
                     {b.description && <div className="text-[10px] text-gray-500 truncate max-w-md">{b.description}</div>}
                   </td>
                   <td className="px-5 py-3 text-gray-300">{b.primary_identity || b.direct_ancestor || '—'}</td>
@@ -2271,7 +2271,7 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
   onSaved: () => void;
   onError: (msg: string | null) => void;
 }) {
-  const [spec, setSpec] = useState(existing?.characteristic || existing?.bucket_name || '');
+  const [spec, setSpec] = useState(existing?.bucket_name || '');
   const [identity, setIdentity] = useState(existing?.primary_identity || existing?.direct_ancestor || '');
   const [desc, setDesc] = useState(existing?.description || '');
   const [include, setInclude] = useState((existing?.include_terms || []).join(', '));
@@ -2280,7 +2280,7 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
   const [busy, setBusy] = useState(false);
   const [nameError, setNameError] = useState<string | null>(null);
 
-  const originalName = existing?.characteristic || existing?.bucket_name || '';
+  const originalName = existing?.bucket_name || '';
 
   const save = async () => {
     if (!spec.trim()) return;
@@ -2310,7 +2310,7 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
         }
       }
       const payload = {
-        characteristic: trimmedName,
+        bucket_name: trimmedName,
         primary_identity: identity.trim(),
         description: desc.trim(),
         include_terms: include.split(',').map(s => s.trim()).filter(Boolean),
@@ -2339,7 +2339,7 @@ function LibraryBucketEditor({ existing, onCancel, onSaved, onError }: {
       <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{existing ? 'Edit' : 'New'} library bucket</div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
         <div>
-          <input value={spec} onChange={e => { setSpec(e.target.value); if (nameError) setNameError(null); }} placeholder="Characteristic (Layer 2, unique)"
+          <input value={spec} onChange={e => { setSpec(e.target.value); if (nameError) setNameError(null); }} placeholder="Sub-Identity (Layer 2, unique)"
             className={`w-full px-3 py-2 bg-[#1c1c1c] border rounded text-xs text-white placeholder-gray-600 focus:outline-none ${nameError ? 'border-red-500/60 focus:border-red-500' : 'border-[#2e2e2e] focus:border-[#3ecf8e]'}`} />
           {nameError && <div className="text-[10px] text-red-300 mt-1">{nameError}</div>}
         </div>
@@ -2466,7 +2466,7 @@ function StatCard({ label, value, color }: { label: string; value: string; color
 
 // ───── Phase 1a: AI-proposed tag review panel ─────────────────────
 
-type TaxKind = 'identities' | 'characteristics' | 'sectors';
+type TaxKind = 'identities' | 'sub_identities' | 'sectors';
 
 function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, finalizing, finalizeProgress, lastFinalize }: {
   runId: string;
@@ -2484,14 +2484,14 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   finalizeProgress?: { current: number; total: number; note?: string } | null;
   lastFinalize?: { at: Date; rerouted: number; nullified: number; failed: number } | null;
 }) {
-  const [proposed, setProposed] = useState<{ identities: any[]; characteristics: any[]; sectors: any[] } | null>(null);
+  const [proposed, setProposed] = useState<{ identities: any[]; sub_identities: any[]; sectors: any[] } | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [busyAllKind, setBusyAllKind] = useState<string | null>(null);
   const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
   // Per-kind selection sets — drives the "Apply selected (N)" buttons.
   // Stored as Sets keyed by item name; reset whenever proposals change.
   const [selected, setSelected] = useState<Record<TaxKind, Set<string>>>({
-    identities: new Set(), characteristics: new Set(), sectors: new Set()
+    identities: new Set(), sub_identities: new Set(), sectors: new Set()
   });
 
   const refresh = useCallback(async () => {
@@ -2503,8 +2503,8 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
       // Drop any selection entries whose item is no longer in the panel
       // (e.g. accepted in a prior pass). Avoids stale checkmarks.
       setSelected(prev => {
-        const next: Record<TaxKind, Set<string>> = { identities: new Set(), characteristics: new Set(), sectors: new Set() };
-        for (const k of ['identities', 'characteristics', 'sectors'] as TaxKind[]) {
+        const next: Record<TaxKind, Set<string>> = { identities: new Set(), sub_identities: new Set(), sectors: new Set() };
+        for (const k of ['identities', 'sub_identities', 'sectors'] as TaxKind[]) {
           const live = new Set((data[k] || []).map((p: any) => p.name));
           for (const n of prev[k]) if (live.has(n)) next[k].add(n);
         }
@@ -2517,7 +2517,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
 
   const acceptOne = async (kind: TaxKind, name: string, parent?: string): Promise<void> => {
     const body: any = { name, created_by: 'ai' };
-    if (kind === 'characteristics' && parent) body.parent_identity = parent;
+    if (kind === 'sub_identities' && parent) body.parent_identity = parent;
     const res = await fetch(`/api/bucketing/taxonomy/${kind}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2538,7 +2538,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   };
 
   // Generic batch-apply for a set of items (used by Accept-all + Apply-selected).
-  // For characteristics, parent identities must exist first — we accept any
+  // For sub-identities, parent identities must exist first — we accept any
   // selected/proposed parents before the children to avoid FK-by-name fails.
   const applyBatch = async (kind: TaxKind, items: any[]) => {
     if (!proposed || items.length === 0) return;
@@ -2547,7 +2547,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
     onError(null);
     let done = 0;
     let firstError: string | null = null;
-    if (kind === 'characteristics') {
+    if (kind === 'sub_identities') {
       const neededParents = new Set(items.map(p => p.parent).filter(Boolean));
       for (const ip of (proposed.identities || [])) {
         if (neededParents.has(ip.name)) {
@@ -2571,7 +2571,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
     await refresh();
     // No auto-recalc here — the user runs that explicitly via the
     // Finalize button (or the manual Recalculate next to the Discovered
-    // Characteristics header). Auto-firing on every batch was burning
+    // Sub-Identities header). Auto-firing on every batch was burning
     // LLM tokens for partial accepts.
   };
 
@@ -2602,7 +2602,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   };
 
   if (!proposed) return null;
-  const total = proposed.identities.length + proposed.characteristics.length + proposed.sectors.length;
+  const total = proposed.identities.length + proposed.sub_identitys.length + proposed.sectors.length;
   if (total === 0) return null;
 
   return (
@@ -2622,7 +2622,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
         The tagger proposed entries that aren't in the library. Tick the ones you want to keep (use the column header checkbox to tick all at once) and click "Apply selected", or use the per-row "Accept" button. Accepted entries are saved to the library; click "Finalize taxonomy" once you're done so the remaining proposals get re-tagged against the library only.
       </p>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-        {(['identities','characteristics','sectors'] as const).map(kind => {
+        {(['identities','sub_identities','sectors'] as const).map(kind => {
           const items = proposed[kind];
           const sel = selected[kind];
           const allSelected = items.length > 0 && sel.size === items.length;
@@ -2687,7 +2687,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                         <div className="text-[10px] text-gray-500 truncate" title={p.samples?.join(' · ')}>
                           {p.count}× · ex: {(p.samples || []).slice(0, 2).join(' · ')}
                         </div>
-                        {kind === 'characteristics' && p.parent && (
+                        {kind === 'sub_identities' && p.parent && (
                           <div className="text-[9px] text-gray-600">under {p.parent}</div>
                         )}
                       </div>
@@ -2794,7 +2794,7 @@ function Phase1aQAQueuePanel({ runId, onError }: { runId: string; onError: (m: s
               <tr className="border-b border-[#2e2e2e] text-[9px] font-bold text-gray-500 uppercase tracking-wider">
                 <th className="px-4 py-2 text-left">Industry</th>
                 <th className="px-4 py-2 text-left">Identity</th>
-                <th className="px-4 py-2 text-left">Characteristic</th>
+                <th className="px-4 py-2 text-left">Sub-Identity</th>
                 <th className="px-4 py-2 text-left">Sector</th>
                 <th className="px-4 py-2 text-right">Conf</th>
               </tr>
@@ -2804,7 +2804,7 @@ function Phase1aQAQueuePanel({ runId, onError }: { runId: string; onError: (m: s
                 <tr key={i} className="hover:bg-white/[0.02]">
                   <td className="px-4 py-2 text-gray-200 max-w-md truncate" title={q.industry_string}>{q.industry_string}</td>
                   <td className="px-4 py-2 text-gray-400">{q.primary_identity || '—'}</td>
-                  <td className="px-4 py-2 text-gray-400">{q.characteristic || '—'}</td>
+                  <td className="px-4 py-2 text-gray-400">{q.sub_identity || '—'}</td>
                   <td className="px-4 py-2 text-gray-400">{q.sector || '—'}</td>
                   <td className="px-4 py-2 text-right text-amber-400 font-mono">{q.confidence != null ? Number(q.confidence).toFixed(2) : '—'}</td>
                 </tr>
@@ -2817,7 +2817,7 @@ function Phase1aQAQueuePanel({ runId, onError }: { runId: string; onError: (m: s
   );
 }
 
-// ───── Taxonomy Library: editable Identity / Characteristic / Sector lists ─────
+// ───── Taxonomy Library: editable Identity / Sub-Identity / Sector lists ─────
 
 interface TaxRow {
   id: string;
@@ -2831,8 +2831,8 @@ interface TaxRow {
 }
 
 function TaxonomyLibrary({ onError }: { onError: (m: string | null) => void }) {
-  const [tab, setTab] = useState<'identities' | 'characteristics' | 'sectors'>('identities');
-  const [data, setData] = useState<{ identities: TaxRow[]; characteristics: TaxRow[]; sectors: TaxRow[] }>({ identities: [], characteristics: [], sectors: [] });
+  const [tab, setTab] = useState<'identities' | 'sub_identities' | 'sectors'>('identities');
+  const [data, setData] = useState<{ identities: TaxRow[]; sub_identities: TaxRow[]; sectors: TaxRow[] }>({ identities: [], sub_identities: [], sectors: [] });
   const [loading, setLoading] = useState(false);
   const [editing, setEditing] = useState<TaxRow | null>(null);
   const [creating, setCreating] = useState(false);
@@ -2909,7 +2909,7 @@ function TaxonomyLibrary({ onError }: { onError: (m: string | null) => void }) {
       </div>
       <div className="flex justify-between items-center">
         <div className="flex gap-1">
-          {(['identities', 'characteristics', 'sectors'] as const).map(t => (
+          {(['identities', 'sub_identities', 'sectors'] as const).map(t => (
             <button
               key={t}
               onClick={() => { setTab(t); setEditing(null); setCreating(false); }}
@@ -2942,7 +2942,7 @@ function TaxonomyLibrary({ onError }: { onError: (m: string | null) => void }) {
           <thead className="bg-[#0e0e0e]">
             <tr className="border-b border-[#2e2e2e] text-[9px] font-bold text-gray-500 uppercase tracking-wider">
               <th className="px-5 py-3 text-left">Name</th>
-              {tab === 'characteristics' && <th className="px-5 py-3 text-left">Parent identity</th>}
+              {tab === 'sub_identities' && <th className="px-5 py-3 text-left">Parent identity</th>}
               <th className="px-5 py-3 text-left">{tab === 'sectors' ? 'Synonyms' : 'Description'}</th>
               {tab === 'identities' && <th className="px-5 py-3 text-center">DQ</th>}
               <th className="px-5 py-3 text-center">Source</th>
@@ -2956,7 +2956,7 @@ function TaxonomyLibrary({ onError }: { onError: (m: string | null) => void }) {
             {rows.map(r => (
               <tr key={r.id} className={`hover:bg-white/[0.02] ${r.archived ? 'opacity-50' : ''}`}>
                 <td className="px-5 py-2 font-bold text-white">{r.name}</td>
-                {tab === 'characteristics' && <td className="px-5 py-2 text-gray-300">{r.parent_identity || '—'}</td>}
+                {tab === 'sub_identities' && <td className="px-5 py-2 text-gray-300">{r.parent_identity || '—'}</td>}
                 <td className="px-5 py-2 text-gray-400 max-w-md truncate">
                   {tab === 'sectors' ? (r.synonyms || '—') : (r.description || '—')}
                 </td>
@@ -2993,7 +2993,7 @@ function TaxonomyLibrary({ onError }: { onError: (m: string | null) => void }) {
 }
 
 function TaxonomyEditor({ kind, existing, identities, onCancel, onSave }: {
-  kind: 'identities' | 'characteristics' | 'sectors';
+  kind: 'identities' | 'sub_identities' | 'sectors';
   existing: TaxRow | null;
   identities: TaxRow[];
   onCancel: () => void;
@@ -3012,7 +3012,7 @@ function TaxonomyEditor({ kind, existing, identities, onCancel, onSave }: {
       </div>
       <input value={name} onChange={e => setName(e.target.value)} placeholder="Name"
         className="w-full px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]" />
-      {kind === 'characteristics' && (
+      {kind === 'sub_identities' && (
         <select value={parent} onChange={e => setParent(e.target.value)}
           className="w-full px-3 py-2 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]">
           {identities.filter(i => !i.archived).map(i => <option key={i.id} value={i.name}>{i.name}</option>)}
@@ -3038,7 +3038,7 @@ function TaxonomyEditor({ kind, existing, identities, onCancel, onSave }: {
             id: existing?.id,
             name: name.trim(),
             description,
-            ...(kind === 'characteristics' ? { parent_identity: parent } : {}),
+            ...(kind === 'sub_identities' ? { parent_identity: parent } : {}),
             ...(kind === 'sectors' ? { synonyms } : {}),
             ...(kind === 'identities' ? { is_disqualified: isDq } : {})
           })}

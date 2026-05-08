@@ -1,20 +1,20 @@
 /**
- * Bucket Library — reusable characteristic definitions across runs.
+ * Bucket Library — reusable campaign-bucket definitions across runs.
  *
- * The library persists proven (primary_identity, characteristic) pairs and
+ * The library persists proven (primary_identity, bucket_name) pairs and
  * seeds future runs with them. Phase 1b matches contacts against the library
  * deterministically before LLM matching, so saved knowledge wins.
  *
- * v5: bucket_library.functional_specialization was dropped — bucket_name now
- * holds the characteristic name. Inputs accept the new `characteristic` key
- * as well as the legacy `bucket_name` alias.
+ * v6: dropped the legacy `characteristic` alias on LibraryBucketInput —
+ * bucket_library entries are CAMPAIGN BUCKETS, not Layer-2 sub-identities,
+ * so the alias was confusing. Use bucket_name everywhere.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 export interface LibraryBucket {
     id: string;
-    bucket_name: string;                         // holds the characteristic name
+    bucket_name: string;
     primary_identity: string | null;
     description: string | null;
     direct_ancestor: string | null;              // legacy mirror of primary_identity
@@ -31,9 +31,8 @@ export interface LibraryBucket {
 }
 
 export interface LibraryBucketInput {
-    primary_identity?: string;                   // preferred
-    characteristic?: string;                     // preferred (v5)
-    bucket_name?: string;                        // legacy alias for characteristic
+    primary_identity?: string;
+    bucket_name?: string;
     direct_ancestor?: string;                    // legacy alias for primary_identity
     root_category?: string;                      // legacy
     description?: string;
@@ -58,9 +57,9 @@ export async function upsertLibraryBucket(
     supabase: SupabaseClient,
     input: LibraryBucketInput
 ): Promise<LibraryBucket> {
-    const spec = (input.characteristic || input.bucket_name || '').trim();
+    const spec = (input.bucket_name || '').trim();
     const ident = (input.primary_identity || input.direct_ancestor || '').trim();
-    if (!spec) throw new Error('characteristic (or bucket_name) is required');
+    if (!spec) throw new Error('bucket_name is required');
 
     const payload = {
         bucket_name: spec,
@@ -196,7 +195,7 @@ export async function bulkImportLibraryFromText(
 
         try {
             await upsertLibraryBucket(supabase, {
-                characteristic: spec,
+                bucket_name: spec,
                 primary_identity: ident,
                 description: desc
             });
@@ -209,9 +208,10 @@ export async function bulkImportLibraryFromText(
 }
 
 /**
- * Save selected specializations from a completed run into the library.
- * Inputs are functional_specialization names (the new shape). Legacy
- * bucket_name lookup is also accepted for forward-compat.
+ * Save selected sub-identities from a completed run into the library
+ * as new bucket_library entries. The taxonomy proposal stores them in
+ * BucketProposal.sub_identity (v6); older runs may still use
+ * .bucket_name — both are accepted for forward-compat.
  */
 export async function saveRunBucketsToLibrary(
     supabase: SupabaseClient,
@@ -226,16 +226,16 @@ export async function saveRunBucketsToLibrary(
 
     const wanted = new Set(specNames.map(s => s.trim()));
     const selected = (final.buckets as any[]).filter(b => {
-        const spec = b.characteristic || b.bucket_name;
+        const spec = b.sub_identity || b.bucket_name;
         return spec && wanted.has(spec);
     });
-    const matched = new Set(selected.map(b => (b.characteristic || b.bucket_name).trim()));
+    const matched = new Set(selected.map(b => (b.sub_identity || b.bucket_name).trim()));
     const skipped = specNames.filter(n => !matched.has(n.trim()));
 
     let saved = 0;
     for (const b of selected) {
         await upsertLibraryBucket(supabase, {
-            characteristic: b.characteristic || b.bucket_name,
+            bucket_name: b.sub_identity || b.bucket_name,
             primary_identity: b.primary_identity || b.direct_ancestor,
             description: b.description,
             include_terms: b.include || b.include_terms || [],

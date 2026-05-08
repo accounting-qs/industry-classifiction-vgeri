@@ -2005,7 +2005,7 @@ app.post('/api/bucketing/runs/:id/assign', async (req, res) => {
 // additions (manually or via Apply selected / Accept all). Synchronous
 // because the caller polls for refresh anyway — typically 5-30 s depending
 // on how many proposed-new entries remain. Returns the merge stats so the
-// UI can surface "5 characteristic merges, 1 identity dropped" feedback.
+// UI can surface "5 sub-identity merges, 1 identity dropped" feedback.
 app.post('/api/bucketing/runs/:id/recalculate', async (req, res) => {
     const id = req.params.id;
     try {
@@ -2241,7 +2241,7 @@ app.get('/api/bucketing/runs/:id/contacts', async (req, res) => {
         // PostgREST's embed syntax. Fetch the assignment page first, then
         // hydrate contact fields via a second IN-list query.
         let q: any = supabase.from('bucket_assignments')
-            .select('contact_id,bucket_name,bucket_leaf,bucket_ancestor,bucket_root,primary_identity,characteristic,sector,canonical_classification,bucket_reason,pre_rollup_bucket_name,rollup_level,general_reason,reasons,is_generic,is_disqualified,source,confidence,identity_confidence,characteristic_confidence,sector_confidence,assigned_at', { count: 'estimated' })
+            .select('contact_id,bucket_name,bucket_leaf,bucket_ancestor,bucket_root,primary_identity,sub_identity,sector,canonical_classification,bucket_reason,pre_rollup_bucket_name,rollup_level,general_reason,reasons,is_generic,is_disqualified,source,confidence,identity_confidence,sub_identity_confidence,sector_confidence,assigned_at', { count: 'estimated' })
             .eq('bucketing_run_id', id);
         if (bucket) q = q.eq('bucket_name', bucket);
         q = q.order('assigned_at', { ascending: true })
@@ -2328,7 +2328,7 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts', async (req, res) => {
         while (true) {
             const { data: mapRows, error: mErr } = await supabase
                 .from('bucket_industry_map')
-                .select('industry_string,primary_identity,characteristic,sector,bucket_name,canonical_classification,source,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,reasons')
+                .select('industry_string,primary_identity,sub_identity,sector,bucket_name,canonical_classification,source,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,reasons')
                 .eq('bucketing_run_id', id)
                 .range(mOff, mOff + MPAGE - 1);
             if (mErr) return res.status(500).json({ error: mErr.message });
@@ -2363,13 +2363,13 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts', async (req, res) => {
                 enrichment_reasoning: enr?.reasoning || null,
                 enrichment_error: enr?.error_message || null,
                 primary_identity: tax?.primary_identity || null,
-                characteristic: tax?.characteristic || null,
+                sub_identity: tax?.sub_identity || null,
                 sector: tax?.sector || null,
                 canonical_classification: tax?.canonical_classification || null,
                 bucket_name: tax?.bucket_name || null,
                 taxonomy_source: tax?.source || null,
                 identity_confidence: tax?.identity_confidence ?? null,
-                characteristic_confidence: tax?.characteristic_confidence ?? null,
+                sub_identity_confidence: tax?.sub_identity_confidence ?? null,
                 sector_confidence: tax?.sector_confidence ?? null,
                 confidence: tax?.confidence ?? null,
                 is_generic: tax?.is_generic ?? null,
@@ -2397,9 +2397,9 @@ const TAXONOMY_CSV_COLUMNS = [
     'company_name', 'company_website', 'lead_list_name',
     'industry', 'enrichment_status', 'enrichment_classification',
     'enrichment_confidence', 'enrichment_reasoning', 'enrichment_error',
-    'primary_identity', 'characteristic', 'sector',
+    'primary_identity', 'sub_identity', 'sector',
     'canonical_classification', 'bucket_name', 'taxonomy_source',
-    'identity_confidence', 'characteristic_confidence', 'sector_confidence',
+    'identity_confidence', 'sub_identity_confidence', 'sector_confidence',
     'confidence', 'is_generic', 'is_disqualified', 'llm_reason',
 ] as const;
 
@@ -2429,7 +2429,7 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts.csv', async (req, res) => {
         while (true) {
             const { data: mapRows, error: mErr } = await supabase
                 .from('bucket_industry_map')
-                .select('industry_string,primary_identity,characteristic,sector,bucket_name,canonical_classification,source,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason')
+                .select('industry_string,primary_identity,sub_identity,sector,bucket_name,canonical_classification,source,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_generic,is_disqualified,llm_reason')
                 .eq('bucketing_run_id', id)
                 .range(mOff, mOff + MPAGE - 1);
             if (mErr) return res.status(500).json({ error: mErr.message });
@@ -2510,13 +2510,13 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts.csv', async (req, res) => {
                     enrichment_reasoning: enr?.reasoning || null,
                     enrichment_error: enr?.error_message || null,
                     primary_identity: tax?.primary_identity || null,
-                    characteristic: tax?.characteristic || null,
+                    sub_identity: tax?.sub_identity || null,
                     sector: tax?.sector || null,
                     canonical_classification: tax?.canonical_classification || null,
                     bucket_name: tax?.bucket_name || null,
                     taxonomy_source: tax?.source || null,
                     identity_confidence: tax?.identity_confidence ?? null,
-                    characteristic_confidence: tax?.characteristic_confidence ?? null,
+                    sub_identity_confidence: tax?.sub_identity_confidence ?? null,
                     sector_confidence: tax?.sector_confidence ?? null,
                     confidence: tax?.confidence ?? null,
                     is_generic: tax?.is_generic ?? null,
@@ -2566,13 +2566,13 @@ const ASSIGNMENT_CSV_COLUMNS = [
     'industry', 'enrichment_status', 'enrichment_classification',
     'enrichment_confidence', 'enrichment_reasoning',
     // Final taxonomy (from bucket_assignments — Phase 1b output)
-    'primary_identity', 'characteristic', 'sector',
+    'primary_identity', 'sub_identity', 'sector',
     'canonical_classification',
     // Final bucket + rollup metadata
     'bucket_name', 'pre_rollup_bucket_name', 'rollup_level',
     'assignment_source',
     // Confidence
-    'identity_confidence', 'characteristic_confidence', 'sector_confidence',
+    'identity_confidence', 'sub_identity_confidence', 'sector_confidence',
     'confidence',
     // Flags
     'is_disqualified', 'is_generic',
@@ -2627,7 +2627,7 @@ async function loadPhase1aTaxonomyForCsv(runId: string): Promise<Map<string, any
     for (let offset = 0; offset <= 200_000; offset += PAGE) {
         const { data, error } = await supabase
             .from('bucket_industry_map')
-            .select('industry_string,primary_identity,characteristic,sector,canonical_classification,bucket_name,source,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_disqualified,is_generic,llm_reason')
+            .select('industry_string,primary_identity,sub_identity,sector,canonical_classification,bucket_name,source,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_disqualified,is_generic,llm_reason')
             .eq('bucketing_run_id', runId)
             .range(offset, offset + PAGE - 1);
         if (error) throw new Error(`phase1a taxonomy preload failed at offset ${offset}: ${error.message}`);
@@ -2736,7 +2736,7 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
                     enrichment_confidence:     r.enrichment_confidence,
                     enrichment_reasoning:      r.enrichment_reasoning,
                     primary_identity:          firstText(r.primary_identity, phase1a?.primary_identity),
-                    characteristic:            firstText(r.characteristic, phase1a?.characteristic),
+                    sub_identity:            firstText(r.sub_identity, phase1a?.sub_identity),
                     sector:                    firstText(r.sector, phase1a?.sector),
                     canonical_classification:  firstText(r.canonical_classification, phase1a?.canonical_classification),
                     bucket_name:               r.bucket_name,
@@ -2744,7 +2744,7 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
                     rollup_level:              r.rollup_level,
                     assignment_source:         firstText(r.assignment_source, phase1a?.source),
                     identity_confidence:       r.identity_confidence ?? phase1a?.identity_confidence,
-                    characteristic_confidence: r.characteristic_confidence ?? phase1a?.characteristic_confidence,
+                    sub_identity_confidence: r.sub_identity_confidence ?? phase1a?.sub_identity_confidence,
                     sector_confidence:         r.sector_confidence ?? phase1a?.sector_confidence,
                     confidence:                r.assignment_confidence ?? phase1a?.confidence,
                     is_disqualified:           r.is_disqualified ?? phase1a?.is_disqualified,
@@ -3128,7 +3128,7 @@ app.post('/api/bucketing/runs/:id/save-to-library', async (req, res) => {
 });
 
 // ============================================
-// TAXONOMY LIBRARY — editable Identity / Characteristic / Sector lists
+// TAXONOMY LIBRARY — editable Identity / Sub-Identity / Sector lists
 // ============================================
 //
 // The Phase 1a tagger reads these tables every run as the allowed set
@@ -3137,7 +3137,7 @@ app.post('/api/bucketing/runs/:id/save-to-library', async (req, res) => {
 
 const TAXONOMY_TABLES = {
     identities: 'taxonomy_identities',
-    characteristics: 'taxonomy_characteristics',
+    sub_identities: 'taxonomy_sub_identities',
     sectors: 'taxonomy_sectors'
 } as const;
 
@@ -3151,7 +3151,7 @@ app.get('/api/bucketing/taxonomy', async (_req, res) => {
     try {
         const [idRes, chRes, secRes] = await Promise.all([
             supabase.from('taxonomy_identities').select('*').order('sort_order').order('name'),
-            supabase.from('taxonomy_characteristics').select('*').order('sort_order').order('name'),
+            supabase.from('taxonomy_sub_identities').select('*').order('sort_order').order('name'),
             supabase.from('taxonomy_sectors').select('*').order('sort_order').order('name')
         ]);
         if (idRes.error) throw new Error(idRes.error.message);
@@ -3159,7 +3159,7 @@ app.get('/api/bucketing/taxonomy', async (_req, res) => {
         if (secRes.error) throw new Error(secRes.error.message);
         res.json({
             identities: idRes.data || [],
-            characteristics: chRes.data || [],
+            sub_identities: chRes.data || [],
             sectors: secRes.data || []
         });
     } catch (err: any) {
@@ -3185,9 +3185,9 @@ app.post('/api/bucketing/taxonomy/:kind', async (req, res) => {
         if (req.params.kind === 'identities') {
             row.is_disqualified = !!body.is_disqualified;
         }
-        if (req.params.kind === 'characteristics') {
+        if (req.params.kind === 'sub_identities') {
             const parent = String(body.parent_identity || '').trim();
-            if (!parent) return res.status(400).json({ error: 'parent_identity is required for characteristics' });
+            if (!parent) return res.status(400).json({ error: 'parent_identity is required for sub-identities' });
             row.parent_identity = parent;
         }
         if (req.params.kind === 'sectors') {
@@ -3214,7 +3214,7 @@ app.patch('/api/bucketing/taxonomy/:kind/:id', async (req, res) => {
         if (req.params.kind === 'identities' && typeof body.is_disqualified === 'boolean') {
             update.is_disqualified = body.is_disqualified;
         }
-        if (req.params.kind === 'characteristics' && typeof body.parent_identity === 'string' && body.parent_identity.trim()) {
+        if (req.params.kind === 'sub_identities' && typeof body.parent_identity === 'string' && body.parent_identity.trim()) {
             update.parent_identity = body.parent_identity.trim();
         }
         if (req.params.kind === 'sectors' && typeof body.synonyms === 'string') {
@@ -3246,9 +3246,9 @@ app.get('/api/bucketing/runs/:id/proposed-tags', async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('bucket_industry_map')
-            .select('primary_identity,is_new_identity,characteristic,is_new_characteristic,sector,is_new_sector,industry_string,confidence,llm_reason')
+            .select('primary_identity,is_new_identity,sub_identity,is_new_sub_identity,sector,is_new_sector,industry_string,confidence,llm_reason')
             .eq('bucketing_run_id', req.params.id)
-            .or('is_new_identity.eq.true,is_new_characteristic.eq.true,is_new_sector.eq.true');
+            .or('is_new_identity.eq.true,is_new_sub_identity.eq.true,is_new_sector.eq.true');
         if (error) return res.status(500).json({ error: error.message });
 
         const ids = new Map<string, { name: string; samples: string[]; count: number }>();
@@ -3261,11 +3261,11 @@ app.get('/api/bucketing/runs/:id/proposed-tags', async (req, res) => {
                 if (e.samples.length < 5) e.samples.push(r.industry_string);
                 ids.set(r.primary_identity, e);
             }
-            if (r.is_new_characteristic && r.characteristic) {
-                const e = chars.get(r.characteristic) || { name: r.characteristic, parent: r.primary_identity || null, samples: [], count: 0 };
+            if (r.is_new_sub_identity && r.sub_identity) {
+                const e = chars.get(r.sub_identity) || { name: r.sub_identity, parent: r.primary_identity || null, samples: [], count: 0 };
                 e.count++;
                 if (e.samples.length < 5) e.samples.push(r.industry_string);
-                chars.set(r.characteristic, e);
+                chars.set(r.sub_identity, e);
             }
             if (r.is_new_sector && r.sector) {
                 const e = secs.get(r.sector) || { name: r.sector, samples: [], count: 0 };
@@ -3276,7 +3276,7 @@ app.get('/api/bucketing/runs/:id/proposed-tags', async (req, res) => {
         }
         res.json({
             identities: Array.from(ids.values()).sort((a, b) => b.count - a.count),
-            characteristics: Array.from(chars.values()).sort((a, b) => b.count - a.count),
+            sub_identities: Array.from(chars.values()).sort((a, b) => b.count - a.count),
             sectors: Array.from(secs.values()).sort((a, b) => b.count - a.count)
         });
     } catch (err: any) {
@@ -3290,7 +3290,7 @@ app.get('/api/bucketing/runs/:id/qa-queue', async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('bucket_industry_map')
-            .select('industry_string,primary_identity,characteristic,sector,confidence,llm_reason,is_disqualified,bucket_name')
+            .select('industry_string,primary_identity,sub_identity,sector,confidence,llm_reason,is_disqualified,bucket_name')
             .eq('bucketing_run_id', req.params.id)
             .eq('needs_qa', true)
             .order('confidence', { ascending: true })

@@ -67,7 +67,7 @@ export interface PrimaryIdentity {
 }
 
 export interface BucketProposal {
-  characteristic: string;
+  sub_identity: string;
   primary_identity: string;
   description: string;
   identity_type?: string;
@@ -136,9 +136,8 @@ export interface BucketingLogEntry {
 
 export interface LibraryBucket {
   id: string;
-  bucket_name: string;                         // legacy mirror of characteristic
-  primary_identity: string | null;             // v2.3
-  characteristic: string | null;    // v2.3
+  bucket_name: string;                         // canonical name on bucket_library
+  primary_identity: string | null;
   description: string | null;
   direct_ancestor: string | null;              // legacy mirror of primary_identity
   root_category: string | null;                // legacy
@@ -175,7 +174,7 @@ export interface BucketAssignmentRow {
   bucket_ancestor?: string | null;
   bucket_root?: string | null;
   primary_identity?: string | null;
-  characteristic?: string | null;
+  sub_identity?: string | null;
   sector?: string | null;
   pre_rollup_bucket_name?: string | null;
   rollup_level?: string | null;

@@ -9,7 +9,7 @@
  *
  * Phase 1a (TAGGING, batched): the user-selected tagger (gpt-4.1-mini default,
  * Claude Haiku 4.5 optional) reads each distinct enrichments.classification
- * string and assigns identity / characteristic / sector + per-tag confidence.
+ * string and assigns identity / sub-identity / sector + per-tag confidence.
  * vocabulary and produces:
  *   - Identity-first leaf taxonomy (30–60 leaves), each tagged with
  *     identity_type (operator | service_provider | agency | software_vendor |
@@ -24,7 +24,7 @@
  * classification, confidence, reasoning) and writes contact-level pre-rollup
  * decisions before computing final campaign buckets.
  *
- * Volume rollup: sector+characteristic → characteristic → identity → General.
+ * Volume rollup: sector+sub-identity → sub-identity → identity → General.
  * Disqualified / invalid rows land in General with audit reasons.
  */
 
@@ -87,7 +87,7 @@ const RESERVED_DISQUALIFIED = 'Disqualified';
 export const REASON = {
     // Routed into a real campaign bucket — three rollup levels (v5+):
     COMBO_THRESHOLD_MET: 'combo_threshold_met',
-    SPECIALIZATION_THRESHOLD_MET: 'characteristic_threshold_met',
+    SPECIALIZATION_THRESHOLD_MET: 'sub-identity_threshold_met',
     IDENTITY_THRESHOLD_MET: 'identity_threshold_met',
     // Generic Audit moved row out of General into a live bucket.
     GENERIC_AUDIT_RECLAIMED: 'generic_audit_reclaimed',
@@ -208,7 +208,7 @@ interface TaxonomyEntry {
     id: string;
     name: string;
     description?: string | null;
-    parent_identity?: string | null;     // characteristics only
+    parent_identity?: string | null;     // sub-identities only
     is_disqualified?: boolean;           // identities only
     synonyms?: string | null;            // sectors only
     created_by?: string;
@@ -218,7 +218,7 @@ interface TaxonomyEntry {
 
 interface TaxonomySnapshot {
     identities: TaxonomyEntry[];
-    characteristics: TaxonomyEntry[];
+    sub_identities: TaxonomyEntry[];
     sectors: TaxonomyEntry[];
 }
 
@@ -226,18 +226,18 @@ interface IndustryTagging {
     industry: string;
     identity: string | null;
     is_new_identity: boolean;
-    characteristic: string | null;
-    is_new_characteristic: boolean;
+    sub_identity: string | null;
+    is_new_sub_identity: boolean;
     sector: string | null;
     is_new_sector: boolean;
     is_disqualified: boolean;
     // Per-tag 1-10 scores. Drives smart fallbacks in Phase 1b: a row
-    // with identity=8, characteristic=4 should route at the identity
+    // with identity=8, sub-identity=4 should route at the identity
     // level rather than tumble all the way to General. confidence is
     // the legacy single score (= min of the three) kept for existing
     // QA panel + reporting code.
     identity_confidence: number;
-    characteristic_confidence: number;
+    sub_identity_confidence: number;
     sector_confidence: number;
     confidence: number;
     reason: string;
@@ -258,14 +258,14 @@ interface ContactRouteInput {
 }
 
 interface EmbeddingCandidate {
-    characteristic: string;
+    sub_identity: string;
     primary_identity: string;
     score: number;
 }
 
 // A primary_identity is a Layer-1 high-level business type (Agency,
 // Consulting & Advisory, Software & SaaS, …). Layer-2 functional
-// characteristics are nested under it.
+// sub-identities are nested under it.
 interface PrimaryIdentity {
     name: string;
     description: string;
@@ -273,12 +273,12 @@ interface PrimaryIdentity {
     operator_required: boolean;
 }
 
-// A characteristic is the Layer-2 subtype within an identity.
+// A sub-identity is the Layer-2 subtype within an identity.
 // This is the "leaf" the LLM matches industry strings to — but the campaign
 // bucket actually used downstream is decided by the rollup (combo > spec >
 // identity > Generic).
 interface DiscoveredBucket {
-    characteristic: string;
+    sub_identity: string;
     primary_identity: string;        // foreign key to a PrimaryIdentity.name
     description: string;
     identity_type: string;
@@ -299,14 +299,14 @@ interface DiscoveryOutput {
     observed_patterns: string[];
     sector_vocabulary: string[];
     primary_identities: PrimaryIdentity[];
-    buckets: DiscoveredBucket[];   // Layer-2 characteristics
+    buckets: DiscoveredBucket[];   // Layer-2 sub-identities
 }
 
 // Phase 1b returns Layer-1 + Layer-2 + Layer-3 per industry string. Layer-4
 // (campaign bucket) is computed by SQL afterwards.
 interface MatchChain {
     primary_identity: { name: string; score: number; reason: string };
-    characteristic: { name: string; score: number; reason: string };
+    sub_identity: { name: string; score: number; reason: string };
     sector: string;
     identity_type: string;
     generic: boolean;
@@ -318,12 +318,12 @@ interface ContactMapRow {
     contact_id: string;
     industry_string: string;
     primary_identity: string;
-    characteristic: string;
+    sub_identity: string;
     sector: string;
     // Bucket Assignment output (Phase 1a sub-step). When the user has run
     // bucket assignment, this is the LLM's pick from bucket_library (or a
     // proposed new bucket). Phase 1b's rollup prefers these over the
-    // synthesized combo→characteristic→identity name when present.
+    // synthesized combo→sub-identity→identity name when present.
     assigned_bucket_name: string | null;
     assigned_bucket_primary_identity: string | null;
     canonical_classification: string;
@@ -332,11 +332,11 @@ interface ContactMapRow {
     bucket_name: string;
     // Per-tag confidence (0-1). Used by computeContactRollup to gate which
     // layer the row may enter at: a row with sector_confidence < 0.6 is
-    // ineligible for the combo (sector + characteristic) layer.
+    // ineligible for the combo (sector + sub-identity) layer.
     identity_confidence: number;
-    characteristic_confidence: number;
+    sub_identity_confidence: number;
     sector_confidence: number;
-    rollup_level: 'combo' | 'characteristic' | 'identity' | 'general';
+    rollup_level: 'combo' | 'sub_identity' | 'identity' | 'general';
     source: string;
     confidence: number;
     leaf_score: number;
@@ -719,7 +719,7 @@ Layer 1 — PRIMARY IDENTITY (high-level business type, ~6-12 total)
    "Healthcare Operator", "Education Operator", "Staffing & Recruiting",
    "Legal Services", "Accounting & Tax".
 
-Layer 2 — CHARACTERISTIC (subtype within identity)
+Layer 2 — SUB-IDENTITY (subtype within identity)
    What kind of {identity} is it?
    Examples (always coupled to a primary identity):
      Agency → "SEO Agency", "Branding Agency", "Performance Marketing
@@ -742,9 +742,9 @@ Layer 3 — SECTOR (optional vertical served, ~10-20 total)
 CAMPAIGN BUCKET (decided downstream, NOT by you)
    The actual outreach bucket is computed by the rollup engine — not
    predicted. It combines volume across the three axes:
-     - "{sector} {characteristic}" if that combo has enough leads
+     - "{sector} {sub-identity}" if that combo has enough leads
        (e.g. "Real Estate SEO Agency").
-     - Else "{characteristic}" (e.g. "SEO Agency").
+     - Else "{sub-identity}" (e.g. "SEO Agency").
      - Else "{primary_identity}" (e.g. "Agency").
      - Else "General" (single catch-all — disqualified rows go here too).
    You produce accurate Layer 1-3 classifications. The system computes
@@ -767,7 +767,7 @@ Never reverse that order.
 - "Software for schools" is Software & SaaS, not Education.
 
 Distinguish: WHAT the company is vs WHO it serves. Identity decides
-primary_identity + characteristic. Sector served decides
+primary_identity + sub-identity. Sector served decides
 sector.
 
 ========================================
@@ -830,7 +830,7 @@ CRITICAL CONSTRAINTS
 1. Identity > Sector. Bucket the company by what it IS.
 2. Operator evidence required for operator identities.
 3. Accuracy > Coverage. Do not force-fit.
-4. Reusability > Novelty. Identities + characteristics must be reusable.
+4. Reusability > Novelty. Identities + sub-identities must be reusable.
 5. Determinism > Creativity. Predictable behavior at scale.`;
 
 // ────────────────────────────────────────────────────────────────────
@@ -929,10 +929,10 @@ export async function runTaxonomyProposal(
             source: 'general_passthrough',
             confidence: 0,
             primary_identity: null,
-            characteristic: null,
+            sub_identity: null,
             sector: null,
             is_new_identity: false,
-            is_new_characteristic: false,
+            is_new_sub_identity: false,
             is_new_sector: false,
             is_disqualified: false,
             is_generic: true,
@@ -944,7 +944,7 @@ export async function runTaxonomyProposal(
 
     // ── Load active taxonomy library (3 SELECTs) ─────────────────────
     const snapshot = await loadTaxonomySnapshot(supabase);
-    ctx.log(`[Bucketing ${runId}] taxonomy library: ${snapshot.identities.length} identities, ${snapshot.characteristics.length} characteristics, ${snapshot.sectors.length} sectors`);
+    ctx.log(`[Bucketing ${runId}] taxonomy library: ${snapshot.identities.length} identities, ${snapshot.sub_identities.length} sub-identities, ${snapshot.sectors.length} sectors`);
 
     if (completedVocab.length > 0) {
         // ── Tag completed industries (batched, model selected at Setup) ────
@@ -973,11 +973,11 @@ export async function runTaxonomyProposal(
         // when the library is small/empty — without this, a single concept
         // shows up under 4-5 spelling variants in the AI-PROPOSED panel.
         const merges = consolidateTaggings(tagResult.taggings, snapshot);
-        if (merges.identityMerges + merges.characteristicMerges + merges.sectorMerges > 0) {
-            ctx.log(`[Bucketing ${runId}] post-batch dedup: collapsed ${merges.identityMerges} identity / ${merges.characteristicMerges} characteristic / ${merges.sectorMerges} sector duplicate variants`);
+        if (merges.identityMerges + merges.subIdentityMerges + merges.sectorMerges > 0) {
+            ctx.log(`[Bucketing ${runId}] post-batch dedup: collapsed ${merges.identityMerges} identity / ${merges.subIdentityMerges} sub-identity / ${merges.sectorMerges} sector duplicate variants`);
         }
 
-        // LLM semantic consolidation of proposed-new characteristics. Catches
+        // LLM semantic consolidation of proposed-new sub-identities. Catches
         // semantic duplicates the normalizer misses — "Wealth Management" +
         // "Investment Advisory" + "Wealth & Investment Advisory" → one name.
         // No-op when proposed-new count < 60 (small runs don't need it).
@@ -989,20 +989,20 @@ export async function runTaxonomyProposal(
         let totalCharMerges = 0;
         let totalCharCost = 0;
         for (let pass = 1; pass <= 3; pass++) {
-            const r = await consolidateCharacteristicsViaLLM(
+            const r = await consolidateSubIdentitiesViaLLM(
                 supabase, phase1aModel, tagResult.taggings, snapshot, runId, ctx
             );
             totalCharMerges += r.merges;
             totalCharCost += r.costUsd;
             if (r.merges > 0) {
-                ctx.log(`[Bucketing ${runId}] LLM characteristic consolidation pass ${pass}: merged ${r.merges} variant names, $${r.costUsd.toFixed(4)}`);
+                ctx.log(`[Bucketing ${runId}] LLM sub-identity consolidation pass ${pass}: merged ${r.merges} variant names, $${r.costUsd.toFixed(4)}`);
             }
             if (r.merges < 5) break;  // diminishing returns
         }
         const charConsol = { merges: totalCharMerges, costUsd: totalCharCost };
         if (charConsol.merges > 0) {
             totalCost += charConsol.costUsd;
-            ctx.log(`[Bucketing ${runId}] LLM characteristic consolidation TOTAL: ${charConsol.merges} merges, $${charConsol.costUsd.toFixed(4)}`);
+            ctx.log(`[Bucketing ${runId}] LLM sub-identity consolidation TOTAL: ${charConsol.merges} merges, $${charConsol.costUsd.toFixed(4)}`);
         }
 
         // LLM semantic consolidation of proposed-new sectors. Same pattern,
@@ -1043,14 +1043,14 @@ export async function runTaxonomyProposal(
         // produced by the LLM merges collapse into one canonical.
         if (charConsol.merges + secConsol.merges + idConsol.merges + singletonDrop.dropped > 0) {
             const reMerges = consolidateTaggings(tagResult.taggings, snapshot);
-            if (reMerges.identityMerges + reMerges.characteristicMerges + reMerges.sectorMerges > 0) {
-                ctx.log(`[Bucketing ${runId}] post-LLM normalizer pass: collapsed ${reMerges.identityMerges} more identity + ${reMerges.characteristicMerges} more characteristic + ${reMerges.sectorMerges} more sector variants`);
+            if (reMerges.identityMerges + reMerges.subIdentityMerges + reMerges.sectorMerges > 0) {
+                ctx.log(`[Bucketing ${runId}] post-LLM normalizer pass: collapsed ${reMerges.identityMerges} more identity + ${reMerges.subIdentityMerges} more sub-identity + ${reMerges.sectorMerges} more sector variants`);
             }
         }
 
         // ── Build map rows from taggings ─────────────────────────────
         const identitySet = new Set(snapshot.identities.map(i => i.name));
-        const charSet = new Set(snapshot.characteristics.map(c => c.name));
+        const charSet = new Set(snapshot.sub_identities.map(c => c.name));
         const sectorSet = new Set(snapshot.sectors.map(s => s.name));
         const dqIdentities = new Set(snapshot.identities.filter(i => i.is_disqualified).map(i => i.name));
         // Fuzzy dedup: normalize each existing canonical name once so we can
@@ -1062,7 +1062,7 @@ export async function runTaxonomyProposal(
         const identityCanonical = new Map<string, string>();
         for (const i of snapshot.identities) identityCanonical.set(normalizeTaxonomyName(i.name), i.name);
         const charCanonical = new Map<string, string>();
-        for (const c of snapshot.characteristics) charCanonical.set(normalizeTaxonomyName(c.name), c.name);
+        for (const c of snapshot.sub_identities) charCanonical.set(normalizeTaxonomyName(c.name), c.name);
         const sectorCanonical = new Map<string, string>();
         for (const s of snapshot.sectors) sectorCanonical.set(normalizeTaxonomyName(s.name), s.name);
         // Identity-DQ cascade is OFF by default — we trust the tagger's per-row
@@ -1092,16 +1092,16 @@ export async function runTaxonomyProposal(
             // Fuzzy-dedup: if the LLM's tag normalizes to an existing canonical
             // entry, rewrite the tag to that canonical name and clear is_new_*.
             const idCanonical = t.identity ? (identityCanonical.get(normalizeTaxonomyName(t.identity)) || null) : null;
-            const chCanonical = t.characteristic ? (charCanonical.get(normalizeTaxonomyName(t.characteristic)) || null) : null;
+            const chCanonical = t.sub_identity ? (charCanonical.get(normalizeTaxonomyName(t.sub_identity)) || null) : null;
             const secCanonical = t.sector ? (sectorCanonical.get(normalizeTaxonomyName(t.sector)) || null) : null;
             const tIdentity = idCanonical || t.identity;
-            const tCharacteristic = chCanonical || t.characteristic;
+            const tSubIdentity = chCanonical || t.sub_identity;
             const tSector = secCanonical || t.sector;
             const tIsNewIdentity = !!t.is_new_identity && !idCanonical && !identitySet.has(tIdentity || '');
-            const tIsNewCharacteristic = !!t.is_new_characteristic && !chCanonical && !charSet.has(tCharacteristic || '');
+            const tIsNewSubIdentity = !!t.is_new_sub_identity && !chCanonical && !charSet.has(tSubIdentity || '');
             const tIsNewSector = !!t.is_new_sector && !secCanonical && !sectorSet.has(tSector || '');
 
-            // Pre-rollup name: characteristic preferred → identity → fallback.
+            // Pre-rollup name: sub-identity preferred → identity → fallback.
             // The actual final bucket_name is rewritten by the volume rollup
             // in Phase 1b. Disqualified is terminal — never rolled up.
             let preBucket: string;
@@ -1109,8 +1109,8 @@ export async function runTaxonomyProposal(
                 preBucket = RESERVED_DISQUALIFIED;
             } else if (lowConf) {
                 preBucket = RESERVED_GENERAL;
-            } else if (tCharacteristic) {
-                preBucket = tCharacteristic;
+            } else if (tSubIdentity) {
+                preBucket = tSubIdentity;
             } else if (tIdentity) {
                 preBucket = tIdentity;
             } else {
@@ -1121,8 +1121,8 @@ export async function runTaxonomyProposal(
             // narrowest available fields. Used for the CSV export.
             const canonical = isDisqualified
                 ? 'Disqualified'
-                : (tSector && tCharacteristic ? `${tSector} ${tCharacteristic}`
-                    : (tCharacteristic || tIdentity || 'Generic'));
+                : (tSector && tSubIdentity ? `${tSector} ${tSubIdentity}`
+                    : (tSubIdentity || tIdentity || 'Generic'));
 
             preMapRows.push({
                 bucketing_run_id: runId,
@@ -1132,13 +1132,13 @@ export async function runTaxonomyProposal(
                 source: 'llm_phase1a',
                 confidence: Number(conf01.toFixed(2)),
                 identity_confidence: Number(((t.identity_confidence || 0) / 10).toFixed(2)),
-                characteristic_confidence: Number(((t.characteristic_confidence || 0) / 10).toFixed(2)),
+                sub_identity_confidence: Number(((t.sub_identity_confidence || 0) / 10).toFixed(2)),
                 sector_confidence: Number(((t.sector_confidence || 0) / 10).toFixed(2)),
                 primary_identity: tIdentity,
-                characteristic: tCharacteristic,
+                sub_identity: tSubIdentity,
                 sector: tSector,
                 is_new_identity: tIsNewIdentity,
-                is_new_characteristic: tIsNewCharacteristic,
+                is_new_sub_identity: tIsNewSubIdentity,
                 is_new_sector: tIsNewSector,
                 is_disqualified: isDisqualified,
                 is_generic: false,
@@ -1183,18 +1183,18 @@ export async function runTaxonomyProposal(
     // ── Build a synthetic taxonomy_proposal for the existing UI ──────
     // The Review screen reads taxonomy_proposal.{primary_identities, buckets}
     // — we synthesize them from the unique tags actually used so the user
-    // sees a familiar tree (Identity → Characteristic) backed by the new
+    // sees a familiar tree (Identity → Sub-Identity) backed by the new
     // tag-based classification.
     const usedIdentitySet = new Set<string>();
     const usedCharByKey = new Map<string, { spec: string; identity: string; description: string }>();
     const usedSectors = new Set<string>();
     for (const r of finalRows) {
         if (r.primary_identity) usedIdentitySet.add(r.primary_identity);
-        if (r.characteristic && r.primary_identity) {
-            const key = `${r.primary_identity}::${r.characteristic}`;
+        if (r.sub_identity && r.primary_identity) {
+            const key = `${r.primary_identity}::${r.sub_identity}`;
             if (!usedCharByKey.has(key)) {
-                const charDesc = snapshot.characteristics.find(c => c.name === r.characteristic)?.description || '';
-                usedCharByKey.set(key, { spec: r.characteristic, identity: r.primary_identity, description: charDesc });
+                const charDesc = snapshot.sub_identities.find(c => c.name === r.sub_identity)?.description || '';
+                usedCharByKey.set(key, { spec: r.sub_identity, identity: r.primary_identity, description: charDesc });
             }
         }
         if (r.sector) usedSectors.add(r.sector);
@@ -1210,9 +1210,9 @@ export async function runTaxonomyProposal(
         };
     });
 
-    // Only emit a bucket per (identity, characteristic) pair where the tagger
+    // Only emit a bucket per (identity, sub-identity) pair where the tagger
     // committed to BOTH layers. Identity-only rows (the tagger was sure about
-    // identity but not characteristic) don't get a fake "identity as spec"
+    // identity but not sub-identity) don't get a fake "identity as spec"
     // bucket — instead Phase 1b's rollup decides their fate based on
     // identity volume vs the threshold (clears → identity bucket, doesn't →
     // General with reason=low_volume). This keeps the user's rule "if you
@@ -1220,7 +1220,7 @@ export async function runTaxonomyProposal(
     const buckets: DiscoveredBucket[] = [];
     for (const c of usedCharByKey.values()) {
         buckets.push({
-            characteristic: c.spec,
+            sub_identity: c.spec,
             primary_identity: c.identity,
             description: c.description,
             identity_type: 'other',
@@ -1244,7 +1244,7 @@ export async function runTaxonomyProposal(
         },
         taxonomy_snapshot: {
             identities: snapshot.identities,
-            characteristics: snapshot.characteristics,
+            sub_identities: snapshot.sub_identities,
             sectors: snapshot.sectors
         },
         // taxonomy_model is now set by /determine from the user's Setup
@@ -1271,14 +1271,14 @@ export async function runTaxonomyProposal(
     ctx.log(`[Bucketing ${runId}] Phase 1a done — tagged ${finalRows.length} industries (${dqVocab.length} DQ, ${completedVocab.length} via LLM), $${totalCost.toFixed(4)}`, 'phase');
     ctx.progress({
         phase: 'phase1a', step: 'done', current: 1, total: 1,
-        note: `Tagging complete — ${primaryIdentities.length} identities, ${buckets.length} characteristics, ${usedSectors.size} sectors used`
+        note: `Tagging complete — ${primaryIdentities.length} identities, ${buckets.length} sub-identities, ${usedSectors.size} sectors used`
     });
 }
 
 // ────────────────────────────────────────────────────────────────────
 // RECALC AGAINST UPDATED LIBRARY
 //
-// After the Review screen accepts AI-proposed identities/characteristics/
+// After the Review screen accepts AI-proposed identities/sub-identities/
 // sectors, those entries land in the taxonomy_* library tables. The
 // existing bucket_industry_map rows still carry the original tag strings
 // (which is correct — accepting doesn't change names) but their
@@ -1291,12 +1291,12 @@ export async function runTaxonomyProposal(
 //   3. Refreshes is_new_* flags by checking each tag against the live
 //      library (cheap, no LLM).
 //   4. Re-runs the cheap normalizer dedup + every LLM consolidation pass
-//      (characteristics / sectors / identities) so any STILL-proposed-new
+//      (sub-identities / sectors / identities) so any STILL-proposed-new
 //      entries can merge INTO the now-canonical library names.
 //   5. Drops new-identity singletons (count < 3) — same rule as Phase 1a.
 //   6. Writes the updated tags back to bucket_industry_map and
 //      re-synthesizes taxonomy_proposal so the Review screen's
-//      Discovered Characteristics panel reflects the new shape.
+//      Discovered Sub-Identities panel reflects the new shape.
 //
 // Intentionally does NOT re-tag any contact via LLM — the per-row tags
 // produced by Phase 1a are kept intact. Only consolidation/flag refresh.
@@ -1310,7 +1310,7 @@ export async function recalculateTaxonomyWithLibrary(
     updatedRows: number;
     flagsRefreshed: number;
     identityMerges: number;
-    characteristicMerges: number;
+    subIdentityMerges: number;
     sectorMerges: number;
     singletonsDropped: number;
     costUsd: number;
@@ -1325,7 +1325,7 @@ export async function recalculateTaxonomyWithLibrary(
     const phase1aModel = (run.taxonomy_model as string) || 'gpt-4.1-mini';
 
     const snapshot = await loadTaxonomySnapshot(supabase);
-    ctx.log(`[Recalc ${runId}] library snapshot: ${snapshot.identities.length} identities, ${snapshot.characteristics.length} characteristics, ${snapshot.sectors.length} sectors`);
+    ctx.log(`[Recalc ${runId}] library snapshot: ${snapshot.identities.length} identities, ${snapshot.sub_identities.length} sub-identities, ${snapshot.sectors.length} sectors`);
 
     // Pull every row in this run's bucket_industry_map. Paginate to dodge
     // PostgREST's 1000-row hard cap (same trick the streaming CSV uses).
@@ -1347,7 +1347,7 @@ export async function recalculateTaxonomyWithLibrary(
     ctx.log(`[Recalc ${runId}] loaded ${allRows.length} bucket_industry_map rows`);
 
     // Disqualified-passthrough rows (source != 'llm_phase1a') don't carry
-    // identity/characteristic/sector data — leave them untouched.
+    // identity/sub-identity/sector data — leave them untouched.
     const llmRows = allRows.filter(r => r.source === 'llm_phase1a');
 
     // Hydrate IndustryTagging[] from rows. Stored confidences are 0-1
@@ -1356,31 +1356,31 @@ export async function recalculateTaxonomyWithLibrary(
         industry: r.industry_string,
         identity: r.primary_identity || null,
         is_new_identity: !!r.is_new_identity,
-        characteristic: r.characteristic || null,
-        is_new_characteristic: !!r.is_new_characteristic,
+        sub_identity: r.sub_identity || null,
+        is_new_sub_identity: !!r.is_new_sub_identity,
         sector: r.sector || null,
         is_new_sector: !!r.is_new_sector,
         is_disqualified: !!r.is_disqualified,
         identity_confidence: Math.round((Number(r.identity_confidence) || 0) * 10),
-        characteristic_confidence: Math.round((Number(r.characteristic_confidence) || 0) * 10),
+        sub_identity_confidence: Math.round((Number(r.sub_identity_confidence) || 0) * 10),
         sector_confidence: Math.round((Number(r.sector_confidence) || 0) * 10),
         confidence: Math.round((Number(r.confidence) || 0) * 10),
         reason: r.llm_reason || ''
     }));
 
     const libIdentities = new Set(snapshot.identities.map(i => i.name));
-    const libChars = new Set(snapshot.characteristics.map(c => c.name));
+    const libChars = new Set(snapshot.sub_identities.map(c => c.name));
     const libSectors = new Set(snapshot.sectors.map(s => s.name));
 
     // Snapshot the original is_new flags so we can count how many flipped.
     const originalFlags = taggings.map(t => ({
-        ni: !!t.is_new_identity, nc: !!t.is_new_characteristic, ns: !!t.is_new_sector
+        ni: !!t.is_new_identity, nc: !!t.is_new_sub_identity, ns: !!t.is_new_sector
     }));
 
     // Step 1 — refresh is_new_* against the now-current library.
     for (const t of taggings) {
         t.is_new_identity = !!t.is_new_identity && !libIdentities.has(t.identity || '');
-        t.is_new_characteristic = !!t.is_new_characteristic && !libChars.has(t.characteristic || '');
+        t.is_new_sub_identity = !!t.is_new_sub_identity && !libChars.has(t.sub_identity || '');
         t.is_new_sector = !!t.is_new_sector && !libSectors.has(t.sector || '');
     }
 
@@ -1394,7 +1394,7 @@ export async function recalculateTaxonomyWithLibrary(
     let costUsd = 0;
     let totalCharMerges = 0;
     for (let pass = 1; pass <= 2; pass++) {
-        const r = await consolidateCharacteristicsViaLLM(supabase, phase1aModel, taggings, snapshot, runId, ctx);
+        const r = await consolidateSubIdentitiesViaLLM(supabase, phase1aModel, taggings, snapshot, runId, ctx);
         totalCharMerges += r.merges;
         costUsd += r.costUsd;
         if (r.merges < 5) break;
@@ -1417,12 +1417,12 @@ export async function recalculateTaxonomyWithLibrary(
     for (let i = 0; i < taggings.length; i++) {
         const t = taggings[i];
         const newNi = !!t.is_new_identity && !libIdentities.has(t.identity || '');
-        const newNc = !!t.is_new_characteristic && !libChars.has(t.characteristic || '');
+        const newNc = !!t.is_new_sub_identity && !libChars.has(t.sub_identity || '');
         const newNs = !!t.is_new_sector && !libSectors.has(t.sector || '');
         const orig = originalFlags[i];
         if (newNi !== orig.ni || newNc !== orig.nc || newNs !== orig.ns) flagsRefreshed++;
         t.is_new_identity = newNi;
-        t.is_new_characteristic = newNc;
+        t.is_new_sub_identity = newNc;
         t.is_new_sector = newNs;
     }
 
@@ -1439,14 +1439,14 @@ export async function recalculateTaxonomyWithLibrary(
         let preBucket: string;
         if (isDisqualified) preBucket = RESERVED_DISQUALIFIED;
         else if (lowConf) preBucket = RESERVED_GENERAL;
-        else if (t.characteristic) preBucket = t.characteristic;
+        else if (t.sub_identity) preBucket = t.sub_identity;
         else if (t.identity) preBucket = t.identity;
         else preBucket = RESERVED_GENERAL;
 
         const canonical = isDisqualified
             ? 'Disqualified'
-            : (t.sector && t.characteristic ? `${t.sector} ${t.characteristic}`
-                : (t.characteristic || t.identity || 'Generic'));
+            : (t.sector && t.sub_identity ? `${t.sector} ${t.sub_identity}`
+                : (t.sub_identity || t.identity || 'Generic'));
 
         updates.push({
             bucketing_run_id: runId,
@@ -1458,10 +1458,10 @@ export async function recalculateTaxonomyWithLibrary(
             source: 'llm_phase1a',
             raw_industry: t.industry,
             primary_identity: t.identity,
-            characteristic: t.characteristic,
+            sub_identity: t.sub_identity,
             sector: t.sector,
             is_new_identity: t.is_new_identity,
-            is_new_characteristic: t.is_new_characteristic,
+            is_new_sub_identity: t.is_new_sub_identity,
             is_new_sector: t.is_new_sector,
             is_disqualified: isDisqualified,
             bucket_name: preBucket,
@@ -1483,11 +1483,11 @@ export async function recalculateTaxonomyWithLibrary(
     const usedSectors = new Set<string>();
     for (const r of updates) {
         if (r.primary_identity) usedIdentitySet.add(r.primary_identity);
-        if (r.characteristic && r.primary_identity) {
-            const key = `${r.primary_identity}::${r.characteristic}`;
+        if (r.sub_identity && r.primary_identity) {
+            const key = `${r.primary_identity}::${r.sub_identity}`;
             if (!usedCharByKey.has(key)) {
-                const charDesc = snapshot.characteristics.find(c => c.name === r.characteristic)?.description || '';
-                usedCharByKey.set(key, { spec: r.characteristic, identity: r.primary_identity, description: charDesc });
+                const charDesc = snapshot.sub_identities.find(c => c.name === r.sub_identity)?.description || '';
+                usedCharByKey.set(key, { spec: r.sub_identity, identity: r.primary_identity, description: charDesc });
             }
         }
         if (r.sector) usedSectors.add(r.sector);
@@ -1499,7 +1499,7 @@ export async function recalculateTaxonomyWithLibrary(
     const buckets: DiscoveredBucket[] = [];
     for (const c of usedCharByKey.values()) {
         buckets.push({
-            characteristic: c.spec, primary_identity: c.identity, description: c.description,
+            sub_identity: c.spec, primary_identity: c.identity, description: c.description,
             identity_type: 'other', operator_required: false, priority_rank: 5,
             include: [], exclude: [], example_strings: [],
             strong_identity_signals: [], weak_sector_signals: [], disqualifying_signals: []
@@ -1514,7 +1514,7 @@ export async function recalculateTaxonomyWithLibrary(
         },
         taxonomy_snapshot: {
             identities: snapshot.identities,
-            characteristics: snapshot.characteristics,
+            sub_identities: snapshot.sub_identities,
             sectors: snapshot.sectors
         },
         cost_usd: (Number(run.cost_usd) || 0) + costUsd
@@ -1526,7 +1526,7 @@ export async function recalculateTaxonomyWithLibrary(
         updatedRows: updates.length,
         flagsRefreshed,
         identityMerges: idConsol.merges,
-        characteristicMerges: totalCharMerges,
+        subIdentityMerges: totalCharMerges,
         sectorMerges: secConsol.merges,
         singletonsDropped: singletonDrop.dropped,
         costUsd
@@ -1557,7 +1557,7 @@ function buildLibraryOnlyTaggingPrompt(s: TaxonomySnapshot): string {
     const idLines = s.identities.map(i =>
         `  - ${i.name}${i.is_disqualified ? ' [DQ]' : ''}: ${i.description || ''}`
     ).join('\n');
-    const chLines = s.characteristics.map(c =>
+    const chLines = s.sub_identities.map(c =>
         `  - ${c.name} (under ${c.parent_identity}): ${c.description || ''}`
     ).join('\n');
     const secLines = s.sectors.map(sec =>
@@ -1567,10 +1567,10 @@ function buildLibraryOnlyTaggingPrompt(s: TaxonomySnapshot): string {
     return `You are FINALIZING tags for B2B contact industries that the prior tagging pass left as proposals (entries not in the curated library). Your job is to re-tag each industry using ONLY entries from the library below — or null if nothing fits.
 
 HARD CONSTRAINTS:
-- You MUST pick identity / characteristic / sector from the library lists below, EXACTLY as written (verbatim).
-- You MUST NOT invent new entries. Do NOT set is_new_identity / is_new_characteristic / is_new_sector to true. They will be ignored anyway.
+- You MUST pick identity / sub-identity / sector from the library lists below, EXACTLY as written (verbatim).
+- You MUST NOT invent new entries. Do NOT set is_new_identity / is_new_sub_identity / is_new_sector to true. They will be ignored anyway.
 - If no library identity is even loosely applicable, return identity=null. The contact will route to General. This is acceptable.
-- characteristic and sector are independently optional — return null if no library entry fits.
+- sub-identity and sector are independently optional — return null if no library entry fits.
 
 Library is the source of truth. The prior tagging pass over-proposed; this pass forces every row to library or null.
 
@@ -1579,7 +1579,7 @@ CANONICAL TAXONOMY:
 == IDENTITY (Layer 1 — required when applicable) ==
 ${idLines || '  (library is empty)'}
 
-== CHARACTERISTIC (Layer 2 — must be a child of the chosen identity, or null) ==
+== SUB-IDENTITY (Layer 2 — must be a child of the chosen identity, or null) ==
 ${chLines || '  (library is empty)'}
 
 == SECTOR (Layer 3 — vertical served, or null) ==
@@ -1588,7 +1588,7 @@ ${secLines || '  (library is empty)'}
 INSTRUCTIONS PER INDUSTRY:
 1. Read the industry text.
 2. Identity: choose the closest library identity, or null if none reasonably applies.
-3. Characteristic: ONLY among entries whose parent_identity equals the identity you chose. Closest fit, or null.
+3. Sub-Identity: ONLY among entries whose parent_identity equals the identity you chose. Closest fit, or null.
 4. Sector: closest served vertical, or null.
 5. Confidence (1-10) per layer — be honest. If you're forcing a weak match, drop the score.
 6. is_disqualified: true ONLY if the chosen identity is marked [DQ] above AND identity_confidence ≥ 7.
@@ -1599,11 +1599,11 @@ OUTPUT (strict JSON):
     {
       "id": <integer matching the input>,
       "identity": "<library entry verbatim, or null>",
-      "characteristic": "<library entry verbatim, or null>",
+      "sub-identity": "<library entry verbatim, or null>",
       "sector": "<library entry verbatim, or null>",
       "is_disqualified": false,
       "identity_confidence": <1-10>,
-      "characteristic_confidence": <1-10>,
+      "sub_identity_confidence": <1-10>,
       "sector_confidence": <1-10>,
       "reason": "<one short sentence — why this library entry, or why null>"
     },
@@ -1640,7 +1640,7 @@ export async function finalizeTaxonomyAgainstLibrary(
     }
 
     const snapshot = await loadTaxonomySnapshot(supabase);
-    if (snapshot.identities.length === 0 && snapshot.characteristics.length === 0 && snapshot.sectors.length === 0) {
+    if (snapshot.identities.length === 0 && snapshot.sub_identities.length === 0 && snapshot.sectors.length === 0) {
         throw new Error('Library is empty — accept at least some AI-proposed entries before finalizing.');
     }
 
@@ -1663,10 +1663,10 @@ export async function finalizeTaxonomyAgainstLibrary(
     }
     const candidates = allRows.filter(r =>
         r.source === 'llm_phase1a' && (
-            r.is_new_identity || r.is_new_characteristic || r.is_new_sector
+            r.is_new_identity || r.is_new_sub_identity || r.is_new_sector
         )
     );
-    ctx.log(`[Finalize ${runId}] ${candidates.length} orphan row(s) to re-tag against library (${snapshot.identities.length} identities, ${snapshot.characteristics.length} characteristics, ${snapshot.sectors.length} sectors)`);
+    ctx.log(`[Finalize ${runId}] ${candidates.length} orphan row(s) to re-tag against library (${snapshot.identities.length} identities, ${snapshot.sub_identities.length} sub-identities, ${snapshot.sectors.length} sectors)`);
 
     if (candidates.length === 0) {
         return { candidates: 0, rerouted: 0, nullified: 0, failed: 0, costUsd: 0 };
@@ -1771,7 +1771,7 @@ export async function finalizeTaxonomyAgainstLibrary(
     for (const t of taggings) taggingByIndustry.set(t.industry, t);
 
     const libIdentities = new Set(snapshot.identities.map(i => i.name));
-    const libChars = new Set(snapshot.characteristics.map(c => c.name));
+    const libChars = new Set(snapshot.sub_identities.map(c => c.name));
     const libSectors = new Set(snapshot.sectors.map(s => s.name));
     const dqIdentities = new Set(snapshot.identities.filter(i => i.is_disqualified).map(i => i.name));
 
@@ -1798,7 +1798,7 @@ export async function finalizeTaxonomyAgainstLibrary(
                 raw_industry: row.raw_industry || row.industry_string,
                 bucket_name: row.bucket_name || RESERVED_GENERAL,
                 is_new_identity: false,
-                is_new_characteristic: false,
+                is_new_sub_identity: false,
                 is_new_sector: false
             });
             continue;
@@ -1807,7 +1807,7 @@ export async function finalizeTaxonomyAgainstLibrary(
         // Library-only enforcement: if the LLM hallucinated something not in
         // the library (model drift), drop it to null.
         const newIdentity = t.identity && libIdentities.has(t.identity) ? t.identity : null;
-        const newCharacteristic = t.characteristic && libChars.has(t.characteristic) ? t.characteristic : null;
+        const newSubIdentity = t.sub_identity && libChars.has(t.sub_identity) ? t.sub_identity : null;
         const newSector = t.sector && libSectors.has(t.sector) ? t.sector : null;
 
         // DQ propagation matches Phase 1a's logic.
@@ -1819,16 +1819,16 @@ export async function finalizeTaxonomyAgainstLibrary(
         let preBucket: string;
         if (isDisqualified) preBucket = RESERVED_DISQUALIFIED;
         else if (lowConf) preBucket = RESERVED_GENERAL;
-        else if (newCharacteristic) preBucket = newCharacteristic;
+        else if (newSubIdentity) preBucket = newSubIdentity;
         else if (newIdentity) preBucket = newIdentity;
         else preBucket = RESERVED_GENERAL;
 
         const canonical = isDisqualified
             ? 'Disqualified'
-            : (newSector && newCharacteristic ? `${newSector} ${newCharacteristic}`
-                : (newCharacteristic || newIdentity || 'Generic'));
+            : (newSector && newSubIdentity ? `${newSector} ${newSubIdentity}`
+                : (newSubIdentity || newIdentity || 'Generic'));
 
-        if (!newIdentity && !newCharacteristic && !newSector) nullified++;
+        if (!newIdentity && !newSubIdentity && !newSector) nullified++;
         else rerouted++;
 
         updates.push({
@@ -1838,14 +1838,14 @@ export async function finalizeTaxonomyAgainstLibrary(
             source: 'llm_phase1a',
             raw_industry: row.raw_industry || row.industry_string,
             primary_identity: newIdentity,
-            characteristic: newCharacteristic,
+            sub_identity: newSubIdentity,
             sector: newSector,
             is_new_identity: false,
-            is_new_characteristic: false,
+            is_new_sub_identity: false,
             is_new_sector: false,
             is_disqualified: isDisqualified,
             identity_confidence: Number(((t.identity_confidence || 0) / 10).toFixed(2)),
-            characteristic_confidence: Number(((t.characteristic_confidence || 0) / 10).toFixed(2)),
+            sub_identity_confidence: Number(((t.sub_identity_confidence || 0) / 10).toFixed(2)),
             sector_confidence: Number(((t.sector_confidence || 0) / 10).toFixed(2)),
             confidence: Number(((t.confidence || 0) / 10).toFixed(2)),
             bucket_name: preBucket,
@@ -1869,7 +1869,7 @@ export async function finalizeTaxonomyAgainstLibrary(
         for (let off = 0; off < 200_000; off += PAGE) {
             const { data, error } = await supabase
                 .from('bucket_industry_map')
-                .select('industry_string,primary_identity,characteristic,sector')
+                .select('industry_string,primary_identity,sub-identity,sector')
                 .eq('bucketing_run_id', runId)
                 .range(off, off + PAGE - 1);
             if (error) throw new Error(`bucket_industry_map re-fetch failed at offset ${off}: ${error.message}`);
@@ -1883,11 +1883,11 @@ export async function finalizeTaxonomyAgainstLibrary(
     const usedSectors = new Set<string>();
     for (const r of refreshedRows) {
         if (r.primary_identity) usedIdentitySet.add(r.primary_identity);
-        if (r.characteristic && r.primary_identity) {
-            const key = `${r.primary_identity}::${r.characteristic}`;
+        if (r.sub_identity && r.primary_identity) {
+            const key = `${r.primary_identity}::${r.sub_identity}`;
             if (!usedCharByKey.has(key)) {
-                const charDesc = snapshot.characteristics.find(c => c.name === r.characteristic)?.description || '';
-                usedCharByKey.set(key, { spec: r.characteristic, identity: r.primary_identity, description: charDesc });
+                const charDesc = snapshot.sub_identities.find(c => c.name === r.sub_identity)?.description || '';
+                usedCharByKey.set(key, { spec: r.sub_identity, identity: r.primary_identity, description: charDesc });
             }
         }
         if (r.sector) usedSectors.add(r.sector);
@@ -1899,7 +1899,7 @@ export async function finalizeTaxonomyAgainstLibrary(
     const buckets: DiscoveredBucket[] = [];
     for (const c of usedCharByKey.values()) {
         buckets.push({
-            characteristic: c.spec, primary_identity: c.identity, description: c.description,
+            sub_identity: c.spec, primary_identity: c.identity, description: c.description,
             identity_type: 'other', operator_required: false, priority_rank: 5,
             include: [], exclude: [], example_strings: [],
             strong_identity_signals: [], weak_sector_signals: [], disqualifying_signals: []
@@ -1914,7 +1914,7 @@ export async function finalizeTaxonomyAgainstLibrary(
         },
         taxonomy_snapshot: {
             identities: snapshot.identities,
-            characteristics: snapshot.characteristics,
+            sub_identities: snapshot.sub_identities,
             sectors: snapshot.sectors
         },
         cost_usd: (Number(run.cost_usd) || 0) + costUsd
@@ -1928,14 +1928,14 @@ export async function finalizeTaxonomyAgainstLibrary(
 // ────────────────────────────────────────────────────────────────────
 // BUCKET ASSIGNMENT — map every taxonomy-tagged industry to a bucket
 //
-// User's mental model: taxonomy (identity / characteristic / sector)
+// User's mental model: taxonomy (identity / sub-identity / sector)
 // classifies WHAT the contact is, with no size limits. Buckets are the
 // FINAL campaign segments — fewer in number, with min_volume gating
 // at this step. They live in bucket_library and grow over time as the
 // LLM proposes new ones for industries that don't fit.
 //
 // This pass takes every Phase 1a-tagged row and asks an LLM:
-//   "Given this industry text + (identity, characteristic, sector),
+//   "Given this industry text + (identity, sub-identity, sector),
 //    pick the closest bucket from bucket_library, or propose a new
 //    bucket (with primary_identity) if nothing fits."
 //
@@ -1997,7 +1997,7 @@ function buildBucketAssignmentPrompt(
 
     return `You assign B2B contacts to CAMPAIGN BUCKETS. Buckets are coarser than the per-contact taxonomy — they're the actual outreach segments a marketer would run.
 
-For each industry the user provides, you receive the taxonomy tags from the prior pass: identity, characteristic, sector. Use them to pick the closest bucket from the BUCKET LIBRARY below — or propose a new bucket if nothing in the library fits.
+For each industry the user provides, you receive the taxonomy tags from the prior pass: identity, sub-identity, sector. Use them to pick the closest bucket from the BUCKET LIBRARY below — or propose a new bucket if nothing in the library fits.
 
 BUCKET LIBRARY (curated by the user — prefer these whenever applicable):
 
@@ -2010,7 +2010,7 @@ RULES:
 1. PREFER LIBRARY: if any library bucket is even loosely applicable, pick it (verbatim). The library is the source of truth — only propose new buckets when nothing reasonable fits.
 2. NEW PROPOSALS: when proposing a new bucket, set is_new=true. The bucket_name should be marketer-friendly (e.g. "FinTech / Financial Software", "Renewable Energy Services" — not too narrow, not generic). Required fields: bucket_name AND primary_identity (must be one from the VALID PRIMARY IDENTITIES list).
 3. NULL: if the contact's taxonomy is too vague to bucket meaningfully (e.g. identity=null, or generic catch-all), set bucket_name=null. The contact will route to General.
-4. CONSISTENCY: when two industries share the same identity + characteristic, they should usually get the same bucket. Don't fork unless the difference is meaningful for outreach.
+4. CONSISTENCY: when two industries share the same identity + sub-identity, they should usually get the same bucket. Don't fork unless the difference is meaningful for outreach.
 5. Confidence 1-10: 10 = obvious fit, 7 = good fit, 5 = forced match, 3 = stretch. Use the score honestly.
 
 OUTPUT (strict JSON, key MUST be "results"):
@@ -2073,7 +2073,7 @@ export async function runBucketAssignment(
         for (let off = 0; off < 200_000; off += PAGE) {
             const { data, error } = await supabase
                 .from('bucket_industry_map')
-                .select('industry_string,primary_identity,characteristic,sector,is_disqualified,source')
+                .select('industry_string,primary_identity,sub-identity,sector,is_disqualified,source')
                 .eq('bucketing_run_id', runId)
                 .range(off, off + PAGE - 1);
             if (error) throw new Error(`bucket_industry_map fetch failed at offset ${off}: ${error.message}`);
@@ -2117,7 +2117,7 @@ export async function runBucketAssignment(
                 id: i,
                 industry: r.industry_string,
                 identity: r.primary_identity,
-                characteristic: r.characteristic,
+                sub_identity: r.sub_identity,
                 sector: r.sector
             }))
         });
@@ -2310,15 +2310,15 @@ export async function runBucketAssignment(
 async function loadTaxonomySnapshot(supabase: SupabaseClient): Promise<TaxonomySnapshot> {
     const [idRes, chRes, secRes] = await Promise.all([
         supabase.from('taxonomy_identities').select('*').eq('archived', false).order('sort_order'),
-        supabase.from('taxonomy_characteristics').select('*').eq('archived', false).order('sort_order'),
+        supabase.from('taxonomy_sub_identities').select('*').eq('archived', false).order('sort_order'),
         supabase.from('taxonomy_sectors').select('*').eq('archived', false).order('sort_order')
     ]);
     if (idRes.error) throw new Error(`taxonomy_identities load failed: ${idRes.error.message}`);
-    if (chRes.error) throw new Error(`taxonomy_characteristics load failed: ${chRes.error.message}`);
+    if (chRes.error) throw new Error(`taxonomy_sub_identities load failed: ${chRes.error.message}`);
     if (secRes.error) throw new Error(`taxonomy_sectors load failed: ${secRes.error.message}`);
     return {
         identities: (idRes.data || []) as TaxonomyEntry[],
-        characteristics: (chRes.data || []) as TaxonomyEntry[],
+        sub_identities: (chRes.data || []) as TaxonomyEntry[],
         sectors: (secRes.data || []) as TaxonomyEntry[]
     };
 }
@@ -2432,13 +2432,13 @@ async function tagIndustries(
                         industry: v.industry,
                         identity: null,
                         is_new_identity: false,
-                        characteristic: null,
-                        is_new_characteristic: false,
+                        sub_identity: null,
+                        is_new_sub_identity: false,
                         sector: null,
                         is_new_sector: false,
                         is_disqualified: false,
                         identity_confidence: 0,
-                        characteristic_confidence: 0,
+                        sub_identity_confidence: 0,
                         sector_confidence: 0,
                         confidence: 0,
                         reason: `parse_empty: ${text.slice(0, 100)}`
@@ -2457,13 +2457,13 @@ async function tagIndustries(
                     industry: v.industry,
                     identity: null,
                     is_new_identity: false,
-                    characteristic: null,
-                    is_new_characteristic: false,
+                    sub_identity: null,
+                    is_new_sub_identity: false,
                     sector: null,
                     is_new_sector: false,
                     is_disqualified: false,
                     identity_confidence: 0,
-                    characteristic_confidence: 0,
+                    sub_identity_confidence: 0,
                     sector_confidence: 0,
                     confidence: 0,
                     reason: `tagging_error: ${err.message?.slice(0, 200)}`
@@ -2506,7 +2506,7 @@ function buildTaggingSystemPrompt(s: TaxonomySnapshot): string {
     const idLines = s.identities.map(i =>
         `  - ${i.name}${i.is_disqualified ? ' [DQ]' : ''}: ${i.description || ''}`
     ).join('\n');
-    const chLines = s.characteristics.map(c =>
+    const chLines = s.sub_identities.map(c =>
         `  - ${c.name} (under ${c.parent_identity}): ${c.description || ''}`
     ).join('\n');
     const secLines = s.sectors.map(sec =>
@@ -2519,7 +2519,7 @@ For each industry text the user provides, return three independent tags. The thr
 
 1. **Identity** (REQUIRED) — what kind of company is it at its core? Pick from the IDENTITY library below. Strongly prefer the closest existing entry. Only propose a new identity (is_new_identity=true) when no library entry is even loosely applicable AND the new identity satisfies the GRANULARITY RULES below. Identities marked [DQ] are *historically* disqualified for B2B outreach; treat the marker as a strong hint, not a hard rule (see DISQUALIFICATION RULES).
 
-2. **Characteristic** (optional) — the company's primary functional sub-type within its identity. Pick from the CHARACTERISTICS library below; the parent_identity must match the identity you chose. Strongly prefer the closest existing entry. Only propose a new characteristic (is_new_characteristic=true) when no library entry is even loosely applicable AND the new entry satisfies the GRANULARITY RULES below. If no characteristic applies, return null.
+2. **Sub-Identity** (optional) — the company's primary functional sub-type within its identity. Pick from the SUB-IDENTITIES library below; the parent_identity must match the identity you chose. Strongly prefer the closest existing entry. Only propose a new sub-identity (is_new_sub_identity=true) when no library entry is even loosely applicable AND the new entry satisfies the GRANULARITY RULES below. If no sub-identity applies, return null.
 
 3. **Sector** (optional) — the specific vertical the company serves. Pick from the SECTOR library below. Sector is independent of identity (a "Marketing Agency serving Healthcare" has identity=Agency, sector=Healthcare / Medical). Strongly prefer the closest existing entry. Only propose a new sector (is_new_sector=true) when no library entry covers the served vertical AND the new entry satisfies the GRANULARITY RULES below. If the company doesn't have a clear served sector, return null.
 
@@ -2541,8 +2541,8 @@ TOO NARROW (forbidden — collapse to a broader identity):
   "Logistics & Supply Chain Services" → "Transportation & Logistics"
   "Telecommunications" + "Telecommunications Services" (same — pick one)
 
-== CHARACTERISTIC (Layer 2) — most common over-segmentation source ==
-The specific functional sub-type within the chosen Identity. Target: ~3–8 characteristics per identity. Total characteristics across the whole run: 40–100 unless you have a strong reason to exceed.
+== SUB-IDENTITY (Layer 2) — most common over-segmentation source ==
+The specific functional sub-type within the chosen Identity. Target: ~3–8 sub-identities per identity. Total sub-identities across the whole run: 40–100 unless you have a strong reason to exceed.
 
 RIGHT level (examples by identity):
   Agency: SEO Agency · Performance Marketing Agency · Creative Agency · PR Agency · Branding Agency
@@ -2551,15 +2551,15 @@ RIGHT level (examples by identity):
   Real Estate: Brokerage · Property Management · Real Estate Development · Real Estate Investment
   Consulting & Advisory: Business Consulting · Management Consulting · Financial Advisory · HR Consulting · IT Consulting
 
-DO NOT create a new characteristic unless ALL of these are true:
+DO NOT create a new sub-identity unless ALL of these are true:
   1. It can apply to multiple companies, not just one.
-  2. It is meaningfully different from existing characteristics under the same identity.
+  2. It is meaningfully different from existing sub-identities under the same identity.
   3. It is useful for segmentation, personalization, filtering, or campaign strategy.
-  4. It is not just a rewording or slightly narrower version of an existing characteristic.
+  4. It is not just a rewording or slightly narrower version of an existing sub-identity.
   5. It does not mix in served verticals — those belong in Sector.
   6. It does not describe a tiny niche unless that niche appears repeatedly and is commercially useful.
 
-Before adding a new characteristic, ALWAYS check whether it should be merged into an existing broader characteristic. Examples of merges you MUST apply:
+Before adding a new sub-identity, ALWAYS check whether it should be merged into an existing broader sub-identity. Examples of merges you MUST apply:
   "Financial Advisory Services" → Financial Advisory
   "Investment Advisory" → Financial Advisory  (or Investment Management depending on context)
   "Investment & Development" → Real Estate Investment  (or Real Estate Development)
@@ -2571,13 +2571,13 @@ Before adding a new characteristic, ALWAYS check whether it should be merged int
   "Managed IT Services and Cybersecurity" → Managed IT Services
   "FinTech Software Company" → FinTech SaaS
 
-Quality check before finalizing a characteristic. Ask:
-  1. Is this characteristic reusable across multiple companies?
+Quality check before finalizing a sub-identity. Ask:
+  1. Is this sub-identity reusable across multiple companies?
   2. Is it meaningfully distinct from existing options?
   3. Would a marketer or sales operator actually use this distinction?
   4. Could this be merged into a broader label without losing important value?
-  5. Is this actually a sector instead of a characteristic?
-Only keep the characteristic if the answers support keeping it. When in doubt, merge into a broader existing characteristic instead of creating a new one.
+  5. Is this actually a sector instead of a sub-identity?
+Only keep the sub-identity if the answers support keeping it. When in doubt, merge into a broader existing sub-identity instead of creating a new one.
 
 == SECTOR (Layer 3) ==
 The vertical the company SERVES, only when EXPLICITLY stated in the input. Independent of identity. Target: 10–20 sectors total in a typical run.
@@ -2611,25 +2611,25 @@ DO NOT use as a sector (these are identities or non-verticals — return BLANK i
   Corporate · B2B · Small Business · Subscription · Holding Company
 
 Examples:
-  ✓ Marketing agency for healthcare companies → identity=Agency, characteristic=Performance Marketing Agency, sector=Healthcare
-  ✓ SaaS platform for real estate investors → identity=Software & SaaS, characteristic=Vertical SaaS, sector=Real Estate
-  ✓ Wealth management firm (no vertical mentioned) → identity=Financial Services, characteristic=Wealth Management, sector=BLANK
+  ✓ Marketing agency for healthcare companies → identity=Agency, sub-identity=Performance Marketing Agency, sector=Healthcare
+  ✓ SaaS platform for real estate investors → identity=Software & SaaS, sub-identity=Vertical SaaS, sector=Real Estate
+  ✓ Wealth management firm (no vertical mentioned) → identity=Financial Services, sub-identity=Wealth Management, sector=BLANK
   ✓ "Influencer marketing agency" (no vertical) → sector=BLANK, NOT "Marketing & Advertising"
   ✓ Hedge fund (multi-strategy) → sector=BLANK, NOT "Multi-industry" unless the text explicitly says it
 
 == WHEN IN DOUBT ==
 - Keep Identity broad and stable.
-- Keep Characteristics controlled and reusable.
+- Keep Sub-Identities controlled and reusable.
 - Keep Sector only for explicitly served markets.
 - Prefer merging over creating new categories.
-- Avoid one-off characteristics, near-duplicates, plural/singular variants.
+- Avoid one-off sub-identities, near-duplicates, plural/singular variants.
 - Use the EXACT spelling of the canonical names above so different batches converge.
 The bar to set is_new_*=true is HIGH: only do it when no existing or canonical name is even loosely applicable AND the new entry passes the quality checks above.
 
 CLASSIFICATION RULES (critical):
 - Classify by core business identity FIRST, sector served SECOND. A PE firm focused on healthcare is identity=Financial Services, NOT Healthcare.
 - Operators in a vertical (a hospital, a SaaS company) belong to that identity. Service providers TO that vertical (an agency that markets healthcare, a consultant to insurers) belong to the service identity, with the vertical going into sector.
-- **SERVICES vs PRODUCTS — do not collapse them**. Companies that *rent*, *maintain*, *repair*, or *operate-as-a-service* should NEVER be tagged "B2B Product Manufacturer" / "Industrial Equipment / Machinery" just because they're industrial-adjacent. If no services characteristic fits, prefer a Services / Field Services / Equipment Rental / Maintenance Services characteristic if one exists in the library — otherwise propose one (is_new_characteristic=true) rather than picking a wrong manufacturer label. Reserve Manufacturer characteristics for companies whose primary act is *making* a physical product.
+- **SERVICES vs PRODUCTS — do not collapse them**. Companies that *rent*, *maintain*, *repair*, or *operate-as-a-service* should NEVER be tagged "B2B Product Manufacturer" / "Industrial Equipment / Machinery" just because they're industrial-adjacent. If no services sub-identity fits, prefer a Services / Field Services / Equipment Rental / Maintenance Services sub-identity if one exists in the library — otherwise propose one (is_new_sub_identity=true) rather than picking a wrong manufacturer label. Reserve Manufacturer sub-identities for companies whose primary act is *making* a physical product.
 - **Talent / Artist Management is an Agency, not Consulting.** Don't tag artist management firms, modeling agencies, or sports management firms as Management Consulting.
 - **Game / Software studios are Software & SaaS (or a new Software identity), not Hospitality / Travel / Consumer Retail** — even if the games are sold to consumers. Use is_disqualified=true only if the company is unambiguously pure-consumer with no B2B angle.
 
@@ -2647,10 +2647,10 @@ DISQUALIFICATION RULES (be CONSERVATIVE — false negatives are worse than false
 - When uncertain, set is_disqualified=false and let the user decide downstream. The reason field should explain why if you DO disqualify.
 
 CONFIDENCE SCORING (per tag, 1-10):
-- Return THREE independent confidence scores: identity_confidence, characteristic_confidence, sector_confidence.
+- Return THREE independent confidence scores: identity_confidence, sub_identity_confidence, sector_confidence.
 - Each scores how sure you are about THAT tag specifically, not the whole row.
-- A "PE firm investing in healthcare" might be identity_confidence=10, characteristic_confidence=9, sector_confidence=8 (sector clear).
-- A "consulting firm" with no vertical mentioned might be identity_confidence=8, characteristic_confidence=5 (which kind of consulting?), sector_confidence=2 (no sector mentioned — return null sector and score 1-3).
+- A "PE firm investing in healthcare" might be identity_confidence=10, sub_identity_confidence=9, sector_confidence=8 (sector clear).
+- A "consulting firm" with no vertical mentioned might be identity_confidence=8, sub_identity_confidence=5 (which kind of consulting?), sector_confidence=2 (no sector mentioned — return null sector and score 1-3).
 - <6 means: this specific tag is a guess; downstream code may ignore it.
 - If you return null for a tag (e.g. no sector applicable), set its confidence to 1.
 
@@ -2665,13 +2665,13 @@ not "output" — exactly "results"). Each item's "id" MUST match the input "id"
       "id": <integer matching input id>,
       "identity": "<library name or new>" | null,
       "is_new_identity": <bool>,
-      "characteristic": "<library name or new>" | null,
-      "is_new_characteristic": <bool>,
+      "sub-identity": "<library name or new>" | null,
+      "is_new_sub_identity": <bool>,
       "sector": "<library name or new>" | null,
       "is_new_sector": <bool>,
       "is_disqualified": <bool>,
       "identity_confidence": <1-10 integer>,
-      "characteristic_confidence": <1-10 integer>,
+      "sub_identity_confidence": <1-10 integer>,
       "sector_confidence": <1-10 integer>,
       "reason": "<brief justification, <= 30 words>"
     }, ...
@@ -2681,7 +2681,7 @@ not "output" — exactly "results"). Each item's "id" MUST match the input "id"
 == IDENTITY LIBRARY ==
 ${idLines}
 
-== CHARACTERISTICS LIBRARY ==
+== SUB-IDENTITIES LIBRARY ==
 ${chLines}
 
 == SECTOR LIBRARY ==
@@ -2736,7 +2736,7 @@ function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
     // in json_object mode often echoes back the user prompt's key (`industries`)
     // instead of the prompt-specified `results`. We accept either by scanning
     // the parsed object's top-level values for the first array of items that
-    // look like taggings (have `id`, `identity`, or `characteristic`).
+    // look like taggings (have `id`, `identity`, or `sub-identity`).
     let arr: any[] = [];
     if (Array.isArray(parsed)) {
         arr = parsed;
@@ -2769,19 +2769,19 @@ function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
         // for all three. The min becomes the overall confidence.
         const legacyConf = typeof item.confidence === 'number' ? item.confidence : 0;
         const idConf = typeof item.identity_confidence === 'number' ? item.identity_confidence : legacyConf;
-        const chConf = typeof item.characteristic_confidence === 'number' ? item.characteristic_confidence : legacyConf;
+        const chConf = typeof item.sub_identity_confidence === 'number' ? item.sub_identity_confidence : legacyConf;
         const secConf = typeof item.sector_confidence === 'number' ? item.sector_confidence : legacyConf;
         out.push({
             industry: v.industry,
             identity: nz(item.identity),
             is_new_identity: !!item.is_new_identity,
-            characteristic: nz(item.characteristic),
-            is_new_characteristic: !!item.is_new_characteristic,
+            sub_identity: nz(item.sub_identity),
+            is_new_sub_identity: !!item.is_new_sub_identity,
             sector: nz(item.sector),
             is_new_sector: !!item.is_new_sector,
             is_disqualified: !!item.is_disqualified,
             identity_confidence: idConf,
-            characteristic_confidence: chConf,
+            sub_identity_confidence: chConf,
             sector_confidence: secConf,
             confidence: Math.min(idConf || 10, chConf || 10, secConf || 10),
             reason: typeof item.reason === 'string' ? item.reason.slice(0, 500) : ''
@@ -2796,7 +2796,7 @@ function nz(v: any): string | null {
     return s.length > 0 ? s : null;
 }
 
-// Post-batch dedup: collapse near-duplicate identity / characteristic /
+// Post-batch dedup: collapse near-duplicate identity / sub-identity /
 // sector tags WITHIN a single run's taggings array. Phase 1a runs in
 // 40-concurrent batches that don't see each other's output, so the same
 // concept can show up under 4-5 spelling variants ("Field Services /
@@ -2810,7 +2810,7 @@ function nz(v: any): string | null {
 // frequent variant > shortest. Then rewrite every tagging in-place.
 function consolidateTaggings(taggings: IndustryTagging[], snapshot: TaxonomySnapshot): {
     identityMerges: number;
-    characteristicMerges: number;
+    subIdentityMerges: number;
     sectorMerges: number;
 } {
     const buildCanonical = (
@@ -2848,7 +2848,7 @@ function consolidateTaggings(taggings: IndustryTagging[], snapshot: TaxonomySnap
     };
 
     const id = buildCanonical(snapshot.identities.map(i => i.name), t => t.identity);
-    const ch = buildCanonical(snapshot.characteristics.map(c => c.name), t => t.characteristic);
+    const ch = buildCanonical(snapshot.sub_identities.map(c => c.name), t => t.sub_identity);
     const sec = buildCanonical(snapshot.sectors.map(s => s.name), t => t.sector);
 
     for (const t of taggings) {
@@ -2857,10 +2857,10 @@ function consolidateTaggings(taggings: IndustryTagging[], snapshot: TaxonomySnap
             const can = id.canonical.get(norm);
             if (can) t.identity = can;
         }
-        if (t.characteristic) {
-            const norm = normalizeTaxonomyName(t.characteristic);
+        if (t.sub_identity) {
+            const norm = normalizeTaxonomyName(t.sub_identity);
             const can = ch.canonical.get(norm);
-            if (can) t.characteristic = can;
+            if (can) t.sub_identity = can;
         }
         if (t.sector) {
             const norm = normalizeTaxonomyName(t.sector);
@@ -2870,7 +2870,7 @@ function consolidateTaggings(taggings: IndustryTagging[], snapshot: TaxonomySnap
     }
     return {
         identityMerges: id.merges,
-        characteristicMerges: ch.merges,
+        subIdentityMerges: ch.merges,
         sectorMerges: sec.merges
     };
 }
@@ -2889,7 +2889,7 @@ function normalizeTaxonomyName(name: string): string {
     // Strip parenthesized notes like "(under Tech)" the LLM occasionally adds.
     s = s.replace(/\s*\([^)]*\)\s*$/g, '').trim();
     // Strip leading "B2B " — the LLM sprinkles this for emphasis and it's
-    // never semantically meaningful at the identity / characteristic level.
+    // never semantically meaningful at the identity / sub-identity level.
     s = s.replace(/^b2b\s+/i, '').trim();
     // Collapse delimiter + connector variants so "Field Services / Maintenance"
     // and "Field Services & Maintenance" and "Field Services and Maintenance"
@@ -2921,18 +2921,18 @@ function normalizeTaxonomyName(name: string): string {
     return s;
 }
 
-// LLM-based semantic consolidation of proposed-new characteristics. Runs
+// LLM-based semantic consolidation of proposed-new sub-identities. Runs
 // AFTER consolidateTaggings (which only catches normalized-name matches).
 // The LLM merges semantically similar entries the normalizer can't catch
 // ("Wealth Management" + "Investment Advisory" + "Wealth & Investment
 // Advisory" → all collapse to "Wealth Management"). Skipped when there
-// are < 60 proposed-new characteristics — for small runs it's not worth
+// are < 60 proposed-new sub-identities — for small runs it's not worth
 // the extra LLM call.
 //
 // Input: the taggings array + the library snapshot.
-// Output: how many characteristic names were merged. Mutates `taggings`
+// Output: how many sub-identity names were merged. Mutates `taggings`
 // in-place to use the canonical name from each merge group.
-async function consolidateCharacteristicsViaLLM(
+async function consolidateSubIdentitiesViaLLM(
     supabase: SupabaseClient,
     model: string,
     taggings: IndustryTagging[],
@@ -2940,15 +2940,15 @@ async function consolidateCharacteristicsViaLLM(
     runId: string,
     ctx: BucketingCtx
 ): Promise<{ merges: number; costUsd: number }> {
-    const libraryNames = new Set(snapshot.characteristics.map(c => c.name));
+    const libraryNames = new Set(snapshot.sub_identities.map(c => c.name));
 
-    // Count distinct proposed-new characteristic occurrences, grouped with
+    // Count distinct proposed-new sub-identity occurrences, grouped with
     // their parent identity (so the LLM only merges WITHIN the same identity
     // — "FinTech SaaS" under Software & SaaS shouldn't merge with "FinTech
     // Investment" under Financial Services).
     const counts = new Map<string, { count: number; identity: string }>();
     for (const t of taggings) {
-        const c = t.characteristic;
+        const c = t.sub_identity;
         if (!c) continue;
         if (libraryNames.has(c)) continue;            // skip library-canonical
         const key = `${t.identity || ''}::${c}`;
@@ -2957,7 +2957,7 @@ async function consolidateCharacteristicsViaLLM(
         else counts.set(key, { count: 1, identity: t.identity || '' });
     }
     if (counts.size < 60) {
-        ctx.log(`[Bucketing ${runId}] characteristic consolidation skipped (${counts.size} proposed-new < 60 threshold)`);
+        ctx.log(`[Bucketing ${runId}] sub-identity consolidation skipped (${counts.size} proposed-new < 60 threshold)`);
         return { merges: 0, costUsd: 0 };
     }
 
@@ -2965,8 +2965,8 @@ async function consolidateCharacteristicsViaLLM(
     // names first since those are more likely to "win" as canonical.
     const entries = Array.from(counts.entries())
         .map(([key, v]) => {
-            const [identity, characteristic] = key.split('::');
-            return { identity, characteristic, count: v.count };
+            const [identity, subIdentity] = key.split('::');
+            return { identity, sub_identity: subIdentity, count: v.count };
         })
         .sort((a, b) => b.count - a.count);
 
@@ -2982,29 +2982,29 @@ async function consolidateCharacteristicsViaLLM(
     const byIdent = new Map<string, { name: string; count: number }[]>();
     for (const e of entries) {
         if (!byIdent.has(e.identity)) byIdent.set(e.identity, []);
-        byIdent.get(e.identity)!.push({ name: e.characteristic, count: e.count });
+        byIdent.get(e.identity)!.push({ name: e.sub_identity, count: e.count });
     }
 
-    // Library characteristics indexed by parent_identity. Each per-identity
-    // chunk surfaces its slice as "EXISTING LIBRARY CHARACTERISTICS UNDER
+    // Library sub-identities indexed by parent_identity. Each per-identity
+    // chunk surfaces its slice as "EXISTING LIBRARY SUB-IDENTITIES UNDER
     // THIS IDENTITY" so the LLM merges proposals INTO library entries first
     // (the user's curated taxonomy is the source of truth and must never be
     // removed or renamed by the consolidator).
     const libraryByIdentity = new Map<string, string[]>();
-    for (const c of snapshot.characteristics) {
+    for (const c of snapshot.sub_identities) {
         const parent = c.parent_identity || '';
         if (!libraryByIdentity.has(parent)) libraryByIdentity.set(parent, []);
         libraryByIdentity.get(parent)!.push(c.name);
     }
 
-    const systemPrompt = `You consolidate a list of B2B characteristic proposals into a small, reusable canonical set. Each characteristic is a sub-type within a primary identity.
+    const systemPrompt = `You consolidate a list of B2B sub-identity proposals into a small, reusable canonical set. Each sub-identity is a sub-type within a primary identity.
 
-GOAL: collapse near-duplicate / overly narrow entries within the same identity. TARGET: 3–6 characteristics per identity, TOTAL 50–80 across the whole list. If the input has more than 80 distinct characteristics, you MUST merge aggressively. Be RUTHLESS — leaving variants separate is the failure mode, merging too much is rare.
+GOAL: collapse near-duplicate / overly narrow entries within the same identity. TARGET: 3–6 sub-identities per identity, TOTAL 50–80 across the whole list. If the input has more than 80 distinct sub-identities, you MUST merge aggressively. Be RUTHLESS — leaving variants separate is the failure mode, merging too much is rare.
 
 LIBRARY PRIORITY (CRITICAL):
-The user prompt for each identity may include a section "EXISTING LIBRARY CHARACTERISTICS UNDER THIS IDENTITY". Those names are the user's curated taxonomy and are the source of truth — they MUST be your first choice as merge targets. ALWAYS prefer merging proposals INTO a library entry over inventing or picking a canonical from the lists below. NEVER remove or rename a library entry. Only fall back to the canonical lists below when no library entry under the same identity is even loosely applicable.
+The user prompt for each identity may include a section "EXISTING LIBRARY SUB-IDENTITIES UNDER THIS IDENTITY". Those names are the user's curated taxonomy and are the source of truth — they MUST be your first choice as merge targets. ALWAYS prefer merging proposals INTO a library entry over inventing or picking a canonical from the lists below. NEVER remove or rename a library entry. Only fall back to the canonical lists below when no library entry under the same identity is even loosely applicable.
 
-CANONICAL CHARACTERISTICS BY IDENTITY (fallback when no library match exists — use these names verbatim wherever applicable):
+CANONICAL SUB-IDENTITIES BY IDENTITY (fallback when no library match exists — use these names verbatim wherever applicable):
 
 Agency: SEO Agency · Performance Marketing Agency · Creative Agency · Branding Agency · PR Agency · Event Management Agency · Talent Management Agency · Manufacturers' Representative
 Software & SaaS: FinTech SaaS · Vertical SaaS · MarTech SaaS · HR SaaS · CRM / Sales Software · Cybersecurity Software · Custom Software Development · Game Development
@@ -3095,20 +3095,20 @@ REQUIRED MERGE PATTERNS — APPLY EVERY ONE OF THESE (these are observed in real
   "B2B " prefix → strip ("B2B SaaS" → SaaS context-dependent)
 
 LOW-COUNT MERGE RULE (count ≤ 2):
-Any characteristic appearing only 1–2 times in the input list MUST be either:
-  (a) merged into the closest broader sibling characteristic under the same identity (preferred), OR
+Any sub-identity appearing only 1–2 times in the input list MUST be either:
+  (a) merged into the closest broader sibling sub-identity under the same identity (preferred), OR
   (b) dropped to null if no reasonable sibling exists (output {"from": "<name>", "to": ""})
-Low-count entries fragment the bucket count without earning their own viable bucket — a 1× characteristic will roll up to identity-only at min_volume anyway.
+Low-count entries fragment the bucket count without earning their own viable bucket — a 1× sub-identity will roll up to identity-only at min_volume anyway.
 
 IDENTITY-BLEED RULE (CRITICAL):
-If the characteristic name IS an identity name (e.g. "Healthcare Operator" used as a characteristic, "Field Services & Maintenance" used as a characteristic, "Consulting & Advisory" used as a characteristic, "Legal Services" used as a characteristic, "Non-Profit & Association" used as a characteristic, "Hospitality & Travel" used as a characteristic, "Energy & Utilities" used as a characteristic, "Staffing & Recruiting" used as a characteristic, "Operator" used as a characteristic), drop it to null with {"from": "<name>", "to": ""}. The contact will roll up to identity-only via the cascade. Identity names should never appear as characteristics.
+If the sub-identity name IS an identity name (e.g. "Healthcare Operator" used as a sub-identity, "Field Services & Maintenance" used as a sub-identity, "Consulting & Advisory" used as a sub-identity, "Legal Services" used as a sub-identity, "Non-Profit & Association" used as a sub-identity, "Hospitality & Travel" used as a sub-identity, "Energy & Utilities" used as a sub-identity, "Staffing & Recruiting" used as a sub-identity, "Operator" used as a sub-identity), drop it to null with {"from": "<name>", "to": ""}. The contact will roll up to identity-only via the cascade. Identity names should never appear as sub-identities.
 
 QUALITY CHECK before keeping a name as-is. Ask:
-  1. Is this characteristic reusable across multiple companies (≥3 ideally)?
+  1. Is this sub-identity reusable across multiple companies (≥3 ideally)?
   2. Is it meaningfully distinct from existing options under the same identity?
   3. Would a marketer or sales operator actually use this distinction in a campaign?
   4. Could this be merged into a broader label without losing important value?
-  5. Is this actually a sector (vertical served) instead of a characteristic?
+  5. Is this actually a sector (vertical served) instead of a sub-identity?
 Only keep the name if the answers support it. When in doubt, MERGE.
 
 HARD RULES:
@@ -3119,11 +3119,11 @@ HARD RULES:
 OUTPUT (strict JSON, key MUST be "merges"):
 {
   "merges": [
-    { "from": "<original characteristic name verbatim>", "to": "<canonical name OR empty string \\"\\" to drop>" },
+    { "from": "<original sub-identity name verbatim>", "to": "<canonical name OR empty string \\"\\" to drop>" },
     ...
   ]
 }
-Only include entries where from != to (or where to="" to drop). Be ruthless — if the input has 200+ characteristics, expect to output 150+ merges.`;
+Only include entries where from != to (or where to="" to drop). Be ruthless — if the input has 200+ sub-identities, expect to output 150+ merges.`;
 
     // Per-identity LLM call. Each call gets a small input (5-50 chars under
     // ONE identity) and produces small output (3-30 merges). Failures in
@@ -3135,9 +3135,9 @@ Only include entries where from != to (or where to="" to drop). Be ruthless — 
         const inputBody = list.map(l => `  - "${l.name}" (${l.count}×)`).join('\n');
         const libUnderId = (libraryByIdentity.get(identity) || []).slice().sort();
         const libBlock = libUnderId.length > 0
-            ? `\n\nEXISTING LIBRARY CHARACTERISTICS UNDER THIS IDENTITY (source of truth — always prefer these as merge targets, NEVER remove or rename):\n${libUnderId.map(n => `  - "${n}"`).join('\n')}`
-            : '\n\n(No library characteristics exist yet under this identity — use canonical fallback list from system prompt.)';
-        const userPrompt = `Identity to consolidate: ${identity || '(none)'}${libBlock}\n\nProposed-new characteristics under this identity (apply LIBRARY PRIORITY rule from system prompt, then REQUIRED MERGE PATTERNS, LOW-COUNT MERGE, and IDENTITY-BLEED rules):\n\n${inputBody}`;
+            ? `\n\nEXISTING LIBRARY SUB-IDENTITIES UNDER THIS IDENTITY (source of truth — always prefer these as merge targets, NEVER remove or rename):\n${libUnderId.map(n => `  - "${n}"`).join('\n')}`
+            : '\n\n(No library sub-identities exist yet under this identity — use canonical fallback list from system prompt.)';
+        const userPrompt = `Identity to consolidate: ${identity || '(none)'}${libBlock}\n\nProposed-new sub-identities under this identity (apply LIBRARY PRIORITY rule from system prompt, then REQUIRED MERGE PATTERNS, LOW-COUNT MERGE, and IDENTITY-BLEED rules):\n\n${inputBody}`;
 
         const isAnthropic = model.startsWith('claude-');
         let text = '';
@@ -3215,7 +3215,7 @@ Only include entries where from != to (or where to="" to drop). Be ruthless — 
     const limit = pLimit(5);
     const candidates = Array.from(byIdent.entries()).filter(([_, list]) => list.length >= 5);
     if (candidates.length === 0) {
-        ctx.log(`[Bucketing ${runId}] characteristic consolidation: no identities with >= 5 entries to consolidate`);
+        ctx.log(`[Bucketing ${runId}] sub-identity consolidation: no identities with >= 5 entries to consolidate`);
         return { merges: 0, costUsd: 0 };
     }
 
@@ -3235,22 +3235,22 @@ Only include entries where from != to (or where to="" to drop). Be ruthless — 
     })));
 
     if (totalErrors > 0) {
-        ctx.log(`[Bucketing ${runId}] characteristic consolidation: ${totalErrors}/${candidates.length} identities failed (non-fatal — others applied)`);
+        ctx.log(`[Bucketing ${runId}] sub-identity consolidation: ${totalErrors}/${candidates.length} identities failed (non-fatal — others applied)`);
     }
 
     // Apply the mapping in-place. An empty string target means "drop to null"
     // — used by LOW-COUNT MERGE and IDENTITY-BLEED rules. The contact will
     // then roll up to identity-only via the cascade.
     for (const t of taggings) {
-        if (t.characteristic && mergeMap.has(t.characteristic)) {
-            const target = mergeMap.get(t.characteristic) || '';
-            t.characteristic = target.trim() ? target : null;
+        if (t.sub_identity && mergeMap.has(t.sub_identity)) {
+            const target = mergeMap.get(t.sub_identity) || '';
+            t.sub_identity = target.trim() ? target : null;
         }
     }
     return { merges: mergeMap.size, costUsd: totalCost };
 }
 
-// Sector-specific consolidation. Same shape as the characteristic version
+// Sector-specific consolidation. Same shape as the sub-identity version
 // but with sector-tailored merge rules and a more aggressive "drop or merge
 // to BLANK" instruction. Sectors fragment heavily across batches because
 // the LLM invents niche verticals (Sports / Sports & Athletics / Esports)
@@ -3405,7 +3405,7 @@ Only include entries where from != to (or where to is "" to drop). Be aggressive
 }
 
 // LLM semantic consolidation of proposed-new IDENTITIES (Layer 1 — top-level
-// business model). Smaller input than characteristics (typically 5–25
+// business model). Smaller input than sub-identities (typically 5–25
 // proposals), so a single LLM call is sufficient. The library list is
 // included in the prompt so the LLM can merge proposals INTO existing
 // canonical names rather than fork variants. Identity is the cascade root,
@@ -3545,8 +3545,8 @@ Only include entries where from != to (or where to is "" to drop).`;
         return { merges: 0, costUsd };
     }
 
-    // Apply: empty target = drop identity (and its child characteristic, since
-    // characteristic is parented to identity — orphaned characteristics from
+    // Apply: empty target = drop identity (and its child sub-identity, since
+    // sub-identity is parented to identity — orphaned sub-identities from
     // a dropped identity rarely make sense). Sector is independent and stays.
     for (const t of taggings) {
         if (t.identity && mergeMap.has(t.identity)) {
@@ -3555,7 +3555,7 @@ Only include entries where from != to (or where to is "" to drop).`;
                 t.identity = target;
             } else {
                 t.identity = null;
-                t.characteristic = null;
+                t.sub_identity = null;
             }
         }
     }
@@ -3563,7 +3563,7 @@ Only include entries where from != to (or where to is "" to drop).`;
 }
 
 // Deterministic post-pass: any proposed-new identity with count < 3 gets
-// dropped (the row's identity + characteristic become null and the contact
+// dropped (the row's identity + sub-identity become null and the contact
 // rolls up to General via the cascade). Singletons fragment the library
 // without earning a viable bucket — at min_volume, a 1× identity has no
 // chance of clearing the floor. Runs AFTER the LLM consolidation pass so
@@ -3592,7 +3592,7 @@ function dropSingletonNewIdentities(
     for (const t of taggings) {
         if (t.identity && singletons.has(t.identity)) {
             t.identity = null;
-            t.characteristic = null;
+            t.sub_identity = null;
             rerouted++;
         }
     }
@@ -3605,10 +3605,10 @@ function dropSingletonNewIdentities(
 // ────────────────────────────────────────────────────────────────────
 
 interface TaxonomyEdits {
-    keep?: string[];                              // characteristic names
+    keep?: string[];                              // sub-identity names
     rename?: Record<string, string>;              // {old spec name: new spec name}
     add?: {
-        characteristic: string;
+        sub_identity: string;
         primary_identity: string;
         description: string;
         identity_type?: string;
@@ -3636,25 +3636,25 @@ export async function applyTaxonomyEdits(
         for (const [oldName, newName] of Object.entries(edits.rename)) {
             const target = newName.trim();
             if (!target || RESERVED.has(target.toLowerCase())) continue;
-            leaves = leaves.map(b => b.characteristic === oldName
-                ? { ...b, characteristic: target }
+            leaves = leaves.map(b => b.sub_identity === oldName
+                ? { ...b, sub_identity: target }
                 : b);
         }
     }
 
     if (edits.keep) {
         const keepSet = new Set(edits.keep.map(s => s.trim()));
-        leaves = leaves.filter(b => keepSet.has(b.characteristic));
+        leaves = leaves.filter(b => keepSet.has(b.sub_identity));
     }
 
     if (edits.add) {
         for (const a of edits.add) {
-            const spec = (a.characteristic || '').trim();
+            const spec = (a.sub_identity || '').trim();
             const ident = (a.primary_identity || '').trim();
             if (!spec || RESERVED.has(spec.toLowerCase()) || !ident) continue;
-            if (leaves.some(l => l.characteristic === spec)) continue;
+            if (leaves.some(l => l.sub_identity === spec)) continue;
             leaves.push({
-                characteristic: spec,
+                sub_identity: spec,
                 primary_identity: ident,
                 description: (a.description || '').trim(),
                 identity_type: a.identity_type || 'other',
@@ -3684,7 +3684,7 @@ export async function applyTaxonomyEdits(
         update.preferred_library_ids = edits.preferred_library_ids;
     }
     await supabase.from('bucketing_runs').update(update).eq('id', runId);
-    ctx.log(`[Bucketing ${runId}] taxonomy edits applied: ${leaves.length} characteristics`);
+    ctx.log(`[Bucketing ${runId}] taxonomy edits applied: ${leaves.length} sub-identities`);
 
     // Rebuild the preview map so Review counts reflect the edited taxonomy
     // (renames / drops / new specs all change which industries map where).
@@ -3771,7 +3771,7 @@ export async function runAssignment(
         ctx.log(`[Bucketing ${runId}] no proposal buckets — every contact will route to General/Disqualified per fallback rules`, 'warn');
     }
     const sectorVocab: string[] = (final as any)?.sector_vocabulary || [];
-    const finalSpecNames = new Set(leaves.map(l => l.characteristic));
+    const finalSpecNames = new Set(leaves.map(l => l.sub_identity));
 
     // Library buckets the user opted into for this run. Only keep library
     // specs that survived Review; a dropped library spec must not reappear
@@ -3782,8 +3782,8 @@ export async function runAssignment(
         const { data } = await supabase
             .from('bucket_library').select('*').in('id', preferredIds);
         libraryBuckets = (data || []).filter((b: any) =>
-            (b.characteristic || b.bucket_name) && (b.primary_identity || b.direct_ancestor)
-            && finalSpecNames.has(b.characteristic || b.bucket_name)
+            (b.sub_identity || b.bucket_name) && (b.primary_identity || b.direct_ancestor)
+            && finalSpecNames.has(b.sub_identity || b.bucket_name)
         );
     }
 
@@ -3892,7 +3892,7 @@ export async function runAssignment(
                     const industryKey = (c.classification || c.industry || '').trim();
                     const tax = industryKey ? taxonomyMap.get(industryKey) : null;
                     const usable = tax && (
-                        tax.is_disqualified || tax.primary_identity || tax.characteristic
+                        tax.is_disqualified || tax.primary_identity || tax.sub_identity
                     );
                     if (usable) {
                         assignedRows.push(makeJoinedContactRow(runId, c, tax));
@@ -4008,13 +4008,13 @@ export async function runAssignment(
             const slice = industryStrings.slice(i, i + 200);
             const { data: confRows } = await supabase
                 .from('bucket_industry_map')
-                .select('industry_string,identity_confidence,characteristic_confidence,sector_confidence')
+                .select('industry_string,identity_confidence,sub_identity_confidence,sector_confidence')
                 .eq('bucketing_run_id', runId)
                 .in('industry_string', slice);
             for (const cr of (confRows || []) as any[]) {
                 confByIndustry.set(cr.industry_string, {
                     id: typeof cr.identity_confidence === 'number' ? cr.identity_confidence : undefined,
-                    ch: typeof cr.characteristic_confidence === 'number' ? cr.characteristic_confidence : undefined,
+                    ch: typeof cr.sub_identity_confidence === 'number' ? cr.sub_identity_confidence : undefined,
                     sec: typeof cr.sector_confidence === 'number' ? cr.sector_confidence : undefined
                 });
             }
@@ -4024,7 +4024,7 @@ export async function runAssignment(
         const c = confByIndustry.get(r.industry_string || '');
         if (c) {
             if (typeof c.id === 'number' && (r.identity_confidence == null || r.identity_confidence === 0)) r.identity_confidence = c.id;
-            if (typeof c.ch === 'number' && (r.characteristic_confidence == null || r.characteristic_confidence === 0)) r.characteristic_confidence = c.ch;
+            if (typeof c.ch === 'number' && (r.sub_identity_confidence == null || r.sub_identity_confidence === 0)) r.sub_identity_confidence = c.ch;
             if (typeof c.sec === 'number' && (r.sector_confidence == null || r.sector_confidence === 0)) r.sector_confidence = c.sec;
         }
     }
@@ -4035,7 +4035,7 @@ export async function runAssignment(
 
     // Generic Audit — always runs after rollup. Pattern-recovers rows
     // from General by re-routing groups of ≥ min_volume/4 rows up the
-    // chain to characteristic or identity buckets that already exist.
+    // chain to sub-identity or identity buckets that already exist.
     const auditRes = await timeStep('generic_audit', async () =>
         runGenericAudit(rolledRows, Number(run.min_volume || 0))
     );
@@ -4105,13 +4105,13 @@ function cleanScore(n: number | undefined | null): number {
     return Number(Math.max(0, Math.min(1, n)).toFixed(2));
 }
 
-function preRollupName(row: Pick<ContactMapRow, 'sector' | 'characteristic' | 'primary_identity' | 'is_generic' | 'is_disqualified'>): string {
+function preRollupName(row: Pick<ContactMapRow, 'sector' | 'sub_identity' | 'primary_identity' | 'is_generic' | 'is_disqualified'>): string {
     if (row.is_disqualified) return RESERVED_DISQUALIFIED;
     if (row.is_generic) return RESERVED_GENERAL;
-    if (row.characteristic && row.sector && row.sector !== 'Multi-industry') {
-        return `${row.sector} ${row.characteristic}`;
+    if (row.sub_identity && row.sector && row.sector !== 'Multi-industry') {
+        return `${row.sector} ${row.sub_identity}`;
     }
-    if (row.characteristic) return row.characteristic;
+    if (row.sub_identity) return row.sub_identity;
     if (row.primary_identity) return row.primary_identity;
     return RESERVED_GENERAL;
 }
@@ -4136,7 +4136,7 @@ async function fetchPhase1aTaxonomyMap(
     while (true) {
         const { data, error } = await supabase
             .from('bucket_industry_map')
-            .select('industry_string,primary_identity,characteristic,sector,confidence,identity_confidence,characteristic_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,source,assigned_bucket_name,assigned_bucket_primary_identity')
+            .select('industry_string,primary_identity,sub-identity,sector,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,source,assigned_bucket_name,assigned_bucket_primary_identity')
             .eq('bucketing_run_id', runId)
             .range(offset, offset + PAGE - 1);
         if (error) {
@@ -4164,12 +4164,12 @@ function makeJoinedContactRow(
 ): ContactMapRow {
     return makeMatchedContactRow(runId, contact, {
         primary_identity: tax.primary_identity || '',
-        characteristic: tax.characteristic || '',
+        sub_identity: tax.sub_identity || '',
         sector: tax.sector || '',
         source: 'phase1a_taxonomy',
         confidence: Number(tax.confidence) || 0,
         identity_confidence: Number(tax.identity_confidence) || 0,
-        characteristic_confidence: Number(tax.characteristic_confidence) || 0,
+        sub_identity_confidence: Number(tax.sub_identity_confidence) || 0,
         sector_confidence: Number(tax.sector_confidence) || 0,
         leaf_score: Number(tax.confidence) || 0,
         ancestor_score: Number(tax.identity_confidence) || 0,
@@ -4204,7 +4204,7 @@ function makeGeneralContactRow(
         contact_id: contact.contact_id,
         industry_string: (contact.classification || contact.industry || '').trim(),
         primary_identity: '',
-        characteristic: '',
+        sub_identity: '',
         sector: '',
         assigned_bucket_name: null,
         assigned_bucket_primary_identity: null,
@@ -4213,7 +4213,7 @@ function makeGeneralContactRow(
         pre_rollup_bucket_name: RESERVED_GENERAL,
         bucket_name: RESERVED_GENERAL,
         identity_confidence: 0,
-        characteristic_confidence: 0,
+        sub_identity_confidence: 0,
         sector_confidence: 0,
         rollup_level: 'general',
         source: 'unclassifiable',
@@ -4237,12 +4237,12 @@ function makeMatchedContactRow(
     contact: ContactRouteInput,
     params: {
         primary_identity: string;
-        characteristic: string;
+        sub_identity: string;
         sector: string;
         source: string;
         confidence: number;
         identity_confidence?: number;
-        characteristic_confidence?: number;
+        sub_identity_confidence?: number;
         sector_confidence?: number;
         leaf_score: number;
         ancestor_score: number;
@@ -4259,16 +4259,16 @@ function makeMatchedContactRow(
 ): ContactMapRow {
     const canonical = params.is_disqualified
         ? 'Disqualified'
-        : (params.sector && params.characteristic
-            ? `${params.sector} ${params.characteristic}`
-            : (params.characteristic || params.primary_identity || 'Generic'));
+        : (params.sector && params.sub_identity
+            ? `${params.sector} ${params.sub_identity}`
+            : (params.sub_identity || params.primary_identity || 'Generic'));
 
     const row: ContactMapRow = {
         bucketing_run_id: runId,
         contact_id: contact.contact_id,
         industry_string: (contact.classification || contact.industry || '').trim(),
         primary_identity: params.primary_identity,
-        characteristic: params.characteristic,
+        sub_identity: params.sub_identity,
         sector: params.sector,
         assigned_bucket_name: params.assigned_bucket_name ?? null,
         assigned_bucket_primary_identity: params.assigned_bucket_primary_identity ?? null,
@@ -4277,7 +4277,7 @@ function makeMatchedContactRow(
         pre_rollup_bucket_name: RESERVED_GENERAL,
         bucket_name: RESERVED_GENERAL,
         identity_confidence: cleanScore(params.identity_confidence ?? params.confidence),
-        characteristic_confidence: cleanScore(params.characteristic_confidence ?? params.confidence),
+        sub_identity_confidence: cleanScore(params.sub_identity_confidence ?? params.confidence),
         sector_confidence: cleanScore(params.sector_confidence ?? params.confidence),
         rollup_level: 'general',
         source: params.source,
@@ -4294,10 +4294,10 @@ function makeMatchedContactRow(
     row.bucket_name = row.pre_rollup_bucket_name;
     row.rollup_level = row.bucket_name === RESERVED_GENERAL
         ? 'general'
-        : row.characteristic && row.sector && row.sector !== 'Multi-industry'
+        : row.sub_identity && row.sector && row.sector !== 'Multi-industry'
             ? 'combo'
-            : row.characteristic
-                ? 'characteristic'
+            : row.sub_identity
+                ? 'sub_identity'
                 : 'identity';
     return row;
 }
@@ -4320,27 +4320,27 @@ const TAG_CONF_FLOOR = 0.4;
 // to General with REASON.LOW_VOLUME.
 function effectiveTags(row: ContactMapRow): {
     primary_identity: string;
-    characteristic: string;
+    sub_identity: string;
     sector: string;
     masked: string[];   // names of layers we suppressed, for bucket_reason
 } {
     const idLow = row.identity_confidence != null && row.identity_confidence < TAG_CONF_FLOOR;
-    const chLow = row.characteristic_confidence != null && row.characteristic_confidence < TAG_CONF_FLOOR;
+    const chLow = row.sub_identity_confidence != null && row.sub_identity_confidence < TAG_CONF_FLOOR;
     const secLow = row.sector_confidence != null && row.sector_confidence < TAG_CONF_FLOOR;
     const masked: string[] = [];
-    let ch = row.characteristic || '';
+    let ch = row.sub_identity || '';
     let sec = row.sector || '';
     if (idLow) {
         // Identity itself is shaky — drop everything below it so the
         // cascade only attempts the identity-only bucket.
-        if (ch) masked.push('characteristic');
+        if (ch) masked.push('sub_identity');
         if (sec) masked.push('sector');
         masked.push('identity_low');
         ch = '';
         sec = '';
     } else {
         if (chLow) {
-            if (ch) masked.push('characteristic');
+            if (ch) masked.push('sub_identity');
             ch = '';
         }
         if (secLow) {
@@ -4350,7 +4350,7 @@ function effectiveTags(row: ContactMapRow): {
     }
     return {
         primary_identity: row.primary_identity || '',
-        characteristic: ch,
+        sub_identity: ch,
         sector: sec,
         masked
     };
@@ -4360,20 +4360,20 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
     // Per-row effective view, computed once.
     const effective = rows.map(r => effectiveTags(r));
 
-    // 3-level rollup cascade: combo (sector + characteristic) → characteristic
+    // 3-level rollup cascade: combo (sector + sub-identity) → sub-identity
     // → identity → General. The two intermediate "core" layers (functional_
     // core, sector_core) were dropped in v5 — they were rollup-only fallback
     // buckets that added complexity without sharpening segmentation.
     //
     // v6 BUCKET ASSIGNMENT: when assigned_bucket_name is populated (the
     // user ran the bucket-assignment step), it takes precedence over the
-    // combo/characteristic layers. The cascade simplifies to:
+    // combo/sub-identity layers. The cascade simplifies to:
     //   assigned_bucket → primary_identity → General
     // Min_volume still gates: if an assigned bucket has < min_volume
     // contacts, those contacts roll up to its primary_identity.
     const assignedBucketCounts = new Map<string, number>();
     const comboCounts = new Map<string, number>();
-    const characteristicCounts = new Map<string, number>();
+    const subIdentityCounts = new Map<string, number>();
     const identityCounts = new Map<string, number>();
 
     for (let i = 0; i < rows.length; i++) {
@@ -4383,10 +4383,10 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
         if (row.assigned_bucket_name) {
             assignedBucketCounts.set(row.assigned_bucket_name, (assignedBucketCounts.get(row.assigned_bucket_name) || 0) + 1);
         }
-        if (eff.characteristic) {
-            characteristicCounts.set(eff.characteristic, (characteristicCounts.get(eff.characteristic) || 0) + 1);
+        if (eff.sub_identity) {
+            subIdentityCounts.set(eff.sub_identity, (subIdentityCounts.get(eff.sub_identity) || 0) + 1);
             if (eff.sector && eff.sector !== 'Multi-industry') {
-                const combo = `${eff.sector} ${eff.characteristic}`;
+                const combo = `${eff.sector} ${eff.sub_identity}`;
                 comboCounts.set(combo, (comboCounts.get(combo) || 0) + 1);
             }
         }
@@ -4416,7 +4416,7 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
             && (assignedBucketCounts.get(next.assigned_bucket_name) || 0) >= minVolume) {
             // v6 path: bucket-assignment step decided the bucket; min_volume met.
             next.bucket_name = next.assigned_bucket_name;
-            next.rollup_level = 'characteristic'; // bucket-assignment lives at characteristic-equivalent layer
+            next.rollup_level = 'sub_identity'; // bucket-assignment lives at sub-identity-equivalent layer
             next.general_reason = REASON.SPECIALIZATION_THRESHOLD_MET;
             next.bucket_reason = `Bucket assignment cleared ${minVolume}-lead threshold${maskedSuffix}`;
         } else if (next.assigned_bucket_name && eff.primary_identity
@@ -4426,22 +4426,22 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
             next.rollup_level = 'identity';
             next.general_reason = REASON.IDENTITY_THRESHOLD_MET;
             next.bucket_reason = `Assigned bucket "${next.assigned_bucket_name}" below ${minVolume}-lead threshold — rolled up to identity${maskedSuffix}`;
-        } else if (eff.characteristic && eff.sector && eff.sector !== 'Multi-industry'
-            && (comboCounts.get(`${eff.sector} ${eff.characteristic}`) || 0) >= minVolume) {
-            next.bucket_name = `${eff.sector} ${eff.characteristic}`;
+        } else if (eff.sub_identity && eff.sector && eff.sector !== 'Multi-industry'
+            && (comboCounts.get(`${eff.sector} ${eff.sub_identity}`) || 0) >= minVolume) {
+            next.bucket_name = `${eff.sector} ${eff.sub_identity}`;
             next.rollup_level = 'combo';
             next.general_reason = REASON.COMBO_THRESHOLD_MET;
-            next.bucket_reason = `Sector + characteristic combo cleared ${minVolume}-lead threshold${maskedSuffix}`;
-        } else if (eff.characteristic && (characteristicCounts.get(eff.characteristic) || 0) >= minVolume) {
-            next.bucket_name = eff.characteristic;
-            next.rollup_level = 'characteristic';
+            next.bucket_reason = `Sector + sub-identity combo cleared ${minVolume}-lead threshold${maskedSuffix}`;
+        } else if (eff.sub_identity && (subIdentityCounts.get(eff.sub_identity) || 0) >= minVolume) {
+            next.bucket_name = eff.sub_identity;
+            next.rollup_level = 'sub_identity';
             next.general_reason = REASON.SPECIALIZATION_THRESHOLD_MET;
-            next.bucket_reason = `Characteristic cleared threshold${maskedSuffix}`;
+            next.bucket_reason = `Sub-Identity cleared threshold${maskedSuffix}`;
         } else if (eff.primary_identity && (identityCounts.get(eff.primary_identity) || 0) >= minVolume) {
             next.bucket_name = eff.primary_identity;
             next.rollup_level = 'identity';
             next.general_reason = REASON.IDENTITY_THRESHOLD_MET;
-            next.bucket_reason = `Rolled up to primary_identity; characteristic too small${maskedSuffix}`;
+            next.bucket_reason = `Rolled up to primary_identity; sub-identity too small${maskedSuffix}`;
         } else {
             next.bucket_name = RESERVED_GENERAL;
             next.rollup_level = 'general';
@@ -4465,11 +4465,11 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
         if (!smallest) break;
         for (const row of rolled) {
             if (row.bucket_name !== smallest) continue;
-            // 3-level demotion: combo → characteristic → identity → General
-            if (row.rollup_level === 'combo' && row.characteristic) {
-                row.bucket_name = row.characteristic;
-                row.rollup_level = 'characteristic';
-            } else if (row.rollup_level === 'characteristic' && row.primary_identity) {
+            // 3-level demotion: combo → sub-identity → identity → General
+            if (row.rollup_level === 'combo' && row.sub_identity) {
+                row.bucket_name = row.sub_identity;
+                row.rollup_level = 'sub_identity';
+            } else if (row.rollup_level === 'sub_identity' && row.primary_identity) {
                 row.bucket_name = row.primary_identity;
                 row.rollup_level = 'identity';
             } else {
@@ -4484,11 +4484,11 @@ function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBu
 }
 
 // Generic Audit — runs after computeContactRollup. Looks at rows currently
-// in the General bucket, groups them by (combo OR characteristic OR
+// in the General bucket, groups them by (combo OR sub-identity OR
 // primary_identity), and re-routes groups of ≥ floor(minVolume/4) rows to a
 // matching live bucket if one exists in the run. Recovers volume that the
 // rollup left in General because the narrowest (combo) layer was too small
-// but a broader layer (characteristic, identity) already had a bucket.
+// but a broader layer (sub-identity, identity) already had a bucket.
 function runGenericAudit(rows: ContactMapRow[], minVolume: number): {
     rows: ContactMapRow[];
     reclaimed: number;
@@ -4505,7 +4505,7 @@ function runGenericAudit(rows: ContactMapRow[], minVolume: number): {
     const groupFloor = Math.max(50, Math.floor((minVolume || 0) / 4));
 
     // Group General rows by target bucket candidate. Try three candidates
-    // in priority order (combo → characteristic → identity); first match
+    // in priority order (combo → sub-identity → identity); first match
     // against a live bucket wins. This mirrors the simplified 3-level
     // cascade in computeContactRollup.
     const groups = new Map<string, { rows: ContactMapRow[]; from: string }>();
@@ -4513,11 +4513,11 @@ function runGenericAudit(rows: ContactMapRow[], minVolume: number): {
         if (r.bucket_name !== RESERVED_GENERAL) continue;
         if (r.is_disqualified) continue;
         const candidates: { name: string; from: string }[] = [];
-        if (r.sector && r.characteristic && r.sector !== 'Multi-industry') {
-            candidates.push({ name: `${r.sector} ${r.characteristic}`, from: 'combo' });
+        if (r.sector && r.sub_identity && r.sector !== 'Multi-industry') {
+            candidates.push({ name: `${r.sector} ${r.sub_identity}`, from: 'combo' });
         }
-        if (r.characteristic) {
-            candidates.push({ name: r.characteristic, from: 'characteristic' });
+        if (r.sub_identity) {
+            candidates.push({ name: r.sub_identity, from: 'sub_identity' });
         }
         if (r.primary_identity) {
             candidates.push({ name: r.primary_identity, from: 'identity' });
@@ -4537,7 +4537,7 @@ function runGenericAudit(rows: ContactMapRow[], minVolume: number): {
             r.bucket_name = bucketName;
             r.rollup_level = g.from === 'identity' ? 'identity'
                 : g.from === 'combo' ? 'combo'
-                : 'characteristic';
+                : 'sub_identity';
             r.general_reason = REASON.GENERIC_AUDIT_RECLAIMED;
             r.bucket_reason = `Generic Audit: re-routed from General to ${bucketName} (matched on ${g.from})`;
         }
@@ -4559,7 +4559,7 @@ async function writeContactMapAndAssignments(
         contact_id: row.contact_id,
         industry_string: row.industry_string,
         primary_identity: row.primary_identity || null,
-        characteristic: row.characteristic || null,
+        sub_identity: row.sub_identity || null,
         sector: row.sector || null,
         canonical_classification: row.canonical_classification || null,
         bucket_reason: row.bucket_reason || null,
@@ -4569,7 +4569,7 @@ async function writeContactMapAndAssignments(
         source: row.source,
         confidence: row.confidence,
         identity_confidence: row.identity_confidence ?? null,
-        characteristic_confidence: row.characteristic_confidence ?? null,
+        sub_identity_confidence: row.sub_identity_confidence ?? null,
         sector_confidence: row.sector_confidence ?? null,
         leaf_score: row.leaf_score,
         ancestor_score: row.ancestor_score,
@@ -4593,13 +4593,13 @@ async function writeContactMapAndAssignments(
         source: row.source,
         confidence: row.confidence,
         identity_confidence: row.identity_confidence ?? null,
-        characteristic_confidence: row.characteristic_confidence ?? null,
+        sub_identity_confidence: row.sub_identity_confidence ?? null,
         sector_confidence: row.sector_confidence ?? null,
-        bucket_leaf: row.characteristic || null,
+        bucket_leaf: row.sub_identity || null,
         bucket_ancestor: row.primary_identity || null,
         bucket_root: row.primary_identity || null,
         primary_identity: row.primary_identity || null,
-        characteristic: row.characteristic || null,
+        sub_identity: row.sub_identity || null,
         sector: row.sector || null,
         canonical_classification: row.canonical_classification || null,
         bucket_reason: row.bucket_reason || null,
@@ -4697,7 +4697,7 @@ function escapeRegExp(s: string): string {
 // Embeds the user's selected library buckets and matches each vocabulary
 // industry against them. High-confidence hits short-circuit the LLM and
 // produce a map row using the library's primary_identity +
-// characteristic, with sector extracted deterministically.
+// sub-identity, with sector extracted deterministically.
 // ─── preview embedding pass (post-discovery, pre-review) ───────────
 //
 // Replaces the old "seed from example_strings" behavior. After Phase 1a
@@ -4719,7 +4719,7 @@ async function runPreviewEmbedding(
         const sig = (l.strong_identity_signals || []).slice(0, 6).join(', ');
         const inc = (l.include || []).slice(0, 6).join(', ');
         const examples = (l.example_strings || []).slice(0, 3).join(' | ');
-        return `${l.characteristic} (under ${l.primary_identity}): ${l.description || ''}. Identity: ${l.identity_type}. Strong signals: ${sig}. Include: ${inc}. Examples: ${examples}.`;
+        return `${l.sub_identity} (under ${l.primary_identity}): ${l.description || ''}. Identity: ${l.identity_type}. Strong signals: ${sig}. Include: ${inc}. Examples: ${examples}.`;
     });
     const vocabTexts = vocab.map(v => v.industry);
 
@@ -4742,14 +4742,14 @@ async function runPreviewEmbedding(
             rows.push({
                 bucketing_run_id: runId,
                 industry_string: vocab[i].industry,
-                bucket_name: leaf.characteristic,
+                bucket_name: leaf.sub_identity,
                 source: 'preview_embedding',
                 confidence: Number(top.s.toFixed(2)),
-                bucket_leaf: leaf.characteristic,
+                bucket_leaf: leaf.sub_identity,
                 bucket_ancestor: leaf.primary_identity,
                 bucket_root: leaf.primary_identity,
                 primary_identity: leaf.primary_identity,
-                characteristic: leaf.characteristic,
+                sub_identity: leaf.sub_identity,
                 sector: sector,
                 leaf_score: Number(top.s.toFixed(2)),
                 ancestor_score: Number(top.s.toFixed(2)),
@@ -4775,7 +4775,7 @@ async function runLibraryFirstMatch(
     // Library bucket vector representation. Identity signals + include terms
     // dominate so cosine matches business identity, not sector.
     const libTexts = libraryBuckets.map(b => {
-        const spec = b.characteristic || b.bucket_name || '';
+        const spec = b.sub_identity || b.bucket_name || '';
         const ident = b.primary_identity || b.direct_ancestor || '';
         const inc = (b.include_terms || []).slice(0, 8).join(', ');
         const examples = (b.example_strings || []).slice(0, 4).join(' | ');
@@ -4796,7 +4796,7 @@ async function runLibraryFirstMatch(
         const second = sorted[1] || { s: 0 };
         if (top.s >= EMBED_AUTO_THRESHOLD && (top.s - second.s) >= EMBED_MARGIN) {
             const lib = libraryBuckets[top.j];
-            const spec = lib.characteristic || lib.bucket_name || '';
+            const spec = lib.sub_identity || lib.bucket_name || '';
             const ident = lib.primary_identity || lib.direct_ancestor || '';
             const sector = extractSectorFocus(vocab[i].industry, sectorVocab);
             autoAssigned.push({
@@ -4809,7 +4809,7 @@ async function runLibraryFirstMatch(
                 bucket_ancestor: ident,
                 bucket_root: ident,
                 primary_identity: ident,
-                characteristic: spec,
+                sub_identity: spec,
                 sector: sector,
                 leaf_score: Number(top.s.toFixed(2)),
                 ancestor_score: Number(top.s.toFixed(2)),
@@ -4835,11 +4835,11 @@ async function runEmbeddingPrefilter(
     if (vocab.length === 0 || leaves.length === 0) return { autoAssigned: [], pending: vocab, costUsd: 0 };
 
     // Embedding text leans on identity signals so cosine matches the
-    // characteristic, not the vertical the company serves.
+    // sub-identity, not the vertical the company serves.
     const leafTexts = leaves.map(l => {
         const sig = (l.strong_identity_signals || []).slice(0, 6).join(', ');
         const inc = (l.include || []).slice(0, 6).join(', ');
-        return `${l.characteristic} (under ${l.primary_identity}): ${l.description || ''}. Identity: ${l.identity_type}. Strong signals: ${sig}. Include: ${inc}.`;
+        return `${l.sub_identity} (under ${l.primary_identity}): ${l.description || ''}. Identity: ${l.identity_type}. Strong signals: ${sig}. Include: ${inc}.`;
     });
     const vocabTexts = vocab.map(v => v.industry);
     const allInputs = [...leafTexts, ...vocabTexts];
@@ -4871,14 +4871,14 @@ async function runEmbeddingPrefilter(
             autoAssigned.push({
                 bucketing_run_id: runId,
                 industry_string: vocab[i].industry,
-                bucket_name: leaf.characteristic, // pre-rollup placeholder
+                bucket_name: leaf.sub_identity, // pre-rollup placeholder
                 source: 'embedding',
                 confidence: Number(top.s.toFixed(2)),
-                bucket_leaf: leaf.characteristic,
+                bucket_leaf: leaf.sub_identity,
                 bucket_ancestor: leaf.primary_identity,
                 bucket_root: leaf.primary_identity,
                 primary_identity: leaf.primary_identity,
-                characteristic: leaf.characteristic,
+                sub_identity: leaf.sub_identity,
                 sector: sector,
                 leaf_score: Number(top.s.toFixed(2)),
                 ancestor_score: Number(top.s.toFixed(2)),
@@ -4904,7 +4904,7 @@ async function runContactLibraryFirstMatch(
         return { autoAssigned: [], pending: contacts, costUsd: 0 };
     }
     const libTexts = libraryBuckets.map(b => {
-        const spec = b.characteristic || b.bucket_name || '';
+        const spec = b.sub_identity || b.bucket_name || '';
         const ident = b.primary_identity || b.direct_ancestor || '';
         const inc = (b.include_terms || []).slice(0, 8).join(', ');
         const examples = (b.example_strings || []).slice(0, 4).join(' | ');
@@ -4924,11 +4924,11 @@ async function runContactLibraryFirstMatch(
         const second = sorted[1] || { s: 0 };
         if (top.s >= CONTACT_EMBED_AUTO_THRESHOLD && (top.s - second.s) >= CONTACT_EMBED_MARGIN) {
             const lib = libraryBuckets[top.j];
-            const spec = lib.characteristic || lib.bucket_name || '';
+            const spec = lib.sub_identity || lib.bucket_name || '';
             const ident = lib.primary_identity || lib.direct_ancestor || '';
             autoAssigned.push(makeMatchedContactRow(runId, contacts[i], {
                 primary_identity: ident,
-                characteristic: spec,
+                sub_identity: spec,
                 sector: extractSectorFocus(contactRoutingText(contacts[i]), sectorVocab),
                 source: 'library_match',
                 confidence: top.s,
@@ -4957,7 +4957,7 @@ async function runContactEmbeddingPrefilter(
         const sig = (l.strong_identity_signals || []).slice(0, 6).join(', ');
         const inc = (l.include || []).slice(0, 6).join(', ');
         const examples = (l.example_strings || []).slice(0, 4).join(' | ');
-        return `${l.characteristic} (under ${l.primary_identity}): ${l.description || ''}. Identity: ${l.identity_type}. Strong signals: ${sig}. Include: ${inc}. Examples: ${examples}.`;
+        return `${l.sub_identity} (under ${l.primary_identity}): ${l.description || ''}. Identity: ${l.identity_type}. Strong signals: ${sig}. Include: ${inc}. Examples: ${examples}.`;
     });
     const contactTexts = contacts.map(contactRoutingText);
     const { embeddings, costUsd } = await embedBatch([...leafTexts, ...contactTexts]);
@@ -4975,7 +4975,7 @@ async function runContactEmbeddingPrefilter(
         if (!leaf.operator_required && top.s >= CONTACT_EMBED_AUTO_THRESHOLD && (top.s - second.s) >= CONTACT_EMBED_MARGIN) {
             autoAssigned.push(makeMatchedContactRow(runId, contacts[i], {
                 primary_identity: leaf.primary_identity,
-                characteristic: leaf.characteristic,
+                sub_identity: leaf.sub_identity,
                 sector: extractSectorFocus(contactRoutingText(contacts[i]), sectorVocab),
                 source: 'embedding_high_confidence',
                 confidence: top.s,
@@ -4986,7 +4986,7 @@ async function runContactEmbeddingPrefilter(
             }));
         } else {
             const embedding_candidates = sorted.slice(0, 8).map(({ s, j }) => ({
-                characteristic: leaves[j].characteristic,
+                sub_identity: leaves[j].sub_identity,
                 primary_identity: leaves[j].primary_identity,
                 score: Number(s.toFixed(3))
             }));
@@ -5043,15 +5043,15 @@ async function runContactMatchingLLM(
 ): Promise<{ rows: ContactMapRow[]; costUsd: number }> {
     if (pending.length === 0) return { rows: [], costUsd: 0 };
 
-    const validSpecNames = new Set(leaves.map(l => l.characteristic));
+    const validSpecNames = new Set(leaves.map(l => l.sub_identity));
     const validIdentityNames = new Set(leaves.map(l => l.primary_identity));
-    const identityBySpec = new Map(leaves.map(l => [l.characteristic, l.primary_identity]));
+    const identityBySpec = new Map(leaves.map(l => [l.sub_identity, l.primary_identity]));
     const refByIdentity: Record<string, any[]> = {};
     for (const l of leaves) {
         const ident = l.primary_identity;
         if (!refByIdentity[ident]) refByIdentity[ident] = [];
         refByIdentity[ident].push({
-            characteristic: l.characteristic,
+            sub_identity: l.sub_identity,
             description: l.description,
             identity_type: l.identity_type,
             operator_required: l.operator_required,
@@ -5107,10 +5107,10 @@ async function runContactMatchingLLM(
         for (let i = 0; i < batch.length; i++) {
             const contact = batch[i];
             const r = results[i] || makeFallbackChain();
-            const specOk = !!r.characteristic.name
-                && validSpecNames.has(r.characteristic.name)
-                && r.characteristic.score >= 0.40;
-            const specName = specOk ? r.characteristic.name : '';
+            const specOk = !!r.sub_identity.name
+                && validSpecNames.has(r.sub_identity.name)
+                && r.sub_identity.score >= 0.40;
+            const specName = specOk ? r.sub_identity.name : '';
             const identityCandidate = specOk
                 ? (identityBySpec.get(specName) || r.primary_identity.name)
                 : r.primary_identity.name;
@@ -5122,18 +5122,18 @@ async function runContactMatchingLLM(
             const isGeneric = isDisqualified ? false : (!specName && !identName);
             rows.push(makeMatchedContactRow(runId, contact, {
                 primary_identity: isDisqualified ? '' : identName,
-                characteristic: isDisqualified ? '' : specName,
+                sub_identity: isDisqualified ? '' : specName,
                 sector: isDisqualified ? '' : (r.sector || '').trim(),
                 source: 'llm_phase1b',
-                confidence: specName ? r.characteristic.score : r.primary_identity.score,
-                leaf_score: r.characteristic.score,
+                confidence: specName ? r.sub_identity.score : r.primary_identity.score,
+                leaf_score: r.sub_identity.score,
                 ancestor_score: r.primary_identity.score,
                 root_score: r.primary_identity.score,
                 is_generic: isGeneric,
                 is_disqualified: isDisqualified,
                 general_reason: isDisqualified ? 'disqualified' : (isGeneric ? 'generic_low_confidence' : null),
                 reasons: {
-                    spec: r.characteristic.reason,
+                    spec: r.sub_identity.reason,
                     identity: r.primary_identity.reason,
                     identity_type: r.identity_type,
                     model_generic: r.generic
@@ -5156,7 +5156,7 @@ async function classifyContactBatch(
     const systemPrompt = `${PROJECT_CONTEXT}
 
 ========================================
-PHASE 1B — ROUTE EACH CONTACT TO IDENTITY + CHARACTERISTIC + SECTOR
+PHASE 1B — ROUTE EACH CONTACT TO IDENTITY + SUB-IDENTITY + SECTOR
 ========================================
 
 You classify individual company contacts, not abstract industry labels.
@@ -5165,11 +5165,11 @@ and reasoning. Do not invent facts beyond those fields.
 
 Return three separate fields:
 - primary_identity: Layer 1, must be one of BUCKET_REFERENCE keys
-- characteristic: Layer 2, must be listed under that identity
+- sub_identity: Layer 2, must be listed under that identity
 - sector: Layer 3, must be from SECTOR_VOCABULARY, "Multi-industry", or ""
 
 General is a last resort. If a primary_identity is a reasonable fit, return it
-even when no characteristic is precise. Only leave both names blank when the
+even when no sub-identity is precise. Only leave both names blank when the
 business is truly unclear, bad data, clear non-ICP, or confidence is below 0.40.
 
 Each contact may include embedding_candidate_buckets. Treat these as a shortlist,
@@ -5179,19 +5179,19 @@ reference bucket if the contact evidence is clearly better.
 Rules:
 - Strong business-model nouns beat sector nouns.
 - "Serving X" does not mean "is X"; X belongs in sector.
-- Operator characteristics require explicit operator evidence.
+- Operator sub-identities require explicit operator evidence.
 - Disqualify only clear ecommerce/DTC physical, local geo-tied services,
   brick-and-mortar retail, or low-ticket consumer.
 - SERVICES vs PRODUCTS — never tag a company that rents/maintains/repairs/
   operates-as-a-service as "B2B Product Manufacturer" or any product
-  manufacturer characteristic. If no services-side characteristic fits,
+  manufacturer sub-identity. If no services-side sub-identity fits,
   prefer the identity-only fallback (return primary_identity, leave
-  characteristic "") rather than picking a wrong product label.
+  sub-identity "") rather than picking a wrong product label.
 - Talent / artist / sports management firms are Agency, not Consulting.
 - Game / software studios are Software & SaaS, not Hospitality / Travel /
   Consumer Retail — only DQ if unambiguously pure-consumer, no B2B angle.
 - Scores are alignment scores, not probabilities. Use >=0.40 for a reasonable
-  identity/characteristic fit, >=0.70 for strong fit.
+  identity/sub-identity fit, >=0.70 for strong fit.
 - Reasons: max 18 words each and cite the contact fields.
 
 Return strict JSON only.`;
@@ -5218,7 +5218,7 @@ Return JSON: { "assignments": [<one object per contact in the same order>] }
 Each assignment object:
 {
   "primary_identity": {"name": "<identity key from BUCKET_REFERENCE or empty>", "score": 0.00, "reason": ""},
-  "characteristic": {"name": "<spec under that identity, or empty>", "score": 0.00, "reason": ""},
+  "sub-identity": {"name": "<spec under that identity, or empty>", "score": 0.00, "reason": ""},
   "sector": "<from SECTOR_VOCABULARY, 'Multi-industry', or ''>",
   "identity_type": "<operator|service_provider|agency|software_vendor|investor|advisor|staffing|distributor|media|other>",
   "generic": false,
@@ -5235,11 +5235,11 @@ Each assignment object:
                 items: {
                     type: 'object',
                     additionalProperties: false,
-                    required: ['primary_identity', 'characteristic',
+                    required: ['primary_identity', 'sub_identity',
                                'sector', 'identity_type', 'generic', 'disqualified'],
                     properties: {
                         primary_identity: chainItemSchema(),
-                        characteristic: chainItemSchema(),
+                        sub_identity: chainItemSchema(),
                         sector: { type: 'string' },
                         identity_type: { type: 'string' },
                         generic: { type: 'boolean' },
@@ -5310,7 +5310,7 @@ Each assignment object:
 
     let { assignments, costUsd } = result;
     const drift = assignments.some(a =>
-        (a.characteristic.name && !validSpecNames.has(a.characteristic.name)) ||
+        (a.sub_identity.name && !validSpecNames.has(a.sub_identity.name)) ||
         (a.primary_identity.name && !validIdentityNames.has(a.primary_identity.name))
     );
     if (drift) {
@@ -5336,9 +5336,9 @@ async function runMatchingLLM(
     if (pending.length === 0) return { rows: [], costUsd: 0 };
 
     // Valid Layer-1 + Layer-2 names (the LLM may only return these).
-    const validSpecNames = new Set(leaves.map(l => l.characteristic));
+    const validSpecNames = new Set(leaves.map(l => l.sub_identity));
     const validIdentityNames = new Set(leaves.map(l => l.primary_identity));
-    const identityBySpec = new Map(leaves.map(l => [l.characteristic, l.primary_identity]));
+    const identityBySpec = new Map(leaves.map(l => [l.sub_identity, l.primary_identity]));
 
     // Bucket reference is the cacheable prompt prefix. Group by primary_identity
     // so the model sees the hierarchy clearly.
@@ -5347,7 +5347,7 @@ async function runMatchingLLM(
         const ident = l.primary_identity;
         if (!refByIdentity[ident]) refByIdentity[ident] = [];
         refByIdentity[ident].push({
-            characteristic: l.characteristic,
+            sub_identity: l.sub_identity,
             description: l.description,
             identity_type: l.identity_type,
             operator_required: l.operator_required,
@@ -5397,10 +5397,10 @@ async function runMatchingLLM(
         for (let i = 0; i < batch.length; i++) {
             const ind = batch[i].industry;
             const r = results[i] || makeFallbackChain();
-            const specOk = r.characteristic.name
-                && validSpecNames.has(r.characteristic.name)
-                && r.characteristic.score >= 0.55;
-            const specName = specOk ? r.characteristic.name : '';
+            const specOk = r.sub_identity.name
+                && validSpecNames.has(r.sub_identity.name)
+                && r.sub_identity.score >= 0.55;
+            const specName = specOk ? r.sub_identity.name : '';
             // Trust the spec→identity mapping from Phase 1a, not whatever the
             // LLM returned for primary_identity (drift guard).
             const identName = specOk
@@ -5415,20 +5415,20 @@ async function runMatchingLLM(
                 // with the campaign bucket (combo / spec / identity / Generic).
                 bucket_name: specName || RESERVED_GENERAL,
                 source: 'llm_phase1b',
-                confidence: Number((r.characteristic.score || 0).toFixed(2)),
+                confidence: Number((r.sub_identity.score || 0).toFixed(2)),
                 bucket_leaf: specName,
                 bucket_ancestor: identName,
                 bucket_root: identName,
                 primary_identity: identName,
-                characteristic: specName,
+                sub_identity: specName,
                 sector: (r.sector || '').trim(),
-                leaf_score: r.characteristic.score,
+                leaf_score: r.sub_identity.score,
                 ancestor_score: r.primary_identity.score,
                 root_score: r.primary_identity.score,
                 is_generic: !!r.generic && !specOk,
                 is_disqualified: !!r.disqualified,
                 reasons: {
-                    spec: r.characteristic.reason,
+                    spec: r.sub_identity.reason,
                     identity: r.primary_identity.reason,
                     identity_type: r.identity_type
                 }
@@ -5442,7 +5442,7 @@ async function runMatchingLLM(
 function makeFallbackChain(): MatchChain {
     return {
         primary_identity: { name: '', score: 0, reason: 'fallback' },
-        characteristic: { name: '', score: 0, reason: 'fallback' },
+        sub_identity: { name: '', score: 0, reason: 'fallback' },
         sector: '',
         identity_type: 'other',
         generic: true,
@@ -5460,12 +5460,12 @@ async function classifyBatch(
     const systemPrompt = `${PROJECT_CONTEXT}
 
 ========================================
-PHASE 1B — ROUTE EACH COMPANY TO IDENTITY + CHARACTERISTIC + SECTOR
+PHASE 1B — ROUTE EACH COMPANY TO IDENTITY + SUB-IDENTITY + SECTOR
 ========================================
 
 You produce three separate classifications per company:
   - primary_identity      (Layer 1, MUST be one of the identity keys in BUCKET_REFERENCE)
-  - characteristic (Layer 2, MUST be one of the characteristic
+  - sub-identity (Layer 2, MUST be one of the sub-identity
                           names listed UNDER that identity in BUCKET_REFERENCE)
   - sector          (Layer 3, optional — from SECTOR_VOCABULARY only)
 
@@ -5478,14 +5478,14 @@ DECISION SEQUENCE (apply in this order):
    Investor? Software vendor? Agency? Consulting firm? Staffing firm?
    MSP? Operator (clinic, school, government entity)?
 
-2) Inside that identity, pick the CHARACTERISTIC that best fits.
+2) Inside that identity, pick the SUB-IDENTITY that best fits.
    Examples: under "Agency" → "SEO Agency"; under "Financial Services" →
    "Private Equity Firm"; under "Consulting & Advisory" → "IT Consulting".
 
 3) Determine SECTOR — the vertical the company SERVES if explicitly
    stated. If multiple, use "Multi-industry". If unspecified, "".
 
-4) If neither identity nor characteristic fits at >= 0.55 confidence,
+4) If neither identity nor sub-identity fits at >= 0.55 confidence,
    set generic = true and leave the name fields empty. Never use a sector
    word as a shortcut bucket.
 
@@ -5505,7 +5505,7 @@ Rule 2 — "Serving X" does NOT mean "is X".
   • marketing for law firms ≠ law firm
   • IT services for government agencies ≠ government entity
 
-Rule 3 — Operator characteristics (operator_required=true) require
+Rule 3 — Operator sub-identities (operator_required=true) require
   EXPLICIT operator evidence: "clinic", "hospital", "school district",
   "university", "city government", "church", "property management
   company", "factory". Generic sector mentions are NOT evidence.
@@ -5513,31 +5513,31 @@ Rule 3 — Operator characteristics (operator_required=true) require
 Rule 4 — When BOTH identity and sector appear, fill BOTH fields.
   Example: "Healthcare private equity firm" →
     primary_identity = "Financial Services",
-    characteristic = "Private Equity Firm",
+    sub-identity = "Private Equity Firm",
     sector = "Healthcare".
 
 EXPLICIT EXAMPLES — CORRECT:
   • "Healthcare private equity investment firm" →
       primary_identity = Financial Services
-      characteristic = Private Equity Firm
+      sub-identity = Private Equity Firm
       sector = Healthcare
   • "Government IT consulting firm" →
       primary_identity = Consulting & Advisory  (or IT Services depending
         on which identity contains "IT Consulting" in BUCKET_REFERENCE)
-      characteristic = IT Consulting
+      sub-identity = IT Consulting
       sector = Government
   • "Marketing agency for dental practices" →
       primary_identity = Agency
-      characteristic = Performance Marketing Agency  (or
+      sub-identity = Performance Marketing Agency  (or
         Branding Agency, etc — pick the closest spec from BUCKET_REFERENCE)
       sector = Healthcare
   • "Real estate software for hospitals" →
       primary_identity = Software & SaaS
-      characteristic = PropTech SaaS  (or Vertical SaaS)
+      sub-identity = PropTech SaaS  (or Vertical SaaS)
       sector = Real Estate     ← yes, real estate is the OWN model
   • "Medical clinic" →
       primary_identity = Healthcare Operator
-      characteristic = Medical Clinic / Hospital
+      sub-identity = Medical Clinic / Hospital
       sector = ""
 
 EXPLICIT EXAMPLES — INCORRECT:
@@ -5548,15 +5548,15 @@ EXPLICIT EXAMPLES — INCORRECT:
   • "Software for schools" → primary_identity = Education ❌
 
 PRESSURE TEST: "If outreach were written for this primary_identity +
-characteristic, would the recipient say 'yes that's me' or 'no that's
+sub-identity, would the recipient say 'yes that's me' or 'no that's
 my client'?" If 'my client' → routing is wrong.
 
 OUTPUT CONSTRAINTS:
 - primary_identity.name MUST be one of the identity keys in BUCKET_REFERENCE,
   or "" if generic / disqualified.
-- characteristic.name MUST be a spec listed under that exact
+- sub-identity.name MUST be a spec listed under that exact
   identity, or "" if generic / disqualified.
-- characteristic.score must be <= primary_identity.score.
+- sub-identity.score must be <= primary_identity.score.
 - sector MUST be from SECTOR_VOCABULARY, "Multi-industry", or "".
   NEVER put an identity noun in sector.
 - identity_type ∈ operator | service_provider | agency | software_vendor |
@@ -5579,7 +5579,7 @@ Return JSON: { "assignments": [<one object per company in the same order>] }
 Each assignment object:
 {
   "primary_identity": {"name": "<identity key from BUCKET_REFERENCE or empty>", "score": 0.00, "reason": ""},
-  "characteristic": {"name": "<spec under that identity, or empty>", "score": 0.00, "reason": ""},
+  "sub-identity": {"name": "<spec under that identity, or empty>", "score": 0.00, "reason": ""},
   "sector": "<from SECTOR_VOCABULARY, 'Multi-industry', or ''>",
   "identity_type": "<operator|service_provider|agency|software_vendor|investor|advisor|staffing|distributor|media|other>",
   "generic": false,
@@ -5596,11 +5596,11 @@ Each assignment object:
                 items: {
                     type: 'object',
                     additionalProperties: false,
-                    required: ['primary_identity', 'characteristic',
+                    required: ['primary_identity', 'sub_identity',
                                'sector', 'identity_type', 'generic', 'disqualified'],
                     properties: {
                         primary_identity: chainItemSchema(),
-                        characteristic: chainItemSchema(),
+                        sub_identity: chainItemSchema(),
                         sector: { type: 'string' },
                         identity_type: { type: 'string' },
                         generic: { type: 'boolean' },
@@ -5655,7 +5655,7 @@ Each assignment object:
 
     let { assignments, costUsd } = result;
     const drift = assignments.some(a =>
-        (a.characteristic.name && !validSpecNames.has(a.characteristic.name)) ||
+        (a.sub_identity.name && !validSpecNames.has(a.sub_identity.name)) ||
         (a.primary_identity.name && !validIdentityNames.has(a.primary_identity.name))
     );
     if (drift) {

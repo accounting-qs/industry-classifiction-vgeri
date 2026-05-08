@@ -21,12 +21,12 @@ const REQUIRED_SCHEMA: Record<string, string[]> = {
     // sector_core. primary_identity is now the canonical identity column.
     bucket_industry_map: [
         'bucketing_run_id', 'industry_string', 'bucket_name', 'source', 'confidence',
-        'primary_identity', 'characteristic', 'sector',
-        'is_new_identity', 'is_new_characteristic', 'is_new_sector',
+        'primary_identity', 'sub_identity', 'sector',
+        'is_new_identity', 'is_new_sub_identity', 'is_new_sector',
         'is_disqualified', 'is_generic',
         'needs_qa', 'raw_industry', 'llm_reason',
         'canonical_classification',
-        'identity_confidence', 'characteristic_confidence', 'sector_confidence',
+        'identity_confidence', 'sub_identity_confidence', 'sector_confidence',
         // v6 bucket-assignment columns (20260513)
         'assigned_bucket_name', 'assigned_bucket_primary_identity',
         'is_new_bucket', 'bucket_assignment_reason', 'bucket_assignment_confidence',
@@ -35,25 +35,25 @@ const REQUIRED_SCHEMA: Record<string, string[]> = {
     bucket_assignments: [
         'bucketing_run_id', 'contact_id', 'bucket_name', 'source', 'confidence',
         'bucket_leaf', 'bucket_ancestor', 'bucket_root',
-        'primary_identity', 'characteristic', 'sector',
+        'primary_identity', 'sub_identity', 'sector',
         'pre_rollup_bucket_name', 'rollup_level',
         'general_reason', 'reasons',
         'is_generic', 'is_disqualified',
         'canonical_classification', 'bucket_reason',
-        'identity_confidence', 'characteristic_confidence', 'sector_confidence',
+        'identity_confidence', 'sub_identity_confidence', 'sector_confidence',
         'assigned_at',
     ],
     // Per-contact pre-rollup decisions (Phase 1b writes here).
     bucket_contact_map: [
         'bucketing_run_id', 'contact_id', 'industry_string',
-        'primary_identity', 'characteristic', 'sector',
+        'primary_identity', 'sub_identity', 'sector',
         'pre_rollup_bucket_name', 'bucket_name', 'rollup_level',
         'source', 'confidence',
         'leaf_score', 'ancestor_score', 'root_score',
         'is_generic', 'is_disqualified',
         'general_reason', 'reasons',
         'canonical_classification', 'bucket_reason',
-        'identity_confidence', 'characteristic_confidence', 'sector_confidence',
+        'identity_confidence', 'sub_identity_confidence', 'sector_confidence',
         'assigned_at',
     ],
     // Run-level metadata (read + updated by both phases).
@@ -69,10 +69,11 @@ const REQUIRED_SCHEMA: Record<string, string[]> = {
         'generic_audit',
         'apply_identity_dq_cascade',
     ],
-    // Editable taxonomy library (read by Phase 1a). v5: dropped functional_core
-    // from characteristics, sector_core from sectors.
+    // Editable taxonomy library (read by Phase 1a). v6: taxonomy_characteristics
+    // renamed to taxonomy_sub_identities (column "characteristic" → "sub_identity"
+    // across the bucketing tables); the table holds Layer-2 sub-identity entries.
     taxonomy_identities: ['id', 'name', 'description', 'is_disqualified', 'created_by', 'archived'],
-    taxonomy_characteristics: ['id', 'name', 'parent_identity', 'description', 'created_by', 'archived'],
+    taxonomy_sub_identities: ['id', 'name', 'parent_identity', 'description', 'created_by', 'archived'],
     taxonomy_sectors: ['id', 'name', 'synonyms', 'description', 'created_by', 'archived'],
     bucketing_run_logs: ['id', 'bucketing_run_id', 'timestamp', 'level', 'message'],
 };
