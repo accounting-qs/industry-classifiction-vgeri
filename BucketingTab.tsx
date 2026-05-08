@@ -906,11 +906,41 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
   // to keep.
   const [finalizing, setFinalizing] = useState(false);
   const [lastFinalize, setLastFinalize] = useState<{ at: Date; rerouted: number; nullified: number; failed: number } | null>(null);
+  // Live progress polled while the finalize POST is in flight. The
+  // service writes bucketing_runs.progress every 40 industries (debounced
+  // to 700 ms server-side), so 1 s polling sees every update without
+  // hammering the DB.
+  const [finalizeProgress, setFinalizeProgress] = useState<{ current: number; total: number; note?: string } | null>(null);
+  const finalizePollRef = useRef<number | null>(null);
+
+  // Stop polling on unmount so we don't leak intervals if the user
+  // navigates away mid-finalize.
+  useEffect(() => () => {
+    if (finalizePollRef.current) { window.clearInterval(finalizePollRef.current); finalizePollRef.current = null; }
+  }, []);
 
   const triggerFinalize = useCallback(async () => {
     if (!confirm('Re-tag all remaining AI-proposed entries against the library only? Anything that doesn\'t fit a library entry will route to General.')) return;
     setFinalizing(true);
+    setFinalizeProgress({ current: 0, total: 0 });
     onError(null);
+    // Poll bucketing_runs.progress while the finalize call is in flight.
+    if (finalizePollRef.current) window.clearInterval(finalizePollRef.current);
+    finalizePollRef.current = window.setInterval(async () => {
+      try {
+        const r = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}`);
+        const d = await r.json();
+        const p = d?.run?.progress;
+        if (p && p.step === 'finalize') {
+          setFinalizeProgress({
+            current: Number(p.current || 0),
+            total: Number(p.total || 0),
+            note: typeof p.note === 'string' ? p.note : undefined
+          });
+        }
+      } catch { /* keep polling */ }
+    }, 1000);
+
     try {
       const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/finalize-taxonomy`, { method: 'POST' });
       const data = await res.json();
@@ -925,6 +955,11 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
     } catch (e: any) {
       onError(e.message);
     } finally {
+      if (finalizePollRef.current) {
+        window.clearInterval(finalizePollRef.current);
+        finalizePollRef.current = null;
+      }
+      setFinalizeProgress(null);
       setFinalizing(false);
     }
   }, [run.id, onRefresh, onError]);
@@ -1135,6 +1170,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
         recalcing={recalcing}
         onFinalize={triggerFinalize}
         finalizing={finalizing}
+        finalizeProgress={finalizeProgress}
         lastFinalize={lastFinalize}
       />
       <Phase1aQAQueuePanel runId={run.id} onError={onError} />
@@ -2432,7 +2468,7 @@ function StatCard({ label, value, color }: { label: string; value: string; color
 
 type TaxKind = 'identities' | 'characteristics' | 'sectors';
 
-function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, finalizing, lastFinalize }: {
+function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, finalizing, finalizeProgress, lastFinalize }: {
   runId: string;
   onError: (m: string | null) => void;
   // Surfaced to disable batch buttons while a parent-driven recalc is
@@ -2443,6 +2479,9 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   // panel so the action lives next to the proposals it operates on.
   onFinalize?: () => Promise<void> | void;
   finalizing?: boolean;
+  // Live progress while the finalize POST is in flight (parent polls
+  // bucketing_runs.progress at 1 Hz). null when not finalizing.
+  finalizeProgress?: { current: number; total: number; note?: string } | null;
   lastFinalize?: { at: Date; rerouted: number; nullified: number; failed: number } | null;
 }) {
   const [proposed, setProposed] = useState<{ identities: any[]; characteristics: any[]; sectors: any[] } | null>(null);
@@ -2536,8 +2575,6 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
     // LLM tokens for partial accepts.
   };
 
-  const acceptAll = (kind: TaxKind) => proposed && applyBatch(kind, proposed[kind]);
-
   const applySelected = (kind: TaxKind) => {
     if (!proposed) return;
     const want = selected[kind];
@@ -2582,7 +2619,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
         )}
       </div>
       <p className="text-[11px] text-gray-400 mb-3">
-        The tagger proposed entries that aren't in the library. Tick the ones you want to keep and click "Apply selected", or use "Accept all" / individual "Accept" buttons. Accepted entries are saved to the library AND the run is automatically recalculated so other proposed entries can merge into them.
+        The tagger proposed entries that aren't in the library. Tick the ones you want to keep (use the column header checkbox to tick all at once) and click "Apply selected", or use the per-row "Accept" button. Accepted entries are saved to the library; click "Finalize taxonomy" once you're done so the remaining proposals get re-tagged against the library only.
       </p>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {(['identities','characteristics','sectors'] as const).map(kind => {
@@ -2616,26 +2653,16 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                   >ⓘ</span>
                 </label>
                 {items.length > 0 && (
-                  <div className="flex gap-1">
-                    <button
-                      onClick={() => applySelected(kind)}
-                      disabled={busyAllKind !== null || sel.size === 0 || !!recalcing}
-                      className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-30"
-                      title={`Add only the checked ${kind} to the library`}
-                    >
-                      {busyAllKind === kind && bulkProgress
-                        ? `${bulkProgress.done}/${bulkProgress.total}…`
-                        : `Apply selected (${sel.size})`}
-                    </button>
-                    <button
-                      onClick={() => acceptAll(kind)}
-                      disabled={busyAllKind !== null || !!recalcing}
-                      className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-200 hover:bg-[#3e3e3e] disabled:opacity-50"
-                      title={`Add every proposed ${kind.slice(0, -1)} to the library`}
-                    >
-                      Accept all ({items.length})
-                    </button>
-                  </div>
+                  <button
+                    onClick={() => applySelected(kind)}
+                    disabled={busyAllKind !== null || sel.size === 0 || !!recalcing}
+                    className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-30"
+                    title={`Add the checked ${kind} to the library — use the column header checkbox to tick them all at once`}
+                  >
+                    {busyAllKind === kind && bulkProgress
+                      ? `${bulkProgress.done}/${bulkProgress.total}…`
+                      : `Apply selected (${sel.size})`}
+                  </button>
                 )}
               </div>
               <ul className="space-y-1">
@@ -2681,28 +2708,53 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
         })}
       </div>
       {onFinalize && (
-        <div className="mt-4 pt-3 border-t border-amber-500/20 flex items-start justify-between gap-3 flex-wrap">
-          <div className="flex-1 min-w-0">
-            <div className="text-[11px] font-bold text-amber-200">
-              Finalize taxonomy — re-tag remaining proposals against the library only
-            </div>
-            <div className="text-[10px] text-gray-400 mt-0.5">
-              Forces every still-orphan tag to a library entry (or null → General). No new entries are proposed in this pass. Run this once you're done accepting AI suggestions, BEFORE Apply &amp; Assign.
-            </div>
-            {lastFinalize && (
-              <div className="text-[10px] text-gray-500 mt-1.5 font-mono">
-                Last finalize {lastFinalize.at.toLocaleTimeString()} · {lastFinalize.rerouted} → library, {lastFinalize.nullified} → General{lastFinalize.failed > 0 ? `, ${lastFinalize.failed} batch failures` : ''}
+        <div className="mt-4 pt-3 border-t border-amber-500/20">
+          <div className="flex items-start justify-between gap-3 flex-wrap">
+            <div className="flex-1 min-w-0">
+              <div className="text-[11px] font-bold text-amber-200">
+                Finalize taxonomy — re-tag remaining proposals against the library only
               </div>
-            )}
+              <div className="text-[10px] text-gray-400 mt-0.5">
+                Forces every still-orphan tag to a library entry (or null → General). No new entries are proposed in this pass. Run this once you're done accepting AI suggestions, BEFORE Apply &amp; Assign.
+              </div>
+              {lastFinalize && !finalizing && (
+                <div className="text-[10px] text-gray-500 mt-1.5 font-mono">
+                  Last finalize {lastFinalize.at.toLocaleTimeString()} · {lastFinalize.rerouted} → library, {lastFinalize.nullified} → General{lastFinalize.failed > 0 ? `, ${lastFinalize.failed} batch failures` : ''}
+                </div>
+              )}
+            </div>
+            <button
+              onClick={onFinalize}
+              disabled={!!finalizing || !!recalcing}
+              className="shrink-0 px-3 py-1.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-200 border border-amber-500/40 hover:bg-amber-500/30 disabled:opacity-50 flex items-center gap-1"
+            >
+              {finalizing ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
+              {finalizing ? 'Finalizing…' : 'Finalize taxonomy'}
+            </button>
           </div>
-          <button
-            onClick={onFinalize}
-            disabled={!!finalizing || !!recalcing}
-            className="shrink-0 px-3 py-1.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-200 border border-amber-500/40 hover:bg-amber-500/30 disabled:opacity-50 flex items-center gap-1"
-          >
-            {finalizing ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
-            {finalizing ? 'Finalizing…' : 'Finalize taxonomy'}
-          </button>
+          {finalizing && (() => {
+            const cur = finalizeProgress?.current || 0;
+            const tot = finalizeProgress?.total || 0;
+            const pct = tot > 0 ? Math.min(100, Math.round((cur / tot) * 100)) : null;
+            return (
+              <div className="mt-3">
+                <div className="flex items-center justify-between text-[10px] font-mono mb-1">
+                  <span className="text-amber-200/80">
+                    {finalizeProgress?.note || 'Re-tagging orphan industries against the library…'}
+                  </span>
+                  <span className="text-gray-400">
+                    {cur.toLocaleString()}{tot > 0 ? ` / ${tot.toLocaleString()}` : ''}{pct !== null ? ` · ${pct}%` : ''}
+                  </span>
+                </div>
+                <div className="h-1.5 bg-[#1c1c1c] rounded overflow-hidden">
+                  <div
+                    className="h-full bg-amber-400/70 transition-all duration-300"
+                    style={{ width: pct !== null ? `${pct}%` : '15%' }}
+                  />
+                </div>
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>
