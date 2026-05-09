@@ -1599,7 +1599,7 @@ OUTPUT (strict JSON):
     {
       "id": <integer matching the input>,
       "identity": "<library entry verbatim, or null>",
-      "sub-identity": "<library entry verbatim, or null>",
+      "sub_identity": "<library entry verbatim, or null>",
       "sector": "<library entry verbatim, or null>",
       "is_disqualified": false,
       "identity_confidence": <1-10>,
@@ -2665,7 +2665,7 @@ not "output" — exactly "results"). Each item's "id" MUST match the input "id"
       "id": <integer matching input id>,
       "identity": "<library name or new>" | null,
       "is_new_identity": <bool>,
-      "sub-identity": "<library name or new>" | null,
+      "sub_identity": "<library name or new>" | null,
       "is_new_sub_identity": <bool>,
       "sector": "<library name or new>" | null,
       "is_new_sector": <bool>,
@@ -5218,7 +5218,7 @@ Return JSON: { "assignments": [<one object per contact in the same order>] }
 Each assignment object:
 {
   "primary_identity": {"name": "<identity key from BUCKET_REFERENCE or empty>", "score": 0.00, "reason": ""},
-  "sub-identity": {"name": "<spec under that identity, or empty>", "score": 0.00, "reason": ""},
+  "sub_identity": {"name": "<spec under that identity, or empty>", "score": 0.00, "reason": ""},
   "sector": "<from SECTOR_VOCABULARY, 'Multi-industry', or ''>",
   "identity_type": "<operator|service_provider|agency|software_vendor|investor|advisor|staffing|distributor|media|other>",
   "generic": false,
@@ -5579,7 +5579,7 @@ Return JSON: { "assignments": [<one object per company in the same order>] }
 Each assignment object:
 {
   "primary_identity": {"name": "<identity key from BUCKET_REFERENCE or empty>", "score": 0.00, "reason": ""},
-  "sub-identity": {"name": "<spec under that identity, or empty>", "score": 0.00, "reason": ""},
+  "sub_identity": {"name": "<spec under that identity, or empty>", "score": 0.00, "reason": ""},
   "sector": "<from SECTOR_VOCABULARY, 'Multi-industry', or ''>",
   "identity_type": "<operator|service_provider|agency|software_vendor|investor|advisor|staffing|distributor|media|other>",
   "generic": false,
