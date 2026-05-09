@@ -87,7 +87,7 @@ const RESERVED_DISQUALIFIED = 'Disqualified';
 export const REASON = {
     // Routed into a real campaign bucket — three rollup levels (v5+):
     COMBO_THRESHOLD_MET: 'combo_threshold_met',
-    SPECIALIZATION_THRESHOLD_MET: 'sub-identity_threshold_met',
+    SPECIALIZATION_THRESHOLD_MET: 'sub_identity_threshold_met',
     IDENTITY_THRESHOLD_MET: 'identity_threshold_met',
     // Generic Audit moved row out of General into a live bucket.
     GENERIC_AUDIT_RECLAIMED: 'generic_audit_reclaimed',
@@ -1869,7 +1869,7 @@ export async function finalizeTaxonomyAgainstLibrary(
         for (let off = 0; off < 200_000; off += PAGE) {
             const { data, error } = await supabase
                 .from('bucket_industry_map')
-                .select('industry_string,primary_identity,sub-identity,sector')
+                .select('industry_string,primary_identity,sub_identity,sector')
                 .eq('bucketing_run_id', runId)
                 .range(off, off + PAGE - 1);
             if (error) throw new Error(`bucket_industry_map re-fetch failed at offset ${off}: ${error.message}`);
@@ -2073,7 +2073,7 @@ export async function runBucketAssignment(
         for (let off = 0; off < 200_000; off += PAGE) {
             const { data, error } = await supabase
                 .from('bucket_industry_map')
-                .select('industry_string,primary_identity,sub-identity,sector,is_disqualified,source')
+                .select('industry_string,primary_identity,sub_identity,sector,is_disqualified,source')
                 .eq('bucketing_run_id', runId)
                 .range(off, off + PAGE - 1);
             if (error) throw new Error(`bucket_industry_map fetch failed at offset ${off}: ${error.message}`);
@@ -4136,7 +4136,7 @@ async function fetchPhase1aTaxonomyMap(
     while (true) {
         const { data, error } = await supabase
             .from('bucket_industry_map')
-            .select('industry_string,primary_identity,sub-identity,sector,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,source,assigned_bucket_name,assigned_bucket_primary_identity')
+            .select('industry_string,primary_identity,sub_identity,sector,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,source,assigned_bucket_name,assigned_bucket_primary_identity')
             .eq('bucketing_run_id', runId)
             .range(offset, offset + PAGE - 1);
         if (error) {
