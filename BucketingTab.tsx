@@ -1204,7 +1204,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
     <div className="space-y-4">
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
         <div className="text-xs text-gray-300">
-          <span className="font-bold text-white">{primaryIdentities.length}</span> primary identities · <span className="font-bold text-white">{sourceBuckets.length}</span> sub-identities · <span className="font-bold text-white">{run.total_contacts?.toLocaleString() || '?'}</span> contacts
+          <span className="font-bold text-white">{primaryIdentities.length}</span> primary identities · <span className="font-bold text-white" title="Pairs where Phase 1a committed BOTH identity and sub-identity. Zero is normal if the LLM only committed identity-level tags.">{sourceBuckets.length}</span> sub-identity pairs · <span className="font-bold text-white" title="Buckets the bucket-assignment pass mapped industries to (post Run Bucket Assignment).">{discoveredBuckets.length}</span> discovered buckets · <span className="font-bold text-white">{run.total_contacts?.toLocaleString() || '?'}</span> contacts
           {run.taxonomy_model && <span className="text-gray-500"> · model: {run.taxonomy_model}</span>}
         </div>
         {observedPatterns.length > 0 && (
@@ -1428,10 +1428,10 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
               onClick={triggerRecalc}
               disabled={recalcing || finalizing}
               className="px-2 py-1 rounded text-[10px] font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e] disabled:opacity-50 normal-case tracking-normal flex items-center gap-1"
-              title="Re-process this run against the current library: refresh is_new flags + re-run consolidation passes so accepted entries become canonical merge targets"
+              title="Re-pass Phase 1a sub-identities against the current taxonomy library: refresh is_new flags + run consolidation so accepted entries become canonical merge targets. Does NOT re-run Bucket Assignment — use the green button above for that."
             >
               {recalcing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
-              {recalcing ? 'Recalculating…' : 'Recalculate'}
+              {recalcing ? 'Recalculating…' : 'Recalculate sub-identities'}
             </button>
           </div>
         </div>
@@ -1524,7 +1524,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
           )}
         </div>
         <p className="text-[10px] text-gray-500 italic mt-1">
-          Selected library buckets short-circuit the Phase 1b LLM via embedding match — keeping a curated set selected is the cheapest way to bucket overlapping lists.
+          Selected library buckets short-circuit the Phase 1b per-contact LLM via embedding match — independent of Bucket Assignment, which decides industry → bucket. Keep a curated set selected as the cheapest way to bucket overlapping lists.
         </p>
         {showLib && (
           <div className="mt-2 border border-[#2e2e2e] rounded max-h-48 overflow-y-auto custom-scrollbar">
@@ -1608,8 +1608,15 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
           </button>
           <button
             onClick={() => apply(true)}
-            disabled={busy !== 'none' || kept.size === 0 || recalcing || finalizing || assigningBuckets}
-            title={recalcing ? 'Recalculation in progress…' : finalizing ? 'Finalize in progress…' : assigningBuckets ? 'Bucket assignment in progress…' : ''}
+            disabled={busy !== 'none' || recalcing || finalizing || assigningBuckets}
+            title={
+              recalcing ? 'Recalculation in progress…'
+              : finalizing ? 'Finalize in progress…'
+              : assigningBuckets ? 'Bucket assignment in progress…'
+              : (discoveredBuckets.length === 0 && !lastBucketAssign)
+                  ? 'No bucket assignment yet — every contact will route to General. Click "Run Bucket Assignment" first if you want library buckets used.'
+                  : 'Save taxonomy edits and run Phase 1b (per-contact routing).'
+            }
             className="px-4 py-2 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1"
           >
             {busy === 'assigning' ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
