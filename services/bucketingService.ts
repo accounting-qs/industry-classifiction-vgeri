@@ -2121,8 +2121,13 @@ export async function runBucketAssignment(
                 sector: r.sector
             }))
         });
-        try {
-            let text = '';
+        // Single LLM call wrapped in a retry-once that fires only on
+        // transient OpenAI-side errors (5xx, abort/network, timeouts).
+        // Real 4xx errors and parse failures aren't retried — they're
+        // batch-content problems, not network blips. Real-world impact:
+        // OpenAI's intermittent 502s used to leak ~30 batches per ~6k-batch
+        // run as failed; with one retry that drops to ~2-3.
+        const callOnce = async (): Promise<string> => {
             if (isAnthropic) {
                 const resp = await anthropic!.messages.create({
                     model: phase1aModel,
@@ -2134,7 +2139,7 @@ export async function runBucketAssignment(
                 totalIn += usage.input_tokens || 0;
                 totalOut += usage.output_tokens || 0;
                 totalCachedIn += usage.cache_read_input_tokens || 0;
-                text = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
+                return (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
             } else {
                 const resp = await fetch('https://api.openai.com/v1/chat/completions', {
                     method: 'POST',
@@ -2157,7 +2162,23 @@ export async function runBucketAssignment(
                 totalIn += (usage.prompt_tokens || 0);
                 totalCachedIn += cached;
                 totalOut += usage.completion_tokens || 0;
-                text = json.choices?.[0]?.message?.content || '';
+                return json.choices?.[0]?.message?.content || '';
+            }
+        };
+        const isRetryable = (msg: string) =>
+            /OpenAI 5\d\d/.test(msg) || /OpenAI 429/.test(msg)
+            || /fetch failed|ECONNRESET|ETIMEDOUT|socket hang up|network/i.test(msg);
+
+        try {
+            let text = '';
+            try { text = await callOnce(); }
+            catch (e: any) {
+                if (ctx.abortSignal?.aborted || e?.name === 'AbortError') throw e;
+                if (!isRetryable(e?.message || '')) throw e;
+                // Brief jittered backoff so a wave of concurrent batches
+                // hitting the same upstream blip doesn't all retry in lockstep.
+                await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 700)));
+                text = await callOnce();
             }
 
             // Parse — tolerant of the same key variations as the Phase 1a tagger.

@@ -994,6 +994,19 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
   const [lastBucketAssign, setLastBucketAssign] = useState<{ at: Date; matched: number; proposed: number; nullified: number; failed: number } | null>(null);
   const [bucketProposals, setBucketProposals] = useState<{ name: string; parent: string; count: number; samples: string[]; reasons: string[] }[]>([]);
   const [discoveredBuckets, setDiscoveredBuckets] = useState<{ assigned_bucket_name: string; assigned_bucket_primary_identity: string; is_new_bucket: boolean; contact_count: number }[]>([]);
+  // Live progress polled while the bucket-assign POST is in flight.
+  // The service writes bucketing_runs.progress every 5 batches
+  // (50 industries) — 1 s polling sees every update without DB hammering.
+  const [bucketAssignProgress, setBucketAssignProgress] = useState<{ current: number; total: number; note?: string } | null>(null);
+  const bucketAssignPollRef = useRef<number | null>(null);
+  // Wall-clock start of the in-flight bucket-assign POST. Used to compute
+  // an ETA in the progress bar — refreshed each time we kick off the run.
+  const lastBucketAssignStartRef = useRef<number | null>(null);
+
+  // Stop polling on unmount so the interval doesn't outlive the component.
+  useEffect(() => () => {
+    if (bucketAssignPollRef.current) { window.clearInterval(bucketAssignPollRef.current); bucketAssignPollRef.current = null; }
+  }, []);
 
   const refreshBucketPanels = useCallback(async () => {
     try {
@@ -1008,9 +1021,27 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
 
   useEffect(() => { refreshBucketPanels(); }, [refreshBucketPanels]);
 
-  const triggerBucketAssign = useCallback(async () => {
-    setAssigningBuckets(true);
-    onError(null);
+  // Run a bucket-assignment POST with live progress polling. Both the
+  // standalone "Run Bucket Assignment" button and the "Accept all +
+  // re-assign" path share this so the user always sees a live percent.
+  const runAssignWithProgress = useCallback(async () => {
+    setBucketAssignProgress({ current: 0, total: 0 });
+    lastBucketAssignStartRef.current = Date.now();
+    if (bucketAssignPollRef.current) window.clearInterval(bucketAssignPollRef.current);
+    bucketAssignPollRef.current = window.setInterval(async () => {
+      try {
+        const r = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}`);
+        const d = await r.json();
+        const p = d?.run?.progress;
+        if (p && p.step === 'bucket_assign') {
+          setBucketAssignProgress({
+            current: Number(p.current || 0),
+            total: Number(p.total || 0),
+            note: typeof p.note === 'string' ? p.note : undefined
+          });
+        }
+      } catch { /* keep polling */ }
+    }, 1000);
     try {
       const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/assign-buckets`, { method: 'POST' });
       const data = await res.json();
@@ -1022,6 +1053,20 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
         nullified: data.nullified || 0,
         failed: data.failed || 0
       });
+    } finally {
+      if (bucketAssignPollRef.current) {
+        window.clearInterval(bucketAssignPollRef.current);
+        bucketAssignPollRef.current = null;
+      }
+      setBucketAssignProgress(null);
+    }
+  }, [run.id]);
+
+  const triggerBucketAssign = useCallback(async () => {
+    setAssigningBuckets(true);
+    onError(null);
+    try {
+      await runAssignWithProgress();
       await refreshBucketPanels();
       onRefresh();
     } catch (e: any) {
@@ -1029,7 +1074,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
     } finally {
       setAssigningBuckets(false);
     }
-  }, [run.id, refreshBucketPanels, onRefresh, onError]);
+  }, [runAssignWithProgress, refreshBucketPanels, onRefresh, onError]);
 
   const acceptProposedBucket = async (name: string, parent: string) => {
     onError(null);
@@ -1037,7 +1082,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
       const res = await fetch('/api/bucketing/library', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sub_identity: name, primary_identity: parent })
+        body: JSON.stringify({ bucket_name: name, primary_identity: parent })
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -1058,16 +1103,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
       // Re-run bucket assignment so newly-accepted entries flip from
       // is_new_bucket=true to false, and the library list now contains
       // them as canonical merge targets for any remaining proposals.
-      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/assign-buckets`, { method: 'POST' });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `Re-assign failed (${res.status})`);
-      setLastBucketAssign({
-        at: new Date(),
-        matched: data.matched || 0,
-        proposed: data.proposed || 0,
-        nullified: data.nullified || 0,
-        failed: data.failed || 0
-      });
+      await runAssignWithProgress();
       await refreshBucketPanels();
       onRefresh();
     } catch (e: any) {
@@ -1221,6 +1257,39 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
             {assigningBuckets ? 'Assigning…' : 'Run Bucket Assignment'}
           </button>
         </div>
+
+        {assigningBuckets && (() => {
+          const cur = bucketAssignProgress?.current || 0;
+          const tot = bucketAssignProgress?.total || 0;
+          const pct = tot > 0 ? Math.min(100, Math.round((cur / tot) * 100)) : null;
+          // Rough ETA: ~0.5 s per industry on average (10/batch, 30 concurrent
+          // batches → 1 wave/0.5 s ≈ 60 industries/s ≈ 30s per 1k). Surface
+          // it once we have enough samples for the math to mean something.
+          const etaSec = (cur > 50 && tot > cur)
+            ? Math.round(((tot - cur) / cur) * (Date.now() - (lastBucketAssignStartRef.current || Date.now())) / 1000)
+            : null;
+          const etaTxt = etaSec !== null && etaSec > 0
+            ? (etaSec >= 60 ? `${Math.floor(etaSec / 60)}m ${etaSec % 60}s` : `${etaSec}s`)
+            : null;
+          return (
+            <div className="mt-3">
+              <div className="flex items-center justify-between text-[10px] font-mono mb-1">
+                <span className="text-[#3ecf8e]/80">
+                  {bucketAssignProgress?.note || 'Asking the LLM to map every industry to a bucket…'}
+                </span>
+                <span className="text-gray-400">
+                  {cur.toLocaleString()}{tot > 0 ? ` / ${tot.toLocaleString()}` : ''}{pct !== null ? ` · ${pct}%` : ''}{etaTxt ? ` · ETA ${etaTxt}` : ''}
+                </span>
+              </div>
+              <div className="h-1.5 bg-[#1c1c1c] rounded overflow-hidden">
+                <div
+                  className="h-full bg-[#3ecf8e] transition-all duration-300"
+                  style={{ width: pct !== null ? `${pct}%` : '15%' }}
+                />
+              </div>
+            </div>
+          );
+        })()}
 
         {bucketProposals.length > 0 && (
           <div className="mt-4 pt-3 border-t border-[#3ecf8e]/20">
