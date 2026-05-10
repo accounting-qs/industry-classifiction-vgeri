@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { db } from './services/supabaseClient';
 import { JobProcessor } from './services/jobProcessor';
-import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, recalculateTaxonomyWithLibrary, finalizeTaxonomyAgainstLibrary, runBucketAssignment, BucketingCancelledError } from './services/bucketingService';
+import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, recalculateTaxonomyWithLibrary, finalizeTaxonomyAgainstLibrary, runBucketAssignment, BucketingCancelledError, debugTagSingleIndustry } from './services/bucketingService';
 import {
     listLibrary,
     upsertLibraryBucket,
@@ -2118,6 +2118,25 @@ app.get('/api/bucketing/runs/:id/phase1a-stats', async (req, res) => {
             sample_null_sub_identity: sampleNullSub,
             all_null_sub_identity
         });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Single-industry pressure test for the Phase 1a tagger. Hits the same
+// prompt + parser used in production so a regression in either layer
+// (LLM returning the wrong key, parser dropping a value, snapshot empty,
+// etc.) shows up in one curl. Returns raw + parsed side by side.
+app.post('/api/bucketing/debug/test-tag', async (req, res) => {
+    try {
+        const { industry, sample_companies, model } = req.body || {};
+        if (!industry || typeof industry !== 'string') {
+            return res.status(400).json({ error: 'industry (string) required' });
+        }
+        const samples = Array.isArray(sample_companies) ? sample_companies.filter((s: any) => typeof s === 'string') : [];
+        const m = (typeof model === 'string' && model) ? model : 'gpt-4.1-mini';
+        const result = await debugTagSingleIndustry(supabase, industry.trim(), samples, m, buildBucketingCtx('debug'));
+        res.json(result);
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }

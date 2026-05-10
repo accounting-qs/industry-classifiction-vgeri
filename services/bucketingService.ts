@@ -2328,6 +2328,97 @@ export async function runBucketAssignment(
 // PHASE 1A HELPERS — taxonomy snapshot + per-string tagging
 // ────────────────────────────────────────────────────────────────────
 
+export async function loadTaxonomySnapshotForDebug(supabase: SupabaseClient): Promise<TaxonomySnapshot> {
+    return loadTaxonomySnapshot(supabase);
+}
+
+// Single-industry pressure test. Routes through the same prompt + parser
+// + dedup pass as production tagIndustries, then returns the raw LLM
+// output alongside the parsed result so a regression in either layer
+// shows up immediately. Not used by the bucketing pipeline itself.
+export async function debugTagSingleIndustry(
+    supabase: SupabaseClient,
+    industry: string,
+    sampleCompanies: string[],
+    model: string,
+    ctx: BucketingCtx
+): Promise<{
+    raw_response: string;
+    parsed: IndustryTagging | null;
+    snapshot: { identities: number; sub_identities: number; sectors: number };
+    prompt_chars: number;
+    model_used: string;
+    cost_usd: number;
+}> {
+    const snapshot = await loadTaxonomySnapshot(supabase);
+    const isAnthropic = model.startsWith('claude-');
+    const isOpenAI = model.startsWith('gpt-');
+    if (!isAnthropic && !isOpenAI) throw new Error(`Unsupported model: ${model}`);
+
+    const anthropic = isAnthropic ? await getAnthropic(supabase) : null;
+    if (isAnthropic && !anthropic) throw new Error('Anthropic API key not configured.');
+
+    const systemPrompt = buildTaggingSystemPrompt(snapshot);
+    const vocab: VocabRow[] = [{
+        industry,
+        n: 1,
+        enrichment_status: 'completed',
+        sample_companies: sampleCompanies.slice(0, 2)
+    }];
+    const userPrompt = JSON.stringify({
+        industries: vocab.map((v, i) => ({ id: i, industry: v.industry, sample_companies: v.sample_companies || [] }))
+    });
+
+    let raw = '';
+    let cost = 0;
+    if (isAnthropic) {
+        const resp = await anthropic!.messages.create({
+            model,
+            max_tokens: 2000,
+            system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+            messages: [{ role: 'user', content: userPrompt }]
+        }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
+        raw = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
+        const usage: any = (resp as any).usage || {};
+        cost = computeAnthropicCost(model, usage.input_tokens || 0, usage.output_tokens || 0);
+    } else {
+        const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model,
+                max_tokens: 2000,
+                response_format: { type: 'json_object' },
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt }
+                ]
+            }),
+            signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal)
+        });
+        if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
+        const json: any = await resp.json();
+        raw = json.choices?.[0]?.message?.content || '';
+        const usage = json.usage || {};
+        const cached = usage.prompt_tokens_details?.cached_tokens || 0;
+        cost = computeOpenAICost(model, (usage.prompt_tokens || 0) - cached, cached, usage.completion_tokens || 0);
+    }
+
+    const parsed = parseTaggingJson(raw, vocab);
+    return {
+        raw_response: raw,
+        parsed: parsed[0] || null,
+        snapshot: {
+            identities: snapshot.identities.length,
+            sub_identities: snapshot.sub_identities.length,
+            sectors: snapshot.sectors.length
+        },
+        prompt_chars: systemPrompt.length + userPrompt.length,
+        model_used: model,
+        cost_usd: cost
+    };
+}
+
 async function loadTaxonomySnapshot(supabase: SupabaseClient): Promise<TaxonomySnapshot> {
     const [idRes, chRes, secRes] = await Promise.all([
         supabase.from('taxonomy_identities').select('*').eq('archived', false).order('sort_order'),
