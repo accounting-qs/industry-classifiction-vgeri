@@ -1008,18 +1008,61 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
     if (bucketAssignPollRef.current) { window.clearInterval(bucketAssignPollRef.current); bucketAssignPollRef.current = null; }
   }, []);
 
+  // Phase 1a diagnostic stats: counts + identity distribution straight
+  // from bucket_industry_map. Surfaces the "all-null sub-identity" case
+  // that bricks the existing Discovered Sub-Identities panel for runs
+  // tagged before the May 9 prompt-key fix.
+  const [phase1aStats, setPhase1aStats] = useState<{
+    total_rows: number;
+    llm_rows: number;
+    dq_passthrough_rows: number;
+    needs_qa_rows: number;
+    with_identity: number;
+    with_sub_identity: number;
+    with_sector: number;
+    distinct_identities: number;
+    identity_distribution: { identity: string; industry_count: number }[];
+    sample_null_sub_identity: { industry_string: string; primary_identity: string | null; llm_reason: string | null }[];
+    all_null_sub_identity: boolean;
+  } | null>(null);
+  const [retagging, setRetagging] = useState(false);
+
   const refreshBucketPanels = useCallback(async () => {
     try {
-      const [pRes, dRes] = await Promise.all([
+      const [pRes, dRes, sRes] = await Promise.all([
         fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/proposed-buckets`).then(r => r.json()),
-        fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/discovered-buckets`).then(r => r.json())
+        fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/discovered-buckets`).then(r => r.json()),
+        fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/phase1a-stats`).then(r => r.json())
       ]);
       setBucketProposals(Array.isArray(pRes.buckets) ? pRes.buckets : []);
       setDiscoveredBuckets(Array.isArray(dRes.buckets) ? dRes.buckets : []);
+      if (sRes && typeof sRes === 'object' && !('error' in sRes)) setPhase1aStats(sRes);
     } catch { /* silent — surfacing here would be noise */ }
   }, [run.id]);
 
   useEffect(() => { refreshBucketPanels(); }, [refreshBucketPanels]);
+
+  // Re-tag from scratch. Used to recover runs whose Phase 1a ran with
+  // the broken prompt key (May 8 and earlier — sub_identity came back
+  // null on every row). Confirm before firing because it costs LLM
+  // tokens and overwrites every map row for the run.
+  const triggerRetagPhase1a = useCallback(async () => {
+    if (!confirm('Re-tag Phase 1a from scratch? This wipes the current bucket_industry_map for this run and re-calls the LLM tagger on every industry. Costs LLM tokens; takes 1–5 minutes for a 70k-contact run.')) return;
+    setRetagging(true);
+    onError(null);
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/retag-phase1a`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Re-tag failed (${res.status})`);
+      // The endpoint returns 202 immediately and the tagger runs in
+      // the background. Bump the parent so it re-polls run status.
+      onRefresh();
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setRetagging(false);
+    }
+  }, [run.id, onError, onRefresh]);
 
   // Run a bucket-assignment POST with live progress polling. Both the
   // standalone "Run Bucket Assignment" button and the "Accept all +
@@ -1220,6 +1263,70 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
           </div>
         )}
       </div>
+
+      {/* Stale-prompt detection. Old runs (tagged before commit 5e51a5e
+          on May 9) returned null for every sub_identity — the original
+          prompt JSON key was hyphenated but the parser expected
+          underscore. Recalculate / Finalize can't fix it (they read the
+          existing data). The only path is a full re-tag. */}
+      {phase1aStats?.all_null_sub_identity && (
+        <div className="border border-amber-500/40 rounded-xl bg-amber-500/5 p-4">
+          <div className="flex items-start justify-between gap-3 flex-wrap">
+            <div className="flex-1 min-w-0">
+              <div className="text-[10px] font-bold text-amber-300 uppercase tracking-widest mb-1">
+                Phase 1a missing sub-identities
+              </div>
+              <div className="text-[11px] text-gray-300">
+                This run has <span className="font-mono text-white">{phase1aStats.llm_rows.toLocaleString()}</span> Phase 1a rows but <span className="font-mono text-white">0</span> have a sub-identity — meaning the LLM was called with a buggy prompt that returned null sub_identity on every row (fixed May 9 via prompt key change). Recalculate / Finalize cannot recover these because they re-read the same null values. Re-tag from scratch to fix.
+              </div>
+            </div>
+            <button
+              onClick={triggerRetagPhase1a}
+              disabled={retagging || finalizing || recalcing || assigningBuckets}
+              className="shrink-0 px-3 py-1.5 rounded text-[10px] font-bold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-50 flex items-center gap-1"
+              title="Wipe this run's bucket_industry_map and re-call the Phase 1a tagger on every industry. Costs LLM tokens."
+            >
+              {retagging ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
+              {retagging ? 'Re-tagging…' : 'Re-tag Phase 1a'}
+            </button>
+          </div>
+          {phase1aStats.sample_null_sub_identity.length > 0 && (
+            <details className="mt-2 text-[10px] text-gray-400">
+              <summary className="cursor-pointer hover:text-gray-200">Sample null-sub-identity rows ({phase1aStats.sample_null_sub_identity.length})</summary>
+              <ul className="mt-1.5 space-y-0.5 font-mono">
+                {phase1aStats.sample_null_sub_identity.map((s, i) => (
+                  <li key={i} className="truncate">
+                    <span className="text-gray-300">{s.industry_string}</span> → {s.primary_identity || '(no identity)'} · {s.llm_reason || '(no reason)'}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
+
+      {/* Always-visible identity distribution. Works even when sub-identity
+          pairs are 0 (the old Discovered Sub-Identities panel renders
+          nothing in that case, leaving the user staring at a blank
+          screen). */}
+      {phase1aStats && phase1aStats.identity_distribution.length > 0 && (
+        <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e]">
+          <div className="px-4 py-3 border-b border-[#2e2e2e] text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between gap-3 flex-wrap">
+            <span>Phase 1a identity distribution ({phase1aStats.distinct_identities})</span>
+            <span className="text-gray-600 normal-case tracking-normal font-normal">
+              {phase1aStats.with_identity.toLocaleString()} industries with identity · {phase1aStats.with_sub_identity.toLocaleString()} with sub-identity · {phase1aStats.with_sector.toLocaleString()} with sector
+            </span>
+          </div>
+          <div className="divide-y divide-[#2e2e2e]/40 max-h-72 overflow-y-auto custom-scrollbar">
+            {phase1aStats.identity_distribution.map(row => (
+              <div key={row.identity} className="px-4 py-1.5 flex items-center justify-between gap-3 text-[11px]">
+                <span className="text-gray-200 truncate">{row.identity}</span>
+                <span className="font-mono text-gray-500 shrink-0">{row.industry_count.toLocaleString()} industries</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <Phase1aProposedTagsPanel
         runId={run.id}

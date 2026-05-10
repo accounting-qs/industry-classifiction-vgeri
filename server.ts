@@ -2047,6 +2047,122 @@ app.post('/api/bucketing/runs/:id/assign-buckets', async (req, res) => {
     }
 });
 
+// Diagnostic: read-only summary of what Phase 1a actually persisted for
+// this run. Surfaces the silent-failure mode where the LLM tagger
+// returned all-null sub_identity values (the May 8 prompt-key bug):
+// total_rows but with_sub_identity=0 means the run is salvageable only
+// by re-tagging from scratch.
+app.get('/api/bucketing/runs/:id/phase1a-stats', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const PAGE = 1000;
+        let total = 0;
+        let withIdentity = 0;
+        let withSubIdentity = 0;
+        let withSector = 0;
+        let llmRows = 0;
+        let dqPassthrough = 0;
+        let needsQa = 0;
+        const identityCounts = new Map<string, number>();
+        const sampleNullSub: Array<{ industry_string: string; primary_identity: string | null; llm_reason: string | null }> = [];
+
+        for (let off = 0; off < 200_000; off += PAGE) {
+            const { data, error } = await supabase
+                .from('bucket_industry_map')
+                .select('industry_string,primary_identity,sub_identity,sector,source,is_disqualified,needs_qa,llm_reason')
+                .eq('bucketing_run_id', id)
+                .range(off, off + PAGE - 1);
+            if (error) return res.status(500).json({ error: error.message });
+            const rows = (data || []) as any[];
+            for (const r of rows) {
+                total++;
+                if (r.source === 'llm_phase1a') llmRows++;
+                if (r.source === 'general_passthrough') dqPassthrough++;
+                if (r.needs_qa) needsQa++;
+                if (r.primary_identity) {
+                    withIdentity++;
+                    identityCounts.set(r.primary_identity, (identityCounts.get(r.primary_identity) || 0) + 1);
+                }
+                if (r.sub_identity) withSubIdentity++;
+                if (r.sector) withSector++;
+                if (r.source === 'llm_phase1a' && !r.sub_identity && r.primary_identity && sampleNullSub.length < 5) {
+                    sampleNullSub.push({
+                        industry_string: r.industry_string,
+                        primary_identity: r.primary_identity,
+                        llm_reason: (r.llm_reason || '').slice(0, 200) || null
+                    });
+                }
+            }
+            if (rows.length < PAGE) break;
+        }
+
+        const identity_distribution = Array.from(identityCounts.entries())
+            .map(([identity, count]) => ({ identity, industry_count: count }))
+            .sort((a, b) => b.industry_count - a.industry_count);
+
+        // The "stale prompt" diagnosis: a run has all-null sub_identity
+        // but committed identities. New runs after May 9 prompt fix won't
+        // hit this; pre-fix runs (May 8 22:25 Mar 11 M&A) all do.
+        const all_null_sub_identity = llmRows > 0 && withSubIdentity === 0;
+
+        res.json({
+            total_rows: total,
+            llm_rows: llmRows,
+            dq_passthrough_rows: dqPassthrough,
+            needs_qa_rows: needsQa,
+            with_identity: withIdentity,
+            with_sub_identity: withSubIdentity,
+            with_sector: withSector,
+            distinct_identities: identityCounts.size,
+            identity_distribution,
+            sample_null_sub_identity: sampleNullSub,
+            all_null_sub_identity
+        });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Re-run Phase 1a from scratch on an existing run. Used to recover runs
+// tagged before the May 9 prompt-key fix (where sub_identity came back
+// null on every row). runTaxonomyProposal is idempotent — wipes prior
+// bucket_industry_map rows for the run before re-tagging — so this is
+// safe to fire on any completed run.
+app.post('/api/bucketing/runs/:id/retag-phase1a', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const { data: run, error } = await supabase
+            .from('bucketing_runs').select('status').eq('id', id).single();
+        if (error || !run) return res.status(404).json({ error: error?.message || 'Run not found' });
+        if (run.status !== 'taxonomy_ready' && run.status !== 'completed' && run.status !== 'failed') {
+            return res.status(400).json({ error: `Cannot re-tag from status "${run.status}"` });
+        }
+
+        await supabase.from('bucketing_runs').update({
+            status: 'taxonomy_pending',
+            cancel_requested: false,
+            error_message: null
+        }).eq('id', id);
+
+        const ctx = buildBucketingCtx(id);
+        // Fire-and-forget. The worker handles its own error state — same
+        // pattern as the initial run dispatch in /determine.
+        runTaxonomyProposal(supabase, id, ctx).catch(async (err: any) => {
+            const cancelled = err instanceof BucketingCancelledError;
+            console.error(`[Bucketing] Re-tag Phase 1a ${cancelled ? 'cancelled' : 'failed'} for ${id}:`, err);
+            await supabase.from('bucketing_runs').update({
+                status: cancelled ? 'cancelled' : 'failed',
+                cancel_requested: false,
+                error_message: cancelled ? 'Cancelled by user' : (err.message?.slice(0, 1000) || String(err))
+            }).eq('id', id);
+        });
+
+        res.status(202).json({ ok: true, retag_started: true });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Returns the unique AI-proposed buckets that aren't yet in
 // bucket_library (is_new_bucket=true rows from this run), grouped for
 // the AI-Proposed Buckets panel. Counts how many industries propose
