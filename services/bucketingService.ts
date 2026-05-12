@@ -3924,7 +3924,8 @@ async function rebuildPreviewMap(
 export async function runAssignment(
     supabase: SupabaseClient,
     runId: string,
-    ctx: BucketingCtx
+    ctx: BucketingCtx,
+    opts?: { resume?: boolean }
 ): Promise<void> {
     // Same pre-flight as Phase 1a — covers cases where the user retries
     // assignment after a schema migration ran mid-cycle. Cheap probe.
@@ -3987,30 +3988,13 @@ export async function runAssignment(
         }
     };
 
-    await timeStep('clear_previous_assignments', async () => {
-        const { error: clearContactMapError } = await supabase
-            .from('bucket_contact_map')
-            .delete()
-            .eq('bucketing_run_id', runId);
-        if (clearContactMapError) throw new Error(`contact map cleanup failed: ${clearContactMapError.message}`);
-        const { error: clearAssignmentsError } = await supabase
-            .from('bucket_assignments')
-            .delete()
-            .eq('bucketing_run_id', runId);
-        if (clearAssignmentsError) throw new Error(`assignment cleanup failed: ${clearAssignmentsError.message}`);
-    });
-
-    // Streaming Phase 1b: load contacts in keyset chunks, route each
-    // chunk through library / embedding / LLM matchers, append to the
-    // persistent assignedRows[] array, then drop the chunk from memory.
-    // Without this, peak memory holds both the contacts[] array (~100 MB
-    // on 500k contacts) AND the assignedRows[] (~150 MB) at the same
-    // time. Chunked: only the current chunk's contacts (~5 MB) plus
-    // assignedRows is alive.
-    await ctx.checkCancel();
-    ctx.log(`[Bucketing ${runId}] step 1-4/5: streaming routing in chunks of ${CONTACT_PAGE_SIZE.toLocaleString()}`, 'phase');
-    ctx.progress({ phase: 'phase1b', step: 'streaming_route', note: 'Loading + routing contacts in chunks…' });
-
+    // Chunk-level resume support. The streaming routing below writes each
+    // chunk to bucket_contact_map immediately so a cancellation preserves
+    // work. On a /resume call, opts.resume=true → we skip the clear,
+    // hydrate the in-memory assignedRows[] from the existing rows, and
+    // seed the keyset paginator from the highest contact_id already
+    // routed so the loop picks up after the last persisted chunk.
+    const isResume = !!opts?.resume;
     const assignedRows: ContactMapRow[] = [];
     let lastContactId: string | null = null;
     let chunkNum = 0;
@@ -4021,6 +4005,83 @@ export async function runAssignment(
     let libraryMatched = 0;
     let embeddingMatched = 0;
     let llmRouted = 0;
+    let hydratedCount = 0;
+
+    if (isResume) {
+        const hydrated = await timeStep('hydrate_resume_state', async () =>
+            fetchPreRollupContactMap(supabase, runId)
+        );
+        if (hydrated.length > 0) {
+            for (const r of hydrated) assignedRows.push(r);
+            hydratedCount = hydrated.length;
+            // Cursor: max contact_id across hydrated rows. The paginator
+            // skips contacts whose id <= lastContactId, so picking the
+            // max guarantees we don't re-route anyone.
+            lastContactId = hydrated[0].contact_id;
+            for (const r of hydrated) if (r.contact_id > lastContactId!) lastContactId = r.contact_id;
+            totalLoaded = hydrated.length;
+            chunkNum = Math.ceil(totalLoaded / CONTACT_PAGE_SIZE);
+            // Restore per-source counters from the hydrated rows so the
+            // per-chunk log line + final summary stay accurate. Source
+            // strings match the canonical values written by the matchers:
+            //   makeGeneralContactRow → 'unclassifiable' (early-DQ)
+            //   makeJoinedContactRow  → 'phase1a_taxonomy' (JOIN-first)
+            //   runContactLibraryFirstMatch → 'library_match'
+            //   runContactEmbeddingPrefilter → 'embedding' / 'embedding_high_confidence'
+            //   runContactMatchingLLM → 'llm_phase1b'
+            for (const r of hydrated) {
+                const src = r.source || '';
+                if (src === 'unclassifiable') {
+                    totalDqEarly++;
+                } else if (src === 'phase1a_taxonomy') {
+                    phase1aJoined++;
+                } else if (src === 'library_match') {
+                    libraryMatched++;
+                } else if (src === 'embedding' || src === 'embedding_high_confidence') {
+                    embeddingMatched++;
+                } else if (src === 'llm_phase1b') {
+                    llmRouted++;
+                }
+            }
+            totalUsable = phase1aJoined + libraryMatched + embeddingMatched + llmRouted;
+            ctx.log(`[Bucketing ${runId}] RESUME — hydrated ${hydrated.length.toLocaleString()} rows; continuing from contact_id > ${lastContactId}`, 'phase');
+        } else {
+            ctx.log(`[Bucketing ${runId}] resume requested but no existing rows in bucket_contact_map — treating as fresh start`, 'warn');
+        }
+    }
+
+    if (!isResume || hydratedCount === 0) {
+        await timeStep('clear_previous_assignments', async () => {
+            const { error: clearContactMapError } = await supabase
+                .from('bucket_contact_map')
+                .delete()
+                .eq('bucketing_run_id', runId);
+            if (clearContactMapError) throw new Error(`contact map cleanup failed: ${clearContactMapError.message}`);
+            const { error: clearAssignmentsError } = await supabase
+                .from('bucket_assignments')
+                .delete()
+                .eq('bucketing_run_id', runId);
+            if (clearAssignmentsError) throw new Error(`assignment cleanup failed: ${clearAssignmentsError.message}`);
+        });
+    } else {
+        // On a resume that actually hydrated rows, bucket_assignments may
+        // still hold stale entries from a prior FINISHED run on the same
+        // id (resume of a cancelled run is a no-op for bucket_assignments
+        // since we only write that table at the end). Wipe just that
+        // table to keep the final write clean.
+        const { error } = await supabase.from('bucket_assignments').delete().eq('bucketing_run_id', runId);
+        if (error) throw new Error(`assignment cleanup failed on resume: ${error.message}`);
+        ctx.log(`[Bucketing ${runId}] skipping bucket_contact_map clear on resume; cleared stale bucket_assignments`);
+    }
+
+    // Streaming Phase 1b: load contacts in keyset chunks, route each
+    // chunk through library / embedding / LLM matchers, append to the
+    // persistent assignedRows[] array, persist the new rows to
+    // bucket_contact_map immediately (so cancellations preserve work),
+    // then drop the chunk from memory.
+    await ctx.checkCancel();
+    ctx.log(`[Bucketing ${runId}] step 1-4/5: streaming routing in chunks of ${CONTACT_PAGE_SIZE.toLocaleString()}${isResume && hydratedCount > 0 ? ` (resuming after ${hydratedCount.toLocaleString()} rows)` : ''}`, 'phase');
+    ctx.progress({ phase: 'phase1b', step: 'streaming_route', note: 'Loading + routing contacts in chunks…' });
 
     // Load Phase 1a's per-industry-string taxonomy once and reuse it for
     // every chunk. The JOIN-first step below short-circuits the LLM for any
@@ -4034,6 +4095,10 @@ export async function runAssignment(
         while (true) {
             await ctx.checkCancel();
             chunkNum++;
+
+            // Snapshot assignedRows length so we can slice off ONLY this
+            // chunk's new rows for the per-chunk pre-rollup write.
+            const chunkInsertStart = assignedRows.length;
 
             const chunk = await fetchContactsChunk(supabase, run.list_names, lastContactId, CONTACT_PAGE_SIZE, ctx);
             if (chunk.rows.length === 0) break;
@@ -4119,6 +4184,17 @@ export async function runAssignment(
                     row.bucket_reason = 'No buckets defined for this run — defaulted to General';
                     assignedRows.push(row);
                 }
+            }
+
+            // Checkpoint: persist this chunk's new pre-rollup rows to
+            // bucket_contact_map immediately. If the run is cancelled
+            // before completion, /resume hydrates these back instead of
+            // re-routing the contacts. bucket_name here is the
+            // tentative pre-rollup value; the final rollup writes the
+            // canonical bucket_name in the same row via upsert.
+            const newChunkRows = assignedRows.slice(chunkInsertStart);
+            if (newChunkRows.length > 0) {
+                await writeContactMapRows(supabase, newChunkRows);
             }
 
             ctx.log(
@@ -4725,11 +4801,15 @@ function runGenericAudit(rows: ContactMapRow[], minVolume: number): {
     return { rows, reclaimed, targets };
 }
 
-async function writeContactMapAndAssignments(
+// Persist a slice of ContactMapRow into bucket_contact_map. Used in
+// two places: the per-chunk checkpoint inside the streaming route (so
+// cancellations preserve work) and the final post-rollup upsert (which
+// updates bucket_name + rollup_level on the already-checkpointed rows).
+async function writeContactMapRows(
     supabase: SupabaseClient,
-    runId: string,
     rows: ContactMapRow[]
 ): Promise<void> {
+    if (rows.length === 0) return;
     const mapRows = rows.map(row => ({
         bucketing_run_id: row.bucketing_run_id,
         contact_id: row.contact_id,
@@ -4761,6 +4841,74 @@ async function writeContactMapAndAssignments(
             .upsert(chunk, { onConflict: 'bucketing_run_id,contact_id' });
         if (error) throw new Error(`contact map insert failed: ${error.message}`);
     }
+}
+
+// Hydrate ContactMapRow[] from bucket_contact_map for a given run. Used
+// on /resume to restore the in-memory assignedRows array so the rollup
+// at the end of streaming sees the FULL set (hydrated + new) and the
+// volume thresholds remain correct.
+async function fetchPreRollupContactMap(
+    supabase: SupabaseClient,
+    runId: string
+): Promise<ContactMapRow[]> {
+    const out: ContactMapRow[] = [];
+    const PAGE = 1000;
+    let cursor: string | null = null;
+    while (true) {
+        let q: any = supabase.from('bucket_contact_map')
+            .select('*')
+            .eq('bucketing_run_id', runId)
+            .order('contact_id', { ascending: true })
+            .limit(PAGE);
+        if (cursor) q = q.gt('contact_id', cursor);
+        const { data, error } = await q;
+        if (error) throw new Error(`resume hydrate failed: ${error.message}`);
+        const rows = (data || []) as any[];
+        if (rows.length === 0) break;
+        for (const r of rows) {
+            out.push({
+                bucketing_run_id: r.bucketing_run_id,
+                contact_id: r.contact_id,
+                industry_string: r.industry_string || '',
+                primary_identity: r.primary_identity || '',
+                sub_identity: r.sub_identity || '',
+                sector: r.sector || '',
+                assigned_bucket_name: r.assigned_bucket_name || null,
+                assigned_bucket_primary_identity: r.assigned_bucket_primary_identity || null,
+                canonical_classification: r.canonical_classification || '',
+                bucket_reason: r.bucket_reason || '',
+                pre_rollup_bucket_name: r.pre_rollup_bucket_name || r.bucket_name || '',
+                bucket_name: r.bucket_name || '',
+                identity_confidence: Number(r.identity_confidence ?? 0),
+                sub_identity_confidence: Number(r.sub_identity_confidence ?? 0),
+                sector_confidence: Number(r.sector_confidence ?? 0),
+                rollup_level: (r.rollup_level || 'general') as ContactMapRow['rollup_level'],
+                source: r.source || '',
+                confidence: Number(r.confidence ?? 0),
+                leaf_score: Number(r.leaf_score ?? 0),
+                ancestor_score: Number(r.ancestor_score ?? 0),
+                root_score: Number(r.root_score ?? 0),
+                is_generic: !!r.is_generic,
+                is_disqualified: !!r.is_disqualified,
+                general_reason: r.general_reason || null,
+                reasons: r.reasons || {}
+            });
+        }
+        if (rows.length < PAGE) break;
+        cursor = rows[rows.length - 1].contact_id;
+    }
+    return out;
+}
+
+async function writeContactMapAndAssignments(
+    supabase: SupabaseClient,
+    runId: string,
+    rows: ContactMapRow[]
+): Promise<void> {
+    // Re-uses the per-chunk writer for the contact_map upsert (so the
+    // final post-rollup write updates bucket_name on the already-
+    // checkpointed rows). bucket_assignments stays a one-shot write.
+    await writeContactMapRows(supabase, rows);
 
     const assignmentRows = rows.map(row => ({
         bucketing_run_id: runId,

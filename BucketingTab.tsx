@@ -871,6 +871,12 @@ function BucketingProgressPanel({ run, title, onError }: {
             {elapsedTxt && <> · elapsed {elapsedTxt}</>}
           </div>
         )}
+        {/* Backgrounded-job hint. The run continues server-side regardless
+            of whether this tab is open — the polling above just resumes
+            when the user reopens the run. */}
+        <div className="text-[10px] text-gray-600 mt-2 italic">
+          Safe to close this tab or navigate away — the run continues on the server. Reopen this run from the index to resume live progress.
+        </div>
       </div>
 
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] overflow-hidden">
@@ -945,7 +951,7 @@ function BucketingDetail({ run, library, bucketCounts, sectorMix, generalBreakdo
   if (run.status === 'taxonomy_ready') {
     return <BucketingReview run={run} library={library} bucketCounts={bucketCounts} onRefresh={onRefresh} onError={onError} />;
   }
-  return <BucketingResults run={run} bucketCounts={bucketCounts} sectorMix={sectorMix} generalBreakdown={generalBreakdown} onError={onError} onLibrarySaved={onLibrarySaved} />;
+  return <BucketingResults run={run} bucketCounts={bucketCounts} sectorMix={sectorMix} generalBreakdown={generalBreakdown} onRefresh={onRefresh} onError={onError} onLibrarySaved={onLibrarySaved} />;
 }
 
 // ───── REVIEW VIEW ──────────────────────────────────────────────
@@ -1319,7 +1325,12 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
           throw new Error(data.error || `Assign failed (${ar.status})`);
         }
       }
-      onRefresh();
+      // Await the parent refresh so Phase 1b's status='assigning' lands
+      // BEFORE we clear the busy spinner — without the await, busy flips
+      // back to 'none' for ~500 ms while fetchActive is still in flight,
+      // and the user sees the Review screen with no spinner before the
+      // parent finally swaps to BucketingProgressPanel.
+      await Promise.resolve(onRefresh());
     } catch (e: any) {
       onError(e.message);
     } finally {
@@ -1778,6 +1789,25 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
         </div>
       </div>
 
+      {/* Inline starting banner — visible during the brief window between
+          POSTing /assign and the parent re-rendering to the Phase 1b
+          progress panel. Makes it obvious that the click landed and that
+          the run is now backgrounded. */}
+      {busy === 'assigning' && (
+        <div className="border border-[#3ecf8e]/40 rounded-xl bg-[#3ecf8e]/5 p-4 flex items-start gap-3">
+          <Loader2 className="w-4 h-4 text-[#3ecf8e] animate-spin shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <div className="text-[11px] font-bold text-[#3ecf8e]">
+              Phase 1b started — opening live progress view…
+            </div>
+            <div className="text-[10px] text-gray-400 mt-0.5">
+              You can safely close this tab or navigate away — Phase 1b runs in the background on the server.
+              When you return, open this run from the index to see the live progress + ETA.
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="flex justify-between items-center gap-2 flex-wrap">
         <button
           onClick={exportTaxonomyCsv}
@@ -1918,13 +1948,205 @@ function BucketChainList({
   );
 }
 
+// ───── PIPELINE RE-RUN PANEL ──────────────────────────────────────
+// Lets the user re-run any single phase of the bucketing pipeline on
+// a finished (or failed) run without having to delete it and start
+// over. Each re-run fires the same backend endpoint that ran the
+// phase originally:
+//   - Phase 1a    → POST /retag-phase1a   (LLM re-tag every industry)
+//   - Bucket Assignment → POST /assign-buckets (industry → bucket)
+//   - Phase 1b    → POST /assign           (per-contact routing)
+// Each endpoint flips bucketing_runs.status to its phase-specific
+// "in flight" value before returning 202, so the parent BucketingDetail
+// auto-routes to BucketingProgressPanel within the next 1.5 s poll tick.
+
+function PipelineRerunPanel({ run, onRefresh, onError }: {
+  run: BucketingRun;
+  onRefresh: () => void;
+  onError: (msg: string | null) => void;
+}) {
+  // One state machine so only one re-run can be in-flight at a time —
+  // the others get disabled while a phase is starting up.
+  const [busy, setBusy] = useState<null | 'phase1a' | 'bucket_assign' | 'phase1b'>(null);
+
+  // Inline progress polled while the bucket-assign POST is in flight.
+  // Phase 1a / Phase 1b flip bucketing_runs.status so the parent
+  // BucketingDetail auto-routes to BucketingProgressPanel; Bucket
+  // Assignment doesn't flip status, so we surface its live progress
+  // right here on the Results screen via the same poll-bucketing_runs
+  // pattern the Review screen uses.
+  const [bucketAssignProgress, setBucketAssignProgress] = useState<{ current: number; total: number; note?: string } | null>(null);
+  const bucketAssignPollRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (bucketAssignPollRef.current) { window.clearInterval(bucketAssignPollRef.current); bucketAssignPollRef.current = null; }
+  }, []);
+
+  const post = async (endpoint: string, label: typeof busy, errorPrefix: string) => {
+    setBusy(label);
+    onError(null);
+    // Spin up live progress polling for the synchronous bucket-assign
+    // POST so the user sees forward motion (the call can take minutes).
+    if (label === 'bucket_assign') {
+      setBucketAssignProgress({ current: 0, total: 0 });
+      if (bucketAssignPollRef.current) window.clearInterval(bucketAssignPollRef.current);
+      bucketAssignPollRef.current = window.setInterval(async () => {
+        try {
+          const r = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}`);
+          const d = await r.json();
+          const p = d?.run?.progress;
+          if (p && p.step === 'bucket_assign') {
+            setBucketAssignProgress({
+              current: Number(p.current || 0),
+              total: Number(p.total || 0),
+              note: typeof p.note === 'string' ? p.note : undefined
+            });
+          }
+        } catch { /* keep polling */ }
+      }, 1000);
+    }
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}${endpoint}`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `${errorPrefix} failed (${res.status})`);
+      // Wait one tick before refreshing so the status flip on the server
+      // lands before the parent's fetchActive picks it up — without this
+      // we sometimes see status=completed for one beat after the click.
+      await new Promise(r => setTimeout(r, 200));
+      onRefresh();
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      if (bucketAssignPollRef.current) {
+        window.clearInterval(bucketAssignPollRef.current);
+        bucketAssignPollRef.current = null;
+      }
+      setBucketAssignProgress(null);
+      setBusy(null);
+    }
+  };
+
+  const rerunPhase1a = () => {
+    if (!confirm(
+      'Re-tag Phase 1a from scratch?\n\n' +
+      'This wipes bucket_industry_map for this run and re-calls the LLM tagger ' +
+      'on every distinct industry. Bucket Assignment + Phase 1b results stay ' +
+      'in the DB but will be stale until you re-run them too.\n\n' +
+      'Cost: ~$15–150 depending on the model. Takes 1–5 min for a 70k-contact run.'
+    )) return;
+    post('/retag-phase1a', 'phase1a', 'Phase 1a re-tag');
+  };
+
+  const rerunBucketAssign = () => {
+    if (!confirm(
+      'Re-run Bucket Assignment?\n\n' +
+      'Re-asks the LLM to map every Phase 1a-tagged industry to a campaign ' +
+      'bucket from bucket_library. Phase 1a tags stay intact. Phase 1b\'s ' +
+      'per-contact assignments will be stale until you re-run Phase 1b too.\n\n' +
+      'Cost: a few cents typically (industries, not contacts).'
+    )) return;
+    post('/assign-buckets', 'bucket_assign', 'Bucket Assignment');
+  };
+
+  const rerunPhase1b = () => {
+    if (!confirm(
+      'Re-run Phase 1b (per-contact routing)?\n\n' +
+      'Wipes bucket_contact_map + bucket_assignments and re-routes every ' +
+      'contact through the library / embedding / LLM cascade using the ' +
+      'current Phase 1a tags + Bucket Assignment + run settings ' +
+      '(min_volume, bucket_budget, library reuse).\n\n' +
+      'Cost: usually small thanks to the JOIN-first lookup; takes minutes-to-hours ' +
+      'depending on contact count and cache hit rate.'
+    )) return;
+    post('/assign', 'phase1b', 'Phase 1b');
+  };
+
+  const inFlight = busy !== null;
+
+  return (
+    <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
+      <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">
+        Re-run pipeline steps
+      </div>
+      <p className="text-[11px] text-gray-400 mb-3">
+        Re-run any single phase on this run without deleting it. Each phase is
+        independent at the backend; re-running an earlier phase invalidates the
+        downstream output until you re-run those phases too.
+      </p>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+        <button
+          onClick={rerunPhase1a}
+          disabled={inFlight}
+          className="px-3 py-2 rounded text-[11px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-200 hover:bg-[#2e2e2e] hover:border-[#3ecf8e]/40 disabled:opacity-50 flex items-center justify-center gap-1.5"
+          title="Wipe bucket_industry_map for this run and re-call the Phase 1a LLM tagger on every industry."
+        >
+          {busy === 'phase1a'
+            ? <Loader2 className="w-3 h-3 animate-spin" />
+            : <RotateCcw className="w-3 h-3" />}
+          {busy === 'phase1a' ? 'Starting…' : 'Re-tag Phase 1a'}
+        </button>
+        <button
+          onClick={rerunBucketAssign}
+          disabled={inFlight}
+          className="px-3 py-2 rounded text-[11px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-200 hover:bg-[#2e2e2e] hover:border-[#3ecf8e]/40 disabled:opacity-50 flex items-center justify-center gap-1.5"
+          title="Re-map every industry to a campaign bucket. Phase 1a tags stay intact."
+        >
+          {busy === 'bucket_assign'
+            ? <Loader2 className="w-3 h-3 animate-spin" />
+            : <RotateCcw className="w-3 h-3" />}
+          {busy === 'bucket_assign' ? 'Starting…' : 'Re-run Bucket Assignment'}
+        </button>
+        <button
+          onClick={rerunPhase1b}
+          disabled={inFlight}
+          className="px-3 py-2 rounded text-[11px] font-bold bg-[#3ecf8e]/10 border border-[#3ecf8e]/40 text-[#3ecf8e] hover:bg-[#3ecf8e]/20 disabled:opacity-50 flex items-center justify-center gap-1.5"
+          title="Wipe bucket_contact_map and re-route every contact. Uses current Phase 1a + Bucket Assignment + run settings."
+        >
+          {busy === 'phase1b'
+            ? <Loader2 className="w-3 h-3 animate-spin" />
+            : <Play className="w-3 h-3" />}
+          {busy === 'phase1b' ? 'Starting…' : 'Re-run Phase 1b'}
+        </button>
+      </div>
+      {busy === 'bucket_assign' && (() => {
+        const cur = bucketAssignProgress?.current || 0;
+        const tot = bucketAssignProgress?.total || 0;
+        const pct = tot > 0 ? Math.min(100, Math.round((cur / tot) * 100)) : null;
+        return (
+          <div className="mt-3">
+            <div className="flex items-center justify-between text-[10px] font-mono mb-1">
+              <span className="text-[#3ecf8e]/80">
+                {bucketAssignProgress?.note || 'Asking the LLM to map every industry to a bucket…'}
+              </span>
+              <span className="text-gray-400">
+                {cur.toLocaleString()}{tot > 0 ? ` / ${tot.toLocaleString()}` : ''}{pct !== null ? ` · ${pct}%` : ''}
+              </span>
+            </div>
+            <div className="h-1.5 bg-[#1c1c1c] rounded overflow-hidden">
+              <div
+                className="h-full bg-[#3ecf8e] transition-all duration-300"
+                style={{ width: pct !== null ? `${pct}%` : '15%' }}
+              />
+            </div>
+          </div>
+        );
+      })()}
+      <p className="text-[10px] text-gray-600 italic mt-2">
+        After clicking, you'll be switched to the live progress view automatically
+        (Phase 1a / Phase 1b) or see progress here (Bucket Assignment).
+        Safe to close the tab — runs continue server-side.
+      </p>
+    </div>
+  );
+}
+
 // ───── RESULTS VIEW ───────────────────────────────────────────────
 
-function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onError, onLibrarySaved }: {
+function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onRefresh, onError, onLibrarySaved }: {
   run: BucketingRun;
   bucketCounts: any[];
   sectorMix: any[];
   generalBreakdown: any[];
+  onRefresh: () => void;
   onError: (msg: string | null) => void;
   onLibrarySaved: () => void;
 }) {
@@ -2103,6 +2325,8 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onEr
         <StatCard label="Contacts assigned" value={total.toLocaleString()} color="text-[#3ecf8e]" />
         <StatCard label="Total cost" value={`$${(Number(run.cost_usd) || 0).toFixed(3)}`} color="text-white" />
       </div>
+
+      <PipelineRerunPanel run={run} onRefresh={onRefresh} onError={onError} />
 
       {Array.isArray(run.quality_warnings) && run.quality_warnings.length > 0 && (
         <div className="border border-amber-500/30 rounded-xl bg-amber-500/5 p-4">

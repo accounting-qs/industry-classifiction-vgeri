@@ -2299,9 +2299,10 @@ app.post('/api/bucketing/runs/:id/cancel', async (req, res) => {
 });
 
 // Resume a cancelled run. If the cancel happened during Phase 1a, retrigger
-// runTaxonomyProposal. If during Phase 1b, retrigger runAssignment. Both
-// phases are idempotent at the phase level — they wipe and rebuild the
-// per-phase output tables so the resume is clean.
+// runTaxonomyProposal (always fresh — Phase 1a is fast enough to redo).
+// If during Phase 1b, retrigger runAssignment with resume=true so the
+// streaming routing picks up after the last chunk persisted to
+// bucket_contact_map instead of re-routing every contact from id 0.
 app.post('/api/bucketing/runs/:id/resume', async (req, res) => {
     const id = req.params.id;
     try {
@@ -2325,7 +2326,7 @@ app.post('/api/bucketing/runs/:id/resume', async (req, res) => {
         const ctx = buildBucketingCtx(id);
         const fn = resumePhase === 'phase1a'
             ? () => runTaxonomyProposal(supabase, id, ctx)
-            : () => runAssignment(supabase, id, ctx);
+            : () => runAssignment(supabase, id, ctx, { resume: true });
 
         fn().catch(async (err: any) => {
             const cancelled = err instanceof BucketingCancelledError;
