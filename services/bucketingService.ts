@@ -1118,10 +1118,15 @@ export async function runTaxonomyProposal(
             }
 
             // Canonical classification: concise truth statement combining the
-            // narrowest available fields. Used for the CSV export.
+            // narrowest available fields. Used for the CSV export. Old format
+            // glued sector + sub_identity with a space ("Construction &
+            // Infrastructure Custom Home Builder") which read as a single
+            // garbled name; explicit " — " separator + parens for sector
+            // makes "Custom Home Builder (Construction & Infrastructure)"
+            // read as one tag with vertical context.
             const canonical = isDisqualified
                 ? 'Disqualified'
-                : (tSector && tSubIdentity ? `${tSector} ${tSubIdentity}`
+                : (tSubIdentity && tSector ? `${tSubIdentity} (${tSector})`
                     : (tSubIdentity || tIdentity || 'Generic'));
 
             preMapRows.push({
@@ -1445,7 +1450,7 @@ export async function recalculateTaxonomyWithLibrary(
 
         const canonical = isDisqualified
             ? 'Disqualified'
-            : (t.sector && t.sub_identity ? `${t.sector} ${t.sub_identity}`
+            : (t.sub_identity && t.sector ? `${t.sub_identity} (${t.sector})`
                 : (t.sub_identity || t.identity || 'Generic'));
 
         updates.push({
@@ -1825,7 +1830,7 @@ export async function finalizeTaxonomyAgainstLibrary(
 
         const canonical = isDisqualified
             ? 'Disqualified'
-            : (newSector && newSubIdentity ? `${newSector} ${newSubIdentity}`
+            : (newSubIdentity && newSector ? `${newSubIdentity} (${newSector})`
                 : (newSubIdentity || newIdentity || 'Generic'));
 
         if (!newIdentity && !newSubIdentity && !newSector) nullified++;
@@ -2738,9 +2743,35 @@ Examples:
 - Use the EXACT spelling of the canonical names above so different batches converge.
 The bar to set is_new_*=true is HIGH: only do it when no existing or canonical name is even loosely applicable AND the new entry passes the quality checks above.
 
+HARD KEYWORD ROUTING (applies BEFORE any other rule — if the input matches, the identity is fixed):
+
+- Mentions "SaaS", "software platform", "software for", "B2B software", or names a software product
+    → identity MUST be Software & SaaS (NEVER Agency, NEVER Consulting)
+- Mentions "staffing", "recruiting", "recruitment", "talent acquisition", "executive search"
+    → identity MUST be Staffing & Recruiting (NEVER Government Contractor, NEVER Agency)
+- Mentions "law firm", "litigation services", "legal services", "court reporting", "legal videography", "attorney", "paralegal"
+    → identity MUST be Legal Services (NEVER Accounting & Tax, NEVER Consulting)
+- Mentions "venture capital", "VC fund", "private equity", "PE firm", "hedge fund", "investment management", "asset management", "family office", "wealth management"
+    → identity MUST be Financial Services (NEVER Software & SaaS even if they invest in software companies)
+- Starts with "Manufacturer", "Maker of", or describes the company as "manufactures X" / "produces X"
+    → identity MUST be Manufacturing & Industrial (NEVER Staffing & Recruiting, NEVER Agency)
+- Mentions "marketing agency", "advertising agency", "creative agency", "branding agency", "PR agency", "media agency", "digital agency", "performance marketing"
+    → identity MUST be Agency (NEVER Consulting & Advisory unless the company explicitly self-identifies as a consultancy)
+- Mentions "non-profit", "nonprofit", "501(c)", "foundation", "charity", "land trust"
+    → identity MUST be Non-Profit & Association (NEVER Manufacturing — even when they conserve land or build housing)
+- Mentions "architecture", "architectural design", "interior design", "engineering firm", "general contractor", "home builder"
+    → identity MUST be Construction & Engineering (NEVER Manufacturing)
+- Mentions "real estate brokerage", "real estate developer", "property management", "real estate investment"
+    → identity MUST be Real Estate
+- Mentions "compliance software", "compliance technology", "regtech", "supply-chain software", "documentation software", "collaboration software"
+    → identity MUST be Software & SaaS
+
+When ANY of the above patterns matches, you MUST use the stated identity even if the company also serves a different vertical. The vertical goes into SECTOR, never into IDENTITY. If two patterns conflict, prefer the one whose keyword appears earlier in the input.
+
 CLASSIFICATION RULES (critical):
 - Classify by core business identity FIRST, sector served SECOND. A PE firm focused on healthcare is identity=Financial Services, NOT Healthcare.
 - Operators in a vertical (a hospital, a SaaS company) belong to that identity. Service providers TO that vertical (an agency that markets healthcare, a consultant to insurers) belong to the service identity, with the vertical going into sector.
+- **"X for Y" means identity=X, sector=Y.** Examples: "Digital marketing for nonprofits" → identity=Agency, sector=Non-Profit & Social Impact. "SaaS for K-12 schools" → identity=Software & SaaS, sector=Education. NEVER let the served vertical (Y) become the identity.
 - **SERVICES vs PRODUCTS — do not collapse them**. Companies that *rent*, *maintain*, *repair*, or *operate-as-a-service* should NEVER be tagged "B2B Product Manufacturer" / "Industrial Equipment / Machinery" just because they're industrial-adjacent. If no services sub-identity fits, prefer a Services / Field Services / Equipment Rental / Maintenance Services sub-identity if one exists in the library — otherwise propose one (is_new_sub_identity=true) rather than picking a wrong manufacturer label. Reserve Manufacturer sub-identities for companies whose primary act is *making* a physical product.
 - **Talent / Artist Management is an Agency, not Consulting.** Don't tag artist management firms, modeling agencies, or sports management firms as Management Consulting.
 - **Game / Software studios are Software & SaaS (or a new Software identity), not Hospitality / Travel / Consumer Retail** — even if the games are sold to consumers. Use is_disqualified=true only if the company is unambiguously pure-consumer with no B2B angle.
@@ -2883,19 +2914,35 @@ function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
         const idConf = typeof item.identity_confidence === 'number' ? item.identity_confidence : legacyConf;
         const chConf = typeof item.sub_identity_confidence === 'number' ? item.sub_identity_confidence : legacyConf;
         const secConf = typeof item.sector_confidence === 'number' ? item.sector_confidence : legacyConf;
+        // Validate each tag slot: drop values that look like sentence
+        // text rather than a taxonomy name. Stops the "primary_identity =
+        // 'The homepage explicitly states…'" failure mode where the LLM
+        // dumps reason text into the wrong field.
+        const rawIdentity = nz(item.identity);
+        const rawSubIdentity = nz(item.sub_identity);
+        const rawSector = nz(item.sector);
+        const cleanIdentity = validTag(rawIdentity);
+        const cleanSubIdentity = validTag(rawSubIdentity);
+        const cleanSector = validTag(rawSector);
+        const hadTextBleed = (rawIdentity && !cleanIdentity)
+            || (rawSubIdentity && !cleanSubIdentity)
+            || (rawSector && !cleanSector);
+
         out.push({
             industry: v.industry,
-            identity: nz(item.identity),
-            is_new_identity: !!item.is_new_identity,
-            sub_identity: nz(item.sub_identity),
-            is_new_sub_identity: !!item.is_new_sub_identity,
-            sector: nz(item.sector),
-            is_new_sector: !!item.is_new_sector,
+            identity: cleanIdentity,
+            is_new_identity: !!item.is_new_identity && !!cleanIdentity,
+            sub_identity: cleanSubIdentity,
+            is_new_sub_identity: !!item.is_new_sub_identity && !!cleanSubIdentity,
+            sector: cleanSector,
+            is_new_sector: !!item.is_new_sector && !!cleanSector,
             is_disqualified: !!item.is_disqualified,
-            identity_confidence: idConf,
-            sub_identity_confidence: chConf,
-            sector_confidence: secConf,
-            confidence: Math.min(idConf || 10, chConf || 10, secConf || 10),
+            identity_confidence: hadTextBleed ? Math.min(idConf, 4) : idConf,
+            sub_identity_confidence: hadTextBleed ? Math.min(chConf, 4) : chConf,
+            sector_confidence: hadTextBleed ? Math.min(secConf, 4) : secConf,
+            confidence: hadTextBleed
+                ? Math.min(4, idConf || 10, chConf || 10, secConf || 10)
+                : Math.min(idConf || 10, chConf || 10, secConf || 10),
             reason: typeof item.reason === 'string' ? item.reason.slice(0, 500) : ''
         });
     }
@@ -2906,6 +2953,23 @@ function nz(v: any): string | null {
     if (v === null || v === undefined) return null;
     const s = String(v).trim();
     return s.length > 0 ? s : null;
+}
+
+// Reject obvious text-bleed values where the LLM dumped reasoning prose
+// into a tag slot (e.g. primary_identity="The homepage explicitly states
+// that Sunflower Development Center specializes in..."). Real taxonomy
+// names are short (5–40 chars), have no sentence punctuation, and don't
+// start with sentence-y words. Anything that fails these checks is
+// nullified at parse time so it can't pollute bucket_industry_map.
+const TAG_MAX_LEN = 60;
+const TAG_SENTENCE_START = /^(The |A |This |It |They |Their |Based on |According to |Looking at )/i;
+const TAG_SENTENCE_PUNCT = /[.!?]\s+[A-Z]/;
+function validTag(v: string | null): string | null {
+    if (!v) return null;
+    if (v.length > TAG_MAX_LEN) return null;
+    if (TAG_SENTENCE_START.test(v)) return null;
+    if (TAG_SENTENCE_PUNCT.test(v)) return null;
+    return v;
 }
 
 // Post-batch dedup: collapse near-duplicate identity / sub-identity /

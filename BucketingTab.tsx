@@ -483,11 +483,19 @@ function BucketingStatusBadge({ status }: { status: string }) {
 
 // Phase 1a model options surfaced on the Setup screen. The cost field is
 // "approx for 100k contacts" — based on the typical 32k distinct
-// classification strings we've measured (dedup ratio ~1.45). Actual cost
-// scales with vocab size, not raw contact count.
+// classification strings we've measured (dedup ratio ~1.45) and the
+// pricing table in services/bucketingService.ts. Quality column reflects
+// real-world accuracy on our identity-vs-sector failure modes (e.g.
+// "B2B SaaS for…" → Software & SaaS, not Agency). The smaller models
+// over-pick generic identities ("Manufacturing & Industrial", "Agency")
+// when the input is ambiguous — Sonnet 4.6 fixes most of that for ~5×
+// the mini cost, which is usually the right tradeoff for a one-off run.
 const PHASE1A_MODEL_OPTIONS = [
-  { id: 'gpt-4.1-mini',     label: 'gpt-4.1-mini (default)', approxCost100k: '~$15–25', note: 'Cheapest. Good quality on structured taxonomy picks.' },
-  { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5',       approxCost100k: '~$40–70', note: 'Slightly stronger on edge-case identities.' },
+  { id: 'gpt-4.1-mini',     label: 'gpt-4.1-mini',                       approxCost100k: '~$15–25',   recommended: false, note: 'Cheapest. Misclassifies ~40% of nuanced cases (identity↔sector confusion).' },
+  { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5',                   approxCost100k: '~$40–70',   recommended: false, note: 'Slightly stronger than mini on edge-case identities. Still struggles with “serves X” vs “is X”.' },
+  { id: 'gpt-4.1',          label: 'gpt-4.1',                            approxCost100k: '~$60–90',   recommended: false, note: 'Solid mid-tier. Catches most “SaaS misclassified as Agency” cases.' },
+  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (recommended)',   approxCost100k: '~$100–150', recommended: true,  note: 'Best balance of quality + cost. Follows the strict identity-vs-sector rules reliably. Use this unless cost is a hard constraint.' },
+  { id: 'claude-opus-4-7',  label: 'Claude Opus 4.7',                    approxCost100k: '~$450–600', recommended: false, note: 'Strongest reasoning. Overkill for most taxonomies — only worth it on small, high-stakes lists.' },
 ] as const;
 type Phase1aModel = typeof PHASE1A_MODEL_OPTIONS[number]['id'];
 
@@ -502,7 +510,10 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
   // Default OFF — trust the tagger's per-row is_disqualified decision instead of
   // auto-DQ'ing every contact whose identity is library-flagged [DQ].
   const [applyIdentityDqCascade, setApplyIdentityDqCascade] = useState(false);
-  const [phase1aModel, setPhase1aModel] = useState<Phase1aModel>('gpt-4.1-mini');
+  // Default to the option flagged `recommended: true` — falls back to
+  // gpt-4.1-mini if no recommendation is set so the picker is never empty.
+  const defaultModel: Phase1aModel = (PHASE1A_MODEL_OPTIONS.find(o => o.recommended)?.id || 'gpt-4.1-mini') as Phase1aModel;
+  const [phase1aModel, setPhase1aModel] = useState<Phase1aModel>(defaultModel);
 
   const toggleList = (n: string) => {
     const s = new Set(selectedLists);
@@ -579,7 +590,14 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
                 />
                 <span className="flex-1 min-w-0">
                   <span className="flex items-baseline justify-between gap-2 flex-wrap">
-                    <span className={`text-[11px] font-bold ${isSel ? 'text-[#3ecf8e]' : 'text-gray-200'}`}>{opt.label}</span>
+                    <span className="flex items-center gap-1.5">
+                      <span className={`text-[11px] font-bold ${isSel ? 'text-[#3ecf8e]' : 'text-gray-200'}`}>{opt.label}</span>
+                      {opt.recommended && (
+                        <span className="text-[9px] font-bold uppercase tracking-widest bg-[#3ecf8e]/20 text-[#3ecf8e] border border-[#3ecf8e]/40 px-1.5 py-0.5 rounded">
+                          Recommended
+                        </span>
+                      )}
+                    </span>
                     <span className="text-[10px] font-mono text-gray-500">{opt.approxCost100k} / 100k contacts</span>
                   </span>
                   <span className="block text-[10px] text-gray-500 italic mt-0.5">{opt.note}</span>
@@ -745,13 +763,78 @@ function BucketingProgressPanel({ run, title, onError }: {
     ? formatDuration(p.elapsed_seconds)
     : null;
 
+  // Pipeline step chain. We surface the three automated steps so the
+  // user can see where in the whole bucketing run they are. Bucket
+  // Assignment is a manual click that lives between Phase 1a and 1b,
+  // but its progress flows through the same panel via step=bucket_assign.
+  type PhaseState = 'done' | 'active' | 'pending';
+  const phaseFromProgress = String(p?.phase || '');
+  const stepFromProgress = String(p?.step || '');
+  const isBucketAssign = stepFromProgress === 'bucket_assign';
+  const isPhase1a = phaseFromProgress === 'phase1a' && !isBucketAssign;
+  const isPhase1b = phaseFromProgress === 'phase1b';
+  const status = String((run as any).status || '');
+  const phase1aState: PhaseState =
+    isPhase1a ? 'active'
+    : (status === 'taxonomy_pending') ? 'active'
+    : 'done';                                // any later status implies 1a finished
+  const bucketAssignState: PhaseState =
+    isBucketAssign ? 'active'
+    : isPhase1b || status === 'completed' ? 'done'
+    : 'pending';
+  const phase1bState: PhaseState =
+    isPhase1b ? 'active'
+    : status === 'completed' ? 'done'
+    : 'pending';
+  const phaseChain: Array<{ label: string; state: PhaseState; sub?: string }> = [
+    { label: 'Phase 1a Discovery', state: phase1aState, sub: 'tag every distinct industry' },
+    { label: 'Bucket Assignment', state: bucketAssignState, sub: 'industry → campaign bucket' },
+    { label: 'Phase 1b Routing', state: phase1bState, sub: 'per-contact assignment' }
+  ];
+  const stepNumber =
+    phase1bState === 'active' ? 3
+    : bucketAssignState === 'active' ? 2
+    : 1;
+  const etaLabel = phase1bState === 'active' ? 'TOTAL REMAINING'
+    : phase1aState === 'active' ? 'PHASE 1a ETA'
+    : 'STEP ETA';
+
   return (
     <div className="space-y-3">
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-5">
+        {/* Pipeline step chain — surfaces total progress across the
+            automated steps so the ETA below is interpretable. */}
+        <div className="flex items-center gap-2 mb-4 text-[10px] font-bold uppercase tracking-widest">
+          {phaseChain.map((step, idx) => {
+            const color =
+              step.state === 'done' ? 'text-[#3ecf8e]'
+              : step.state === 'active' ? 'text-white'
+              : 'text-gray-600';
+            const dotBg =
+              step.state === 'done' ? 'bg-[#3ecf8e] text-black'
+              : step.state === 'active' ? 'bg-[#3ecf8e]/20 text-[#3ecf8e] border border-[#3ecf8e]'
+              : 'bg-[#1c1c1c] text-gray-500 border border-[#2e2e2e]';
+            return (
+              <div key={step.label} className="flex items-center gap-2 min-w-0">
+                <span className={`flex items-center justify-center w-5 h-5 rounded-full text-[10px] font-bold ${dotBg}`}>
+                  {step.state === 'done' ? <CheckCircle2 className="w-3 h-3" /> : (idx + 1)}
+                </span>
+                <div className="min-w-0">
+                  <div className={`truncate ${color}`}>{step.label}</div>
+                  <div className="text-gray-600 normal-case tracking-normal font-normal text-[9px] truncate">{step.sub}</div>
+                </div>
+                {idx < phaseChain.length - 1 && (
+                  <div className={`h-px w-6 mx-1 ${step.state === 'done' ? 'bg-[#3ecf8e]/60' : 'bg-[#2e2e2e]'}`} />
+                )}
+              </div>
+            );
+          })}
+        </div>
+
         <div className="flex items-center gap-3 mb-3">
           <Loader2 className="w-5 h-5 text-[#3ecf8e] animate-spin" />
           <div className="flex-1 min-w-0">
-            <div className="text-sm font-bold text-white">{title}</div>
+            <div className="text-sm font-bold text-white">{title} <span className="text-gray-500 font-normal text-[11px]">· step {stepNumber} of 3</span></div>
             <div className="text-[11px] text-gray-500 truncate">{note}</div>
           </div>
           <div className="text-right shrink-0">
@@ -759,7 +842,7 @@ function BucketingProgressPanel({ run, title, onError }: {
               {pct !== null ? `${pct}%` : '—'}
             </div>
             <div className="text-[10px] text-gray-500 uppercase tracking-widest">
-              {etaTxt ? `ETA ${etaTxt}` : (elapsedTxt ? `${elapsedTxt} elapsed` : 'estimating…')}
+              {etaTxt ? `${etaLabel} ${etaTxt}` : (elapsedTxt ? `${elapsedTxt} elapsed` : 'estimating…')}
             </div>
           </div>
           <button
@@ -2723,6 +2806,42 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   const [selected, setSelected] = useState<Record<TaxKind, Set<string>>>({
     identities: new Set(), sub_identities: new Set(), sectors: new Set()
   });
+  // Per-kind sets of items the user accepted this session. /proposed-tags
+  // keeps returning accepted items until a recalc/finalize clears the
+  // is_new_* flags on bucket_industry_map, so we need local memory to
+  // mark them as Accepted in the UI. Persisted in sessionStorage keyed
+  // by runId so a tab refresh doesn't lose the visual state.
+  const acceptedStorageKey = `bucketing.acceptedTags.${runId}`;
+  const [accepted, setAccepted] = useState<Record<TaxKind, Set<string>>>(() => {
+    try {
+      const raw = sessionStorage.getItem(acceptedStorageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        return {
+          identities: new Set(parsed.identities || []),
+          sub_identities: new Set(parsed.sub_identities || []),
+          sectors: new Set(parsed.sectors || [])
+        };
+      }
+    } catch { /* fall through */ }
+    return { identities: new Set(), sub_identities: new Set(), sectors: new Set() };
+  });
+  const persistAccepted = useCallback((next: Record<TaxKind, Set<string>>) => {
+    try {
+      sessionStorage.setItem(acceptedStorageKey, JSON.stringify({
+        identities: Array.from(next.identities),
+        sub_identities: Array.from(next.sub_identities),
+        sectors: Array.from(next.sectors)
+      }));
+    } catch { /* quota — non-fatal */ }
+  }, [acceptedStorageKey]);
+  const markAccepted = useCallback((kind: TaxKind, names: string[]) => {
+    setAccepted(prev => {
+      const next = { ...prev, [kind]: new Set([...prev[kind], ...names]) };
+      persistAccepted(next);
+      return next;
+    });
+  }, [persistAccepted]);
 
   const refresh = useCallback(async () => {
     try {
@@ -2762,6 +2881,10 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
     onError(null);
     try {
       await acceptOne(kind, name, parent);
+      // Mark accepted FIRST so the refresh-driven re-render reflects the
+      // accepted state immediately (otherwise the item flickers back to
+      // its un-accepted style for a tick).
+      markAccepted(kind, [name]);
       await refresh();
     } catch (e: any) { onError(e.message); }
     finally { setBusyKey(null); }
@@ -2785,9 +2908,11 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
         }
       }
     }
+    const succeeded: string[] = [];
     for (const p of items) {
       try {
         await acceptOne(kind, p.name, p.parent);
+        succeeded.push(p.name);
       } catch (e: any) {
         if (!firstError) firstError = e.message;
       }
@@ -2797,6 +2922,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
     setBusyAllKind(null);
     setBulkProgress(null);
     if (firstError) onError(`Some ${kind} couldn't be added: ${firstError}`);
+    if (succeeded.length > 0) markAccepted(kind, succeeded);
     setSelected(prev => ({ ...prev, [kind]: new Set() }));
     await refresh();
     // No auto-recalc here — the user runs that explicitly via the
@@ -2822,10 +2948,13 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
 
   const toggleSelectAll = (kind: TaxKind) => {
     if (!proposed) return;
-    const all = proposed[kind].map((p: any) => p.name as string);
+    // Exclude already-accepted items — selecting them would no-op against
+    // the library (unique-constraint conflict) and clutter the count.
+    const all = proposed[kind]
+      .map((p: any) => p.name as string)
+      .filter((n: string) => !accepted[kind].has(n));
     setSelected(prev => {
       const cur = prev[kind];
-      // If everything is selected, clear; else select all.
       const nextSet = cur.size === all.length ? new Set<string>() : new Set(all);
       return { ...prev, [kind]: nextSet };
     });
@@ -2855,8 +2984,12 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
         {(['identities','sub_identities','sectors'] as const).map(kind => {
           const items = proposed[kind];
           const sel = selected[kind];
-          const allSelected = items.length > 0 && sel.size === items.length;
+          // "All selected" is relative to the un-accepted items only —
+          // accepted items aren't selectable and shouldn't gate the header.
+          const selectableCount = items.filter((p: any) => !accepted[kind].has(p.name)).length;
+          const allSelected = selectableCount > 0 && sel.size === selectableCount;
           const someSelected = sel.size > 0;
+          const acceptedCount = items.filter((p: any) => accepted[kind].has(p.name)).length;
           // Layer-explanation tooltips. Native title= attribute so the
           // browser's built-in tooltip handles hover (no extra deps).
           const tooltip = TAXONOMY_LAYER_HELP[kind];
@@ -2872,10 +3005,13 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                     checked={allSelected}
                     ref={el => { if (el) el.indeterminate = someSelected && !allSelected; }}
                     onChange={() => toggleSelectAll(kind)}
-                    disabled={items.length === 0}
+                    disabled={selectableCount === 0}
                     className="w-3 h-3 accent-[#3ecf8e]"
                   />
-                  <span>{kind} ({items.length})</span>
+                  <span>
+                    {kind} ({items.length})
+                    {acceptedCount > 0 && <span className="text-emerald-400/80 font-normal normal-case"> · {acceptedCount} accepted</span>}
+                  </span>
                   <span
                     className="text-gray-600 hover:text-amber-400 text-[11px] leading-none"
                     title={tooltip}
@@ -2899,21 +3035,26 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                 {items.map((p: any) => {
                   const key = `${kind}:${p.name}`;
                   const isChecked = sel.has(p.name);
+                  const isAccepted = accepted[kind].has(p.name);
                   return (
                     <li
                       key={key}
                       className={`flex items-center justify-between gap-2 px-2 py-1.5 border rounded text-[11px] transition-colors ${
-                        isChecked ? 'bg-[#3ecf8e]/10 border-[#3ecf8e]/40' : 'bg-[#1c1c1c] border-[#2e2e2e]'
+                        isAccepted ? 'bg-emerald-500/10 border-emerald-500/40'
+                          : isChecked ? 'bg-[#3ecf8e]/10 border-[#3ecf8e]/40'
+                          : 'bg-[#1c1c1c] border-[#2e2e2e]'
                       }`}
+                      title={isAccepted ? 'Accepted in this session — added to the library. Run Finalize Taxonomy / Recalculate to clear it from this list.' : undefined}
                     >
                       <input
                         type="checkbox"
                         checked={isChecked}
                         onChange={() => toggleSelect(kind, p.name)}
-                        className="w-3 h-3 accent-[#3ecf8e] shrink-0"
+                        disabled={isAccepted}
+                        className="w-3 h-3 accent-[#3ecf8e] shrink-0 disabled:opacity-30"
                       />
                       <div className="min-w-0 flex-1">
-                        <div className="font-bold text-white truncate" title={p.name}>{p.name}</div>
+                        <div className={`font-bold truncate ${isAccepted ? 'text-emerald-300' : 'text-white'}`} title={p.name}>{p.name}</div>
                         <div className="text-[10px] text-gray-500 truncate" title={p.samples?.join(' · ')}>
                           {p.count}× · ex: {(p.samples || []).slice(0, 2).join(' · ')}
                         </div>
@@ -2921,13 +3062,23 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                           <div className="text-[9px] text-gray-600">under {p.parent}</div>
                         )}
                       </div>
-                      <button
-                        onClick={() => accept(kind, p.name, p.parent)}
-                        disabled={busyKey === key}
-                        className="shrink-0 px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
-                      >
-                        {busyKey === key ? '…' : 'Accept'}
-                      </button>
+                      {isAccepted ? (
+                        <span
+                          className="shrink-0 px-2 py-1 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1"
+                          title="Already added to the taxonomy library in this session"
+                        >
+                          <CheckCircle2 className="w-3 h-3" />
+                          Accepted
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => accept(kind, p.name, p.parent)}
+                          disabled={busyKey === key}
+                          className="shrink-0 px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
+                        >
+                          {busyKey === key ? '…' : 'Accept'}
+                        </button>
+                      )}
                     </li>
                   );
                 })}

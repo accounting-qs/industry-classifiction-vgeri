@@ -2463,7 +2463,7 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts', async (req, res) => {
         while (true) {
             const { data: mapRows, error: mErr } = await supabase
                 .from('bucket_industry_map')
-                .select('industry_string,primary_identity,sub_identity,sector,bucket_name,canonical_classification,source,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,reasons')
+                .select('industry_string,primary_identity,sub_identity,sector,bucket_name,assigned_bucket_name,assigned_bucket_primary_identity,canonical_classification,source,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,reasons')
                 .eq('bucketing_run_id', id)
                 .range(mOff, mOff + MPAGE - 1);
             if (mErr) return res.status(500).json({ error: mErr.message });
@@ -2502,6 +2502,8 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts', async (req, res) => {
                 sector: tax?.sector || null,
                 canonical_classification: tax?.canonical_classification || null,
                 bucket_name: tax?.bucket_name || null,
+                assigned_bucket_name: tax?.assigned_bucket_name || null,
+                assigned_bucket_primary_identity: tax?.assigned_bucket_primary_identity || null,
                 taxonomy_source: tax?.source || null,
                 identity_confidence: tax?.identity_confidence ?? null,
                 sub_identity_confidence: tax?.sub_identity_confidence ?? null,
@@ -2533,7 +2535,11 @@ const TAXONOMY_CSV_COLUMNS = [
     'industry', 'enrichment_status', 'enrichment_classification',
     'enrichment_confidence', 'enrichment_reasoning', 'enrichment_error',
     'primary_identity', 'sub_identity', 'sector',
-    'canonical_classification', 'bucket_name', 'taxonomy_source',
+    'canonical_classification', 'bucket_name',
+    // Campaign-bucket assignment from the Bucket Assignment LLM pass.
+    // Null if Bucket Assignment hasn't run yet on the row's industry.
+    'assigned_bucket_name', 'assigned_bucket_primary_identity',
+    'taxonomy_source',
     'identity_confidence', 'sub_identity_confidence', 'sector_confidence',
     'confidence', 'is_generic', 'is_disqualified', 'llm_reason',
 ] as const;
@@ -2564,7 +2570,7 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts.csv', async (req, res) => {
         while (true) {
             const { data: mapRows, error: mErr } = await supabase
                 .from('bucket_industry_map')
-                .select('industry_string,primary_identity,sub_identity,sector,bucket_name,canonical_classification,source,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_generic,is_disqualified,llm_reason')
+                .select('industry_string,primary_identity,sub_identity,sector,bucket_name,assigned_bucket_name,assigned_bucket_primary_identity,canonical_classification,source,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_generic,is_disqualified,llm_reason')
                 .eq('bucketing_run_id', id)
                 .range(mOff, mOff + MPAGE - 1);
             if (mErr) return res.status(500).json({ error: mErr.message });
@@ -2649,6 +2655,8 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts.csv', async (req, res) => {
                     sector: tax?.sector || null,
                     canonical_classification: tax?.canonical_classification || null,
                     bucket_name: tax?.bucket_name || null,
+                    assigned_bucket_name: tax?.assigned_bucket_name || null,
+                    assigned_bucket_primary_identity: tax?.assigned_bucket_primary_identity || null,
                     taxonomy_source: tax?.source || null,
                     identity_confidence: tax?.identity_confidence ?? null,
                     sub_identity_confidence: tax?.sub_identity_confidence ?? null,
@@ -2705,6 +2713,9 @@ const ASSIGNMENT_CSV_COLUMNS = [
     'canonical_classification',
     // Final bucket + rollup metadata
     'bucket_name', 'pre_rollup_bucket_name', 'rollup_level',
+    // Industry → campaign bucket (Bucket Assignment LLM output).
+    // Null on rows whose industry hasn't been bucket-assigned yet.
+    'assigned_bucket_name', 'assigned_bucket_primary_identity',
     'assignment_source',
     // Confidence
     'identity_confidence', 'sub_identity_confidence', 'sector_confidence',
@@ -2762,7 +2773,7 @@ async function loadPhase1aTaxonomyForCsv(runId: string): Promise<Map<string, any
     for (let offset = 0; offset <= 200_000; offset += PAGE) {
         const { data, error } = await supabase
             .from('bucket_industry_map')
-            .select('industry_string,primary_identity,sub_identity,sector,canonical_classification,bucket_name,source,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_disqualified,is_generic,llm_reason')
+            .select('industry_string,primary_identity,sub_identity,sector,canonical_classification,bucket_name,assigned_bucket_name,assigned_bucket_primary_identity,source,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_disqualified,is_generic,llm_reason')
             .eq('bucketing_run_id', runId)
             .range(offset, offset + PAGE - 1);
         if (error) throw new Error(`phase1a taxonomy preload failed at offset ${offset}: ${error.message}`);
@@ -2877,6 +2888,11 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
                     bucket_name:               r.bucket_name,
                     pre_rollup_bucket_name:    firstText(r.pre_rollup_bucket_name, phase1a?.bucket_name),
                     rollup_level:              r.rollup_level,
+                    // Bucket-Assignment output lives on bucket_industry_map
+                    // (not bucket_assignments) so the only source is the
+                    // phase1a preload map.
+                    assigned_bucket_name:             phase1a?.assigned_bucket_name || null,
+                    assigned_bucket_primary_identity: phase1a?.assigned_bucket_primary_identity || null,
                     assignment_source:         firstText(r.assignment_source, phase1a?.source),
                     identity_confidence:       r.identity_confidence ?? phase1a?.identity_confidence,
                     sub_identity_confidence: r.sub_identity_confidence ?? phase1a?.sub_identity_confidence,
