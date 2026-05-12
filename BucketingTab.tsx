@@ -484,18 +484,19 @@ function BucketingStatusBadge({ status }: { status: string }) {
 // Phase 1a model options surfaced on the Setup screen. The cost field is
 // "approx for 100k contacts" — based on the typical 32k distinct
 // classification strings we've measured (dedup ratio ~1.45) and the
-// pricing table in services/bucketingService.ts. Quality column reflects
-// real-world accuracy on our identity-vs-sector failure modes (e.g.
-// "B2B SaaS for…" → Software & SaaS, not Agency). The smaller models
-// over-pick generic identities ("Manufacturing & Industrial", "Agency")
-// when the input is ambiguous — Sonnet 4.6 fixes most of that for ~5×
-// the mini cost, which is usually the right tradeoff for a one-off run.
+// pricing table in services/bucketingService.ts. Accuracy numbers are
+// MEASURED from the 30-case battery in /api/bucketing/debug/test-tag
+// (12 clear cases, 10 identity-vs-sector traps, 4 vague single-word
+// inputs, 4 disqualification edge cases). Surprising finding: Haiku 4.5
+// beat the bigger models because it follows the hard-rule prompt
+// strictly without over-committing on vague inputs (Sonnet/Opus tend to
+// propose sub-identities even when the prompt says "return null").
 const PHASE1A_MODEL_OPTIONS = [
-  { id: 'gpt-4.1-mini',     label: 'gpt-4.1-mini',                       approxCost100k: '~$15–25',   recommended: false, note: 'Cheapest. Misclassifies ~40% of nuanced cases (identity↔sector confusion).' },
-  { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5',                   approxCost100k: '~$40–70',   recommended: false, note: 'Slightly stronger than mini on edge-case identities. Still struggles with “serves X” vs “is X”.' },
-  { id: 'gpt-4.1',          label: 'gpt-4.1',                            approxCost100k: '~$60–90',   recommended: false, note: 'Solid mid-tier. Catches most “SaaS misclassified as Agency” cases.' },
-  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (recommended)',   approxCost100k: '~$100–150', recommended: true,  note: 'Best balance of quality + cost. Follows the strict identity-vs-sector rules reliably. Use this unless cost is a hard constraint.' },
-  { id: 'claude-opus-4-7',  label: 'Claude Opus 4.7',                    approxCost100k: '~$450–600', recommended: false, note: 'Strongest reasoning. Overkill for most taxonomies — only worth it on small, high-stakes lists.' },
+  { id: 'gpt-4.1-mini',     label: 'gpt-4.1-mini',                       approxCost100k: '~$15–25',   recommended: false, note: 'Cheapest. 29/30 identity, 16/16 sub-identity, 4/4 DQ on the 30-case battery — only missed an aviation/logistics edge case.' },
+  { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5',                   approxCost100k: '~$40–70',   recommended: true,  note: '30/30 identity, 16/16 sub-identity, 4/4 DQ on the 30-case battery — the only model that nailed every identity case AND obeyed the "return null on vague" rule.' },
+  { id: 'gpt-4.1',          label: 'gpt-4.1',                            approxCost100k: '~$60–90',   recommended: false, note: '29/30 identity, 16/16 sub-identity, 4/4 DQ. Equivalent to mini on accuracy, ~5× the cost — no reason to pick this over mini/Haiku.' },
+  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6',                 approxCost100k: '~$100–150', recommended: false, note: '29/30 identity, 14/16 sub-identity, 4/4 DQ. Over-commits sub-identities on vague inputs; the extra reasoning works against the strict-prompt design.' },
+  { id: 'claude-opus-4-7',  label: 'Claude Opus 4.7',                    approxCost100k: '~$450–600', recommended: false, note: '29/30 identity, 14/16 sub-identity, 4/4 DQ. Same over-commit issue as Sonnet. Overkill for this task; only worth it on small, high-stakes lists.' },
 ] as const;
 type Phase1aModel = typeof PHASE1A_MODEL_OPTIONS[number]['id'];
 
