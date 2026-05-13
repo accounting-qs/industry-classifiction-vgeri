@@ -10,20 +10,20 @@
 --
 -- HOW TO RUN:
 --   1. Paste this whole file into the Supabase SQL Editor and hit Run.
---   2. The result row shows `updated_this_batch` and `remaining_after`.
---   3. If `remaining_after > 0`, hit Run again. Repeat until it's 0.
---      Each batch processes 25k rows and typically returns in ~10s
---      even on the current dataset.
+--   2. Postgres reports `UPDATE N` where N is the rows touched this run.
+--   3. If N > 0, hit Run again. Repeat until N = 0.
+--      Each batch processes 10k rows and finishes in a few seconds —
+--      well inside the editor's HTTP window.
+--   4. When N reaches 0, run the orphan check at the bottom (commented
+--      out) to confirm no contact-less enrichments are blocking
+--      progress. If it returns 0, you're done.
 --
 -- Idempotent: only touches rows where lead_list_name IS NULL, so
 -- re-running after the column is fully backfilled is a no-op.
-
--- The batch CTE filters on `c.lead_list_name IS NOT NULL` (not just
--- on the enrichment side) so we don't keep re-picking orphaned rows
--- — enrichments whose contact is missing or whose contact has a NULL
--- list name. Without that filter the LIMIT would land on the same
--- ~25k stuck rows on every run and the script would loop forever
--- with `updated_this_batch = 0`.
+--
+-- The batch CTE joins to contacts so we only ever pick backfillable
+-- rows — without that filter the LIMIT could land on orphaned
+-- enrichments and the script would loop forever with UPDATE 0.
 
 WITH batch AS (
     SELECT e.contact_id, c.lead_list_name
@@ -31,31 +31,29 @@ WITH batch AS (
       JOIN contacts c ON c.contact_id = e.contact_id
      WHERE e.lead_list_name IS NULL
        AND c.lead_list_name IS NOT NULL
-     LIMIT 25000
-),
-updated AS (
-    UPDATE enrichments e
-       SET lead_list_name = b.lead_list_name
-      FROM batch b
-     WHERE e.contact_id = b.contact_id
-    RETURNING e.contact_id
+     LIMIT 10000
 )
-SELECT
-    (SELECT COUNT(*) FROM updated) AS updated_this_batch,
-    -- Total rows still waiting on the column. Drops by `updated_this_batch`
-    -- every run. Stop when this hits 0.
-    (SELECT COUNT(*) FROM enrichments WHERE lead_list_name IS NULL) AS remaining_after,
-    -- Enrichments we can never backfill because their contact is
-    -- gone or carries no list name. Subtract this from
-    -- `remaining_after` to find the true end-state: when
-    -- `remaining_after = unbackfillable`, the run is finished.
-    (
-        SELECT COUNT(*)
-          FROM enrichments e
-         WHERE e.lead_list_name IS NULL
-           AND NOT EXISTS (
-               SELECT 1 FROM contacts c
-                WHERE c.contact_id = e.contact_id
-                  AND c.lead_list_name IS NOT NULL
-           )
-    ) AS unbackfillable;
+UPDATE enrichments e
+   SET lead_list_name = b.lead_list_name
+  FROM batch b
+ WHERE e.contact_id = b.contact_id;
+
+-- ─────────────────────────────────────────────────────────────────
+-- Run these one at a time, separately, when you want a status check.
+-- They're NOT wrapped into the batch above because counting NULL rows
+-- across the whole 600k-row table after a fresh UPDATE makes the
+-- editor's HTTP request time out before Postgres finishes.
+-- ─────────────────────────────────────────────────────────────────
+
+-- How many rows are still waiting:
+-- SELECT COUNT(*) AS remaining FROM enrichments WHERE lead_list_name IS NULL;
+
+-- How many of those are orphans (can never be backfilled):
+-- SELECT COUNT(*) AS unbackfillable
+--   FROM enrichments e
+--  WHERE e.lead_list_name IS NULL
+--    AND NOT EXISTS (
+--      SELECT 1 FROM contacts c
+--       WHERE c.contact_id = e.contact_id
+--         AND c.lead_list_name IS NOT NULL
+--    );
