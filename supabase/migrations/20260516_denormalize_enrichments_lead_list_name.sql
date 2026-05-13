@@ -11,34 +11,20 @@
 -- enrichments alone, with an index on (lead_list_name, status), comes
 -- back in well under a second.
 --
--- Apply order: this whole file is idempotent — re-running it is safe.
--- The backfill UPDATE only touches rows where the new column is NULL.
+-- Apply order: run this file first (instant — schema + RPC + trigger
+-- only), then run 20260516_denormalize_enrichments_backfill.sql in
+-- chunks until it reports 0 remaining rows. The backfill was split
+-- out because at ~600k rows a single UPDATE blows past the Supabase
+-- SQL Editor's HTTP timeout (~60s) even with statement_timeout lifted
+-- on the server side — the editor's fetch dies before the query
+-- finishes.
 
 -- 1. Column ----------------------------------------------------------
 
 ALTER TABLE enrichments
     ADD COLUMN IF NOT EXISTS lead_list_name TEXT;
 
--- 2. Backfill from contacts -----------------------------------------
---
--- Bumped statement_timeout on this single statement because at the
--- current ~600k-row scale even an indexed UPDATE … FROM (contacts)
--- can run a few minutes. Wrapped in DO so the SET LOCAL is scoped to
--- the backfill and we don't bleed the timeout into anything that
--- runs after this migration in the same session.
-
-DO $$
-BEGIN
-    SET LOCAL statement_timeout TO '600s';
-    UPDATE enrichments e
-       SET lead_list_name = c.lead_list_name
-      FROM contacts c
-     WHERE e.contact_id = c.contact_id
-       AND e.lead_list_name IS NULL
-       AND c.lead_list_name IS NOT NULL;
-END$$;
-
--- 3. Index for the stats aggregate ----------------------------------
+-- 2. Index for the stats aggregate ----------------------------------
 --
 -- (lead_list_name, status) is the exact filter+grouping shape the RPC
 -- uses. Postgres can satisfy `COUNT(*) FILTER (WHERE status = …)` from
@@ -47,7 +33,7 @@ END$$;
 CREATE INDEX IF NOT EXISTS idx_enrichments_list_status
     ON enrichments (lead_list_name, status);
 
--- 4. Auto-fill trigger ----------------------------------------------
+-- 3. Auto-fill trigger ----------------------------------------------
 --
 -- The application layer (jobProcessor) sets lead_list_name on every
 -- upsert, but this trigger is defense-in-depth: if any code path
@@ -74,7 +60,7 @@ BEFORE INSERT ON enrichments
 FOR EACH ROW
 EXECUTE FUNCTION public.enrichments_set_lead_list_name();
 
--- 5. Fast stats RPC -------------------------------------------------
+-- 4. Fast stats RPC -------------------------------------------------
 --
 -- Replaces the join-based version with a single GROUP BY over
 -- enrichments, plus a LEFT JOIN onto import_lists so lists that have
@@ -120,7 +106,7 @@ $$;
 GRANT EXECUTE ON FUNCTION public.get_list_enrichment_stats()
     TO anon, authenticated, service_role;
 
--- 6. Cascade list renames into enrichments --------------------------
+-- 5. Cascade list renames into enrichments --------------------------
 --
 -- The original rename RPC only updated contacts.lead_list_name; now
 -- that enrichments carries its own copy, the rename has to touch both
@@ -182,6 +168,6 @@ BEGIN
 END;
 $$;
 
--- 7. Let PostgREST pick up the new function signatures --------------
+-- 6. Let PostgREST pick up the new function signatures --------------
 
 NOTIFY pgrst, 'reload schema';
