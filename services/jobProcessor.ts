@@ -776,7 +776,12 @@ export class JobProcessor {
             // Fix #2: Removed page_html — already persisted to scraped_data table, storing again wastes ~6KB/item
             cost: cost,
             source: source,
-            processed_at: new Date().toISOString()
+            processed_at: new Date().toISOString(),
+            // Denormalized from contacts.lead_list_name so the per-list
+            // progress aggregate (get_list_enrichment_stats) can group
+            // without joining contacts. See migration
+            // 20260516_denormalize_enrichments_lead_list_name.sql.
+            lead_list_name: contact.lead_list_name || null,
         };
 
         const cnt = {

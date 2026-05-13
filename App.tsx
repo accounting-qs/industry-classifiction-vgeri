@@ -239,6 +239,9 @@ export default function App() {
   useEffect(() => { loadData(); }, [loadData]);
 
   // Refresh both the distinct list names (used by filter builder) and the rich import_lists metadata (used by the list modal).
+  // The list shell is fetched first (cheap query, renders immediately);
+  // the enrichment progress aggregate is fetched separately so a slow
+  // or missing stats RPC can't block the table from painting.
   const refreshLists = useCallback(() => {
     fetch('/api/distinct/lead_list_name')
       .then(res => res.json())
@@ -248,18 +251,59 @@ export default function App() {
     fetch('/api/import-lists')
       .then(res => res.json())
       .then(data => {
-        // Accept both legacy (bare array) and new ({ lists, stats_source }) shapes
-        // so a rolling deploy doesn't leave the client stranded.
-        if (Array.isArray(data)) {
-          setImportLists(data);
-          setListStatsSource('rpc');
-        } else if (data && Array.isArray(data.lists)) {
-          setImportLists(data.lists);
-          setListStatsSource(data.stats_source === 'fallback' ? 'fallback' : 'rpc');
+        // Accept both legacy (bare array) and new ({ lists, stats_source? }) shapes
+        // so a rolling deploy doesn't leave the client stranded. `stats_source`
+        // is no longer set here — it comes from the /stats endpoint below.
+        const lists = Array.isArray(data) ? data : (data && Array.isArray(data.lists) ? data.lists : null);
+        if (lists) {
+          // Merge with any stats we already have in state — avoids the
+          // progress bars flickering to 0% between the list fetch
+          // landing and the stats fetch landing.
+          setImportLists(prev => {
+            const prevByName: Record<string, { enriched_count?: number; failed_count?: number }> = {};
+            for (const p of prev) prevByName[p.name] = p;
+            return lists.map((l: any) => {
+              const old = prevByName[l.name];
+              return {
+                ...l,
+                enriched_count: old?.enriched_count,
+                failed_count: old?.failed_count,
+              };
+            });
+          });
         }
       })
       .catch(() => { })
       .finally(() => setImportListsLoading(false));
+
+    // Fire-and-forget stats fetch. Failures are silently swallowed —
+    // the list still renders with `enriched_count` undefined, which
+    // `EnrichmentProgress` already handles (treats as 0 completed).
+    fetch('/api/import-lists/stats')
+      .then(res => res.ok ? res.json() : Promise.reject(new Error(`stats ${res.status}`)))
+      .then(data => {
+        if (!data || !Array.isArray(data.stats)) return;
+        const byName = new Map<string, { completed: number; failed: number; total: number }>();
+        for (const row of data.stats) {
+          byName.set(row.lead_list_name, { completed: row.completed, failed: row.failed, total: row.total });
+        }
+        setImportLists(prev => prev.map(l => {
+          const s = byName.get(l.name);
+          if (!s) return { ...l, enriched_count: 0, failed_count: 0 };
+          return {
+            ...l,
+            enriched_count: s.completed,
+            failed_count: s.failed,
+            contact_count: s.total || l.contact_count || 0,
+          };
+        }));
+        setListStatsSource(data.stats_source === 'fallback' ? 'fallback' : 'rpc');
+      })
+      .catch(() => {
+        // Stats endpoint itself failed — surface the banner so the user
+        // knows the progress numbers can't be trusted.
+        setListStatsSource('fallback');
+      });
   }, []);
 
   useEffect(() => { refreshLists(); }, [refreshLists]);

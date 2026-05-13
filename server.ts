@@ -976,6 +976,12 @@ app.post('/api/import', async (req, res) => {
 // IMPORT LISTS (history)
 // ============================================
 
+// Fast path: returns list rows + the cheap `bucketed` flag and nothing
+// else. The expensive completed/failed/total aggregate moved to
+// `/api/import-lists/stats` so the table can render immediately even
+// when the RPC is slow or unavailable — previously a single 60s+
+// timeout on the stats RPC blocked the whole import history view and
+// flipped every row into "approximate stats" fallback mode.
 app.get('/api/import-lists', async (_req, res) => {
     try {
         const { data, error } = await supabase
@@ -987,68 +993,6 @@ app.get('/api/import-lists', async (_req, res) => {
 
         const lists = data || [];
 
-        // Preferred path: `get_list_enrichment_stats` RPC returns
-        // completed/failed/total for every list in one aggregate pass.
-        // PostgREST's per-list count=estimated returned 0 unpredictably
-        // (the planner short-circuits filtered joins), which broke the
-        // "done" indicator and made the same list's count change 30%+
-        // between page refreshes.
-        const { data: stats, error: rpcErr } = await supabase.rpc('get_list_enrichment_stats');
-        const statsByList = new Map<string, { completed: number; failed: number; total: number }>();
-        let statsSource: 'rpc' | 'fallback' = 'rpc';
-
-        if (!rpcErr && Array.isArray(stats)) {
-            // RPC worked. Trust it as the source of truth.
-            for (const row of stats as any[]) {
-                statsByList.set(row.lead_list_name, {
-                    completed: Number(row.completed_count) || 0,
-                    failed: Number(row.failed_count) || 0,
-                    total: Number(row.total_count) || 0,
-                });
-            }
-            // Any list in `import_lists` but missing from the RPC result has
-            // zero rows in the contacts table — the GROUP BY would have
-            // surfaced it otherwise. Fill these in as 0/0/0 instead of
-            // running per-list count=estimated queries (the previous code
-            // here mislabeled the whole response as 'fallback' on a single
-            // empty list, so users with the RPC installed kept seeing the
-            // "RPC isn't installed yet" banner forever).
-            for (const l of lists) {
-                if (!statsByList.has(l.name)) {
-                    statsByList.set(l.name, { completed: 0, failed: 0, total: 0 });
-                }
-            }
-        } else {
-            // RPC truly unavailable (function missing, schema cache stale,
-            // permission denied, etc). Fall back to per-list estimated
-            // counts and tell the client the numbers may drift. Logging
-            // the error code + message so we can tell which failure mode
-            // triggered it from the server logs.
-            statsSource = 'fallback';
-            console.warn(`[import-lists] RPC get_list_enrichment_stats unavailable (code=${(rpcErr as any)?.code || 'n/a'}): ${rpcErr?.message || 'unknown'} — falling back to per-list estimated counts`);
-            await Promise.all(lists.map(async (l: any) => {
-                const [completed, failed] = await Promise.all([
-                    supabase.from('contacts')
-                        .select('contact_id, enrichments!inner(status)', { count: 'estimated', head: true })
-                        .eq('lead_list_name', l.name).eq('enrichments.status', 'completed'),
-                    supabase.from('contacts')
-                        .select('contact_id, enrichments!inner(status)', { count: 'estimated', head: true })
-                        .eq('lead_list_name', l.name).eq('enrichments.status', 'failed'),
-                ]);
-                statsByList.set(l.name, {
-                    completed: completed.count || 0,
-                    failed: failed.count || 0,
-                    total: l.contact_count || 0,
-                });
-            }));
-        }
-
-        // Per-list "has been used in a bucketing run" flag. Single SELECT
-        // over bucketing_runs.list_names + an in-memory Set lookup keeps
-        // this O(lists + runs) — far cheaper than a per-list query, and
-        // it auto-clears when a run is deleted (the next page load just
-        // doesn't see that row). We track count too so the UI can show
-        // "1 run" vs "3 runs" if the user wants that later.
         const bucketedCountByList = new Map<string, number>();
         try {
             const { data: runRows } = await supabase
@@ -1066,22 +1010,73 @@ app.get('/api/import-lists', async (_req, res) => {
             console.warn(`[import-lists] bucketed-flag query failed: ${err.message}`);
         }
 
-        const withCounts = lists.map((l: any) => {
-            const s = statsByList.get(l.name) || { completed: 0, failed: 0, total: l.contact_count || 0 };
+        const withFlags = lists.map((l: any) => {
             const bucketingRunCount = bucketedCountByList.get(l.name) || 0;
             return {
                 ...l,
-                enriched_count: s.completed,
-                failed_count: s.failed,
-                contact_count: s.total || l.contact_count || 0,
                 bucketed: bucketingRunCount > 0,
                 bucketing_run_count: bucketingRunCount,
             };
         });
-        // Object response so we can send metadata (stats_source) alongside
-        // the list — wrapped in a shape the client detects while still
-        // tolerating the older array response during rolling deploys.
-        res.json({ lists: withCounts, stats_source: statsSource });
+        // Object response (kept for back-compat with the older
+        // {lists, stats_source} client). `stats_source` is reported by
+        // the separate /stats endpoint now; we omit it here so the
+        // client doesn't latch onto a stale value.
+        res.json({ lists: withFlags });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Aggregate enrichment progress per list. Split off /api/import-lists
+// so a slow or missing RPC doesn't block the list table from
+// rendering. The client fires this after the list shell paints and
+// merges the counts in when they arrive.
+app.get('/api/import-lists/stats', async (_req, res) => {
+    try {
+        // Preferred path: `get_list_enrichment_stats` RPC returns
+        // completed/failed/total for every list in one aggregate pass.
+        // PostgREST's per-list count=estimated returned 0 unpredictably
+        // (the planner short-circuits filtered joins), which broke the
+        // "done" indicator and made the same list's count change 30%+
+        // between page refreshes.
+        const { data: stats, error: rpcErr } = await supabase.rpc('get_list_enrichment_stats');
+
+        if (!rpcErr && Array.isArray(stats)) {
+            const rows = (stats as any[]).map(row => ({
+                lead_list_name: row.lead_list_name as string,
+                completed: Number(row.completed_count) || 0,
+                failed: Number(row.failed_count) || 0,
+                total: Number(row.total_count) || 0,
+            }));
+            return res.json({ stats: rows, stats_source: 'rpc' as const });
+        }
+
+        // RPC unavailable (function missing, schema cache stale,
+        // permission denied, timeout). Fall back to per-list estimated
+        // counts and tell the client the numbers may drift. The
+        // import_lists row list is small (~tens of rows) so the
+        // parallel head=true queries are cheap even though each one is
+        // approximate.
+        console.warn(`[import-lists/stats] RPC get_list_enrichment_stats unavailable (code=${(rpcErr as any)?.code || 'n/a'}): ${rpcErr?.message || 'unknown'} — falling back to per-list estimated counts`);
+        const { data: lists } = await supabase.from('import_lists').select('name, contact_count');
+        const rows = await Promise.all((lists || []).map(async (l: any) => {
+            const [completed, failed] = await Promise.all([
+                supabase.from('contacts')
+                    .select('contact_id, enrichments!inner(status)', { count: 'estimated', head: true })
+                    .eq('lead_list_name', l.name).eq('enrichments.status', 'completed'),
+                supabase.from('contacts')
+                    .select('contact_id, enrichments!inner(status)', { count: 'estimated', head: true })
+                    .eq('lead_list_name', l.name).eq('enrichments.status', 'failed'),
+            ]);
+            return {
+                lead_list_name: l.name as string,
+                completed: completed.count || 0,
+                failed: failed.count || 0,
+                total: l.contact_count || 0,
+            };
+        }));
+        res.json({ stats: rows, stats_source: 'fallback' as const });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }
@@ -1223,6 +1218,18 @@ app.patch('/api/import-lists/:id', async (req, res) => {
                 .update({ name: oldName })
                 .eq('id', id);
             return res.status(500).json({ error: updContactsErr.message });
+        }
+
+        // Cascade to the denormalized copy on enrichments so the stats RPC
+        // keeps reporting the renamed list. Soft-fail: if the enrichments
+        // table hasn't been migrated yet (no lead_list_name column) we
+        // skip silently — the stats RPC will fall back to the old join.
+        const { error: updEnrichErr } = await supabase
+            .from('enrichments')
+            .update({ lead_list_name: newName })
+            .eq('lead_list_name', oldName);
+        if (updEnrichErr && !/column .*lead_list_name/i.test(updEnrichErr.message || '')) {
+            console.warn(`[import-lists] enrichments rename cascade failed: ${updEnrichErr.message}`);
         }
 
         res.json({ id, name: newName, oldName, contact_count: existing.contact_count, created_at: existing.created_at });
