@@ -18,21 +18,44 @@
 -- Idempotent: only touches rows where lead_list_name IS NULL, so
 -- re-running after the column is fully backfilled is a no-op.
 
+-- The batch CTE filters on `c.lead_list_name IS NOT NULL` (not just
+-- on the enrichment side) so we don't keep re-picking orphaned rows
+-- — enrichments whose contact is missing or whose contact has a NULL
+-- list name. Without that filter the LIMIT would land on the same
+-- ~25k stuck rows on every run and the script would loop forever
+-- with `updated_this_batch = 0`.
+
 WITH batch AS (
-    SELECT contact_id
-      FROM enrichments
-     WHERE lead_list_name IS NULL
+    SELECT e.contact_id, c.lead_list_name
+      FROM enrichments e
+      JOIN contacts c ON c.contact_id = e.contact_id
+     WHERE e.lead_list_name IS NULL
+       AND c.lead_list_name IS NOT NULL
      LIMIT 25000
 ),
 updated AS (
     UPDATE enrichments e
-       SET lead_list_name = c.lead_list_name
-      FROM contacts c
-     WHERE e.contact_id = c.contact_id
-       AND e.contact_id IN (SELECT contact_id FROM batch)
-       AND c.lead_list_name IS NOT NULL
+       SET lead_list_name = b.lead_list_name
+      FROM batch b
+     WHERE e.contact_id = b.contact_id
     RETURNING e.contact_id
 )
 SELECT
-    (SELECT COUNT(*) FROM updated)                                  AS updated_this_batch,
-    (SELECT COUNT(*) FROM enrichments WHERE lead_list_name IS NULL) AS remaining_after;
+    (SELECT COUNT(*) FROM updated) AS updated_this_batch,
+    -- Total rows still waiting on the column. Drops by `updated_this_batch`
+    -- every run. Stop when this hits 0.
+    (SELECT COUNT(*) FROM enrichments WHERE lead_list_name IS NULL) AS remaining_after,
+    -- Enrichments we can never backfill because their contact is
+    -- gone or carries no list name. Subtract this from
+    -- `remaining_after` to find the true end-state: when
+    -- `remaining_after = unbackfillable`, the run is finished.
+    (
+        SELECT COUNT(*)
+          FROM enrichments e
+         WHERE e.lead_list_name IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM contacts c
+                WHERE c.contact_id = e.contact_id
+                  AND c.lead_list_name IS NOT NULL
+           )
+    ) AS unbackfillable;
