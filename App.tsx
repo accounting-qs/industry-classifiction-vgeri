@@ -169,6 +169,12 @@ export default function App() {
   const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; bucketing_run_count?: number }[]>([]);
   const [listStatsSource, setListStatsSource] = useState<'rpc' | 'fallback'>('rpc');
   const [importListsLoading, setImportListsLoading] = useState(true);
+  // Tracks the lazy /api/import-lists/stats fetch independently of the
+  // list shell fetch. While true and a row's enriched_count is still
+  // undefined, the progress column shows a spinner instead of "0% · N
+  // pending" — otherwise a freshly-rendered list looks like every
+  // contact failed enrichment.
+  const [importListsStatsLoading, setImportListsStatsLoading] = useState(true);
   const [showListModal, setShowListModal] = useState(false);
   const [exportJobs, setExportJobs] = useState<ExportJob[]>([]);
   const [deleteJobs, setDeleteJobs] = useState<DeleteJob[]>([]);
@@ -276,9 +282,11 @@ export default function App() {
       .catch(() => { })
       .finally(() => setImportListsLoading(false));
 
-    // Fire-and-forget stats fetch. Failures are silently swallowed —
-    // the list still renders with `enriched_count` undefined, which
-    // `EnrichmentProgress` already handles (treats as 0 completed).
+    // Fire-and-forget stats fetch. The row-level `statsLoading` flag
+    // stays on until this resolves (or rejects), so the progress
+    // column can render a spinner instead of misleading 0% bars while
+    // the aggregate is in flight.
+    setImportListsStatsLoading(true);
     fetch('/api/import-lists/stats')
       .then(res => res.ok ? res.json() : Promise.reject(new Error(`stats ${res.status}`)))
       .then(data => {
@@ -301,9 +309,15 @@ export default function App() {
       })
       .catch(() => {
         // Stats endpoint itself failed — surface the banner so the user
-        // knows the progress numbers can't be trusted.
+        // knows the progress numbers can't be trusted. Mark every row's
+        // counts as 0 so the spinner gives up (better to show empty
+        // bars + the banner than spin forever).
         setListStatsSource('fallback');
-      });
+        setImportLists(prev => prev.map(l =>
+          l.enriched_count === undefined ? { ...l, enriched_count: 0, failed_count: 0 } : l
+        ));
+      })
+      .finally(() => setImportListsStatsLoading(false));
   }, []);
 
   useEffect(() => { refreshLists(); }, [refreshLists]);
@@ -722,6 +736,7 @@ export default function App() {
               onComplete={() => { setActiveTab(AppTab.MANAGER); loadData(); refreshLists(); }}
               importLists={importLists}
               importListsLoading={importListsLoading}
+              importListsStatsLoading={importListsStatsLoading}
               listStatsSource={listStatsSource}
               exportJobs={exportJobs}
               activeListFilter={activeListFilter}
@@ -916,6 +931,7 @@ export default function App() {
         <ListSelectorModal
           lists={importLists}
           loading={importListsLoading}
+          statsLoading={importListsStatsLoading}
           statsSource={listStatsSource}
           activeListFilter={activeListFilter}
           exportJobs={exportJobs}
@@ -991,6 +1007,7 @@ function ThemeToggle({ theme, onChange }: { theme: ThemeChoice; onChange: (t: Th
 function ImportedListsTable({
   lists,
   loading,
+  statsLoading = false,
   statsSource,
   activeListFilter,
   exportJobs,
@@ -1007,6 +1024,7 @@ function ImportedListsTable({
 }: {
   lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; bucketing_run_count?: number }[];
   loading: boolean;
+  statsLoading?: boolean;
   statsSource: 'rpc' | 'fallback';
   activeListFilter: string | null;
   exportJobs: ExportJob[];
@@ -1233,7 +1251,7 @@ function ImportedListsTable({
                     )}
                   </td>
                   <td className="px-5 py-2.5 text-gray-400 text-right font-mono">{l.contact_count.toLocaleString()}</td>
-                  <td className="px-5 py-2.5"><EnrichmentProgress list={l} /></td>
+                  <td className="px-5 py-2.5"><EnrichmentProgress list={l} statsLoading={statsLoading} /></td>
                   <td className="px-5 py-2.5 text-gray-500 text-right">
                     {new Date(l.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
@@ -1355,6 +1373,7 @@ function ImportedListsTable({
 function ListSelectorModal({
   lists,
   loading,
+  statsLoading = false,
   statsSource,
   activeListFilter,
   exportJobs,
@@ -1371,6 +1390,7 @@ function ListSelectorModal({
 }: {
   lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; bucketing_run_count?: number }[];
   loading: boolean;
+  statsLoading?: boolean;
   statsSource: 'rpc' | 'fallback';
   activeListFilter: string | null;
   exportJobs: ExportJob[];
@@ -1405,6 +1425,7 @@ function ListSelectorModal({
           <ImportedListsTable
             lists={lists}
             loading={loading}
+            statsLoading={statsLoading}
             statsSource={statsSource}
             activeListFilter={activeListFilter}
             exportJobs={exportJobs}
@@ -1433,10 +1454,36 @@ function ListSelectorModal({
   );
 }
 
-function EnrichmentProgress({ list }: {
+function EnrichmentProgress({ list, statsLoading = false }: {
   list: { contact_count: number; enriched_count?: number; failed_count?: number };
+  statsLoading?: boolean;
 }) {
   const total = list.contact_count || 0;
+
+  // The lazy /api/import-lists/stats fetch hasn't landed yet for this
+  // row — render an animated placeholder so the bar doesn't read as
+  // "0% · N pending" (which previously made every list look like the
+  // enrichment had failed before the stats request even returned).
+  // Uses `animate-pulse` (standard Tailwind) instead of a custom
+  // shimmer keyframe because Tailwind is loaded from the CDN at
+  // runtime with no build step — custom animations would no-op.
+  if (statsLoading && list.enriched_count === undefined) {
+    return (
+      <div className="flex flex-col gap-1 min-w-[200px]">
+        <div className="flex items-center gap-2">
+          <div className="flex-1 h-1.5 bg-[#1c1c1c] rounded-full overflow-hidden">
+            <div className="h-full w-1/3 bg-[#3ecf8e]/40 rounded-full animate-pulse" />
+          </div>
+          <Loader2 className="w-3 h-3 text-gray-500 animate-spin shrink-0" />
+        </div>
+        <div className="text-[9px] text-gray-600 font-mono flex items-center gap-1">
+          <span className="animate-pulse">loading stats…</span>
+          <span className="text-gray-700">· {total.toLocaleString()} contacts</span>
+        </div>
+      </div>
+    );
+  }
+
   const completed = list.enriched_count || 0;
   const failed = list.failed_count || 0;
   const pending = Math.max(0, total - completed - failed);
@@ -2599,6 +2646,7 @@ function CSVImportWizard({
   onComplete,
   importLists,
   importListsLoading,
+  importListsStatsLoading = false,
   listStatsSource,
   exportJobs,
   activeListFilter,
@@ -2615,6 +2663,7 @@ function CSVImportWizard({
   onComplete: () => void;
   importLists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number }[];
   importListsLoading: boolean;
+  importListsStatsLoading?: boolean;
   listStatsSource: 'rpc' | 'fallback';
   exportJobs: ExportJob[];
   activeListFilter: string | null;
@@ -3336,6 +3385,7 @@ function CSVImportWizard({
           <ImportedListsTable
             lists={importLists}
             loading={importListsLoading}
+            statsLoading={importListsStatsLoading}
             statsSource={listStatsSource}
             activeListFilter={activeListFilter}
             exportJobs={exportJobs}
