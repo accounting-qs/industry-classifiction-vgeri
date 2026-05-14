@@ -1434,10 +1434,10 @@ function ImportedListsTable({
                             return (
                               <button
                                 onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count, mode); }}
-                                className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] transition-colors flex items-center gap-1"
+                                className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] transition-colors flex items-center gap-1 whitespace-nowrap"
                                 title={title}
                               >
-                                <Zap className="w-3 h-3" /> {label}
+                                <Zap className="w-3 h-3 shrink-0" /> {label}
                               </button>
                             );
                           })()}
