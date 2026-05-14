@@ -587,24 +587,26 @@ export default function App() {
     } catch { /* non-fatal */ }
   }, []);
 
-  const enrichList = async (name: string, contactCount: number) => {
+  // mode='resume'   → only enqueue contacts with no enrichment row yet
+  //                   (status='new'). Default for partial / never-run lists.
+  // mode='reenrich' → enqueue every contact in the list, including
+  //                   already-completed ones. Used when the list is at
+  //                   100% and the user explicitly wants a full re-run
+  //                   (e.g. AI model changed). The jobProcessor's domain
+  //                   cache still short-circuits most cache-hit domains so
+  //                   re-enriching a fully-done list is mostly a row-churn
+  //                   operation, not a full AI re-bill.
+  const enrichList = async (name: string, contactCount: number, mode: 'resume' | 'reenrich' = 'resume') => {
     setShowListModal(false);
-    // "Resume mode": only enqueue contacts that have no enrichment row
-    // yet (status='new' on the server's filter taxonomy). Already-completed
-    // rows are skipped — re-enriching them is wasteful (the jobProcessor
-    // would re-upsert and burn AI tokens for cache-miss domains), and the
-    // common case for hitting this button on a partially-done list is to
-    // finish it, not to re-do work. Failed rows are also skipped per
-    // product call (manual re-enrich via Contacts page filters if needed).
-    //
     // Use 'in' operator so resolveFilteredContactIds (server.ts) takes the
     // DB-side RPC fast-path (resolve_enrichment_targets) instead of paginating
     // thousands of IDs one 1000-row PostgREST page at a time.
-    const filters: FilterCondition[] = [
-      { id: '__list_modal__', column: 'lead_list_name', operator: 'in' as FilterOperator, value: [name] },
-      { id: '__resume_mode__', column: 'status', operator: 'in' as FilterOperator, value: ['new'] },
-    ];
-    addLog(`🚀 Resuming enrichment for list "${name}" — only contacts without an enrichment row will be queued.`);
+    const baseFilter: FilterCondition = { id: '__list_modal__', column: 'lead_list_name', operator: 'in' as FilterOperator, value: [name] };
+    const filters: FilterCondition[] = mode === 'reenrich'
+      ? [baseFilter]
+      : [baseFilter, { id: '__resume_mode__', column: 'status', operator: 'in' as FilterOperator, value: ['new'] }];
+    const verb = mode === 'reenrich' ? 'Re-enriching' : 'Resuming';
+    addLog(`🚀 ${verb} enrichment for list "${name}"${mode === 'resume' ? ' — only contacts without an enrichment row will be queued.' : ' — every contact in the list will be re-classified.'}`);
     try {
       const res = await fetch('/api/enrich', {
         method: 'POST',
@@ -616,7 +618,7 @@ export default function App() {
         addLog(`❌ Enrich error: ${err.error || res.status}`);
         return;
       }
-      addLog(`✅ 202 Accepted: Backend cluster scaling up for list "${name}". Watch the queue log for the actual resume count.`);
+      addLog(`✅ 202 Accepted: Backend cluster scaling up for list "${name}". Watch the queue log for the actual ${mode === 'reenrich' ? 're-enrich' : 'resume'} count.`);
       setActiveTab(AppTab.ENRICHMENT);
       // total starts unknown — the server logs the resolved count once the
       // background enqueue lands. Setting to 0 here so the progress bar
@@ -1042,7 +1044,7 @@ function ImportedListsTable({
   exportJobs: ExportJob[];
   deleteJobs?: DeleteJob[];
   onOpenList: (name: string | null) => void;
-  onEnrichList: (name: string, contactCount: number) => void;
+  onEnrichList: (name: string, contactCount: number, mode?: 'resume' | 'reenrich') => void;
   onStartExport: (name: string) => void;
   onClearExport: (jobId: string) => void;
   onRenameList?: (oldName: string, newName: string) => void;
@@ -1351,13 +1353,37 @@ function ImportedListsTable({
                               <Pencil className="w-3 h-3" /> Rename
                             </button>
                           )}
-                          <button
-                            onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count); }}
-                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] transition-colors flex items-center gap-1"
-                            title="Enrich all contacts in this list"
-                          >
-                            <Zap className="w-3 h-3" /> Enrich
-                          </button>
+                          {(() => {
+                            // Three-state button computed per row:
+                            //  - never run (0 done):       "Enrich"    → resume-mode (status='new')
+                            //  - partial (0 < done < total): "Resume"  → resume-mode
+                            //  - fully done (done==total):  "Re-enrich" → full re-run
+                            // Enrich and Resume call the same code path
+                            // (status='new' filter); the only thing that
+                            // changes is the label. Re-enrich drops the
+                            // status filter so already-completed contacts
+                            // get re-classified too.
+                            const total = l.contact_count || 0;
+                            const done = (l.enriched_count || 0) + (l.failed_count || 0);
+                            const allDone = total > 0 && done >= total;
+                            const fresh = done === 0;
+                            const mode: 'resume' | 'reenrich' = allDone ? 'reenrich' : 'resume';
+                            const label = allDone ? 'Re-enrich' : fresh ? 'Enrich' : 'Resume';
+                            const title = allDone
+                              ? 'Re-enrich every contact in this list (re-runs classification on already-done rows)'
+                              : fresh
+                                ? 'Enrich all contacts in this list'
+                                : 'Resume — only contacts without an enrichment row will be queued';
+                            return (
+                              <button
+                                onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count, mode); }}
+                                className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] transition-colors flex items-center gap-1"
+                                title={title}
+                              >
+                                <Zap className="w-3 h-3" /> {label}
+                              </button>
+                            );
+                          })()}
                           <ExportButton job={job} listName={l.name} onStart={onStartExport} onClear={onClearExport} />
                           {onDeleteList && (
                             <button
@@ -1409,7 +1435,7 @@ function ListSelectorModal({
   deleteJobs?: DeleteJob[];
   onClose: () => void;
   onOpenList: (name: string | null) => void;
-  onEnrichList: (name: string, contactCount: number) => void;
+  onEnrichList: (name: string, contactCount: number, mode?: 'resume' | 'reenrich') => void;
   onStartExport: (name: string) => void;
   onClearExport: (jobId: string) => void;
   onRenameList?: (oldName: string, newName: string) => void;
@@ -2680,7 +2706,7 @@ function CSVImportWizard({
   exportJobs: ExportJob[];
   activeListFilter: string | null;
   onOpenList: (name: string | null) => void;
-  onEnrichList: (name: string, contactCount: number) => void;
+  onEnrichList: (name: string, contactCount: number, mode?: 'resume' | 'reenrich') => void;
   onStartExport: (name: string) => void;
   onClearExport: (jobId: string) => void;
   onRefreshLists: () => void;
