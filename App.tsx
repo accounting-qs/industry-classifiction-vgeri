@@ -166,7 +166,7 @@ export default function App() {
   const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
   const [activeListFilter, setActiveListFilter] = useState<string | null>(null);
   const [contactsLoading, setContactsLoading] = useState(false);
-  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; bucketing_run_count?: number }[]>([]);
+  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number }[]>([]);
   const [listStatsSource, setListStatsSource] = useState<'rpc' | 'fallback'>('rpc');
   const [importListsLoading, setImportListsLoading] = useState(true);
   // Tracks the lazy /api/import-lists/stats fetch independently of the
@@ -524,6 +524,32 @@ export default function App() {
     refreshLists();
   }, [refreshLists]);
 
+  // Toggle the manual "bucketed" override on a list. The derived flag
+  // (membership in any bucketing_runs row) is left alone — this only
+  // flips the side-channel column the UI ORs into the displayed
+  // badge. Optimistic update so the badge flips immediately, with a
+  // refresh in finally to reconcile against the server.
+  const setListBucketed = useCallback(async (id: string, manually_bucketed: boolean) => {
+    setImportLists(prev => prev.map(l =>
+      l.id === id ? { ...l, manually_bucketed, bucketed: manually_bucketed || ((l.bucketing_run_count || 0) > 0) } : l
+    ));
+    try {
+      const res = await fetch(`/api/import-lists/${encodeURIComponent(id)}/bucketed`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ manually_bucketed }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        window.alert(err.error || `Update failed (${res.status})`);
+      }
+    } catch (e: any) {
+      window.alert(e?.message || 'Update failed');
+    } finally {
+      refreshLists();
+    }
+  }, [refreshLists]);
+
   // Kicks off a server-side deletion job and returns once the worker is
   // running. The actual delete (chunked enrichments + contacts + list_row)
   // runs independently of this HTTP connection, so the user can navigate
@@ -761,6 +787,7 @@ export default function App() {
               onRefreshLists={refreshLists}
               onRenameList={renameImportList}
               onDeleteList={deleteImportList}
+              onSetListBucketed={setListBucketed}
               deleteJobs={deleteJobs}
               onClearDeleteJob={clearDeleteJob}
             />
@@ -956,6 +983,7 @@ export default function App() {
           onClearExport={clearExportJob}
           onRenameList={renameImportList}
           onDeleteList={deleteImportList}
+          onSetListBucketed={setListBucketed}
           deleteJobs={deleteJobs}
           onClearDeleteJob={clearDeleteJob}
           onGoToImport={() => { setShowListModal(false); setActiveTab(AppTab.IMPORT); }}
@@ -1033,10 +1061,11 @@ function ImportedListsTable({
   onRenameList,
   onDeleteList,
   onClearDeleteJob,
+  onSetListBucketed,
   onGoToImport,
   showAllListsRow = true,
 }: {
-  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; bucketing_run_count?: number }[];
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number }[];
   loading: boolean;
   statsLoading?: boolean;
   statsSource: 'rpc' | 'fallback';
@@ -1050,6 +1079,7 @@ function ImportedListsTable({
   onRenameList?: (oldName: string, newName: string) => void;
   onDeleteList?: (id: string, name: string) => Promise<boolean>;
   onClearDeleteJob?: (jobId: string) => void;
+  onSetListBucketed?: (id: string, manually_bucketed: boolean) => void;
   onGoToImport?: () => void;
   showAllListsRow?: boolean;
 }) {
@@ -1251,17 +1281,41 @@ function ImportedListsTable({
                         {l.name} <span className="text-[10px] text-red-400/70 font-normal">— delete failed: {deleteJob!.error || 'unknown error'}</span>
                       </span>
                     ) : (
-                      <span className="inline-flex items-center gap-1.5">
+                      <div className="flex flex-col gap-1">
                         <span>{l.name}</span>
-                        {l.bucketed && (
-                          <span
-                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-[#3ecf8e]/15 text-[#3ecf8e] border border-[#3ecf8e]/30"
-                            title={`Used in ${l.bucketing_run_count || 1} bucketing run${(l.bucketing_run_count || 1) === 1 ? '' : 's'} — bucketed=${l.bucketing_run_count || 1}`}
-                          >
-                            <Layers className="w-2.5 h-2.5" /> Bucketed
-                          </span>
-                        )}
-                      </span>
+                        <span className="inline-flex items-center gap-1.5">
+                          {l.bucketed && (
+                            <span
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-[#3ecf8e]/15 text-[#3ecf8e] border border-[#3ecf8e]/30"
+                              title={
+                                (l.bucketing_run_count || 0) > 0
+                                  ? `Used in ${l.bucketing_run_count} bucketing run${(l.bucketing_run_count || 1) === 1 ? '' : 's'}${l.manually_bucketed ? ' (also marked manually)' : ''}`
+                                  : 'Marked as bucketed manually'
+                              }
+                            >
+                              <Layers className="w-2.5 h-2.5" /> Bucketed
+                            </span>
+                          )}
+                          {onSetListBucketed && !l.bucketed && (
+                            <button
+                              onClick={e => { e.stopPropagation(); onSetListBucketed(l.id, true); }}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-400 hover:text-[#3ecf8e] hover:border-[#3ecf8e]/40 transition-colors"
+                              title="Mark this list as bucketed (manual override)"
+                            >
+                              <Layers className="w-2.5 h-2.5" /> Mark bucketed
+                            </button>
+                          )}
+                          {onSetListBucketed && l.bucketed && l.manually_bucketed && (l.bucketing_run_count || 0) === 0 && (
+                            <button
+                              onClick={e => { e.stopPropagation(); onSetListBucketed(l.id, false); }}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-red-400 hover:border-red-500/40 transition-colors"
+                              title="Remove manual bucketed marking"
+                            >
+                              <X className="w-2.5 h-2.5" /> Unmark
+                            </button>
+                          )}
+                        </span>
+                      </div>
                     )}
                   </td>
                   <td className="px-5 py-2.5 text-gray-400 text-right font-mono">{l.contact_count.toLocaleString()}</td>
@@ -1424,9 +1478,10 @@ function ListSelectorModal({
   onRenameList,
   onDeleteList,
   onClearDeleteJob,
+  onSetListBucketed,
   onGoToImport,
 }: {
-  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; bucketing_run_count?: number }[];
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number }[];
   loading: boolean;
   statsLoading?: boolean;
   statsSource: 'rpc' | 'fallback';
@@ -1441,6 +1496,7 @@ function ListSelectorModal({
   onRenameList?: (oldName: string, newName: string) => void;
   onDeleteList?: (id: string, name: string) => Promise<boolean>;
   onClearDeleteJob?: (jobId: string) => void;
+  onSetListBucketed?: (id: string, manually_bucketed: boolean) => void;
   onGoToImport: () => void;
 }) {
   return (
@@ -1475,6 +1531,7 @@ function ListSelectorModal({
             onRenameList={onRenameList}
             onDeleteList={onDeleteList}
             onClearDeleteJob={onClearDeleteJob}
+            onSetListBucketed={onSetListBucketed}
             onGoToImport={onGoToImport}
           />
         </div>
@@ -2695,6 +2752,7 @@ function CSVImportWizard({
   onRefreshLists,
   onRenameList,
   onDeleteList,
+  onSetListBucketed,
   deleteJobs,
   onClearDeleteJob,
 }: {
@@ -2712,6 +2770,7 @@ function CSVImportWizard({
   onRefreshLists: () => void;
   onRenameList?: (oldName: string, newName: string) => void;
   onDeleteList?: (id: string, name: string) => Promise<boolean>;
+  onSetListBucketed?: (id: string, manually_bucketed: boolean) => void;
   deleteJobs?: DeleteJob[];
   onClearDeleteJob?: (jobId: string) => void;
 }) {
@@ -3435,6 +3494,7 @@ function CSVImportWizard({
             onRenameList={onRenameList}
             onDeleteList={onDeleteList}
             onClearDeleteJob={onClearDeleteJob}
+            onSetListBucketed={onSetListBucketed}
             showAllListsRow={false}
           />
         </div>

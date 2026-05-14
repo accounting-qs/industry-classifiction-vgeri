@@ -1012,10 +1012,15 @@ app.get('/api/import-lists', async (_req, res) => {
 
         const withFlags = lists.map((l: any) => {
             const bucketingRunCount = bucketedCountByList.get(l.name) || 0;
+            // `bucketed` is true if either source says so — actual run
+            // membership OR the manual override on import_lists. The
+            // client gets both so it can decide whether unmark is
+            // available (only the manual flag is user-toggleable).
             return {
                 ...l,
-                bucketed: bucketingRunCount > 0,
+                bucketed: bucketingRunCount > 0 || !!l.manually_bucketed,
                 bucketing_run_count: bucketingRunCount,
+                manually_bucketed: !!l.manually_bucketed,
             };
         });
         // Object response (kept for back-compat with the older
@@ -1233,6 +1238,39 @@ app.patch('/api/import-lists/:id', async (req, res) => {
         }
 
         res.json({ id, name: newName, oldName, contact_count: existing.contact_count, created_at: existing.created_at });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Manual "bucketed" override toggle. The derived flag (from
+// bucketing_runs.list_names) stays authoritative; this sets the
+// separate `manually_bucketed` column so a list shows the badge
+// even if the run was done outside the in-app flow. Lists that
+// are already bucketed via a real run aren't affected by toggling
+// this flag — the OR in GET /api/import-lists keeps the badge
+// regardless.
+app.patch('/api/import-lists/:id/bucketed', async (req, res) => {
+    const id = String(req.params?.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'id is required' });
+
+    const value = req.body?.manually_bucketed;
+    if (typeof value !== 'boolean') {
+        return res.status(400).json({ error: 'manually_bucketed (boolean) is required' });
+    }
+
+    try {
+        const { data, error } = await supabase
+            .from('import_lists')
+            .update({ manually_bucketed: value })
+            .eq('id', id)
+            .select('id, name, manually_bucketed')
+            .single();
+
+        if (error) return res.status(500).json({ error: error.message });
+        if (!data) return res.status(404).json({ error: 'List not found' });
+
+        res.json({ id: data.id, name: data.name, manually_bucketed: data.manually_bucketed });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }
