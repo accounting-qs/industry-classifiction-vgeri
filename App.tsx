@@ -1201,9 +1201,12 @@ function ImportedListsTable({
         <table className="w-full text-[11px]">
           <thead className="sticky top-0 bg-[#0e0e0e] z-10">
             <tr className="border-b border-[#2e2e2e]">
-              <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider">List Name</th>
-              <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Contacts</th>
-              <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider w-[220px]">Enrichment Progress</th>
+              {/* w-auto + the explicit widths on the other columns push the
+                  list name column to absorb the remaining horizontal space,
+                  which is what stops long names from wrapping. */}
+              <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider w-auto">List Name</th>
+              <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider w-[110px]">Contacts</th>
+              <th className="px-5 py-2.5 text-left text-[9px] font-bold text-gray-500 uppercase tracking-wider w-[170px]">Enrichment Progress</th>
               <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Imported</th>
               <th className="px-5 py-2.5 text-right text-[9px] font-bold text-gray-500 uppercase tracking-wider">Actions</th>
             </tr>
@@ -1564,7 +1567,7 @@ function EnrichmentProgress({ list, statsLoading = false }: {
   // runtime with no build step — custom animations would no-op.
   if (statsLoading && list.enriched_count === undefined) {
     return (
-      <div className="flex flex-col gap-1 min-w-[200px]">
+      <div className="flex flex-col gap-1 min-w-[150px]">
         <div className="flex items-center gap-2">
           <div className="flex-1 h-1.5 bg-[#1c1c1c] rounded-full overflow-hidden">
             <div className="h-full w-1/3 bg-[#3ecf8e]/40 rounded-full animate-pulse" />
@@ -1591,7 +1594,7 @@ function EnrichmentProgress({ list, statsLoading = false }: {
   const isDone = pending === 0 && (completed + failed) > 0;
 
   return (
-    <div className="flex flex-col gap-1 min-w-[200px]">
+    <div className="flex flex-col gap-1 min-w-[150px]">
       <div className="flex items-center gap-2">
         <div className="flex-1 h-1.5 bg-[#1c1c1c] rounded-full overflow-hidden flex">
           <div
@@ -3469,8 +3472,11 @@ function CSVImportWizard({
         )}
       </div>
 
-      {/* Import History — same list view as the Contacts page */}
-      <div className="max-w-5xl mx-auto mt-8">
+      {/* Import History — same list view as the Contacts page.
+          Wider than the upload card above so list names don't wrap to
+          three lines on the longer "Ampleleads, Apr 1 2026, Professional
+          Training, 100 - 250 employees, US"-style entries. */}
+      <div className="max-w-7xl mx-auto mt-8">
         <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl overflow-hidden">
           <div className="px-5 py-3 border-b border-[#2e2e2e] flex items-center gap-2">
             <Clock className="w-4 h-4 text-[#3ecf8e]" />
