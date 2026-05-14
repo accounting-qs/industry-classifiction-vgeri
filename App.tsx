@@ -589,13 +589,22 @@ export default function App() {
 
   const enrichList = async (name: string, contactCount: number) => {
     setShowListModal(false);
+    // "Resume mode": only enqueue contacts that have no enrichment row
+    // yet (status='new' on the server's filter taxonomy). Already-completed
+    // rows are skipped — re-enriching them is wasteful (the jobProcessor
+    // would re-upsert and burn AI tokens for cache-miss domains), and the
+    // common case for hitting this button on a partially-done list is to
+    // finish it, not to re-do work. Failed rows are also skipped per
+    // product call (manual re-enrich via Contacts page filters if needed).
+    //
     // Use 'in' operator so resolveFilteredContactIds (server.ts) takes the
     // DB-side RPC fast-path (resolve_enrichment_targets) instead of paginating
     // thousands of IDs one 1000-row PostgREST page at a time.
     const filters: FilterCondition[] = [
-      { id: '__list_modal__', column: 'lead_list_name', operator: 'in' as FilterOperator, value: [name] }
+      { id: '__list_modal__', column: 'lead_list_name', operator: 'in' as FilterOperator, value: [name] },
+      { id: '__resume_mode__', column: 'status', operator: 'in' as FilterOperator, value: ['new'] },
     ];
-    addLog(`🚀 Deploying enrichment for list "${name}" (${contactCount.toLocaleString()} contacts)...`);
+    addLog(`🚀 Resuming enrichment for list "${name}" — only contacts without an enrichment row will be queued.`);
     try {
       const res = await fetch('/api/enrich', {
         method: 'POST',
@@ -607,9 +616,12 @@ export default function App() {
         addLog(`❌ Enrich error: ${err.error || res.status}`);
         return;
       }
-      addLog(`✅ 202 Accepted: Backend cluster scaling up for list "${name}".`);
+      addLog(`✅ 202 Accepted: Backend cluster scaling up for list "${name}". Watch the queue log for the actual resume count.`);
       setActiveTab(AppTab.ENRICHMENT);
-      setStats({ total: contactCount, completed: 0, failed: 0, isProcessing: true });
+      // total starts unknown — the server logs the resolved count once the
+      // background enqueue lands. Setting to 0 here so the progress bar
+      // doesn't show the inflated csv-row-count as the denominator.
+      setStats({ total: 0, completed: 0, failed: 0, isProcessing: true });
     } catch (e: any) {
       addLog(`❌ Enrich error: ${e.message}`);
     }
