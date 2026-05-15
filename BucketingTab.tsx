@@ -38,7 +38,7 @@ const TAXONOMY_LAYER_HELP = {
 } as const;
 
 export function BucketingTab({ importLists }: {
-  importLists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number }[]
+  importLists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; bucketed?: boolean; bucketing_run_count?: number; manually_bucketed?: boolean }[]
 }) {
   const [view, setView] = useState<BucketingView>('index');
   const [runs, setRuns] = useState<BucketingRun[]>([]);
@@ -501,7 +501,7 @@ const PHASE1A_MODEL_OPTIONS = [
 type Phase1aModel = typeof PHASE1A_MODEL_OPTIONS[number]['id'];
 
 function BucketingSetup({ importLists, onCancel, onStart, loading }: {
-  importLists: { name: string; contact_count: number; enriched_count?: number }[];
+  importLists: { name: string; contact_count: number; enriched_count?: number; bucketed?: boolean; bucketing_run_count?: number; manually_bucketed?: boolean }[];
   onCancel: () => void;
   onStart: (p: { name: string; list_names: string[]; apply_identity_dq_cascade: boolean; phase1a_model: Phase1aModel }) => void;
   loading: boolean;
@@ -548,17 +548,34 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
           <div className="border border-[#2e2e2e] rounded max-h-64 overflow-y-auto custom-scrollbar">
             {importLists.map(l => {
               const isSel = selectedLists.has(l.name);
+              // Show a "Bucketed" badge when this list has appeared in at
+              // least one prior bucketing run (or been manually marked) so
+              // the user can spot already-processed lists at a glance. The
+              // badge is informational only — re-bucketing is still allowed.
+              const runCount = l.bucketing_run_count || 0;
+              const bucketed = !!l.bucketed;
+              const badgeTitle = runCount > 0
+                ? `Previously bucketed ${runCount} run${runCount === 1 ? '' : 's'}`
+                : (l.manually_bucketed ? 'Manually marked as bucketed' : '');
               return (
                 <button
                   key={l.name}
                   onClick={() => toggleList(l.name)}
                   className={`w-full flex items-center justify-between px-3 py-2 text-left text-xs border-b border-[#2e2e2e] last:border-b-0 transition-colors ${isSel ? 'bg-[#3ecf8e]/10 text-[#3ecf8e]' : 'text-gray-300 hover:bg-white/[0.02]'}`}
                 >
-                  <span className="flex items-center gap-2">
-                    <input type="checkbox" checked={isSel} onChange={() => {}} className="w-3 h-3" />
-                    <span className="font-medium">{l.name}</span>
+                  <span className="flex items-center gap-2 min-w-0">
+                    <input type="checkbox" checked={isSel} onChange={() => {}} className="w-3 h-3 flex-shrink-0" />
+                    <span className="font-medium truncate">{l.name}</span>
+                    {bucketed && (
+                      <span
+                        title={badgeTitle}
+                        className="flex-shrink-0 px-1.5 py-[1px] rounded text-[9px] font-bold uppercase tracking-wider bg-[#3ecf8e]/15 text-[#3ecf8e] border border-[#3ecf8e]/30"
+                      >
+                        {l.manually_bucketed && runCount === 0 ? 'Marked' : `Bucketed${runCount > 1 ? ` ×${runCount}` : ''}`}
+                      </span>
+                    )}
                   </span>
-                  <span className="font-mono text-[10px] text-gray-500">
+                  <span className="font-mono text-[10px] text-gray-500 flex-shrink-0 ml-2">
                     {(l.enriched_count || 0).toLocaleString()} enriched / {l.contact_count.toLocaleString()}
                   </span>
                 </button>
