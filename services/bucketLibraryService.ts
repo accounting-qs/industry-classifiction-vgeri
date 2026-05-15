@@ -28,6 +28,11 @@ export interface LibraryBucket {
     archived: boolean;
     created_at: string;
     updated_at: string;
+    // Seeded baseline buckets are tagged is_canonical=true / created_by='seed'.
+    // AI-proposed buckets accepted by the user land as created_by='ai'.
+    // User-added buckets default to created_by='user'.
+    is_canonical?: boolean;
+    created_by?: 'seed' | 'user' | 'ai';
 }
 
 export interface LibraryBucketInput {
@@ -40,6 +45,9 @@ export interface LibraryBucketInput {
     exclude_terms?: string[];
     example_strings?: string[];
     notes?: string;
+    // 'seed' is reserved for the canonical migration. The accept-AI-proposal
+    // flow passes 'ai'; user-driven adds default to 'user'.
+    created_by?: 'seed' | 'user' | 'ai';
 }
 
 export async function listLibrary(
@@ -61,7 +69,7 @@ export async function upsertLibraryBucket(
     const ident = (input.primary_identity || input.direct_ancestor || '').trim();
     if (!spec) throw new Error('bucket_name is required');
 
-    const payload = {
+    const payload: Record<string, unknown> = {
         bucket_name: spec,
         primary_identity: ident || null,
         direct_ancestor: ident || null,          // legacy mirror, kept until v6
@@ -73,6 +81,11 @@ export async function upsertLibraryBucket(
         notes: input.notes?.trim() || null,
         updated_at: new Date().toISOString()
     };
+    // Only thread created_by when the caller explicitly sets it (e.g.
+    // saveRunBucketsToLibrary tagging AI-proposed accepts). Leaving it
+    // undefined keeps existing rows untouched on conflict and lets the
+    // DB default ('user') apply to fresh inserts.
+    if (input.created_by) payload.created_by = input.created_by;
 
     const { data, error } = await supabase.from('bucket_library')
         .upsert(payload, { onConflict: 'bucket_name' })
@@ -240,7 +253,11 @@ export async function saveRunBucketsToLibrary(
             description: b.description,
             include_terms: b.include || b.include_terms || [],
             exclude_terms: b.exclude || b.exclude_terms || [],
-            example_strings: b.example_strings || []
+            example_strings: b.example_strings || [],
+            // These rows originate from an LLM-produced taxonomy proposal
+            // that the user has just accepted — flag the provenance so the
+            // library can surface human-curated vs AI-curated buckets later.
+            created_by: 'ai'
         });
         saved++;
     }
