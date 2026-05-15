@@ -11,7 +11,10 @@ const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '../../.env.local') });
 dotenv.config({ path: path.join(__dirname, '../../.env') });
 
-const MODEL = process.env.EVAL_MODEL || 'claude-haiku-4-5';
+// Default to gpt-4.1-mini to mirror Phase 1b's production model (and what
+// you'd hit if you pick gpt-4.1-mini in the Bucketing UI). Override via
+// EVAL_MODEL=claude-haiku-4-5 to A/B against the recommended Claude option.
+const MODEL = process.env.EVAL_MODEL || 'gpt-4.1-mini';
 const CONCURRENCY = Number(process.env.EVAL_CONCURRENCY || 6);
 const GOLDENS_PATH = path.join(__dirname, 'goldens.json');
 const LAST_RUN_PATH = path.join(__dirname, 'last-run.json');

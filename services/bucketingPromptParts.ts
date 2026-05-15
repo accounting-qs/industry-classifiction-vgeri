@@ -18,6 +18,21 @@ The vertical / served market belongs in SECTOR, never the identity.
     / regtech / compliance software / collaboration software
        → identity = Software & SaaS  (NEVER Agency, NEVER Consulting & Advisory)
 
+ 1b. "X-tech" terms describing a STARTUP / COMPANY / PRODUCT / PLATFORM are
+     software, not the served vertical. Specifically:
+       fintech · regtech · insurtech · edtech · proptech · healthtech /
+       healthtech / medtech · legaltech · martech · adtech · agritech · climatetech
+       → identity = Software & SaaS  (NEVER Financial Services / Insurance Services
+         / Healthcare Operator / etc.)
+     Trigger phrases: "fintech startup", "regtech platform", "insurtech app",
+     "edtech company", "healthtech product".
+     EXCEPTION — when the X-tech term modifies an INVESTOR or OPERATOR noun, the
+     investor/operator identity wins:
+       "fintech investor" / "fintech-focused PE firm" → Financial Services
+       "healthtech VC fund" → Financial Services
+       "edtech operator running 12 schools" → Education Operator
+     In ambiguous cases (no investor/operator noun), DEFAULT TO Software & SaaS.
+
  2. Staffing / recruiting / recruitment / talent acquisition / executive search /
     placement agency / RPO
        → identity = Staffing & Recruiting

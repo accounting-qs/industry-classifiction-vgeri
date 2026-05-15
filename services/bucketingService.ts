@@ -2828,6 +2828,16 @@ Input:  PE-backed software company building tools for restaurants
 Output: identity=Software & SaaS, sub_identity=Vertical SaaS, sector=Hospitality & Travel
 Note:   "PE-backed" is a financing status, NOT the identity
 
+Input:  Venture-backed fintech startup automating B2B payments
+Output: identity=Software & SaaS, sub_identity=FinTech SaaS, sector=null
+Note:   "fintech startup" → Software & SaaS (X-tech rule 1b). "Venture-backed"
+        is a financing status, NOT Financial Services.
+
+Input:  Healthtech company building remote patient monitoring tools
+Output: identity=Software & SaaS, sub_identity=Vertical SaaS, sector=Healthcare
+Note:   "healthtech company" → Software & SaaS (X-tech rule 1b), NOT Healthcare
+        Operator. Healthcare is the served vertical → sector.
+
 Input:  Independent insurance agency for commercial lines
 Output: identity=Insurance Services, sub_identity=Insurance Brokerage, sector=null
 Note:   Insurance Services is its own identity, NOT Financial Services

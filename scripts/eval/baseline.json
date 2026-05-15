@@ -1,16 +1,16 @@
 {
-  "run_at": "2026-05-14T13:15:36.152Z",
-  "model": "claude-haiku-4-5",
+  "run_at": "2026-05-15T10:54:33.223Z",
+  "model": "gpt-4.1-mini",
   "totals": {
-    "primary_identity": 26,
-    "sub_identity": 27,
-    "sector": 28,
+    "primary_identity": 28,
+    "sub_identity": 26,
+    "sector": 27,
     "is_disqualified": 30,
     "overall": 23,
     "n": 30
   },
-  "cost_usd": 0.026885,
-  "elapsed_seconds": 12.2,
+  "cost_usd": 0.0323308,
+  "elapsed_seconds": 12.5,
   "results": [
     {
       "id": "g-001",
@@ -28,7 +28,7 @@
         "sector": null,
         "is_disqualified": false,
         "identity_confidence": 10,
-        "sub_identity_confidence": 8,
+        "sub_identity_confidence": 9,
         "sector_confidence": 1
       },
       "field_pass": {
@@ -38,8 +38,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.0008179999999999999,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Agency\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Performance Marketing Agency\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 8,\n      \"sector_confidence\": 1,\n      \"reason\": \"Digital marketing = Agency. No vertical specified; sector remains null.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.000752,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Agency\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Performance Marketing Agency\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Explicit match for digital marketing agency as Agency with Performance Marketing sub-identity, no vertical stated\"\n    }\n  ]\n}"
     },
     {
       "id": "g-002",
@@ -67,8 +67,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000871,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Financial Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Private Equity\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 10,\n      \"sector_confidence\": 1,\n      \"reason\": \"PE firm matches HARD KEYWORD ROUTING rule 4. No vertical explicitly served → sector null.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0023644000000000004,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Financial Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Private Equity\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 10,\n      \"sector_confidence\": 1,\n      \"reason\": \"Clear mention of private equity firm; identity Financial Services with Private Equity sub-identity\"\n    }\n  ]\n}"
     },
     {
       "id": "g-003",
@@ -96,8 +96,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000918,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Financial Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Venture Capital\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Financial Services\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 10,\n      \"sector_confidence\": 9,\n      \"reason\": \"VC fund is explicitly Financial Services by HARD KEYWORD ROUTING. Sector=Financial Services (vertical served by portfolio companies).\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0023740000000000002,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Financial Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Venture Capital\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Financial Services\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 10,\n      \"sector_confidence\": 9,\n      \"reason\": \"Venture capital fund clearly Financial Services, sub-identity Venture Capital, serves Financial Services sector explicitly.\"\n    }\n  ]\n}"
     },
     {
       "id": "g-004",
@@ -125,8 +125,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000871,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Financial Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Wealth Management\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Wealth management firm explicitly identified; serves HNWI families but no specific vertical sector mentioned.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007511999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Financial Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Wealth Management\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Clear financial services identity with wealth management sub-identity; no explicit served vertical.\"\n    }\n  ]\n}"
     },
     {
       "id": "g-005",
@@ -144,7 +144,7 @@
         "sector": null,
         "is_disqualified": false,
         "identity_confidence": 10,
-        "sub_identity_confidence": 9,
+        "sub_identity_confidence": 10,
         "sector_confidence": 1
       },
       "field_pass": {
@@ -154,8 +154,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.0008870000000000001,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Software & SaaS\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Cybersecurity Software\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Explicit SaaS platform for cybersecurity. No served vertical stated → sector null.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0023660000000000005,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Software & SaaS\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Cybersecurity Software\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 10,\n      \"sector_confidence\": 1,\n      \"reason\": \"Cybersecurity software platform explicitly matches Software & SaaS and Cybersecurity Software.\"\n    }\n  ]\n}"
     },
     {
       "id": "g-006",
@@ -183,8 +183,8 @@
         "is_disqualified": true
       },
       "overall_pass": false,
-      "cost_usd": 0.000922,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"IT Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Managed IT Services\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Managed IT services (MSP) is a direct match to IT Services identity with Managed IT Services sub-identity. No specific vertical served.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0023532,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"IT Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Managed IT Services\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Explicitly described as managed IT services provider\"\n    }\n  ]\n}"
     },
     {
       "id": "g-007",
@@ -199,21 +199,21 @@
       "actual": {
         "primary_identity": "Real Estate",
         "sub_identity": "Brokerage",
-        "sector": null,
+        "sector": "Real Estate",
         "is_disqualified": false,
-        "identity_confidence": 10,
+        "identity_confidence": 9,
         "sub_identity_confidence": 9,
-        "sector_confidence": 1
+        "sector_confidence": 9
       },
       "field_pass": {
         "primary_identity": true,
         "sub_identity": false,
-        "sector": true,
+        "sector": false,
         "is_disqualified": true
       },
       "overall_pass": false,
-      "cost_usd": 0.000881,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Real Estate\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Brokerage\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Commercial real estate brokerage explicitly stated. B2B service provider matching identity + sub_identity library.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007447999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Real Estate\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Brokerage\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Real Estate\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 9,\n      \"reason\": \"Explicit commercial real estate brokerage with office and industrial properties\"\n    }\n  ]\n}"
     },
     {
       "id": "g-008",
@@ -241,8 +241,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000871,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Legal Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Corporate Law\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Law firm → Legal Services. M&A focus fits Corporate Law sub-identity; no specific vertical served.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007507999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Legal Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Corporate Law\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Clear legal firm focused on corporate law M&A, explicit identity and sub-identity\"\n    }\n  ]\n}"
     },
     {
       "id": "g-009",
@@ -256,11 +256,11 @@
       },
       "actual": {
         "primary_identity": "Accounting & Tax",
-        "sub_identity": "Tax Advisory",
+        "sub_identity": null,
         "sector": null,
         "is_disqualified": false,
-        "identity_confidence": 10,
-        "sub_identity_confidence": 8,
+        "identity_confidence": 9,
+        "sub_identity_confidence": 1,
         "sector_confidence": 1
       },
       "field_pass": {
@@ -270,8 +270,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.001011,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Accounting & Tax\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Tax Advisory\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 8,\n      \"sector_confidence\": 1,\n      \"reason\": \"CPA firm with explicit tax, audit, and advisory services. Identity fixed by hard keyword routing (CPA / accounting firm). Sub-identity best fit is Tax Advisory; audit & general advisory span both Tax Advisory and Management Consulting.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007579999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Accounting & Tax\",\n      \"is_new_identity\": false,\n      \"sub_identity\": null,\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 1,\n      \"sector_confidence\": 1,\n      \"reason\": \"CPA firm offering tax, audit, advisory clearly Accounting & Tax; no specific sub-identity or sector mentioned\"\n    }\n  ]\n}"
     },
     {
       "id": "g-010",
@@ -288,8 +288,8 @@
         "sub_identity": "Insurance Brokerage",
         "sector": null,
         "is_disqualified": false,
-        "identity_confidence": 9,
-        "sub_identity_confidence": 9,
+        "identity_confidence": 10,
+        "sub_identity_confidence": 10,
         "sector_confidence": 1
       },
       "field_pass": {
@@ -299,8 +299,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.0008810000000000001,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Insurance Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Insurance Brokerage\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Insurance agency = Insurance Services identity. Commercial lines confirms brokerage sub-type. No vertical explicitly served.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007404,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Insurance Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Insurance Brokerage\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 10,\n      \"sector_confidence\": 1,\n      \"reason\": \"Explicit insurance agency mention; commercial lines implies insurance brokerage\"\n    }\n  ]\n}"
     },
     {
       "id": "g-011",
@@ -317,7 +317,7 @@
         "sub_identity": "Performance Marketing Agency",
         "sector": "Healthcare",
         "is_disqualified": false,
-        "identity_confidence": 10,
+        "identity_confidence": 9,
         "sub_identity_confidence": 8,
         "sector_confidence": 9
       },
@@ -328,8 +328,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.0008920000000000001,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Agency\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Performance Marketing Agency\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Healthcare\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 8,\n      \"sector_confidence\": 9,\n      \"reason\": \"SEO agency (marketing) serving healthcare vertical. Identity=Agency, sector=Healthcare per 'X for Y' rule.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007544,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Agency\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Performance Marketing Agency\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Healthcare\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 8,\n      \"sector_confidence\": 9,\n      \"reason\": \"SEO agency matches Agency identity and Performance Marketing; 'for healthcare clinics' sets Healthcare sector explicitly.\"\n    }\n  ]\n}"
     },
     {
       "id": "g-012",
@@ -357,8 +357,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.0008799999999999999,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Agency\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Branding Agency\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Non-Profit & Social Impact\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 8,\n      \"reason\": \"Explicit branding agency identity. Serves nonprofits as stated vertical.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007551999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Agency\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Branding Agency\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Non-Profit & Social Impact\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 8,\n      \"reason\": \"Explicit agency type; serves nonprofits implied by 'primarily with nonprofits'\"\n    }\n  ]\n}"
     },
     {
       "id": "g-013",
@@ -376,7 +376,7 @@
         "sector": "Education",
         "is_disqualified": false,
         "identity_confidence": 10,
-        "sub_identity_confidence": 8,
+        "sub_identity_confidence": 10,
         "sector_confidence": 10
       },
       "field_pass": {
@@ -386,8 +386,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000923,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Software & SaaS\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Vertical SaaS\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Education\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 8,\n      \"sector_confidence\": 10,\n      \"reason\": \"Software platform explicitly for K-12 schools. Identity fixed by hard keyword routing (SaaS). Sector is Education.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007823999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Software & SaaS\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Vertical SaaS\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Education\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 10,\n      \"sector_confidence\": 10,\n      \"reason\": \"Explicit 'Software platform' triggers Software & SaaS; 'K-12 schools' sets sector Education; vertical SaaS sub-identity matches platform for specific vertical\"\n    }\n  ]\n}"
     },
     {
       "id": "g-014",
@@ -406,7 +406,7 @@
         "is_disqualified": false,
         "identity_confidence": 10,
         "sub_identity_confidence": 10,
-        "sector_confidence": 9
+        "sector_confidence": 10
       },
       "field_pass": {
         "primary_identity": true,
@@ -415,8 +415,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000917,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Staffing & Recruiting\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Healthcare Staffing\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Healthcare\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 10,\n      \"sector_confidence\": 9,\n      \"reason\": \"Staffing agency (HARD KEYWORD ROUTING rule 2) with explicit healthcare vertical (travel nurse placement).\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007548,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Staffing & Recruiting\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Healthcare Staffing\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Healthcare\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 10,\n      \"sector_confidence\": 10,\n      \"reason\": \"Explicit 'Healthcare staffing agency' denotes staffing identity and healthcare sub-identity and sector.\"\n    }\n  ]\n}"
     },
     {
       "id": "g-015",
@@ -429,23 +429,23 @@
         "is_disqualified": false
       },
       "actual": {
-        "primary_identity": "Government Contractor",
-        "sub_identity": "Government Systems Integrator",
+        "primary_identity": "Consulting & Advisory",
+        "sub_identity": null,
         "sector": "Government",
         "is_disqualified": false,
-        "identity_confidence": 9,
-        "sub_identity_confidence": 8,
-        "sector_confidence": 9
+        "identity_confidence": 4,
+        "sub_identity_confidence": 4,
+        "sector_confidence": 4
       },
       "field_pass": {
-        "primary_identity": false,
+        "primary_identity": true,
         "sub_identity": false,
         "sector": true,
         "is_disqualified": true
       },
       "overall_pass": false,
-      "cost_usd": 0.000857,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Government Contractor\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Government Systems Integrator\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Government\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 8,\n      \"sector_confidence\": 9,\n      \"reason\": \"IT consulting for federal agencies matches Government Contractor identity; sector is Government.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0023552,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Consulting & Advisory\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"IT Consulting\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Government\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 9,\n      \"reason\": \"Explicit IT consulting firm serving federal government agencies\"\n    }\n  ]\n}"
     },
     {
       "id": "g-016",
@@ -459,12 +459,12 @@
       },
       "actual": {
         "primary_identity": "Consulting & Advisory",
-        "sub_identity": "Specialty Consulting",
+        "sub_identity": "Risk Management and Insurance Advisory Services",
         "sector": "Financial Services",
         "is_disqualified": false,
-        "identity_confidence": 8,
+        "identity_confidence": 9,
         "sub_identity_confidence": 7,
-        "sector_confidence": 9
+        "sector_confidence": 8
       },
       "field_pass": {
         "primary_identity": false,
@@ -473,8 +473,8 @@
         "is_disqualified": true
       },
       "overall_pass": false,
-      "cost_usd": 0.000903,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Consulting & Advisory\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Specialty Consulting\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Financial Services\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 8,\n      \"sub_identity_confidence\": 7,\n      \"sector_confidence\": 9,\n      \"reason\": \"Cybersecurity consulting is advisory services. 'For financial institutions' explicitly names the served vertical as sector.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.00075,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Consulting & Advisory\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Risk Management and Insurance Advisory Services\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Financial Services\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 7,\n      \"sector_confidence\": 8,\n      \"reason\": \"Explicit mention of consulting and financial institutions sector\"\n    }\n  ]\n}"
     },
     {
       "id": "g-017",
@@ -488,22 +488,22 @@
       },
       "actual": {
         "primary_identity": "Staffing & Recruiting",
-        "sub_identity": "Technical Staffing",
+        "sub_identity": "Professional Staffing",
         "sector": "Construction & Infrastructure",
         "is_disqualified": false,
-        "identity_confidence": 10,
+        "identity_confidence": 9,
         "sub_identity_confidence": 7,
-        "sector_confidence": 9
+        "sector_confidence": 8
       },
       "field_pass": {
         "primary_identity": true,
-        "sub_identity": true,
+        "sub_identity": false,
         "sector": true,
         "is_disqualified": true
       },
-      "overall_pass": true,
-      "cost_usd": 0.0009159999999999999,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Staffing & Recruiting\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Technical Staffing\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Construction & Infrastructure\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 7,\n      \"sector_confidence\": 9,\n      \"reason\": \"Recruiting firm (hard keyword match) placing into construction sector. Technical Staffing captures specialized placement focus.\"\n    }\n  ]\n}\n```"
+      "overall_pass": false,
+      "cost_usd": 0.0007623999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Staffing & Recruiting\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Professional Staffing\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Construction & Infrastructure\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 7,\n      \"sector_confidence\": 8,\n      \"reason\": \"Recruiting firm signals Staffing & Recruiting; focus on construction placements yields Professional Staffing and Construction sector\"\n    }\n  ]\n}"
     },
     {
       "id": "g-018",
@@ -522,7 +522,7 @@
         "is_disqualified": false,
         "identity_confidence": 10,
         "sub_identity_confidence": 10,
-        "sector_confidence": 9
+        "sector_confidence": 10
       },
       "field_pass": {
         "primary_identity": true,
@@ -531,8 +531,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.0008830000000000001,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Financial Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Investment Banking\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Healthcare\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 10,\n      \"sector_confidence\": 9,\n      \"reason\": \"Investment bank → Financial Services identity. M&A advisory → Investment Banking sub_identity. Healthcare focus → Healthcare sector.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007423999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Financial Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Investment Banking\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Healthcare\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 10,\n      \"sector_confidence\": 10,\n      \"reason\": \"Explicitly described as investment bank and healthcare M&A\"\n    }\n  ]\n}"
     },
     {
       "id": "g-019",
@@ -551,7 +551,7 @@
         "is_disqualified": false,
         "identity_confidence": 10,
         "sub_identity_confidence": 9,
-        "sector_confidence": 10
+        "sector_confidence": 8
       },
       "field_pass": {
         "primary_identity": true,
@@ -560,8 +560,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000909,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Software & SaaS\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Vertical SaaS\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Hospitality & Travel\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 10,\n      \"reason\": \"Software platform for restaurants (vertical SaaS). PE backing is financing status, not identity.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007731999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Software & SaaS\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Vertical SaaS\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Hospitality & Travel\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 8,\n      \"reason\": \"X-tech 'software company' = Software & SaaS, 'building tools for restaurants' sets sector Hospitality & Travel\"\n    }\n  ]\n}"
     },
     {
       "id": "g-020",
@@ -576,21 +576,21 @@
       "actual": {
         "primary_identity": "Software & SaaS",
         "sub_identity": "FinTech SaaS",
-        "sector": "Financial Services",
+        "sector": null,
         "is_disqualified": false,
-        "identity_confidence": 9,
-        "sub_identity_confidence": 8,
-        "sector_confidence": 8
+        "identity_confidence": 10,
+        "sub_identity_confidence": 9,
+        "sector_confidence": 1
       },
       "field_pass": {
         "primary_identity": true,
         "sub_identity": true,
-        "sector": false,
+        "sector": true,
         "is_disqualified": true
       },
-      "overall_pass": false,
-      "cost_usd": 0.0009480000000000001,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Software & SaaS\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"FinTech SaaS\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Financial Services\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 8,\n      \"sector_confidence\": 8,\n      \"reason\": \"B2B payments automation platform is SaaS; FinTech vertical; venture-backed is financing status, not identity.\"\n    }\n  ]\n}\n```"
+      "overall_pass": true,
+      "cost_usd": 0.000776,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Software & SaaS\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"FinTech SaaS\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Venture-backed fintech startup triggers Software & SaaS with FinTech SaaS sub-identity per X-tech rule; no explicit sector mentioned\"\n    }\n  ]\n}"
     },
     {
       "id": "g-021",
@@ -605,21 +605,21 @@
       "actual": {
         "primary_identity": "Legal Services",
         "sub_identity": "Intellectual Property Law",
-        "sector": null,
+        "sector": "Technology & Software",
         "is_disqualified": false,
-        "identity_confidence": 10,
-        "sub_identity_confidence": 9,
-        "sector_confidence": 1
+        "identity_confidence": 9,
+        "sub_identity_confidence": 8,
+        "sector_confidence": 7
       },
       "field_pass": {
         "primary_identity": true,
         "sub_identity": true,
-        "sector": true,
+        "sector": false,
         "is_disqualified": true
       },
-      "overall_pass": true,
-      "cost_usd": 0.0008489999999999999,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Legal Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Intellectual Property Law\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Law firm with explicit IP practice focus. Technology context reinforces IP specialization.\"\n    }\n  ]\n}\n```"
+      "overall_pass": false,
+      "cost_usd": 0.0007575999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Legal Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Intellectual Property Law\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Technology & Software\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 8,\n      \"sector_confidence\": 7,\n      \"reason\": \"Strong legal focus with explicit technology/IP practice; sector is technology as served vertical\"\n    }\n  ]\n}"
     },
     {
       "id": "g-022",
@@ -647,8 +647,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000852,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Legal Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": null,\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 1,\n      \"sector_confidence\": 1,\n      \"reason\": \"Hard keyword match: legal videography and court reporting are legal support services. Identity fixed to Legal Services.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007503999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Legal Services\",\n      \"is_new_identity\": false,\n      \"sub_identity\": null,\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 1,\n      \"sector_confidence\": 1,\n      \"reason\": \"Clear legal services role; court reporting is legal services, no explicit sub-identity or sector\"\n    }\n  ]\n}"
     },
     {
       "id": "g-023",
@@ -666,7 +666,7 @@
         "sector": null,
         "is_disqualified": false,
         "identity_confidence": 9,
-        "sub_identity_confidence": 9,
+        "sub_identity_confidence": 8,
         "sector_confidence": 1
       },
       "field_pass": {
@@ -676,8 +676,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000961,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Software & SaaS\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Cybersecurity Software\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Primary identity is software product (Cybersecurity Software per HARD KEYWORD ROUTING rule 1). Professional services are ancillary delivery model, not identity.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007703999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Software & SaaS\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Cybersecurity Software\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 8,\n      \"sector_confidence\": 1,\n      \"reason\": \"Identified as Software & SaaS due to 'cybersecurity software'; sub_identity from software specialty; no explicit served vertical\"\n    }\n  ]\n}"
     },
     {
       "id": "g-024",
@@ -694,8 +694,8 @@
         "sub_identity": "Talent Management Agency",
         "sector": null,
         "is_disqualified": false,
-        "identity_confidence": 9,
-        "sub_identity_confidence": 9,
+        "identity_confidence": 10,
+        "sub_identity_confidence": 10,
         "sector_confidence": 1
       },
       "field_pass": {
@@ -705,8 +705,8 @@
         "is_disqualified": true
       },
       "overall_pass": false,
-      "cost_usd": 0.000857,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Agency\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Talent Management Agency\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Talent management agencies (including sports/athlete representation) belong under Agency identity per routing rules.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007468,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Agency\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Talent Management Agency\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 10,\n      \"sector_confidence\": 1,\n      \"reason\": \"Explicit agency type with clear sub-identity, no specific served vertical mentioned\"\n    }\n  ]\n}"
     },
     {
       "id": "g-025",
@@ -734,8 +734,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000823,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": null,\n      \"is_new_identity\": false,\n      \"sub_identity\": null,\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 2,\n      \"sub_identity_confidence\": 1,\n      \"sector_confidence\": 1,\n      \"reason\": \"Generic descriptor with no specific service type or vertical indicated. Requires clarification to classify.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.002344,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": null,\n      \"is_new_identity\": false,\n      \"sub_identity\": null,\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 2,\n      \"sub_identity_confidence\": 1,\n      \"sector_confidence\": 1,\n      \"reason\": \"Too generic with no clear identity or sector signals\"\n    }\n  ]\n}"
     },
     {
       "id": "g-026",
@@ -748,23 +748,23 @@
         "is_disqualified": false
       },
       "actual": {
-        "primary_identity": null,
+        "primary_identity": "Consulting & Advisory",
         "sub_identity": null,
         "sector": null,
         "is_disqualified": false,
-        "identity_confidence": 2,
+        "identity_confidence": 7,
         "sub_identity_confidence": 1,
         "sector_confidence": 1
       },
       "field_pass": {
-        "primary_identity": false,
+        "primary_identity": true,
         "sub_identity": true,
         "sector": true,
         "is_disqualified": true
       },
-      "overall_pass": false,
-      "cost_usd": 0.000893,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": null,\n      \"is_new_identity\": false,\n      \"sub_identity\": null,\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 2,\n      \"sub_identity_confidence\": 1,\n      \"sector_confidence\": 1,\n      \"reason\": \"Generic 'consulting firm' lacks specificity. Could be strategy, IT, HR, engineering, or specialty consulting. Insufficient signal for confident tagging.\"\n    }\n  ]\n}\n```"
+      "overall_pass": true,
+      "cost_usd": 0.0007536,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Consulting & Advisory\",\n      \"is_new_identity\": false,\n      \"sub_identity\": null,\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 7,\n      \"sub_identity_confidence\": 1,\n      \"sector_confidence\": 1,\n      \"reason\": \"Generic term 'Consulting firm' implies Consulting & Advisory identity without specific sub-identity or sector\"\n    }\n  ]\n}"
     },
     {
       "id": "g-027",
@@ -792,8 +792,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000897,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": null,\n      \"is_new_identity\": false,\n      \"sub_identity\": null,\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 2,\n      \"sub_identity_confidence\": 1,\n      \"sector_confidence\": 1,\n      \"reason\": \"Too generic. 'Technology company' could be Software & SaaS, IT Services, or other identities. No specificity on service type or vertical.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007467999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": null,\n      \"is_new_identity\": false,\n      \"sub_identity\": null,\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 2,\n      \"sub_identity_confidence\": 1,\n      \"sector_confidence\": 1,\n      \"reason\": \"Generic term with no clear match in identity library; no strong signal for sub-identity or sector\"\n    }\n  ]\n}"
     },
     {
       "id": "g-028",
@@ -821,8 +821,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.0009109999999999999,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Hospitality & Travel\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Hospitality Operator\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": true,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Independent, family-owned restaurant with no B2B offering or scalable service component. Pure consumer-facing hospitality.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007576,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Hospitality & Travel\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Hospitality Operator\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": true,\n      \"identity_confidence\": 9,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 1,\n      \"reason\": \"Explicitly a family-owned restaurant (consumer local service), disqualified as B2B outreach.\"\n    }\n  ]\n}"
     },
     {
       "id": "g-029",
@@ -850,8 +850,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000976,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Software & SaaS\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Vertical SaaS\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Hospitality & Travel\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 9,\n      \"reason\": \"SaaS platform (HARD KEYWORD RULE 1) serving boutique hotels (explicit vertical). Vertical SaaS sub-identity applies.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007859999999999999,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Software & SaaS\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Vertical SaaS\",\n      \"is_new_sub_identity\": false,\n      \"sector\": \"Hospitality & Travel\",\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 10,\n      \"sub_identity_confidence\": 9,\n      \"sector_confidence\": 9,\n      \"reason\": \"SaaS platform for boutique hotels; 'hospitality SaaS' triggers Software & SaaS with Vertical SaaS sub-identity and Hospitality & Travel sector\"\n    }\n  ]\n}"
     },
     {
       "id": "g-030",
@@ -868,7 +868,7 @@
         "sub_identity": "Distribution & Wholesale",
         "sector": null,
         "is_disqualified": false,
-        "identity_confidence": 8,
+        "identity_confidence": 7,
         "sub_identity_confidence": 7,
         "sector_confidence": 1
       },
@@ -879,8 +879,8 @@
         "is_disqualified": true
       },
       "overall_pass": true,
-      "cost_usd": 0.000907,
-      "raw_response": "```json\n{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Retail\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Distribution & Wholesale\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 8,\n      \"sub_identity_confidence\": 7,\n      \"sector_confidence\": 1,\n      \"reason\": \"DTC brand with explicit B2B wholesale channel qualifies as inviteable. Retail identity with wholesale distribution sub-type.\"\n    }\n  ]\n}\n```"
+      "cost_usd": 0.0007568,
+      "raw_response": "{\n  \"results\": [\n    {\n      \"id\": 0,\n      \"identity\": \"Retail\",\n      \"is_new_identity\": false,\n      \"sub_identity\": \"Distribution & Wholesale\",\n      \"is_new_sub_identity\": false,\n      \"sector\": null,\n      \"is_new_sector\": false,\n      \"is_disqualified\": false,\n      \"identity_confidence\": 7,\n      \"sub_identity_confidence\": 7,\n      \"sector_confidence\": 1,\n      \"reason\": \"DTC brand with B2B wholesale channel suggests Retail identity with Distribution & Wholesale sub-identity\"\n    }\n  ]\n}"
     }
   ]
 }

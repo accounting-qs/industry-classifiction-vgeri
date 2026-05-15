@@ -492,8 +492,8 @@ function BucketingStatusBadge({ status }: { status: string }) {
 // strictly without over-committing on vague inputs (Sonnet/Opus tend to
 // propose sub-identities even when the prompt says "return null").
 const PHASE1A_MODEL_OPTIONS = [
-  { id: 'gpt-4.1-mini',     label: 'gpt-4.1-mini',                       approxCost100k: '~$15–25',   recommended: false, note: 'Cheapest. 29/30 identity, 16/16 sub-identity, 4/4 DQ on the 30-case battery — only missed an aviation/logistics edge case.' },
-  { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5',                   approxCost100k: '~$40–70',   recommended: true,  note: '30/30 identity, 16/16 sub-identity, 4/4 DQ on the 30-case battery — the only model that nailed every identity case AND obeyed the "return null on vague" rule.' },
+  { id: 'gpt-4.1-mini',     label: 'gpt-4.1-mini',                       approxCost100k: '~$15–25',   recommended: true,  note: 'Default. 28/30 identity, 26/30 sub-identity on the live-taxonomy goldens. Cheapest option; equivalent identity accuracy to Haiku at ~1/3 the cost.' },
+  { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5',                   approxCost100k: '~$40–70',   recommended: false, note: '27/30 identity, 26/30 sub-identity — equivalent to mini on identity, slightly better on sector. Worth the cost if sector accuracy matters a lot.' },
   { id: 'gpt-4.1',          label: 'gpt-4.1',                            approxCost100k: '~$60–90',   recommended: false, note: '29/30 identity, 16/16 sub-identity, 4/4 DQ. Equivalent to mini on accuracy, ~5× the cost — no reason to pick this over mini/Haiku.' },
   { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6',                 approxCost100k: '~$100–150', recommended: false, note: '29/30 identity, 14/16 sub-identity, 4/4 DQ. Over-commits sub-identities on vague inputs; the extra reasoning works against the strict-prompt design.' },
   { id: 'claude-opus-4-7',  label: 'Claude Opus 4.7',                    approxCost100k: '~$450–600', recommended: false, note: '29/30 identity, 14/16 sub-identity, 4/4 DQ. Same over-commit issue as Sonnet. Overkill for this task; only worth it on small, high-stakes lists.' },
