@@ -422,66 +422,84 @@ async function fetchFullVocabulary(
     totalContacts?: number
 ): Promise<VocabRow[]> {
     return withHeartbeat('vocabulary fetch', async () => {
-        const byIndustry = new Map<string, VocabRow>();
-        let lastId: string | null = null;
-        let scanned = 0;
-        let pageNum = 0;
+        await ctx?.checkCancel();
+        ctx?.progress({
+            phase: 'phase1a',
+            step: 'load_vocabulary',
+            current: 0,
+            total: totalContacts,
+            note: `Loading vocabulary from ${listNames.length} list${listNames.length === 1 ? '' : 's'}…`
+        });
 
-        while (true) {
-            await ctx?.checkCancel();
-            pageNum++;
-            const chunk = await fetchContactsChunk(supabase, listNames, lastId, CONTACT_PAGE_SIZE, ctx);
-            if (chunk.rows.length === 0) break;
-            lastId = chunk.nextLastId;
-            scanned += chunk.rows.length;
-
-            for (const contact of chunk.rows) {
-                const { industry, status } = vocabularyStatus(contact);
-                const existing = byIndustry.get(industry);
-                if (!existing) {
-                    if (byIndustry.size >= VOCAB_HARD_LIMIT) {
-                        throw new Error(
-                            `Phase 1a vocabulary exceeds BUCKETING_VOCAB_HARD_LIMIT=${VOCAB_HARD_LIMIT.toLocaleString()} distinct classifications. ` +
-                            `Increase the limit or split the run; refusing to mark a partial taxonomy as complete.`
-                        );
-                    }
-                    byIndustry.set(industry, {
-                        industry,
-                        n: 1,
-                        enrichment_status: status,
-                        sample_companies: contact.company_name ? [contact.company_name] : []
-                    });
-                    continue;
-                }
-
-                existing.n = Number(existing.n || 0) + 1;
-                if (!completedBeats(existing.enrichment_status) && completedBeats(status)) {
-                    existing.enrichment_status = status;
-                }
-                if (contact.company_name && (existing.sample_companies || []).length < 3) {
-                    existing.sample_companies = [...(existing.sample_companies || []), contact.company_name];
-                }
-            }
-
-            if (pageNum % 10 === 0 || !chunk.hasMore) {
-                ctx?.log(
-                    `[Bucketing] vocabulary streamed ${scanned.toLocaleString()}${totalContacts ? `/${totalContacts.toLocaleString()}` : ''} contacts ` +
-                    `→ ${byIndustry.size.toLocaleString()} distinct classifications`
-                );
-            }
-            ctx?.progress({
-                phase: 'phase1a',
-                step: 'load_vocabulary',
-                current: scanned,
-                total: totalContacts,
-                note: `Loaded ${scanned.toLocaleString()}${totalContacts ? `/${totalContacts.toLocaleString()}` : ''} contacts; ${byIndustry.size.toLocaleString()} distinct classifications…`
-            });
-
-            if (!chunk.hasMore) break;
+        // Server-side aggregation via the get_industry_vocabulary RPC.
+        // The RPC runs with statement_timeout=300s, bypassing the role-level
+        // default that previously tripped client-side keyset pagination
+        // after ~3s on real-size lists. One round-trip, GROUP BY industry +
+        // enrichment_status, sorted by n DESC server-side.
+        const t0 = Date.now();
+        const { data, error } = await supabase.rpc('get_industry_vocabulary', {
+            p_list_names: listNames,
+            // +1 so we can detect overflow without truncating silently.
+            p_limit: VOCAB_HARD_LIMIT + 1
+        });
+        const ms = Date.now() - t0;
+        if (error) {
+            ctx?.log(`[Bucketing] vocabulary RPC failed after ${ms}ms: ${error.message}`, 'error');
+            throw new Error(`vocabulary fetch failed: ${error.message}`);
         }
+        const rpcRows = (data || []) as Array<{
+            industry: string;
+            n: number | string;
+            enrichment_status: string;
+            sample_companies: string[] | null;
+        }>;
+        if (rpcRows.length > VOCAB_HARD_LIMIT) {
+            throw new Error(
+                `Phase 1a vocabulary exceeds BUCKETING_VOCAB_HARD_LIMIT=${VOCAB_HARD_LIMIT.toLocaleString()} distinct (industry, status) rows. ` +
+                `Increase the limit or split the run; refusing to mark a partial taxonomy as complete.`
+            );
+        }
+        ctx?.log(
+            `[Bucketing] vocabulary RPC returned ${rpcRows.length.toLocaleString()} (industry, status) rows in ${ms}ms`
+        );
 
-        return Array.from(byIndustry.values())
+        // The RPC groups by (industry, enrichment_status) so the same
+        // industry string can appear under multiple statuses (e.g. some
+        // contacts completed, some failed). Collapse to one VocabRow per
+        // industry: sum counts, keep the highest-precedence status, merge
+        // up to 3 sample companies.
+        const byIndustry = new Map<string, VocabRow>();
+        for (const r of rpcRows) {
+            const existing = byIndustry.get(r.industry);
+            if (!existing) {
+                byIndustry.set(r.industry, {
+                    industry: r.industry,
+                    n: Number(r.n) || 0,
+                    enrichment_status: r.enrichment_status,
+                    sample_companies: (r.sample_companies || []).slice(0, 3)
+                });
+                continue;
+            }
+            existing.n = Number(existing.n || 0) + (Number(r.n) || 0);
+            if (!completedBeats(existing.enrichment_status) && completedBeats(r.enrichment_status)) {
+                existing.enrichment_status = r.enrichment_status;
+            }
+            if ((existing.sample_companies || []).length < 3 && r.sample_companies?.length) {
+                const merged = Array.from(new Set([...(existing.sample_companies || []), ...r.sample_companies]));
+                existing.sample_companies = merged.slice(0, 3);
+            }
+        }
+        const collapsed = Array.from(byIndustry.values())
             .sort((a, b) => Number(b.n || 0) - Number(a.n || 0));
+
+        ctx?.progress({
+            phase: 'phase1a',
+            step: 'load_vocabulary',
+            current: totalContacts || collapsed.reduce((s, v) => s + Number(v.n || 0), 0),
+            total: totalContacts,
+            note: `Loaded ${collapsed.length.toLocaleString()} distinct classifications.`
+        });
+        return collapsed;
     }, ctx);
 }
 
