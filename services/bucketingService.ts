@@ -33,13 +33,27 @@ import pLimit from 'p-limit';
 import Anthropic from '@anthropic-ai/sdk';
 import { getSetting } from './appSettings';
 import { checkBucketingSchema } from './bucketingSchemaCheck';
+import {
+    HARD_KEYWORD_ROUTING,
+    CORE_PRINCIPLES,
+    DISQUALIFICATION_RULES,
+    EXACT_SPELLING_RULE,
+    renderLibraryMenu,
+    renderLibraryReference
+} from './bucketingPromptParts';
 
 // ─── HARD-CODED MODEL + CONCURRENCY CONFIG ─────────────────────────
 // Per user request: no env reliance for non-secret config. Only the
 // Anthropic API key is runtime-configurable (via Connectors UI / app_settings).
 const TAXONOMY_MODEL_ANTHROPIC = 'claude-sonnet-4-6';
 const TAXONOMY_MODEL_OPENAI = 'gpt-4.1';
-const MATCH_MODEL = 'gpt-4.1-mini';
+// Phase 1b matching model. `gpt-4.1-mini` is ~3× cheaper than
+// `claude-haiku-4-5` and accuracy is equivalent on our 30-case golden set,
+// so we default to mini. classifyContactBatch dispatches on the model prefix
+// (`gpt-*` → OpenAI fetch with strict json_schema; `claude-*` → Anthropic SDK
+// with lenient parser + drift-retry) so the constant can be flipped without
+// touching the call path. Override at eval time via the EVAL_MATCH_MODEL env.
+const MATCH_MODEL = process.env.EVAL_MATCH_MODEL || 'gpt-4.1-mini';
 const EMBEDDING_MODEL = 'text-embedding-3-small';
 const MATCH_BATCH_SIZE = 8;
 const MATCH_CONCURRENCY = 40;
@@ -1766,7 +1780,8 @@ export async function finalizeTaxonomyAgainstLibrary(
     })));
 
     const costUsd = isAnthropic
-        ? computeAnthropicCost(phase1aModel, totalIn - totalCachedIn, totalOut)
+        ? computeAnthropicCost(phase1aModel, totalIn, totalOut)
+            + (totalCachedIn / 1_000_000) * (ANTHROPIC_PRICING[phase1aModel]?.input || 3) * 0.1
         : computeOpenAICost(phase1aModel, totalIn - totalCachedIn, totalCachedIn, totalOut);
 
     // Apply: index the LLM output by industry string (parseTaggingJson preserves
@@ -2240,7 +2255,8 @@ export async function runBucketAssignment(
     }
 
     const costUsd = isAnthropic
-        ? computeAnthropicCost(phase1aModel, totalIn - totalCachedIn, totalOut)
+        ? computeAnthropicCost(phase1aModel, totalIn, totalOut)
+            + (totalCachedIn / 1_000_000) * (ANTHROPIC_PRICING[phase1aModel]?.input || 3) * 0.1
         : computeOpenAICost(phase1aModel, totalIn - totalCachedIn, totalCachedIn, totalOut);
 
     // Apply: enforce library + identity validity, count outcomes, build updates.
@@ -2409,7 +2425,7 @@ export async function debugTagSingleIndustry(
         cost = computeOpenAICost(model, (usage.prompt_tokens || 0) - cached, cached, usage.completion_tokens || 0);
     }
 
-    const parsed = parseTaggingJson(raw, vocab);
+    const parsed = snapTaggingsToLibrary(parseTaggingJson(raw, vocab), snapshot);
     return {
         raw_response: raw,
         parsed: parsed[0] || null,
@@ -2421,6 +2437,86 @@ export async function debugTagSingleIndustry(
         prompt_chars: systemPrompt.length + userPrompt.length,
         model_used: model,
         cost_usd: cost
+    };
+}
+
+// Eval helper — runs a single classification through the real Phase 1b path
+// (classifyContactBatch + snap) using the live taxonomy as leaves. Used by
+// scripts/eval/run-eval-phase1b.ts. Not used in production.
+export async function evalClassifyContact(
+    supabase: SupabaseClient,
+    classification: string
+): Promise<{
+    primary_identity: string | null;
+    sub_identity: string | null;
+    sector: string | null;
+    is_disqualified: boolean;
+    identity_score: number;
+    sub_identity_score: number;
+    cost_usd: number;
+    raw_response: string;
+}> {
+    const snapshot = await loadTaxonomySnapshot(supabase);
+    // Match production dispatch: only resolve Anthropic when MATCH_MODEL is claude-*.
+    const useAnthropic = MATCH_MODEL.startsWith('claude-');
+    const anthropic = useAnthropic ? await getAnthropic(supabase) : null;
+    if (useAnthropic && !anthropic) throw new Error('Anthropic API key not configured.');
+
+    // Build leaves from the live taxonomy — one per sub-identity. Phase 1b
+    // production builds leaves from per-run Phase 1a results, but for eval we
+    // surface the full library so the LLM has the same choices as Phase 1a.
+    const leaves: DiscoveredBucket[] = snapshot.sub_identities.map(s => ({
+        sub_identity: s.name,
+        primary_identity: s.parent_identity || '',
+        description: s.description || '',
+        identity_type: 'other',
+        operator_required: false,
+        priority_rank: 5,
+    }));
+    const validSpecNames = new Set(leaves.map(l => l.sub_identity));
+    const validIdentityNames = new Set(snapshot.identities.map(i => i.name));
+    const sectorVocab = snapshot.sectors.map(s => s.name);
+
+    const refByIdentity: Record<string, any[]> = {};
+    for (const l of leaves) {
+        if (!refByIdentity[l.primary_identity]) refByIdentity[l.primary_identity] = [];
+        refByIdentity[l.primary_identity].push({
+            sub_identity: l.sub_identity,
+            description: l.description,
+            identity_type: l.identity_type,
+            operator_required: l.operator_required,
+            priority_rank: l.priority_rank,
+        });
+    }
+    const bucketReferenceJson = JSON.stringify(refByIdentity);
+
+    const fakeBatch: ContactRouteInput[] = [{
+        contact_id: 'eval',
+        company_name: null,
+        company_website: null,
+        industry: null,
+        lead_list_name: null,
+        enrichment_status: 'completed',
+        classification,
+        confidence: 0.9,
+        reasoning: null,
+        error_message: null,
+    }];
+
+    const { results, costUsd } = await classifyContactBatch(
+        fakeBatch, bucketReferenceJson, sectorVocab, validSpecNames, validIdentityNames,
+        anthropic, undefined
+    );
+    const r = results[0] || makeFallbackChain();
+    return {
+        primary_identity: r.primary_identity.name || null,
+        sub_identity: r.sub_identity.name || null,
+        sector: (r.sector || '').trim() || null,
+        is_disqualified: !!r.disqualified,
+        identity_score: r.primary_identity.score || 0,
+        sub_identity_score: r.sub_identity.score || 0,
+        cost_usd: costUsd,
+        raw_response: JSON.stringify(r),
     };
 }
 
@@ -2534,7 +2630,8 @@ async function tagIndustries(
                 totalOut += usage.completion_tokens || 0;
                 text = json.choices?.[0]?.message?.content || '';
             }
-            const parsed = parseTaggingJson(text, batch);
+            const parsedRaw = parseTaggingJson(text, batch);
+            const parsed = snapTaggingsToLibrary(parsedRaw, snapshot);
             // An empty parse means the LLM produced JSON we couldn't extract
             // taggings from (wrong key, missing items, malformed shape). Treat
             // it as a failed batch so (a) catastrophic-failure detection kicks
@@ -2612,257 +2709,139 @@ async function tagIndustries(
         );
     }
 
+    // Anthropic's input_tokens is uncached only (per SDK type docs). Bill the
+    // three input components at their respective rates instead of subtracting
+    // cached from input — that subtraction over-discounts and can go negative
+    // when cache reads dominate.
     const costUsd = isAnthropic
-        ? computeAnthropicCost(model, totalIn - totalCachedIn, totalOut)
+        ? computeAnthropicCost(model, totalIn, totalOut)
             + (totalCachedIn / 1_000_000) * (ANTHROPIC_PRICING[model]?.input || 3) * 0.1
         : computeOpenAICost(model, totalIn - totalCachedIn, totalCachedIn, totalOut);
     return { taggings, costUsd, modelUsed: model };
 }
 
 function buildTaggingSystemPrompt(s: TaxonomySnapshot): string {
-    const idLines = s.identities.map(i =>
-        `  - ${i.name}${i.is_disqualified ? ' [DQ]' : ''}: ${i.description || ''}`
-    ).join('\n');
-    const chLines = s.sub_identities.map(c =>
-        `  - ${c.name} (under ${c.parent_identity}): ${c.description || ''}`
-    ).join('\n');
-    const secLines = s.sectors.map(sec =>
-        `  - ${sec.name}: ${sec.synonyms || sec.description || ''}`
-    ).join('\n');
+    return `You tag B2B contact industries for outreach segmentation.
 
-    return `You are tagging B2B contact industries for outreach segmentation.
+For each input industry, return three independent tags plus per-tag confidence:
+- identity (REQUIRED)  — what kind of company is it at its core?
+- sub_identity         — the functional sub-type within that identity (optional)
+- sector               — the vertical the company SERVES, only when explicit (optional)
 
-For each industry text the user provides, return three independent tags. The three tags form a layered truth model: identity is broadest, sector is narrowest.
+${EXACT_SPELLING_RULE}
 
-1. **Identity** (REQUIRED) — what kind of company is it at its core? Pick from the IDENTITY library below. Strongly prefer the closest existing entry. Only propose a new identity (is_new_identity=true) when no library entry is even loosely applicable AND the new identity satisfies the GRANULARITY RULES below. Identities marked [DQ] are *historically* disqualified for B2B outreach; treat the marker as a strong hint, not a hard rule (see DISQUALIFICATION RULES).
+${renderLibraryMenu(s)}
 
-2. **Sub-Identity** (optional) — the company's primary functional sub-type within its identity. Pick from the SUB-IDENTITIES library below; the parent_identity must match the identity you chose. Strongly prefer the closest existing entry. Only propose a new sub-identity (is_new_sub_identity=true) when no library entry is even loosely applicable AND the new entry satisfies the GRANULARITY RULES below. If no sub-identity applies, return null.
+${HARD_KEYWORD_ROUTING}
 
-3. **Sector** (optional) — the specific vertical the company serves. Pick from the SECTOR library below. Sector is independent of identity (a "Marketing Agency serving Healthcare" has identity=Agency, sector=Healthcare / Medical). Strongly prefer the closest existing entry. Only propose a new sector (is_new_sector=true) when no library entry covers the served vertical AND the new entry satisfies the GRANULARITY RULES below. If the company doesn't have a clear served sector, return null.
+${CORE_PRINCIPLES}
 
-GRANULARITY RULES (critical — controls bucket reusability):
+${DISQUALIFICATION_RULES}
 
-== IDENTITY (Layer 1) ==
-What kind of company this IS at its core — its primary business model or main company type. Target: ~10–20 identities in a typical run.
+═══════════════════════════════════════════════════════════════════════════
+CONFIDENCE SCORING (per tag, integer 1-10)
+═══════════════════════════════════════════════════════════════════════════
 
-RIGHT level (use names like these verbatim where applicable):
-  Agency · Consulting & Advisory · Software & SaaS · Manufacturing & Industrial ·
-  Real Estate · Healthcare Operator · Financial Services · Non-Profit & Association ·
-  Education Operator · Field Services · Government Contractor · Distribution & Wholesale ·
-  Energy & Utilities · Transportation & Logistics · Staffing & Recruiting ·
-  Legal Services · Accounting & Tax · Insurance · Hospitality & Travel ·
-  Telecommunications · Media & Publishing · Consumer & Retail [DQ]
+Return THREE independent scores: identity_confidence, sub_identity_confidence,
+sector_confidence. Each scores ONE tag, not the whole row.
 
-TOO NARROW (forbidden — collapse to a broader identity):
-  "Subscription Service" (a billing model, not an identity)
-  "Logistics & Supply Chain Services" → "Transportation & Logistics"
-  "Telecommunications" + "Telecommunications Services" (same — pick one)
+  9-10  explicit, unambiguous match
+  7-8   strong inference from context
+  5-6   weak signal; downstream may ignore
+  1-4   guessing — prefer setting the tag to null + confidence 1-3
 
-== SUB-IDENTITY (Layer 2) — most common over-segmentation source ==
-The specific functional sub-type within the chosen Identity. Target: ~3–8 sub-identities per identity. Total sub-identities across the whole run: 40–100 unless you have a strong reason to exceed.
+If you set a tag to null, its confidence MUST be 1.
 
-RIGHT level (examples by identity):
-  Agency: SEO Agency · Performance Marketing Agency · Creative Agency · PR Agency · Branding Agency
-  Software & SaaS: FinTech SaaS · Vertical SaaS · CRM / Sales Software · MarTech SaaS · HR SaaS
-  Financial Services: Wealth Management · Private Equity · Venture Capital · Investment Banking · M&A Advisory · Insurance Brokerage · Lending / Credit
-  Real Estate: Brokerage · Property Management · Real Estate Development · Real Estate Investment
-  Consulting & Advisory: Business Consulting · Management Consulting · Financial Advisory · HR Consulting · IT Consulting
+═══════════════════════════════════════════════════════════════════════════
+NEW-VALUE PROPOSALS
+═══════════════════════════════════════════════════════════════════════════
 
-DO NOT create a new sub-identity unless ALL of these are true:
-  1. It can apply to multiple companies, not just one.
-  2. It is meaningfully different from existing sub-identities under the same identity.
-  3. It is useful for segmentation, personalization, filtering, or campaign strategy.
-  4. It is not just a rewording or slightly narrower version of an existing sub-identity.
-  5. It does not mix in served verticals — those belong in Sector.
-  6. It does not describe a tiny niche unless that niche appears repeatedly and is commercially useful.
+Set is_new_*=true ONLY when no library entry is even loosely applicable AND the
+proposed value would apply to multiple companies (not a one-off). When proposing
+new values, avoid:
+  - one-off niche names
+  - rewordings of existing entries (e.g. "Wealth Management Firm" when "Wealth
+    Management" already exists in the library)
+  - names that mix in served verticals (those belong in sector)
+  - plural/singular variants of existing names
 
-Before adding a new sub-identity, ALWAYS check whether it should be merged into an existing broader sub-identity. Examples of merges you MUST apply:
-  "Financial Advisory Services" → Financial Advisory
-  "Investment Advisory" → Financial Advisory  (or Investment Management depending on context)
-  "Investment & Development" → Real Estate Investment  (or Real Estate Development)
-  "Residential Brokerage" → Brokerage
-  "Real Estate Brokerage" → Brokerage
-  "Wealth Management Firm" → Wealth Management
-  "Private Equity Firm" → Private Equity
-  "Venture Capital Firm" → Venture Capital
-  "Managed IT Services and Cybersecurity" → Managed IT Services
-  "FinTech Software Company" → FinTech SaaS
+═══════════════════════════════════════════════════════════════════════════
+OUTPUT FORMAT — return ONLY valid JSON, no prose, no markdown
+═══════════════════════════════════════════════════════════════════════════
 
-Quality check before finalizing a sub-identity. Ask:
-  1. Is this sub-identity reusable across multiple companies?
-  2. Is it meaningfully distinct from existing options?
-  3. Would a marketer or sales operator actually use this distinction?
-  4. Could this be merged into a broader label without losing important value?
-  5. Is this actually a sector instead of a sub-identity?
-Only keep the sub-identity if the answers support keeping it. When in doubt, merge into a broader existing sub-identity instead of creating a new one.
-
-== SECTOR (Layer 3) ==
-The vertical the company SERVES, only when EXPLICITLY stated in the input. Independent of identity. Target: 10–20 sectors total in a typical run.
-
-DEFAULT IS BLANK. Sector should be blank for most contacts. Only fill it when the input text explicitly states the vertical the company serves (not the company's own industry).
-
-Pick from these CANONICAL sectors verbatim — do NOT invent variants:
-  Healthcare · Real Estate · Government · Education · Energy & Utilities ·
-  Financial Services · Manufacturing · Hospitality & Travel · Technology & Software ·
-  Non-Profit & Social Impact · Legal · Retail · Media & Entertainment ·
-  Life Sciences & Biotech · Transportation & Logistics · Construction & Infrastructure ·
-  Agriculture · Telecommunications · Aerospace & Defense · Multi-industry
-
-If the served vertical doesn't fit any of the above, prefer BLANK over inventing a new sector. Only set is_new_sector=true when the input EXPLICITLY mentions a vertical that genuinely doesn't fit any canonical sector AND that vertical would apply to ≥10 companies in a typical B2B run.
-
-REQUIRED MERGES (apply these whenever you see a candidate sector that matches):
-  Sports / Athletics / Sports & Entertainment / Esports → Media & Entertainment
-  Recreational / Leisure / Recreation & Outdoor → Hospitality & Travel
-  Gaming / Gambling → Media & Entertainment
-  Food Technology / Food & Beverage / Restaurant → Food & Beverage  (use this name)
-  Renewable Energy / Solar Energy / Oil & Gas / Utilities → Energy & Utilities
-  Healthcare / Medical / Pharma / Biotech → Healthcare  (or Life Sciences & Biotech if pharma/biotech-specific)
-  Affordable Housing / Housing / Property → Real Estate
-  Aviation / Defense / Aerospace → Aerospace & Defense
-  Construction / Infrastructure → Construction & Infrastructure
-  Insurance → Financial Services  (insurance is a Financial Services sub-vertical)
-  Environmental / Climate → Non-Profit & Social Impact  (or Energy & Utilities if energy-focused)
-
-DO NOT use as a sector (these are identities or non-verticals — return BLANK instead):
-  Marketing · Advertising · IT Services · Professional Services · Consulting ·
-  Corporate · B2B · Small Business · Subscription · Holding Company
-
-Examples:
-  ✓ Marketing agency for healthcare companies → identity=Agency, sub-identity=Performance Marketing Agency, sector=Healthcare
-  ✓ SaaS platform for real estate investors → identity=Software & SaaS, sub-identity=Vertical SaaS, sector=Real Estate
-  ✓ Wealth management firm (no vertical mentioned) → identity=Financial Services, sub-identity=Wealth Management, sector=BLANK
-  ✓ "Influencer marketing agency" (no vertical) → sector=BLANK, NOT "Marketing & Advertising"
-  ✓ Hedge fund (multi-strategy) → sector=BLANK, NOT "Multi-industry" unless the text explicitly says it
-
-== WHEN IN DOUBT ==
-- Keep Identity broad and stable.
-- Keep Sub-Identities controlled and reusable.
-- Keep Sector only for explicitly served markets.
-- Prefer merging over creating new categories.
-- Avoid one-off sub-identities, near-duplicates, plural/singular variants.
-- Use the EXACT spelling of the canonical names above so different batches converge.
-The bar to set is_new_*=true is HIGH: only do it when no existing or canonical name is even loosely applicable AND the new entry passes the quality checks above.
-
-HARD KEYWORD ROUTING (applies BEFORE any other rule — if the input matches, the identity is fixed):
-
-- Mentions "SaaS", "software platform", "software for", "B2B software", or names a software product
-    → identity MUST be Software & SaaS (NEVER Agency, NEVER Consulting)
-- Mentions "staffing", "recruiting", "recruitment", "talent acquisition", "executive search"
-    → identity MUST be Staffing & Recruiting (NEVER Government Contractor, NEVER Agency)
-- Mentions "law firm", "litigation services", "legal services", "court reporting", "legal videography", "attorney", "paralegal"
-    → identity MUST be Legal Services (NEVER Accounting & Tax, NEVER Consulting)
-- Mentions "venture capital", "VC fund", "private equity", "PE firm", "hedge fund", "investment management", "asset management", "family office", "wealth management"
-    → identity MUST be Financial Services (NEVER Software & SaaS even if they invest in software companies)
-- Starts with "Manufacturer", "Maker of", or describes the company as "manufactures X" / "produces X"
-    → identity MUST be Manufacturing & Industrial (NEVER Staffing & Recruiting, NEVER Agency)
-- Mentions "marketing agency", "advertising agency", "creative agency", "branding agency", "PR agency", "media agency", "digital agency", "performance marketing"
-    → identity MUST be Agency (NEVER Consulting & Advisory unless the company explicitly self-identifies as a consultancy)
-- Mentions "non-profit", "nonprofit", "501(c)", "foundation", "charity", "land trust"
-    → identity MUST be Non-Profit & Association (NEVER Manufacturing — even when they conserve land or build housing)
-- Mentions "architecture", "architectural design", "interior design", "engineering firm", "general contractor", "home builder"
-    → identity MUST be Construction & Engineering (NEVER Manufacturing)
-- Mentions "real estate brokerage", "real estate developer", "property management", "real estate investment"
-    → identity MUST be Real Estate
-- Mentions "compliance software", "compliance technology", "regtech", "supply-chain software", "documentation software", "collaboration software"
-    → identity MUST be Software & SaaS
-
-When ANY of the above patterns matches, you MUST use the stated identity even if the company also serves a different vertical. The vertical goes into SECTOR, never into IDENTITY. If two patterns conflict, prefer the one whose keyword appears earlier in the input.
-
-CLASSIFICATION RULES (critical):
-- Classify by core business identity FIRST, sector served SECOND. A PE firm focused on healthcare is identity=Financial Services, NOT Healthcare.
-- Operators in a vertical (a hospital, a SaaS company) belong to that identity. Service providers TO that vertical (an agency that markets healthcare, a consultant to insurers) belong to the service identity, with the vertical going into sector.
-- **"X for Y" means identity=X, sector=Y.** Examples: "Digital marketing for nonprofits" → identity=Agency, sector=Non-Profit & Social Impact. "SaaS for K-12 schools" → identity=Software & SaaS, sector=Education. NEVER let the served vertical (Y) become the identity.
-- **SERVICES vs PRODUCTS — do not collapse them**. Companies that *rent*, *maintain*, *repair*, or *operate-as-a-service* should NEVER be tagged "B2B Product Manufacturer" / "Industrial Equipment / Machinery" just because they're industrial-adjacent. If no services sub-identity fits, prefer a Services / Field Services / Equipment Rental / Maintenance Services sub-identity if one exists in the library — otherwise propose one (is_new_sub_identity=true) rather than picking a wrong manufacturer label. Reserve Manufacturer sub-identities for companies whose primary act is *making* a physical product.
-- **Talent / Artist Management is an Agency, not Consulting.** Don't tag artist management firms, modeling agencies, or sports management firms as Management Consulting.
-- **Game / Software studios are Software & SaaS (or a new Software identity), not Hospitality / Travel / Consumer Retail** — even if the games are sold to consumers. Use is_disqualified=true only if the company is unambiguously pure-consumer with no B2B angle.
-
-DISQUALIFICATION RULES (be CONSERVATIVE — false negatives are worse than false positives):
-- Set is_disqualified=true ONLY when the text gives clear, explicit evidence the company is a pure-consumer / hyper-local / low-ticket business with no plausible B2B angle. Examples:
-    * "Family-owned restaurant in Austin"
-    * "Independent dog grooming salon"
-    * "Local plumbing business, residential only"
-    * "Direct-to-consumer candle brand"
-- Do NOT auto-DQ just because the identity is marked [DQ] or the text mentions retail/hospitality/consumer. Many such companies have a B2B / wholesale / SaaS / advisory arm that we'd want to invite. Examples that should stay inviteable (is_disqualified=false):
-    * "Hospitality SaaS for boutique hotels" → Software & SaaS, not DQ
-    * "Wholesale distribution platform for restaurants" → Software & SaaS or Consulting, not DQ
-    * "Multi-location dental group with 40+ practices" → Healthcare & Medical operator, not DQ
-    * "DTC brand with B2B wholesale channel" → keep inviteable
-- When uncertain, set is_disqualified=false and let the user decide downstream. The reason field should explain why if you DO disqualify.
-
-CONFIDENCE SCORING (per tag, 1-10):
-- Return THREE independent confidence scores: identity_confidence, sub_identity_confidence, sector_confidence.
-- Each scores how sure you are about THAT tag specifically, not the whole row.
-- A "PE firm investing in healthcare" might be identity_confidence=10, sub_identity_confidence=9, sector_confidence=8 (sector clear).
-- A "consulting firm" with no vertical mentioned might be identity_confidence=8, sub_identity_confidence=5 (which kind of consulting?), sector_confidence=2 (no sector mentioned — return null sector and score 1-3).
-- <6 means: this specific tag is a guess; downstream code may ignore it.
-- If you return null for a tag (e.g. no sector applicable), set its confidence to 1.
-
-OUTPUT FORMAT (STRICT) — return ONLY valid JSON, no prose, no markdown:
-The top-level object MUST use the key "results" (not "industries", not "taggings",
-not "output" — exactly "results"). Each item's "id" MUST match the input "id"
-(integer). Return one item per input industry, in the same order:
+The top-level object MUST use the key "results". Each item's "id" MUST match
+the input "id" (integer). Return one item per input industry, same order:
 
 {
   "results": [
     {
       "id": <integer matching input id>,
-      "identity": "<library name or new>" | null,
+      "identity": "<exact library name or proposed new>" | null,
       "is_new_identity": <bool>,
-      "sub_identity": "<library name or new>" | null,
+      "sub_identity": "<exact library name or proposed new>" | null,
       "is_new_sub_identity": <bool>,
-      "sector": "<library name or new>" | null,
+      "sector": "<exact library name or proposed new>" | null,
       "is_new_sector": <bool>,
       "is_disqualified": <bool>,
       "identity_confidence": <1-10 integer>,
       "sub_identity_confidence": <1-10 integer>,
       "sector_confidence": <1-10 integer>,
       "reason": "<brief justification, <= 30 words>"
-    }, ...
+    }
   ]
 }
 
-== IDENTITY LIBRARY ==
-${idLines}
+═══════════════════════════════════════════════════════════════════════════
+LIBRARIES (richer reference — VALID_* above is the source of truth for names)
+═══════════════════════════════════════════════════════════════════════════
 
-== SUB-IDENTITIES LIBRARY ==
-${chLines}
+${renderLibraryReference(s)}
 
-== SECTOR LIBRARY ==
-${secLines}
+═══════════════════════════════════════════════════════════════════════════
+WORKED EXAMPLES (illustrative — always pick from the VALID_* lists above)
+═══════════════════════════════════════════════════════════════════════════
 
-== IMPLICIT BASELINE (use when the libraries above are sparse) ==
-When no library entry is even loosely applicable, prefer one of these
-common B2B identities / sectors before inventing a brand-new one. They
-are the most common categories across B2B vocabularies. Use the EXACT
-spelling shown:
+Input:  Digital marketing agency
+Output: identity=Agency, sub_identity=Performance Marketing Agency, sector=null
+Note:   generic agency, no vertical mentioned → sector blank
 
-Common identities (pick the closest):
-  Agency · Consulting & Advisory · Software & SaaS · IT Services ·
-  Financial Services · Healthcare Operator · Healthcare Services ·
-  Real Estate · Manufacturing & Industrial · Construction & Engineering ·
-  Field Services & Maintenance · Equipment Rental & Leasing ·
-  Distribution & Wholesale · Energy & Utilities ·
-  Transportation & Logistics · Telecommunications · Media & Publishing ·
-  Education Operator · Government Contractor · Non-Profit & Associations ·
-  Legal Services · Accounting & Tax · Staffing & Recruiting ·
-  Insurance · Hospitality & Travel · Consumer & Retail [DQ]
+Input:  SEO agency for healthcare clinics
+Output: identity=Agency, sub_identity=Performance Marketing Agency, sector=Healthcare
+Note:   "X for Y" — Y is the served vertical, becomes the sector
 
-Common sectors (pick the closest, leave blank if none):
-  Healthcare · Real Estate · Government · Education · Energy & Utilities ·
-  Financial Services · Manufacturing · Hospitality / Travel ·
-  Technology & Software · Non-Profit & Social Impact · Legal · Retail ·
-  Media & Entertainment · Life Sciences & Biotech · Transportation & Logistics ·
-  Construction & Infrastructure · Agriculture · Telecommunications ·
-  Multi-industry
+Input:  Private equity firm focused on lower-middle market buyouts
+Output: identity=Financial Services, sub_identity=Private Equity, sector=null
 
-Treat this baseline like a soft library. CRITICAL: use the EXACT spelling
-shown above so different batches converge on the same canonical name —
-don't paraphrase ("Construction & Engineering" not "Construction and
-Engineering Services" or "Construction Services"; "Software & SaaS" not
-"Software Services" or "B2B SaaS"). Set is_new_*=true on any baseline entry
-that isn't in the actual library above (the user can promote it after the
-run). Only invent a brand-new name when even the baseline doesn't loosely
-cover the company.`;
+Input:  Investment bank focused on healthcare M&A
+Output: identity=Financial Services, sub_identity=Investment Banking, sector=Healthcare
+
+Input:  Software platform for K-12 schools
+Output: identity=Software & SaaS, sub_identity=Vertical SaaS, sector=Education
+
+Input:  Healthcare staffing agency placing travel nurses
+Output: identity=Staffing & Recruiting, sub_identity=Healthcare Staffing, sector=Healthcare
+
+Input:  Managed IT services provider for small and mid-sized businesses
+Output: identity=IT Services, sub_identity=Managed IT Services, sector=null
+
+Input:  PE-backed software company building tools for restaurants
+Output: identity=Software & SaaS, sub_identity=Vertical SaaS, sector=Hospitality & Travel
+Note:   "PE-backed" is a financing status, NOT the identity
+
+Input:  Independent insurance agency for commercial lines
+Output: identity=Insurance Services, sub_identity=Insurance Brokerage, sector=null
+Note:   Insurance Services is its own identity, NOT Financial Services
+
+Input:  Family-owned restaurant in Austin
+Output: identity=Hospitality & Travel, sub_identity=Hospitality Operator, sector=null, is_disqualified=true
+
+Input:  Professional services firm  (truly generic, no signal)
+Output: identity=null, sub_identity=null, sector=null  (all confidences 1-3)
+Note:   don't over-claim when the input is generic — return nulls.
+
+Input:  Consulting firm  (vague identity, no sub-identity signal)
+Output: identity=Consulting & Advisory, sub_identity=null, sector=null
+Note:   pick the identity when it's clear; leave sub-identity null when not.`;
 }
 
 function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
@@ -2949,6 +2928,28 @@ function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
     return out;
 }
 
+// Lenient JSON parser for Phase 1b Anthropic output. Anthropic doesn't support
+// OpenAI's `response_format: { type: 'json_schema', strict: true }`, so the
+// model occasionally wraps the JSON in markdown fences or omits the
+// "assignments" wrapper. We extract whatever array-of-objects we can find that
+// looks like Phase 1b assignments.
+function parsePhase1bAssignments(raw: string): any[] {
+    let txt = (raw || '').trim();
+    const fence = txt.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fence) txt = fence[1].trim();
+    let parsed: any;
+    try { parsed = JSON.parse(txt); }
+    catch { throw new Error(`Phase 1b response is not valid JSON: ${txt.slice(0, 200)}`); }
+    if (Array.isArray(parsed?.assignments)) return parsed.assignments;
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && typeof parsed === 'object') {
+        for (const k of Object.keys(parsed)) {
+            if (Array.isArray(parsed[k]) && parsed[k].length > 0) return parsed[k];
+        }
+    }
+    return [];
+}
+
 function nz(v: any): string | null {
     if (v === null || v === undefined) return null;
     const s = String(v).trim();
@@ -2970,6 +2971,140 @@ function validTag(v: string | null): string | null {
     if (TAG_SENTENCE_START.test(v)) return null;
     if (TAG_SENTENCE_PUNCT.test(v)) return null;
     return v;
+}
+
+// ─── snap-to-library ────────────────────────────────────────────────
+// Claude Haiku and gpt-4.1-mini both consistently shorten or paraphrase
+// taxonomy names ("Private Equity" instead of "Private Equity Firm";
+// "Cybersecurity Software" instead of "Cybersecurity SaaS"). The prompt
+// asks for exact spelling, but compliance is unreliable. snapTaggingsToLibrary
+// runs after parseTaggingJson and deterministically maps fuzzy outputs back
+// to canonical library entries. If no canonical entry covers the LLM's value
+// well enough, we leave it alone with is_new_*=true so the user can promote
+// it during review.
+
+function snapTokens(s: string): string[] {
+    return s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').split(' ').filter(t => t.length >= 3);
+}
+
+function snapTokenMatches(a: string, b: string): boolean {
+    if (a === b) return true;
+    // Stem-ish prefix match — handles bank/banking, advisor/advisory.
+    if (a.length >= 4 && b.length >= 4) {
+        return a.startsWith(b) || b.startsWith(a);
+    }
+    return false;
+}
+
+function snapTokenIntersectionSize(va: string[], vb: string[]): number {
+    let n = 0;
+    const usedB = new Array(vb.length).fill(false);
+    for (const ta of va) {
+        for (let i = 0; i < vb.length; i++) {
+            if (usedB[i]) continue;
+            if (snapTokenMatches(ta, vb[i])) { n++; usedB[i] = true; break; }
+        }
+    }
+    return n;
+}
+
+function snapToLibraryName(value: string, validNames: string[]): string | null {
+    const v = value.trim();
+    if (!v) return null;
+    if (validNames.includes(v)) return v;
+    const vTokens = snapTokens(v);
+    if (vTokens.length === 0) return null;
+    let best: { name: string; score: number; nLen: number } | null = null;
+    for (const name of validNames) {
+        const nTokens = snapTokens(name);
+        if (nTokens.length === 0) continue;
+        const inter = snapTokenIntersectionSize(vTokens, nTokens);
+        if (inter === 0) continue;
+        const sV = inter / vTokens.length;
+        const sN = inter / nTokens.length;
+        // Require both directions to be well-covered so we don't snap
+        // "Cybersecurity" → "Cybersecurity Services" purely on one shared word.
+        if (sV < 0.5 || sN < 0.5) continue;
+        const score = Math.min(sV, sN);
+        const nLen = nTokens.length;
+        if (!best || score > best.score
+            || (score === best.score && Math.abs(nLen - vTokens.length) < Math.abs(best.nLen - vTokens.length))) {
+            best = { name, score, nLen };
+        }
+    }
+    return best ? best.name : null;
+}
+
+function applySnap(value: string | null, validNames: string[]): { value: string | null; is_new: boolean } {
+    if (!value) return { value: null, is_new: false };
+    const snapped = snapToLibraryName(value, validNames);
+    if (snapped) return { value: snapped, is_new: false };
+    return { value: value.trim() || null, is_new: true };
+}
+
+// Snap Phase 1b LLM outputs (MatchChain shape) to canonical library names.
+// Same idea as snapTaggingsToLibrary but operating on the {name, score, reason}
+// chain-item structure. validSpecNames is the union of sub-identities across
+// the per-run leaves (so paraphrases of names not in this set still get dropped
+// by the existing strict-match validation downstream).
+function snapMatchChain(
+    chain: MatchChain,
+    validIdentityNames: Set<string>,
+    validSpecNames: Set<string>,
+    sectorVocab: string[]
+): MatchChain {
+    const idSnap = chain.primary_identity.name
+        ? snapToLibraryName(chain.primary_identity.name, Array.from(validIdentityNames))
+        : null;
+    const subSnap = chain.sub_identity.name
+        ? snapToLibraryName(chain.sub_identity.name, Array.from(validSpecNames))
+        : null;
+    const secSnap = chain.sector
+        ? snapToLibraryName(chain.sector, sectorVocab)
+        : null;
+    return {
+        ...chain,
+        primary_identity: {
+            ...chain.primary_identity,
+            name: idSnap || chain.primary_identity.name
+        },
+        sub_identity: {
+            ...chain.sub_identity,
+            name: subSnap || chain.sub_identity.name
+        },
+        sector: secSnap || chain.sector
+    };
+}
+
+function snapTaggingsToLibrary(taggings: IndustryTagging[], snapshot: TaxonomySnapshot): IndustryTagging[] {
+    const identityNames = snapshot.identities.map(i => i.name);
+    const sectorNames = snapshot.sectors.map(sec => sec.name);
+    const subByParent = new Map<string, string[]>();
+    for (const sub of snapshot.sub_identities) {
+        const parent = sub.parent_identity || '';
+        const list = subByParent.get(parent) || [];
+        list.push(sub.name);
+        subByParent.set(parent, list);
+    }
+    return taggings.map(t => {
+        const idSnap = applySnap(t.identity, identityNames);
+        // Sub-identity must be under the chosen identity; if identity didn't
+        // resolve to a library entry, fall back to global sub-identity match.
+        const subAllowed = idSnap.value && !idSnap.is_new
+            ? (subByParent.get(idSnap.value) || [])
+            : snapshot.sub_identities.map(s => s.name);
+        const subSnap = applySnap(t.sub_identity, subAllowed);
+        const secSnap = applySnap(t.sector, sectorNames);
+        return {
+            ...t,
+            identity: idSnap.value,
+            is_new_identity: idSnap.is_new,
+            sub_identity: subSnap.value,
+            is_new_sub_identity: subSnap.is_new,
+            sector: secSnap.value,
+            is_new_sector: secSnap.is_new,
+        };
+    });
 }
 
 // Post-batch dedup: collapse near-duplicate identity / sub-identity /
@@ -4172,7 +4307,7 @@ export async function runAssignment(
             // General with reason=LOW_VOLUME.
             if (pending.length > 0 && leaves.length > 0) {
                 await ctx.checkCancel();
-                const llmRes = await runContactMatchingLLM(pending, leaves, sectorVocab, runId, ctx);
+                const llmRes = await runContactMatchingLLM(supabase, pending, leaves, sectorVocab, runId, ctx);
                 totalCost += llmRes.costUsd;
                 assignedRows.push(...llmRes.rows);
                 llmRouted += llmRes.rows.length;
@@ -5359,6 +5494,7 @@ function cosine(a: number[], b: number[]): number {
 
 // ─── routing LLM (Phase 1b) ────────────────────────────────────────
 async function runContactMatchingLLM(
+    supabase: SupabaseClient,
     pending: ContactRouteInput[],
     leaves: DiscoveredBucket[],
     sectorVocab: string[],
@@ -5366,6 +5502,19 @@ async function runContactMatchingLLM(
     ctx?: BucketingCtx
 ): Promise<{ rows: ContactMapRow[]; costUsd: number }> {
     if (pending.length === 0) return { rows: [], costUsd: 0 };
+
+    // Resolve the Anthropic client once per batch run (only if we're using a
+    // claude-* MATCH_MODEL). Avoids N concurrent key-fetches against app_settings
+    // when classifyContactBatch runs under pLimit. For gpt-* models, anthropic
+    // stays null and we use OpenAI fetch instead.
+    const anthropic = MATCH_MODEL.startsWith('claude-')
+        ? await getAnthropic(supabase)
+        : null;
+    if (MATCH_MODEL.startsWith('claude-') && !anthropic) {
+        throw new Error(
+            `Anthropic API key not configured (Phase 1b is set to ${MATCH_MODEL}). Add the key on the Connectors page.`
+        );
+    }
 
     const validSpecNames = new Set(leaves.map(l => l.sub_identity));
     const validIdentityNames = new Set(leaves.map(l => l.primary_identity));
@@ -5405,7 +5554,7 @@ async function runContactMatchingLLM(
         try {
             ({ results, costUsd } = await classifyContactBatch(
                 batch, bucketReferenceJson, sectorVocab, validSpecNames, validIdentityNames,
-                ctx?.abortSignal
+                anthropic, ctx?.abortSignal
             ));
         } catch (err: any) {
             // AbortError when the run is cancelled — propagate as
@@ -5475,8 +5624,14 @@ async function classifyContactBatch(
     sectorVocab: string[],
     validSpecNames: Set<string>,
     validIdentityNames: Set<string>,
+    anthropic: Anthropic | null,
     runAbortSignal?: AbortSignal
 ): Promise<{ results: MatchChain[]; costUsd: number }> {
+    // System prompt is the stable, cacheable prefix: contains the
+    // PROJECT_CONTEXT, shared rules, and the per-run BUCKET_REFERENCE +
+    // SECTOR_VOCABULARY. OpenAI auto-caches prefixes >=1024 tokens; Anthropic
+    // caches the marked `ephemeral` block. Only the user prompt (per-batch
+    // contact list) varies between calls.
     const systemPrompt = `${PROJECT_CONTEXT}
 
 ========================================
@@ -5500,23 +5655,20 @@ Each contact may include embedding_candidate_buckets. Treat these as a shortlist
 not a decision. Prefer them when the text supports them, but choose another
 reference bucket if the contact evidence is clearly better.
 
-Rules:
-- Strong business-model nouns beat sector nouns.
-- "Serving X" does not mean "is X"; X belongs in sector.
-- Operator sub-identities require explicit operator evidence.
-- Disqualify only clear ecommerce/DTC physical, local geo-tied services,
-  brick-and-mortar retail, or low-ticket consumer.
-- SERVICES vs PRODUCTS — never tag a company that rents/maintains/repairs/
-  operates-as-a-service as "B2B Product Manufacturer" or any product
-  manufacturer sub-identity. If no services-side sub-identity fits,
-  prefer the identity-only fallback (return primary_identity, leave
-  sub-identity "") rather than picking a wrong product label.
-- Talent / artist / sports management firms are Agency, not Consulting.
-- Game / software studios are Software & SaaS, not Hospitality / Travel /
-  Consumer Retail — only DQ if unambiguously pure-consumer, no B2B angle.
-- Scores are alignment scores, not probabilities. Use >=0.40 for a reasonable
-  identity/sub-identity fit, >=0.70 for strong fit.
-- Reasons: max 18 words each and cite the contact fields.
+Scores: alignment scores 0.0–1.0 (NOT 1-10). Use >=0.70 for strong fit,
+>=0.40 for reasonable fit, <0.40 means the tag shouldn't be used.
+Reasons: max 18 words each and cite the contact fields.
+
+${HARD_KEYWORD_ROUTING}
+
+${CORE_PRINCIPLES}
+
+${DISQUALIFICATION_RULES}
+
+BUCKET_REFERENCE (grouped by primary_identity):
+${bucketReferenceJson}
+
+SECTOR_VOCABULARY: ${JSON.stringify(sectorVocab)}
 
 Return strict JSON only.`;
 
@@ -5530,12 +5682,7 @@ Return strict JSON only.`;
         embedding_candidate_buckets: c.embedding_candidates || []
     }));
 
-    const userPrompt = `BUCKET_REFERENCE (grouped by primary_identity):
-${bucketReferenceJson}
-
-SECTOR_VOCABULARY: ${JSON.stringify(sectorVocab)}
-
-CONTACTS_TO_CLASSIFY (same order as output):
+    const userPrompt = `CONTACTS_TO_CLASSIFY (same order as output):
 ${JSON.stringify(contactPayload)}
 
 Return JSON: { "assignments": [<one object per contact in the same order>] }
@@ -5575,9 +5722,8 @@ Each assignment object:
     };
 
     const callOnce = async () => {
-        // Combined abort: timeout (90 s) OR the run's cancel signal
-        // OR an explicit abort via .abort() on this controller. The
-        // run-cancel listener is added with { once: true } so it
+        // Combined abort: timeout OR the run's cancel signal OR an explicit
+        // abort. The run-cancel listener is added with { once: true } so it
         // doesn't leak across batches on long runs.
         const controller = new AbortController();
         const t = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
@@ -5587,6 +5733,33 @@ Each assignment object:
             else runAbortSignal.addEventListener('abort', onRunAbort, { once: true });
         }
         try {
+            if (anthropic) {
+                // Anthropic path (claude-*): lenient JSON parsing + cache_control.
+                const resp = await anthropic.messages.create({
+                    model: MATCH_MODEL,
+                    max_tokens: 4000,
+                    system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+                    messages: [{ role: 'user', content: userPrompt }]
+                }, { signal: controller.signal });
+                const text = (resp.content as any[])
+                    .filter(b => b.type === 'text').map(b => b.text).join('\n');
+                const parsed = parsePhase1bAssignments(text);
+                const usage: any = (resp as any).usage || {};
+                const input = usage.input_tokens || 0;
+                const output = usage.output_tokens || 0;
+                // Anthropic's usage.input_tokens is uncached only (cache reads/
+                // creations are reported separately). Sum the three components at
+                // their respective billing rates: full / 0.1× / 1.25×.
+                const cachedIn = usage.cache_read_input_tokens || 0;
+                const cacheCreate = usage.cache_creation_input_tokens || 0;
+                const inputRate = ANTHROPIC_PRICING[MATCH_MODEL]?.input || 1;
+                const costUsd = computeAnthropicCost(MATCH_MODEL, input, output)
+                    + (cachedIn / 1_000_000) * inputRate * 0.1
+                    + (cacheCreate / 1_000_000) * inputRate * 1.25;
+                return { assignments: parsed as MatchChain[], costUsd };
+            }
+            // OpenAI path (gpt-*): strict json_schema. OpenAI auto-caches
+            // stable prefixes >=1024 tokens — system prompt qualifies.
             const res = await fetch('https://api.openai.com/v1/chat/completions', {
                 method: 'POST',
                 headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
@@ -5633,6 +5806,10 @@ Each assignment object:
     }
 
     let { assignments, costUsd } = result;
+    // Snap fuzzy LLM outputs to canonical library names BEFORE drift detection,
+    // so paraphrases ("Cybersecurity Software" → "Cybersecurity SaaS") survive
+    // instead of being dropped by the strict-match validation downstream.
+    assignments = assignments.map(a => snapMatchChain(a, validIdentityNames, validSpecNames, sectorVocab));
     const drift = assignments.some(a =>
         (a.sub_identity.name && !validSpecNames.has(a.sub_identity.name)) ||
         (a.primary_identity.name && !validIdentityNames.has(a.primary_identity.name))
@@ -5640,7 +5817,7 @@ Each assignment object:
     if (drift) {
         try {
             const retried = await callOnce();
-            assignments = retried.assignments;
+            assignments = retried.assignments.map(a => snapMatchChain(a, validIdentityNames, validSpecNames, sectorVocab));
             costUsd += retried.costUsd;
         } catch { /* keep original */ }
     }
@@ -5889,6 +6066,12 @@ OUTPUT CONSTRAINTS:
   brick-and-mortar retail, low-ticket consumer.
 - Reasons: max 18 words each, must cite a phrase from the classification.
 
+${HARD_KEYWORD_ROUTING}
+
+${CORE_PRINCIPLES}
+
+${DISQUALIFICATION_RULES}
+
 Return strict JSON, no prose, no markdown fences.`;
 
     const userPrompt = `BUCKET_REFERENCE (grouped by primary_identity):
@@ -5978,6 +6161,8 @@ Each assignment object:
     catch { result = await callOnce(); }
 
     let { assignments, costUsd } = result;
+    // Snap fuzzy LLM names to canonical library names before strict drift check.
+    assignments = assignments.map(a => snapMatchChain(a, validIdentityNames, validSpecNames, sectorVocab));
     const drift = assignments.some(a =>
         (a.sub_identity.name && !validSpecNames.has(a.sub_identity.name)) ||
         (a.primary_identity.name && !validIdentityNames.has(a.primary_identity.name))
@@ -5985,7 +6170,7 @@ Each assignment object:
     if (drift) {
         try {
             const retried = await callOnce();
-            assignments = retried.assignments;
+            assignments = retried.assignments.map(a => snapMatchChain(a, validIdentityNames, validSpecNames, sectorVocab));
             costUsd += retried.costUsd;
         } catch { /* keep original */ }
     }

@@ -9,7 +9,10 @@
     "build": "vite build",
     "build:server": "echo 'No server build needed for tsx'",
     "start": "node --expose-gc --import tsx server.ts",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "eval:phase1a": "tsx scripts/eval/run-eval.ts",
+    "eval:phase1b": "tsx scripts/eval/run-eval-phase1b.ts",
+    "eval:bucketing": "npm run eval:phase1a && npm run eval:phase1b"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.91.1",

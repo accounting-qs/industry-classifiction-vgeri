@@ -1,0 +1,362 @@
+{
+  "version": 2,
+  "description": "30-case smoke test for Phase 1a tagger. Expected values match the LIVE taxonomy in the DB (identities/sub-identities/sectors as of v2 — May 2026 after the orphan-fix + sub-identity reshuffle). If you edit taxonomy in the UI, sanity-check this file. Use null when the field should be blank.",
+  "cases": [
+    {
+      "id": "g-001",
+      "category": "canonical",
+      "input": "Digital marketing agency",
+      "expected": {
+        "primary_identity": "Agency",
+        "sub_identity": "Performance Marketing Agency",
+        "sector": null,
+        "is_disqualified": false
+      },
+      "notes": "Plain agency, no served vertical → sector blank. 'Performance Marketing Agency' is the closest live sub-identity for digital marketing"
+    },
+    {
+      "id": "g-002",
+      "category": "canonical",
+      "input": "Private equity firm focused on lower-middle market buyouts",
+      "expected": {
+        "primary_identity": "Financial Services",
+        "sub_identity": "Private Equity",
+        "sector": null,
+        "is_disqualified": false
+      },
+      "notes": "Live taxonomy uses 'Private Equity' (no 'Firm' suffix)"
+    },
+    {
+      "id": "g-003",
+      "category": "canonical",
+      "input": "Venture capital fund investing in early-stage fintech startups",
+      "expected": {
+        "primary_identity": "Financial Services",
+        "sub_identity": "Venture Capital",
+        "sector": "Financial Services",
+        "is_disqualified": false
+      },
+      "notes": "VC = identity; investing IN fintech = sector"
+    },
+    {
+      "id": "g-004",
+      "category": "canonical",
+      "input": "Wealth management firm serving high-net-worth families",
+      "expected": {
+        "primary_identity": "Financial Services",
+        "sub_identity": "Wealth Management",
+        "sector": null,
+        "is_disqualified": false
+      }
+    },
+    {
+      "id": "g-005",
+      "category": "canonical",
+      "input": "Cybersecurity software platform with threat detection and identity management",
+      "expected": {
+        "primary_identity": "Software & SaaS",
+        "sub_identity": "Cybersecurity Software",
+        "sector": null,
+        "is_disqualified": false
+      },
+      "notes": "Live DB uses 'Cybersecurity Software' (not 'Cybersecurity SaaS')"
+    },
+    {
+      "id": "g-006",
+      "category": "canonical",
+      "input": "Managed IT services provider for small and mid-sized businesses",
+      "expected": {
+        "primary_identity": "IT Services",
+        "sub_identity": "Managed IT Services",
+        "sector": null,
+        "is_disqualified": false
+      }
+    },
+    {
+      "id": "g-007",
+      "category": "canonical",
+      "input": "Commercial real estate brokerage covering office and industrial properties",
+      "expected": {
+        "primary_identity": "Real Estate",
+        "sub_identity": "Commercial Real Estate Services",
+        "sector": null,
+        "is_disqualified": false
+      },
+      "notes": "Live taxonomy: 'Commercial Real Estate Services'. 'Brokerage' (generic) would also be acceptable"
+    },
+    {
+      "id": "g-008",
+      "category": "canonical",
+      "input": "Corporate law firm specializing in mergers and acquisitions",
+      "expected": {
+        "primary_identity": "Legal Services",
+        "sub_identity": "Corporate Law",
+        "sector": null,
+        "is_disqualified": false
+      }
+    },
+    {
+      "id": "g-009",
+      "category": "canonical",
+      "input": "CPA firm offering tax, audit, and advisory services",
+      "expected": {
+        "primary_identity": "Accounting & Tax",
+        "sub_identity": null,
+        "sector": null,
+        "is_disqualified": false
+      },
+      "notes": "Live taxonomy only has 'Management Consulting' and 'Tax Advisory' under Accounting & Tax — neither is a clean CPA match, so identity-only",
+      "allow_identity_only": true
+    },
+    {
+      "id": "g-010",
+      "category": "canonical",
+      "input": "Independent insurance agency for commercial lines",
+      "expected": {
+        "primary_identity": "Insurance Services",
+        "sub_identity": "Insurance Brokerage",
+        "sector": null,
+        "is_disqualified": false
+      }
+    },
+    {
+      "id": "g-011",
+      "category": "x-for-y",
+      "input": "SEO agency for healthcare clinics",
+      "expected": {
+        "primary_identity": "Agency",
+        "sub_identity": "Performance Marketing Agency",
+        "sector": "Healthcare",
+        "is_disqualified": false
+      },
+      "notes": "Agency identity wins over the served vertical"
+    },
+    {
+      "id": "g-012",
+      "category": "x-for-y",
+      "input": "Branding agency working primarily with nonprofits",
+      "expected": {
+        "primary_identity": "Agency",
+        "sub_identity": "Branding Agency",
+        "sector": "Non-Profit & Social Impact",
+        "is_disqualified": false
+      }
+    },
+    {
+      "id": "g-013",
+      "category": "x-for-y",
+      "input": "Software platform for K-12 schools",
+      "expected": {
+        "primary_identity": "Software & SaaS",
+        "sub_identity": "Vertical SaaS",
+        "sector": "Education",
+        "is_disqualified": false
+      },
+      "notes": "Vertical SaaS now correctly placed under Software & SaaS"
+    },
+    {
+      "id": "g-014",
+      "category": "x-for-y",
+      "input": "Healthcare staffing agency placing travel nurses",
+      "expected": {
+        "primary_identity": "Staffing & Recruiting",
+        "sub_identity": "Healthcare Staffing",
+        "sector": "Healthcare",
+        "is_disqualified": false
+      }
+    },
+    {
+      "id": "g-015",
+      "category": "x-for-y",
+      "input": "IT consulting firm for federal government agencies",
+      "expected": {
+        "primary_identity": "Consulting & Advisory",
+        "sub_identity": "IT Consulting",
+        "sector": "Government",
+        "is_disqualified": false
+      },
+      "notes": "'IT Consulting' sub-identity lives under Consulting & Advisory (not IT Services) in the live taxonomy"
+    },
+    {
+      "id": "g-016",
+      "category": "x-for-y",
+      "input": "Cybersecurity consulting for financial institutions",
+      "expected": {
+        "primary_identity": "IT Services",
+        "sub_identity": "Cybersecurity Services",
+        "sector": "Financial Services",
+        "is_disqualified": false
+      },
+      "notes": "Cybersecurity Services lives under IT Services in the live taxonomy"
+    },
+    {
+      "id": "g-017",
+      "category": "x-for-y",
+      "input": "Recruiting firm specializing in construction-industry placements",
+      "expected": {
+        "primary_identity": "Staffing & Recruiting",
+        "sub_identity": "Technical Staffing",
+        "sector": "Construction & Infrastructure",
+        "is_disqualified": false
+      },
+      "notes": "Construction trades = technical staffing"
+    },
+    {
+      "id": "g-018",
+      "category": "x-for-y",
+      "input": "Investment bank focused on healthcare M&A",
+      "expected": {
+        "primary_identity": "Financial Services",
+        "sub_identity": "Investment Banking",
+        "sector": "Healthcare",
+        "is_disqualified": false
+      }
+    },
+    {
+      "id": "g-019",
+      "category": "hard-keyword-trap",
+      "input": "PE-backed software company building tools for restaurants",
+      "expected": {
+        "primary_identity": "Software & SaaS",
+        "sub_identity": "Vertical SaaS",
+        "sector": "Hospitality & Travel",
+        "is_disqualified": false
+      },
+      "notes": "PE-backed is a financing status, not identity. Vertical SaaS for hospitality"
+    },
+    {
+      "id": "g-020",
+      "category": "hard-keyword-trap",
+      "input": "Venture-backed fintech startup automating B2B payments",
+      "expected": {
+        "primary_identity": "Software & SaaS",
+        "sub_identity": "FinTech SaaS",
+        "sector": null,
+        "is_disqualified": false
+      }
+    },
+    {
+      "id": "g-021",
+      "category": "hard-keyword-trap",
+      "input": "Law firm with a strong technology and IP practice",
+      "expected": {
+        "primary_identity": "Legal Services",
+        "sub_identity": "Intellectual Property Law",
+        "sector": null,
+        "is_disqualified": false
+      },
+      "notes": "'IP practice' → Intellectual Property Law sub-identity"
+    },
+    {
+      "id": "g-022",
+      "category": "hard-keyword-trap",
+      "input": "Court reporting and legal videography services",
+      "expected": {
+        "primary_identity": "Legal Services",
+        "sub_identity": null,
+        "sector": null,
+        "is_disqualified": false
+      },
+      "notes": "Legal-adjacent services; no specific sub-identity in live taxonomy → identity-only",
+      "allow_identity_only": true
+    },
+    {
+      "id": "g-023",
+      "category": "hard-keyword-trap",
+      "input": "Cybersecurity software firm that also offers professional services",
+      "expected": {
+        "primary_identity": "Software & SaaS",
+        "sub_identity": "Cybersecurity Software",
+        "sector": null,
+        "is_disqualified": false
+      },
+      "notes": "Software is primary"
+    },
+    {
+      "id": "g-024",
+      "category": "hard-keyword-trap",
+      "input": "Talent management agency representing professional athletes",
+      "expected": {
+        "primary_identity": "Agency",
+        "sub_identity": "Talent Management Agency",
+        "sector": "Media & Entertainment",
+        "is_disqualified": false
+      }
+    },
+    {
+      "id": "g-025",
+      "category": "ambiguous-generic",
+      "input": "Professional services firm",
+      "expected": {
+        "primary_identity": null,
+        "sub_identity": null,
+        "sector": null,
+        "is_disqualified": false
+      },
+      "notes": "Too vague — should NOT over-claim. Low confidence accepted",
+      "allow_identity_only": true
+    },
+    {
+      "id": "g-026",
+      "category": "ambiguous-generic",
+      "input": "Consulting firm",
+      "expected": {
+        "primary_identity": "Consulting & Advisory",
+        "sub_identity": null,
+        "sector": null,
+        "is_disqualified": false
+      },
+      "notes": "Identity clear, sub-identity is not"
+    },
+    {
+      "id": "g-027",
+      "category": "ambiguous-generic",
+      "input": "Technology company",
+      "expected": {
+        "primary_identity": null,
+        "sub_identity": null,
+        "sector": null,
+        "is_disqualified": false
+      },
+      "notes": "Could be SaaS / services / hardware",
+      "allow_identity_only": true
+    },
+    {
+      "id": "g-028",
+      "category": "disqualification",
+      "input": "Family-owned restaurant in Austin",
+      "expected": {
+        "primary_identity": "Hospitality & Travel",
+        "sub_identity": "Hospitality Operator",
+        "sector": null,
+        "is_disqualified": true
+      },
+      "notes": "Hospitality & Travel is its own identity in the live taxonomy. DQ from 'family-owned' + local"
+    },
+    {
+      "id": "g-029",
+      "category": "disqualification",
+      "input": "Hospitality SaaS platform for boutique hotels",
+      "expected": {
+        "primary_identity": "Software & SaaS",
+        "sub_identity": "Vertical SaaS",
+        "sector": "Hospitality & Travel",
+        "is_disqualified": false
+      },
+      "notes": "SaaS for hospitality is B2B — NOT disqualified"
+    },
+    {
+      "id": "g-030",
+      "category": "disqualification",
+      "input": "DTC candle brand with a B2B wholesale channel",
+      "expected": {
+        "primary_identity": "Retail",
+        "sub_identity": "Distribution & Wholesale",
+        "sector": null,
+        "is_disqualified": false
+      },
+      "notes": "Live taxonomy has no DTC sub-identity; closest is Distribution & Wholesale because of the B2B channel. Keep inviteable",
+      "allow_identity_only": true
+    }
+  ]
+}
