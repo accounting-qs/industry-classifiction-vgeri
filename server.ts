@@ -1811,6 +1811,35 @@ function getOrCreateRunAbortController(runId: string): AbortController {
     return ac;
 }
 
+// Build a structured failure payload for storage in
+// bucketing_runs.error_message. The UI parses this as JSON and renders an
+// expandable Details section; plain-text values (legacy or empty) still
+// render as before. Reads the run's latest progress to capture which
+// phase/step blew up — that context was previously lost.
+async function buildErrorPayload(runId: string, err: any): Promise<string> {
+    const message = (err?.message ? String(err.message) : String(err || 'Unknown error')).slice(0, 1000);
+    const stack = err?.stack ? String(err.stack).slice(0, 4000) : null;
+    let progress: any = null;
+    try {
+        const { data } = await supabase
+            .from('bucketing_runs').select('progress').eq('id', runId).single();
+        progress = data?.progress || null;
+    } catch { /* progress is best-effort */ }
+    const payload = {
+        kind: 'bucketing_run_error',
+        message,
+        at: new Date().toISOString(),
+        phase: progress?.phase || null,
+        step: progress?.step || null,
+        note: progress?.note || null,
+        current: progress?.current ?? null,
+        total: progress?.total ?? null,
+        elapsed_seconds: progress?.elapsed_seconds ?? null,
+        stack,
+    };
+    return JSON.stringify(payload);
+}
+
 function buildBucketingCtx(runId: string) {
     let lastWrite = 0;
     let pending: any = null;
@@ -1908,10 +1937,11 @@ app.post('/api/bucketing/determine', async (req, res) => {
         runTaxonomyProposal(supabase, data.id, buildBucketingCtx(data.id)).catch(async (err: any) => {
             const cancelled = err instanceof BucketingCancelledError;
             console.error(`[Bucketing] Taxonomy ${cancelled ? 'cancelled' : 'failed'} for ${data.id}:`, err);
+            const errPayload = cancelled ? 'Cancelled by user' : await buildErrorPayload(data.id, err);
             await supabase.from('bucketing_runs').update({
                 status: cancelled ? 'cancelled' : 'failed',
                 cancel_requested: false,
-                error_message: cancelled ? 'Cancelled by user' : (err.message?.slice(0, 1000) || String(err))
+                error_message: errPayload
             }).eq('id', data.id);
             // Purge partial Phase 1a state on cancel/failure so a Resume
             // starts clean and no orphan rows accumulate in the DB.
@@ -2028,10 +2058,11 @@ app.post('/api/bucketing/runs/:id/assign', async (req, res) => {
         runAssignment(supabase, id, buildBucketingCtx(id)).catch(async (err: any) => {
             const cancelled = err instanceof BucketingCancelledError;
             console.error(`[Bucketing] Assignment ${cancelled ? 'cancelled' : 'failed'} for ${id}:`, err);
+            const errPayload = cancelled ? 'Cancelled by user' : await buildErrorPayload(id, err);
             await supabase.from('bucketing_runs').update({
                 status: cancelled ? 'cancelled' : 'failed',
                 cancel_requested: false,
-                error_message: cancelled ? 'Cancelled by user' : (err.message?.slice(0, 1000) || String(err))
+                error_message: errPayload
             }).eq('id', id);
             // Purge partial Phase 1b state. The taxonomy_proposal /
             // bucket_industry_map are Phase 1a artefacts and stay so the
@@ -2163,6 +2194,22 @@ app.get('/api/bucketing/runs/:id/phase1a-stats', async (req, res) => {
             sample_null_sub_identity: sampleNullSub,
             all_null_sub_identity
         });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Coverage summary for a run — single RPC that reports how many of the
+// 293k contacts are represented at each stage. Powers the "Phase 1a
+// coverage" panel in BucketingDetail so the user can pick a rollup
+// threshold against real numbers instead of the partial counts visible
+// in the discovered-buckets view (which only sees JOIN-matched rows).
+app.get('/api/bucketing/runs/:id/coverage', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const { data, error } = await supabase.rpc('get_run_coverage_summary', { p_run_id: id });
+        if (error) return res.status(500).json({ error: error.message });
+        res.json(data || {});
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }
@@ -2376,10 +2423,11 @@ app.post('/api/bucketing/runs/:id/resume', async (req, res) => {
         fn().catch(async (err: any) => {
             const cancelled = err instanceof BucketingCancelledError;
             console.error(`[Bucketing] Resumed ${resumePhase} ${cancelled ? 'cancelled' : 'failed'} for ${id}:`, err);
+            const errPayload = cancelled ? 'Cancelled by user' : await buildErrorPayload(id, err);
             await supabase.from('bucketing_runs').update({
                 status: cancelled ? 'cancelled' : 'failed',
                 cancel_requested: false,
-                error_message: cancelled ? 'Cancelled by user' : (err.message?.slice(0, 1000) || String(err))
+                error_message: errPayload
             }).eq('id', id);
         });
 

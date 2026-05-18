@@ -733,6 +733,233 @@ function BucketingCancelledPanel({ run, onRefresh, onError }: {
   );
 }
 
+// ───── FAILED PANEL ───────────────────────────────────────────────
+// error_message used to be a 1000-char plain string with no context. The
+// backend now writes a JSON payload built by buildErrorPayload(): which
+// phase/step failed, the last progress note, elapsed time, and a stack.
+// Legacy plain-text values still render as before.
+
+type StructuredRunError = {
+  kind: 'bucketing_run_error';
+  message: string;
+  at?: string | null;
+  phase?: string | null;
+  step?: string | null;
+  note?: string | null;
+  current?: number | null;
+  total?: number | null;
+  elapsed_seconds?: number | null;
+  stack?: string | null;
+};
+
+function parseRunError(s: string | null | undefined): StructuredRunError | null {
+  if (!s) return null;
+  const trimmed = s.trim();
+  if (!trimmed.startsWith('{')) return null;
+  try {
+    const obj = JSON.parse(trimmed);
+    if (obj && obj.kind === 'bucketing_run_error') return obj as StructuredRunError;
+    return null;
+  } catch { return null; }
+}
+
+function BucketingFailedPanel({ run }: { run: BucketingRun }) {
+  const [showStack, setShowStack] = useState(false);
+  const parsed = parseRunError(run.error_message);
+
+  if (!parsed) {
+    return (
+      <div className="border border-red-500/30 rounded-xl bg-red-500/5 p-6">
+        <p className="text-sm font-bold text-red-400 flex items-center gap-2">
+          <AlertCircle className="w-4 h-4" /> Run failed
+        </p>
+        <pre className="text-xs text-gray-400 mt-2 whitespace-pre-wrap font-sans">
+          {run.error_message || 'Unknown error.'}
+        </pre>
+      </div>
+    );
+  }
+
+  const ctxBits: string[] = [];
+  if (parsed.phase) ctxBits.push(`phase=${parsed.phase}`);
+  if (parsed.step) ctxBits.push(`step=${parsed.step}`);
+  if (typeof parsed.current === 'number' && typeof parsed.total === 'number' && parsed.total > 0) {
+    ctxBits.push(`progress=${parsed.current.toLocaleString()}/${parsed.total.toLocaleString()}`);
+  }
+  if (typeof parsed.elapsed_seconds === 'number') ctxBits.push(`elapsed=${parsed.elapsed_seconds}s`);
+
+  return (
+    <div className="border border-red-500/30 rounded-xl bg-red-500/5 p-6">
+      <p className="text-sm font-bold text-red-400 flex items-center gap-2">
+        <AlertCircle className="w-4 h-4" /> Run failed
+      </p>
+      <pre className="text-xs text-gray-300 mt-3 whitespace-pre-wrap font-sans">{parsed.message}</pre>
+
+      {(ctxBits.length > 0 || parsed.note) && (
+        <div className="mt-3 text-[11px] font-mono text-gray-500 space-y-1">
+          {ctxBits.length > 0 && <div>{ctxBits.join(' · ')}</div>}
+          {parsed.note && <div className="italic">last progress: {parsed.note}</div>}
+          {parsed.at && <div>at: {parsed.at}</div>}
+        </div>
+      )}
+
+      {parsed.stack && (
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={() => setShowStack(v => !v)}
+            className="text-[11px] font-bold text-gray-400 hover:text-gray-200 underline"
+          >
+            {showStack ? 'Hide' : 'Show'} stack trace
+          </button>
+          {showStack && (
+            <pre className="text-[10px] text-gray-500 mt-2 whitespace-pre-wrap font-mono max-h-72 overflow-y-auto bg-black/30 p-2 rounded border border-[#2e2e2e]">{parsed.stack}</pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ───── COVERAGE PANEL ─────────────────────────────────────────────
+// Surfaces "what fraction of the run's contacts are actually represented
+// at each stage" so the user can pick a sensible min_volume against the
+// real numbers — not just the JOIN-matched subset visible in the
+// discovered-buckets view. Polls /coverage on mount + on refresh.
+
+type CoverageSummary = {
+  total_contacts?: number;
+  distinct_industry_strings?: number;
+  blank_industry_contacts?: number;
+  phase1a_map?: {
+    total_rows?: number;
+    llm_phase1a_rows?: number;
+    general_passthrough_rows?: number;
+    disqualified_rows?: number;
+    bucket_assigned_rows?: number;
+    covered_contacts?: number;
+  };
+  phase1b_assignments?: {
+    total_rows?: number;
+    by_source?: Record<string, number>;
+  };
+  error?: string;
+};
+
+function pct(num?: number | null, denom?: number | null): string {
+  if (!num || !denom) return '0%';
+  return `${Math.round((num / denom) * 1000) / 10}%`;
+}
+
+function RunCoveragePanel({ runId }: { runId: string }) {
+  const [data, setData] = useState<CoverageSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [open, setOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem('bucketing.coveragePanelOpen') !== '0'; }
+    catch { return true; }
+  });
+  const toggle = () => setOpen(v => {
+    try { localStorage.setItem('bucketing.coveragePanelOpen', v ? '0' : '1'); } catch {}
+    return !v;
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setErr(null);
+    fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/coverage`)
+      .then(async r => {
+        const j = await r.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!r.ok || j.error) setErr(j.error || `HTTP ${r.status}`);
+        else setData(j);
+      })
+      .catch(e => { if (!cancelled) setErr(e.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [runId]);
+
+  const total = data?.total_contacts || 0;
+  const map = data?.phase1a_map || {};
+  const assign = data?.phase1b_assignments || {};
+  const covered = map.covered_contacts || 0;
+  const uncovered = Math.max(0, total - covered);
+
+  return (
+    <div className="border border-[#3ecf8e]/30 rounded-xl bg-[#0e0e0e]">
+      <div className="px-4 py-3 border-b border-[#3ecf8e]/20 text-[10px] font-bold text-[#3ecf8e] uppercase tracking-widest flex items-center justify-between gap-3 flex-wrap">
+        <button
+          type="button"
+          onClick={toggle}
+          className="flex items-center gap-2 hover:text-[#3ecf8e]/70 transition-colors text-left"
+          aria-expanded={open}
+        >
+          {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+          <span>Phase 1a coverage — what fraction of contacts each stage covers</span>
+        </button>
+        <span className="text-gray-600 normal-case tracking-normal font-normal">
+          {loading ? 'loading…' : total > 0 ? `${total.toLocaleString()} contacts in run` : ''}
+        </span>
+      </div>
+      {open && (
+        <div className="p-4 text-xs text-gray-300 space-y-3">
+          {err && <div className="text-red-400">Could not load coverage: {err}</div>}
+          {!err && loading && <div className="text-gray-500">Loading coverage summary…</div>}
+          {!err && !loading && data && (
+            <>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <CoverageStat label="Contacts in run" value={total.toLocaleString()} />
+                <CoverageStat label="Distinct industries" value={(data.distinct_industry_strings || 0).toLocaleString()} sub={`${pct(data.distinct_industry_strings, total)} of contacts`} />
+                <CoverageStat label="Blank industry" value={(data.blank_industry_contacts || 0).toLocaleString()} sub={`${pct(data.blank_industry_contacts, total)} of contacts`} />
+                <CoverageStat label="Phase 1a coverage" value={covered.toLocaleString()} sub={`${pct(covered, total)} of contacts join Phase 1a map`} />
+              </div>
+
+              <div className="border-t border-[#2e2e2e] pt-3">
+                <div className="text-[10px] font-bold uppercase tracking-widest text-gray-400 mb-2">Phase 1a rows in bucket_industry_map</div>
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                  <CoverageStat label="Total" value={(map.total_rows || 0).toLocaleString()} />
+                  <CoverageStat label="LLM-tagged" value={(map.llm_phase1a_rows || 0).toLocaleString()} sub={`${pct(map.llm_phase1a_rows, map.total_rows)}`} />
+                  <CoverageStat label="General passthrough" value={(map.general_passthrough_rows || 0).toLocaleString()} sub={`${pct(map.general_passthrough_rows, map.total_rows)}`} />
+                  <CoverageStat label="Disqualified" value={(map.disqualified_rows || 0).toLocaleString()} sub={`${pct(map.disqualified_rows, map.total_rows)}`} />
+                  <CoverageStat label="Bucket-assigned" value={(map.bucket_assigned_rows || 0).toLocaleString()} sub={`${pct(map.bucket_assigned_rows, map.total_rows)}`} />
+                </div>
+                <p className="mt-2 text-[10px] text-gray-500 leading-relaxed">
+                  These rows are <em>distinct industry strings</em>, not contacts. {covered.toLocaleString()} contacts ({pct(covered, total)}) join Phase 1a's map directly; the remaining {uncovered.toLocaleString()} will be routed by Phase 1b's library / embedding / LLM cascade or land in General.
+                </p>
+              </div>
+
+              {(assign.total_rows || 0) > 0 && (
+                <div className="border-t border-[#2e2e2e] pt-3">
+                  <div className="text-[10px] font-bold uppercase tracking-widest text-gray-400 mb-2">Phase 1b bucket_assignments (per-contact final)</div>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                    <CoverageStat label="Total assigned" value={(assign.total_rows || 0).toLocaleString()} sub={`${pct(assign.total_rows, total)} of contacts`} />
+                    {Object.entries(assign.by_source || {}).map(([src, cnt]) => (
+                      <div key={src}>
+                        <CoverageStat label={src} value={Number(cnt || 0).toLocaleString()} sub={pct(Number(cnt || 0), assign.total_rows)} />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CoverageStat({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div className="bg-[#161616] rounded-lg border border-[#2e2e2e] p-2.5">
+      <div className="text-[9px] font-bold uppercase tracking-wider text-gray-500">{label}</div>
+      <div className="text-base font-bold text-white tabular-nums mt-0.5">{value}</div>
+      {sub && <div className="text-[10px] text-gray-500 mt-0.5">{sub}</div>}
+    </div>
+  );
+}
+
 // ───── LIVE PROGRESS PANEL ────────────────────────────────────────
 // Renders the current step, % bar, ETA, and an auto-scrolling tail of
 // log lines. Polls /runs/:id/logs every ~1.5s for new entries.
@@ -965,16 +1192,7 @@ function BucketingDetail({ run, library, bucketCounts, sectorMix, generalBreakdo
     return <BucketingCancelledPanel run={run} onRefresh={onRefresh} onError={onError} />;
   }
   if (run.status === 'failed') {
-    return (
-      <div className="border border-red-500/30 rounded-xl bg-red-500/5 p-6">
-        <p className="text-sm font-bold text-red-400 flex items-center gap-2">
-          <AlertCircle className="w-4 h-4" /> Run failed
-        </p>
-        <pre className="text-xs text-gray-400 mt-2 whitespace-pre-wrap font-sans">
-          {run.error_message || 'Unknown error.'}
-        </pre>
-      </div>
-    );
+    return <BucketingFailedPanel run={run} />;
   }
   if (run.status === 'assigning') {
     return <BucketingProgressPanel run={run} title="Phase 1b — Matching contacts to buckets" onError={onError} />;
@@ -1371,6 +1589,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
 
   return (
     <div className="space-y-4">
+      <RunCoveragePanel runId={run.id} />
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
         <div className="text-xs text-gray-300">
           <span className="font-bold text-white">{primaryIdentities.length}</span> primary identities · <span className="font-bold text-white" title="Pairs where Phase 1a committed BOTH identity and sub-identity. Zero is normal if the LLM only committed identity-level tags.">{sourceBuckets.length}</span> sub-identity pairs · <span className="font-bold text-white" title="Buckets the bucket-assignment pass mapped industries to (post Run Bucket Assignment).">{discoveredBuckets.length}</span> discovered buckets · <span className="font-bold text-white">{run.total_contacts?.toLocaleString() || '?'}</span> contacts
@@ -2373,6 +2592,8 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onRe
         <StatCard label="Contacts assigned" value={total.toLocaleString()} color="text-[#3ecf8e]" />
         <StatCard label="Total cost" value={`$${(Number(run.cost_usd) || 0).toFixed(3)}`} color="text-white" />
       </div>
+
+      <RunCoveragePanel runId={run.id} />
 
       <PipelineRerunPanel run={run} onRefresh={onRefresh} onError={onError} />
 

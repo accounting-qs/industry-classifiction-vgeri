@@ -541,19 +541,15 @@ async function fetchContactsChunk(
     ctx?: BucketingCtx
 ): Promise<{ rows: ContactRouteInput[]; nextLastId: string | null; hasMore: boolean; pageMs: number; enrichmentMs: number }> {
     const pageStart = Date.now();
-    // .range() (not .limit()) is required to bypass PostgREST's default
-    // db-max-rows cap of 1000 — without this, page.length stayed at 1000
-    // even for pageSize=2000, which made hasMore evaluate false on chunk
-    // 1 and the entire run silently stopped after 1k contacts. Same fix
-    // already lives on the vocab RPC at line 375.
-    let q = supabase
-        .from('contacts')
-        .select('contact_id,company_name,company_website,industry,lead_list_name')
-        .in('lead_list_name', listNames)
-        .order('contact_id', { ascending: true })
-        .range(0, pageSize - 1);
-    if (lastId !== null) q = q.gt('contact_id', lastId);
-    const { data, error } = await q;
+    // Server-side RPC with statement_timeout=300s. The direct PostgREST
+    // path used to die at ~3s on 293K-row runs because service_role's
+    // HTTP-side timeout is tighter than the DB statement_timeout we need.
+    // See supabase/migrations/20260519_get_contacts_chunk_rpc.sql.
+    const { data, error } = await supabase.rpc('get_contacts_chunk', {
+        p_list_names: listNames,
+        p_last_id: lastId,
+        p_limit: pageSize
+    });
     const pageMs = Date.now() - pageStart;
     if (error) {
         ctx?.log(`[Bucketing] contact page failed after ${pageMs}ms (lastId=${lastId?.slice(0, 8) || 'null'}): ${error.message}`, 'error');
@@ -635,17 +631,14 @@ async function fetchContactsForRouting(
             await ctx?.checkCancel();
             pageNum++;
             const pageStart = Date.now();
-            // .range() (not .limit()) — PostgREST default db-max-rows is
-            // 1000, so .limit(2000) silently returned 1000 rows. See the
-            // matching fix in fetchContactsChunk above.
-            let q = supabase
-                .from('contacts')
-                .select('contact_id,company_name,company_website,industry,lead_list_name')
-                .in('lead_list_name', listNames)
-                .order('contact_id', { ascending: true })
-                .range(0, CONTACT_PAGE_SIZE - 1);
-            if (lastId !== null) q = q.gt('contact_id', lastId);
-            const { data, error } = await q;
+            // Server-side RPC with statement_timeout=300s — same reason as
+            // fetchContactsChunk: service_role's HTTP-side timeout is
+            // tighter than the DB statement_timeout we need on 200K+ runs.
+            const { data, error } = await supabase.rpc('get_contacts_chunk', {
+                p_list_names: listNames,
+                p_last_id: lastId,
+                p_limit: CONTACT_PAGE_SIZE
+            });
             const pageMs = Date.now() - pageStart;
             if (error) {
                 ctx?.log(`[Bucketing] contact page ${pageNum} failed after ${pageMs}ms (lastId=${lastId?.slice(0, 8) || 'null'}): ${error.message}`, 'error');
