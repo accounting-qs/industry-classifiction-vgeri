@@ -2755,67 +2755,98 @@ function BucketingLibrary({ library, onRefresh, onError }: {
           <p className="text-sm font-bold text-gray-400">Library is empty</p>
           <p className="text-[11px] text-gray-600 mt-1">Save useful buckets from completed runs to reuse them across campaigns.</p>
         </div>
-      ) : (
-        <div className="border border-[#2e2e2e] rounded-xl overflow-hidden bg-[#0e0e0e]">
-          <table className="w-full text-[11px]">
-            <thead className="bg-[#0e0e0e]">
-              <tr className="border-b border-[#2e2e2e] text-[9px] font-bold text-gray-500 uppercase tracking-wider">
-                <th className="px-3 py-3 text-left w-[34px]">
-                  <input
-                    type="checkbox"
-                    checked={allSelected}
-                    ref={el => { if (el) el.indeterminate = someSelected; }}
-                    onChange={toggleAll}
-                    className="w-3.5 h-3.5 align-middle"
-                    title={allSelected ? 'Clear all' : 'Select all'}
-                  />
-                </th>
-                <th className="px-5 py-3 text-left">Sub-Identity</th>
-                <th className="px-5 py-3 text-left">Primary identity</th>
-                <th className="px-5 py-3 text-right">Used</th>
-                <th className="px-5 py-3 text-right">Last used</th>
-                <th className="px-5 py-3 text-right"></th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[#2e2e2e]">
-              {library.map(b => (
-                <tr key={b.id} className={`hover:bg-white/[0.02] ${b.archived ? 'opacity-50' : ''} ${selectedIds.has(b.id) ? 'bg-red-500/5' : ''}`}>
-                  <td className="px-3 py-3">
+      ) : (() => {
+        // Group buckets by primary_identity so the table reads as
+        // "Identity A → bucket 1, bucket 2 …" instead of a flat list.
+        // Buckets without an identity (General / Disqualified or any orphan)
+        // get bucketed under "—" and rendered last.
+        const groups = new Map<string, LibraryBucket[]>();
+        for (const b of library) {
+          const key = ((b.primary_identity || b.direct_ancestor || '') as string).trim() || '—';
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key)!.push(b);
+        }
+        const orderedGroups = Array.from(groups.entries()).sort((a, b) => {
+          if (a[0] === '—' && b[0] !== '—') return 1;
+          if (a[0] !== '—' && b[0] === '—') return -1;
+          return a[0].localeCompare(b[0]);
+        });
+
+        return (
+          <div className="border border-[#2e2e2e] rounded-xl overflow-hidden bg-[#0e0e0e]">
+            <table className="w-full text-[11px]">
+              <thead className="bg-[#0e0e0e]">
+                <tr className="border-b border-[#2e2e2e] text-[9px] font-bold text-gray-500 uppercase tracking-wider">
+                  <th className="px-3 py-3 text-left w-[34px]">
                     <input
                       type="checkbox"
-                      checked={selectedIds.has(b.id)}
-                      onChange={() => toggleOne(b.id)}
+                      checked={allSelected}
+                      ref={el => { if (el) el.indeterminate = someSelected; }}
+                      onChange={toggleAll}
                       className="w-3.5 h-3.5 align-middle"
+                      title={allSelected ? 'Clear all' : 'Select all'}
                     />
-                  </td>
-                  <td className="px-5 py-3">
-                    <div className="font-bold text-white">{b.bucket_name}</div>
-                    {b.description && <div className="text-[10px] text-gray-500 truncate max-w-md">{b.description}</div>}
-                  </td>
-                  <td className="px-5 py-3 text-gray-300">{b.primary_identity || b.direct_ancestor || '—'}</td>
-                  <td className="px-5 py-3 text-right text-gray-300 font-mono">{b.times_used}×</td>
-                  <td className="px-5 py-3 text-right text-gray-500">
-                    {b.last_used_at ? new Date(b.last_used_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '—'}
-                  </td>
-                  <td className="px-5 py-3 text-right">
-                    <div className="flex items-center justify-end gap-1">
-                      <button onClick={() => setEditing(b)} className="p-1.5 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-white" title="Edit">
-                        <Edit3 className="w-3 h-3" />
-                      </button>
-                      <button onClick={() => onArchive(b.id, !b.archived)} className="p-1.5 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-amber-400" title={b.archived ? 'Unarchive' : 'Archive'}>
-                        <Archive className="w-3 h-3" />
-                      </button>
-                      <button onClick={() => onDelete(b.id)} className="p-1.5 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-red-400" title="Delete">
-                        <Trash2 className="w-3 h-3" />
-                      </button>
-                    </div>
-                  </td>
+                  </th>
+                  <th className="px-5 py-3 text-left">Primary identity / Bucket</th>
+                  <th className="px-5 py-3 text-right">Used</th>
+                  <th className="px-5 py-3 text-right">Last used</th>
+                  <th className="px-5 py-3 text-right"></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+              </thead>
+              <tbody className="divide-y divide-[#2e2e2e]">
+                {orderedGroups.map(([identity, buckets]) => {
+                  const sortedBuckets = [...buckets].sort((a, b) => a.bucket_name.localeCompare(b.bucket_name));
+                  return (
+                    <React.Fragment key={identity}>
+                      <tr className="bg-[#161616] border-t border-[#2e2e2e]">
+                        <td colSpan={5} className="px-5 py-2">
+                          <span className="text-[10px] font-bold text-[#3ecf8e] uppercase tracking-wider">{identity}</span>
+                          <span className="ml-2 text-[10px] text-gray-500 font-mono">
+                            {buckets.length} bucket{buckets.length === 1 ? '' : 's'}
+                          </span>
+                        </td>
+                      </tr>
+                      {sortedBuckets.map(b => (
+                        <tr key={b.id} className={`hover:bg-white/[0.02] ${b.archived ? 'opacity-50' : ''} ${selectedIds.has(b.id) ? 'bg-red-500/5' : ''}`}>
+                          <td className="px-3 py-3">
+                            <input
+                              type="checkbox"
+                              checked={selectedIds.has(b.id)}
+                              onChange={() => toggleOne(b.id)}
+                              className="w-3.5 h-3.5 align-middle"
+                            />
+                          </td>
+                          <td className="px-5 py-3 pl-10">
+                            <div className="font-bold text-white">{b.bucket_name}</div>
+                            {b.description && <div className="text-[10px] text-gray-500 truncate max-w-md">{b.description}</div>}
+                          </td>
+                          <td className="px-5 py-3 text-right text-gray-300 font-mono">{b.times_used}×</td>
+                          <td className="px-5 py-3 text-right text-gray-500">
+                            {b.last_used_at ? new Date(b.last_used_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '—'}
+                          </td>
+                          <td className="px-5 py-3 text-right">
+                            <div className="flex items-center justify-end gap-1">
+                              <button onClick={() => setEditing(b)} className="p-1.5 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-white" title="Edit">
+                                <Edit3 className="w-3 h-3" />
+                              </button>
+                              <button onClick={() => onArchive(b.id, !b.archived)} className="p-1.5 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-amber-400" title={b.archived ? 'Unarchive' : 'Archive'}>
+                                <Archive className="w-3 h-3" />
+                              </button>
+                              <button onClick={() => onDelete(b.id)} className="p-1.5 rounded-md bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 hover:text-red-400" title="Delete">
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </React.Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        );
+      })()}
     </div>
   );
 }
