@@ -1990,17 +1990,23 @@ interface BucketLibraryEntry {
     bucket_name: string;
     primary_identity: string | null;
     description: string | null;
+    include_terms: string[];
+    example_strings: string[];
     archived: boolean;
 }
 
 async function loadBucketLibrarySnapshot(supabase: SupabaseClient): Promise<BucketLibraryEntry[]> {
     const { data, error } = await supabase
         .from('bucket_library')
-        .select('id,bucket_name,primary_identity,description,archived')
+        .select('id,bucket_name,primary_identity,description,include_terms,example_strings,archived')
         .eq('archived', false)
         .order('bucket_name');
     if (error) throw new Error(`bucket_library load failed: ${error.message}`);
-    return (data || []) as BucketLibraryEntry[];
+    return (data || []).map((r: any) => ({
+        ...r,
+        include_terms: Array.isArray(r.include_terms) ? r.include_terms : [],
+        example_strings: Array.isArray(r.example_strings) ? r.example_strings : [],
+    })) as BucketLibraryEntry[];
 }
 
 interface BucketDecision {
@@ -2027,11 +2033,28 @@ function buildBucketAssignmentPrompt(
         byIdentity.get(key)!.push(b);
     }
     const libBlock = Array.from(byIdentity.entries()).map(([ident, entries]) => {
-        const lines = entries.map(e => `    - "${e.bucket_name}"${e.description ? ` — ${e.description}` : ''}`).join('\n');
+        const lines = entries.map(e => {
+            const head = `    - "${e.bucket_name}"${e.description ? ` — ${e.description}` : ''}`;
+            const inc = e.include_terms && e.include_terms.length
+                ? `\n        includes: ${e.include_terms.slice(0, 8).map(t => `"${t}"`).join(', ')}`
+                : '';
+            const ex = e.example_strings && e.example_strings.length
+                ? `\n        examples: ${e.example_strings.slice(0, 3).map(t => `"${t}"`).join(', ')}`
+                : '';
+            return `${head}${inc}${ex}`;
+        }).join('\n');
         return `  Identity: ${ident}\n${lines}`;
     }).join('\n\n');
 
     const idNames = snapshot.identities.map(i => `"${i.name}"`).join(', ');
+    // Identities that already have ≥1 library bucket — for these, the LLM
+    // must not propose the identity name itself as a bucket (lazy fallback).
+    // Identities with no library buckets yet are exempt: there, the identity
+    // name is a reasonable starting bucket.
+    const identitiesWithBuckets = Array.from(byIdentity.keys())
+        .filter(k => k !== '(unassigned)')
+        .map(k => `"${k}"`)
+        .join(', ');
 
     return `You assign B2B contacts to CAMPAIGN BUCKETS. Buckets are coarser than the per-contact taxonomy — they're the actual outreach segments a marketer would run.
 
@@ -2045,11 +2068,13 @@ VALID PRIMARY IDENTITIES (use one of these for any new bucket proposal):
 ${idNames || '(none — taxonomy library is empty)'}
 
 RULES:
-1. PREFER LIBRARY: if any library bucket is even loosely applicable, pick it (verbatim). The library is the source of truth — only propose new buckets when nothing reasonable fits.
+1. PREFER LIBRARY: if any library bucket is even loosely applicable, pick it (verbatim). The library is the source of truth — only propose new buckets when nothing reasonable fits. Use the includes / examples lines above to judge fit, not just the name.
 2. NEW PROPOSALS: when proposing a new bucket, set is_new=true. The bucket_name should be marketer-friendly (e.g. "FinTech / Financial Software", "Renewable Energy Services" — not too narrow, not generic). Required fields: bucket_name AND primary_identity (must be one from the VALID PRIMARY IDENTITIES list).
-3. NULL: if the contact's taxonomy is too vague to bucket meaningfully (e.g. identity=null, or generic catch-all), set bucket_name=null. The contact will route to General.
-4. CONSISTENCY: when two industries share the same identity + sub-identity, they should usually get the same bucket. Don't fork unless the difference is meaningful for outreach.
-5. Confidence 1-10: 10 = obvious fit, 7 = good fit, 5 = forced match, 3 = stretch. Use the score honestly.
+3. NO IDENTITY-NAME PROPOSALS: the following identities already have library buckets listed above — for these, bucket_name MUST NOT equal the identity name verbatim. Pick the closest library bucket or propose a more specific name (e.g. under "Agency", propose "B2B Lead Gen Agencies", not just "Agency"). Identities not in this list have no library buckets yet, so the identity name is acceptable as a starting bucket.
+   Identities requiring sub-specific names: ${identitiesWithBuckets || '(none)'}
+4. NULL: if the contact's taxonomy is too vague to bucket meaningfully (e.g. identity=null, or generic catch-all), set bucket_name=null. The contact will route to General.
+5. CONSISTENCY: when two industries share the same identity + sub-identity, they should usually get the same bucket. Don't fork unless the difference is meaningful for outreach.
+6. Confidence 1-10: 10 = obvious fit, 7 = good fit, 5 = forced match, 3 = stretch. Use the score honestly.
 
 OUTPUT (strict JSON, key MUST be "results"):
 {
@@ -2131,7 +2156,15 @@ export async function runBucketAssignment(
 
     const libByName = new Map<string, BucketLibraryEntry>();
     for (const b of bucketLib) libByName.set(b.bucket_name, b);
+    const libNames = Array.from(libByName.keys());
     const validIdentityNames = new Set(snapshot.identities.map(i => i.name));
+    // Identities that already have ≥1 library bucket — used to reject
+    // proposals where the LLM lazily used the identity name as bucket_name.
+    const identitiesWithLibBuckets = new Set(
+        bucketLib.map(b => b.primary_identity).filter((p): p is string => !!p)
+    );
+    let snappedToLibrary = 0;
+    let rejectedIdentityName = 0;
 
     const systemPrompt = buildBucketAssignmentPrompt(bucketLib, snapshot);
 
@@ -2301,6 +2334,18 @@ export async function runBucketAssignment(
         let isNew = d.is_new;
 
         if (bucketName) {
+            // Snap fuzzy LLM names ("CPA Firms", "Accounting & Tax Firms") to
+            // the canonical library entry when they semantically overlap. Same
+            // token-intersection rule as Phase 1a's snapTaggingsToLibrary —
+            // requires ≥50% overlap in both directions so we don't snap
+            // "Agency" → "Full-Service Marketing Agencies" on one token.
+            if (!libByName.has(bucketName)) {
+                const snap = snapToLibraryName(bucketName, libNames);
+                if (snap) {
+                    bucketName = snap;
+                    snappedToLibrary++;
+                }
+            }
             // Library-existing? Use library's primary_identity as canonical
             // (defends against the LLM hallucinating a different parent
             // identity for an existing entry).
@@ -2318,6 +2363,15 @@ export async function runBucketAssignment(
                     bucketName = null;
                     primaryIdent = null;
                     isNew = false;
+                } else if (bucketName === primaryIdent && identitiesWithLibBuckets.has(primaryIdent)) {
+                    // Reject lazy identity-name proposals when that identity
+                    // already has specific buckets in the library — the LLM
+                    // is supposed to pick one or propose a sub-specific name.
+                    // Route to General so the user notices and curates.
+                    bucketName = null;
+                    primaryIdent = null;
+                    isNew = false;
+                    rejectedIdentityName++;
                 }
             }
         }
@@ -2355,7 +2409,7 @@ export async function runBucketAssignment(
         cost_usd: (Number(run.cost_usd) || 0) + costUsd
     }).eq('id', runId);
 
-    ctx.log(`[BucketAssign ${runId}] done — ${matched} matched library, ${proposed} new proposals, ${nullified} → General, ${failed} batch failures, $${costUsd.toFixed(4)}`, 'phase');
+    ctx.log(`[BucketAssign ${runId}] done — ${matched} matched library (${snappedToLibrary} via snap), ${proposed} new proposals, ${nullified} → General (${rejectedIdentityName} were lazy identity-name proposals), ${failed} batch failures, $${costUsd.toFixed(4)}`, 'phase');
 
     return {
         candidates: candidates.length,
