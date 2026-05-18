@@ -1571,8 +1571,17 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
       </div>
 
       {discoveredBuckets.length > 0 && (() => {
+        // General is the final rollup catch-all, not a "discovered" bucket.
+        // The SQL aggregation groups by (bucket_name, primary_identity), so
+        // General appears once per identity that contributed contacts to it.
+        // Surface it ONCE at the bottom with the total — splitting it per
+        // identity made it look like every identity had its own General.
+        const namedRows = discoveredBuckets.filter(b => b.assigned_bucket_name !== RESERVED_GENERAL);
+        const generalTotal = discoveredBuckets
+          .filter(b => b.assigned_bucket_name === RESERVED_GENERAL)
+          .reduce((s, b) => s + Number(b.contact_count || 0), 0);
         const byIdentity = new Map<string, typeof discoveredBuckets>();
-        for (const b of discoveredBuckets) {
+        for (const b of namedRows) {
           const key = b.assigned_bucket_primary_identity || '(no identity)';
           if (!byIdentity.has(key)) byIdentity.set(key, []);
           byIdentity.get(key)!.push(b);
@@ -1633,6 +1642,14 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
                   </div>
                 );
               })}
+              {generalTotal > 0 && (
+                <div className="py-3 px-4 flex items-center gap-2 flex-wrap bg-[#1a1a1a]">
+                  <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 bg-gray-500/10 border border-gray-500/30 px-1.5 py-0.5 rounded">Catch-all</span>
+                  <span className="font-bold text-white">{RESERVED_GENERAL}</span>
+                  <span className="text-[10px] font-mono text-gray-400">{generalTotal.toLocaleString()} contacts</span>
+                  <span className="text-[10px] text-gray-500">— final rollup target across all identities</span>
+                </div>
+              )}
             </div>}
           </div>
         );
