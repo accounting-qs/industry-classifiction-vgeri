@@ -1,8 +1,27 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { AppTab, Contact, Enrichment, BatchStats, MergedContact, FilterCondition, FilterOperator, BucketingRun, BucketProposal, BucketCount, BucketAssignmentCount, LibraryBucket } from './types';
 import { BucketingTab } from './BucketingTab';
 import { ConnectorsTab } from './ConnectorsTab';
+
+const TAB_TO_PATH: Record<AppTab, string> = {
+  [AppTab.IMPORT]: '/import',
+  [AppTab.MANAGER]: '/contacts',
+  [AppTab.ENRICHMENT]: '/pipeline',
+  [AppTab.BUCKETING]: '/bucketing',
+  [AppTab.CONNECTORS]: '/connectors',
+  [AppTab.PROXIES]: '/proxies',
+};
+
+function tabFromPath(pathname: string): AppTab {
+  if (pathname.startsWith('/import')) return AppTab.IMPORT;
+  if (pathname.startsWith('/pipeline')) return AppTab.ENRICHMENT;
+  if (pathname.startsWith('/bucketing')) return AppTab.BUCKETING;
+  if (pathname.startsWith('/connectors')) return AppTab.CONNECTORS;
+  if (pathname.startsWith('/proxies')) return AppTab.PROXIES;
+  return AppTab.MANAGER;
+}
 import { db } from './services/supabaseClient';
 import { enrichBatch } from './services/enrichmentService';
 import Papa from 'papaparse';
@@ -96,7 +115,12 @@ interface DeleteJob {
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<AppTab>(AppTab.IMPORT);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const activeTab = tabFromPath(location.pathname);
+  const setActiveTab = useCallback((tab: AppTab) => {
+    navigate(TAB_TO_PATH[tab]);
+  }, [navigate]);
   const [contacts, setContacts] = useState<MergedContact[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [currentPage, setCurrentPage] = useState(() => {
@@ -741,14 +765,14 @@ export default function App() {
           <h1 className="text-sm font-bold text-white">Quantum Scaling</h1>
         </div>
         <nav className="flex-1 px-2 py-4 space-y-1 overflow-hidden">
-          <SidebarIconButton active={activeTab === AppTab.IMPORT} onClick={() => setActiveTab(AppTab.IMPORT)} icon={<Upload className="w-5 h-5" />} label="Import CSV" />
-          <SidebarIconButton active={activeTab === AppTab.MANAGER} onClick={() => setActiveTab(AppTab.MANAGER)} icon={<Users className="w-5 h-5" />} label="Contacts" />
-          <SidebarIconButton active={activeTab === AppTab.ENRICHMENT} onClick={() => setActiveTab(AppTab.ENRICHMENT)} icon={<Zap className={`w-5 h-5 ${stats.isProcessing ? 'text-[#3ecf8e] animate-pulse' : ''}`} />} label="Pipeline Monitor" />
-          <SidebarIconButton active={activeTab === AppTab.BUCKETING} onClick={() => setActiveTab(AppTab.BUCKETING)} icon={<Layers className="w-5 h-5" />} label="Bucketing" />
+          <SidebarIconButton active={activeTab === AppTab.IMPORT} onClick={() => navigate('/import')} icon={<Upload className="w-5 h-5" />} label="Import CSV" />
+          <SidebarIconButton active={activeTab === AppTab.MANAGER} onClick={() => navigate('/contacts')} icon={<Users className="w-5 h-5" />} label="Contacts" />
+          <SidebarIconButton active={activeTab === AppTab.ENRICHMENT} onClick={() => navigate('/pipeline')} icon={<Zap className={`w-5 h-5 ${stats.isProcessing ? 'text-[#3ecf8e] animate-pulse' : ''}`} />} label="Pipeline Monitor" />
+          <SidebarIconButton active={activeTab === AppTab.BUCKETING} onClick={() => navigate('/bucketing')} icon={<Layers className="w-5 h-5" />} label="Bucketing" />
         </nav>
         <div className="p-2 border-t border-[#2e2e2e] space-y-1">
-          <SidebarIconButton active={activeTab === AppTab.CONNECTORS} onClick={() => setActiveTab(AppTab.CONNECTORS)} icon={<KeyRound className="w-5 h-5" />} label="Connectors" />
-          <SidebarIconButton active={activeTab === AppTab.PROXIES} onClick={() => setActiveTab(AppTab.PROXIES)} icon={<BarChart2 className={`w-5 h-5 ${activeTab === AppTab.PROXIES ? 'text-[#3ecf8e]' : ''}`} />} label="Proxy Performance" />
+          <SidebarIconButton active={activeTab === AppTab.CONNECTORS} onClick={() => navigate('/connectors')} icon={<KeyRound className="w-5 h-5" />} label="Connectors" />
+          <SidebarIconButton active={activeTab === AppTab.PROXIES} onClick={() => navigate('/proxies')} icon={<BarChart2 className={`w-5 h-5 ${activeTab === AppTab.PROXIES ? 'text-[#3ecf8e]' : ''}`} />} label="Proxy Performance" />
         </div>
       </aside>
 
@@ -765,206 +789,124 @@ export default function App() {
         </header>
 
         <div className="flex-1 overflow-hidden flex flex-col">
-          {activeTab === AppTab.PROXIES ? (
-            <ProxyStatsDashboard />
-          ) : activeTab === AppTab.CONNECTORS ? (
-            <ConnectorsTab />
-          ) : activeTab === AppTab.BUCKETING ? (
-            <BucketingTab importLists={importLists} />
-          ) : activeTab === AppTab.IMPORT ? (
-            <CSVImportWizard
-              onComplete={() => { setActiveTab(AppTab.MANAGER); loadData(); refreshLists(); }}
-              importLists={importLists}
-              importListsLoading={importListsLoading}
-              importListsStatsLoading={importListsStatsLoading}
-              listStatsSource={listStatsSource}
-              exportJobs={exportJobs}
-              activeListFilter={activeListFilter}
-              onOpenList={(name) => { setActiveListFilter(name); setActiveTab(AppTab.MANAGER); }}
-              onEnrichList={enrichList}
-              onStartExport={startExportList}
-              onClearExport={clearExportJob}
-              onRefreshLists={refreshLists}
-              onRenameList={renameImportList}
-              onDeleteList={deleteImportList}
-              onSetListBucketed={setListBucketed}
-              deleteJobs={deleteJobs}
-              onClearDeleteJob={clearDeleteJob}
-            />
-          ) : activeTab === AppTab.ENRICHMENT ? (
-            <PipelineMonitor
-              stats={stats}
-              logs={logs}
-              resumePendingQueue={resumePendingQueue}
-              stopEnrichment={stopEnrichment}
-              resetPipeline={resetPipeline}
-              isStopping={isStopping}
-              setLogs={setLogs}
-              logContainerRef={logContainerRef}
-              activeLogFilter={activeLogFilter}
-              setActiveLogFilter={setActiveLogFilter}
-              isLiveTail={isLiveTail}
-              setIsLiveTail={setIsLiveTail}
-              hasNewLogs={hasNewLogs}
-              setHasNewLogs={setHasNewLogs}
-              isLogDropdownOpen={isLogDropdownOpen}
-              setIsLogDropdownOpen={setIsLogDropdownOpen}
-              handleLogScroll={handleLogScroll}
-            />
-          ) : activeTab === AppTab.MANAGER ? (
-            <DataTable
-              data={contacts}
-              activeFilters={activeFilters}
-              onFiltersChange={setActiveFilters}
-              columns={[
-                { key: 'contact_id', label: 'contact_id', type: 'uuid', defaultWidth: 140 },
-                { key: 'lead_list_name', label: 'lead_list', type: 'text', defaultWidth: 150 },
-                { key: 'email', label: 'email', type: 'text', defaultWidth: 200 },
-                { key: 'first_name', label: 'first_name', type: 'text', defaultWidth: 100 },
-                { key: 'last_name', label: 'last_name', type: 'text', defaultWidth: 100 },
-                { key: 'company_website', label: 'website', type: 'text', defaultWidth: 180 },
-                { key: 'classification', label: 'industry', type: 'text', defaultWidth: 180 },
-                { key: 'confidence', label: 'confidence', type: 'confidence', defaultWidth: 110 },
-                { key: 'cost', label: 'cost', type: 'currency', defaultWidth: 90 },
-                { key: 'status', label: 'status', type: 'status', defaultWidth: 140 },
-                { key: 'processed_at', label: 'processed_at', type: 'date', defaultWidth: 130 }
-              ]}
-              selectedIds={selectedIds}
-              isAllFilteredSelected={isAllFilteredSelected}
-              onSetIsAllFilteredSelected={setIsAllFilteredSelected}
-              onToggleRow={(id: string) => {
-                const n = new Set(selectedIds);
-                if (n.has(id)) n.delete(id); else n.add(id);
-                setSelectedIds(n);
-                setIsAllFilteredSelected(false);
-              }}
-              onToggleAll={() => {
-                if (selectedIds.size === contacts.length && contacts.length > 0) {
-                  setSelectedIds(new Set());
+          {(() => {
+            const importElement = (
+              <CSVImportWizard
+                onComplete={() => { navigate('/contacts'); loadData(); refreshLists(); }}
+                importLists={importLists}
+                importListsLoading={importListsLoading}
+                importListsStatsLoading={importListsStatsLoading}
+                listStatsSource={listStatsSource}
+                exportJobs={exportJobs}
+                activeListFilter={activeListFilter}
+                onOpenList={(name) => { setActiveListFilter(name); navigate('/contacts'); }}
+                onEnrichList={enrichList}
+                onStartExport={startExportList}
+                onClearExport={clearExportJob}
+                onRefreshLists={refreshLists}
+                onRenameList={renameImportList}
+                onDeleteList={deleteImportList}
+                onSetListBucketed={setListBucketed}
+                deleteJobs={deleteJobs}
+                onClearDeleteJob={clearDeleteJob}
+              />
+            );
+            const pipelineElement = (
+              <PipelineMonitor
+                stats={stats}
+                logs={logs}
+                resumePendingQueue={resumePendingQueue}
+                stopEnrichment={stopEnrichment}
+                resetPipeline={resetPipeline}
+                isStopping={isStopping}
+                setLogs={setLogs}
+                logContainerRef={logContainerRef}
+                activeLogFilter={activeLogFilter}
+                setActiveLogFilter={setActiveLogFilter}
+                isLiveTail={isLiveTail}
+                setIsLiveTail={setIsLiveTail}
+                hasNewLogs={hasNewLogs}
+                setHasNewLogs={setHasNewLogs}
+                isLogDropdownOpen={isLogDropdownOpen}
+                setIsLogDropdownOpen={setIsLogDropdownOpen}
+                handleLogScroll={handleLogScroll}
+              />
+            );
+            const contactsElement = (
+              <DataTable
+                data={contacts}
+                activeFilters={activeFilters}
+                onFiltersChange={setActiveFilters}
+                columns={[
+                  { key: 'contact_id', label: 'contact_id', type: 'uuid', defaultWidth: 140 },
+                  { key: 'lead_list_name', label: 'lead_list', type: 'text', defaultWidth: 150 },
+                  { key: 'email', label: 'email', type: 'text', defaultWidth: 200 },
+                  { key: 'first_name', label: 'first_name', type: 'text', defaultWidth: 100 },
+                  { key: 'last_name', label: 'last_name', type: 'text', defaultWidth: 100 },
+                  { key: 'company_website', label: 'website', type: 'text', defaultWidth: 180 },
+                  { key: 'classification', label: 'industry', type: 'text', defaultWidth: 180 },
+                  { key: 'confidence', label: 'confidence', type: 'confidence', defaultWidth: 110 },
+                  { key: 'cost', label: 'cost', type: 'currency', defaultWidth: 90 },
+                  { key: 'status', label: 'status', type: 'status', defaultWidth: 140 },
+                  { key: 'processed_at', label: 'processed_at', type: 'date', defaultWidth: 130 }
+                ]}
+                selectedIds={selectedIds}
+                isAllFilteredSelected={isAllFilteredSelected}
+                onSetIsAllFilteredSelected={setIsAllFilteredSelected}
+                onToggleRow={(id: string) => {
+                  const n = new Set(selectedIds);
+                  if (n.has(id)) n.delete(id); else n.add(id);
+                  setSelectedIds(n);
                   setIsAllFilteredSelected(false);
-                } else {
-                  setSelectedIds(new Set(contacts.map(c => c.contact_id)));
-                }
-              }}
-              onEnrichSelected={startEnrichmentQueue}
-              onExportCSV={exportToCSV}
-              isProcessing={stats.isProcessing}
-              currentPage={currentPage}
-              pageSize={pageSize}
-              totalCount={totalCount}
-              onPageChange={(p: number) => setCurrentPage(p)}
-              onPageSizeChange={setPageSize}
-              searchQuery={searchQuery}
-              onSearchQueryChange={setSearchQuery}
-              leadListOptions={leadListOptions}
-              activeListFilter={activeListFilter}
-              activeListContactCount={importLists.find(l => l.name === activeListFilter)?.contact_count || 0}
-              onListFilterChange={setActiveListFilter}
-              onOpenListModal={() => setShowListModal(true)}
-              onEnrichActiveList={() => {
-                if (!activeListFilter) return;
-                const list = importLists.find(l => l.name === activeListFilter);
-                enrichList(activeListFilter, list?.contact_count || 0);
-              }}
-              isLoadingContacts={contactsLoading}
-            />
-          ) : (
-            <div className="flex-1 p-6 overflow-hidden bg-[#1c1c1c] flex flex-col h-full min-h-0">
-              <div className="max-w-5xl mx-auto w-full flex-1 flex flex-col space-y-6 min-h-0 h-full">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h2 className="text-xl font-bold flex items-center gap-3">
-                      <Zap className={stats.isProcessing ? 'text-[#3ecf8e] animate-pulse' : 'text-gray-500'} />
-                      Background Pipeline Monitor
-                    </h2>
-                    <p className="text-[10px] text-gray-500 mt-1 uppercase tracking-widest font-bold">Asynchronous Processing Execution</p>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    {!stats.isProcessing && (
-                      <button onClick={resumePendingQueue} className="flex items-center gap-2 px-4 py-2 bg-[#3ecf8e] hover:bg-[#2fb37a] text-black rounded-lg font-bold text-xs shadow-lg transition-all">
-                        <Play className="w-3.5 h-3.5 fill-current" />
-                        Resume Queue
-                      </button>
-                    )}
-                    {stats.isProcessing && (
-                      <button onClick={stopEnrichment} disabled={isStopping} className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-xs transition-all ${isStopping ? 'bg-rose-900/50 text-rose-300' : 'bg-rose-500 hover:bg-rose-600 text-white shadow-lg'}`}>
-                        {isStopping ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />}
-                        {isStopping ? 'Stopping...' : 'Stop Local Worker'}
-                      </button>
-                    )}
-                    <button onClick={() => setLogs([])} className="flex items-center gap-2 px-3 py-2 text-gray-400 hover:text-white hover:bg-[#2e2e2e] rounded-lg text-xs border border-[#2e2e2e]">
-                      <Trash2 className="w-3.5 h-3.5" /> Clear Logs
-                    </button>
-                  </div>
-                </div>
-                <div className="grid grid-cols-3 gap-6">
-                  <StatCard label="Completed" value={stats.completed} color="text-[#3ecf8e]" />
-                  <StatCard label="Failures" value={stats.failed} color="text-rose-500" />
-                  {stats.queueingPhase ? (
-                    <div className="bg-[#161616] rounded-xl border border-[#2e2e2e] p-4 shadow-lg ring-1 ring-white/5">
-                      <div className="text-[10px] font-bold uppercase tracking-wider text-amber-400/60 mb-1">Queueing...</div>
-                      <div className="text-2xl font-black text-amber-400 tabular-nums">
-                        {(stats.queued || 0).toLocaleString()} <span className="text-sm font-normal text-gray-500">/ {stats.total.toLocaleString()}</span>
-                      </div>
-                      <div className="mt-2 h-1 bg-[#2e2e2e] rounded-full overflow-hidden">
-                        <div className="h-full bg-amber-400 rounded-full transition-all duration-500" style={{ width: `${stats.total > 0 ? ((stats.queued || 0) / stats.total * 100) : 0}%` }} />
-                      </div>
-                    </div>
-                  ) : (
-                    <StatCard label="In Queue" value={stats.inQueue ?? 0} color="text-indigo-400" />
-                  )}
-                </div>
-                <div
-                  ref={logContainerRef}
-                  className="bg-[#0e0e0e] rounded-xl border border-[#2e2e2e] p-0 font-mono text-[11px] flex-1 overflow-y-auto custom-scrollbar shadow-inner mb-6 relative ring-1 ring-white/5 min-h-0"
-                >
-                  {logs.length === 0 ? (
-                    <div className="h-full flex flex-col items-center justify-center opacity-30 text-center text-gray-500 py-20">
-                      <DatabaseZap className="w-12 h-12 mb-4 animate-pulse" />
-                      <p className="text-sm font-bold">Pipeline Idle</p>
-                      <p className="mt-2 text-[10px] uppercase tracking-wider">Queue records to begin processing</p>
-                    </div>
-                  ) : (
-                    <div className="flex flex-col-reverse min-h-full">
-                      {logs.map((l: any, i: number) => {
-                        const date = new Date(l.timestamp);
-                        const timeStr = date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-                        const isError = l.level === 'error';
-                        const isWarn = l.level === 'warn';
-                        const isPhase = l.level === 'phase';
-
-                        return (
-                          <div key={l.id || i} className={`group flex items-start gap-4 px-4 py-1 border-b border-white/5 hover:bg-white/[0.02] transition-colors
-                            ${isError ? 'bg-rose-500/10 border-rose-500/20 text-rose-300' : ''}
-                            ${isWarn ? 'text-amber-300' : ''}
-                            ${isPhase ? 'bg-indigo-500/5 text-indigo-300 font-bold' : 'text-gray-400'}
-                          `}>
-                            <span className="opacity-30 shrink-0 select-none w-16">{timeStr}</span>
-                            <span className="opacity-20 shrink-0 select-none w-12 text-[10px] font-bold">[{l.instance_id}]</span>
-                            <span className={`shrink-0 w-20 flex items-center gap-1.5 font-bold uppercase text-[9px] tracking-wider
-                              ${l.module === 'Scraper' ? 'text-blue-400' : ''}
-                              ${l.module === 'OpenAI' ? 'text-[#3ecf8e]' : ''}
-                              ${l.module === 'Sync' ? 'text-purple-400' : ''}
-                              ${l.module === 'Pipeline' ? 'text-indigo-400' : ''}
-                            `}>
-                              {l.module === 'Scraper' && <Zap className="w-2.5 h-2.5" />}
-                              {l.module === 'OpenAI' && <Cpu className="w-2.5 h-2.5" />}
-                              {l.module === 'Sync' && <Database className="w-2.5 h-2.5" />}
-                              {l.module === 'Pipeline' && <Activity className="w-2.5 h-2.5" />}
-                              {l.module}
-                            </span>
-                            <span className="flex-1 break-words leading-relaxed py-0.5">
-                              {l.message}
-                            </span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
+                }}
+                onToggleAll={() => {
+                  if (selectedIds.size === contacts.length && contacts.length > 0) {
+                    setSelectedIds(new Set());
+                    setIsAllFilteredSelected(false);
+                  } else {
+                    setSelectedIds(new Set(contacts.map(c => c.contact_id)));
+                  }
+                }}
+                onEnrichSelected={startEnrichmentQueue}
+                onExportCSV={exportToCSV}
+                isProcessing={stats.isProcessing}
+                currentPage={currentPage}
+                pageSize={pageSize}
+                totalCount={totalCount}
+                onPageChange={(p: number) => setCurrentPage(p)}
+                onPageSizeChange={setPageSize}
+                searchQuery={searchQuery}
+                onSearchQueryChange={setSearchQuery}
+                leadListOptions={leadListOptions}
+                activeListFilter={activeListFilter}
+                activeListContactCount={importLists.find(l => l.name === activeListFilter)?.contact_count || 0}
+                onListFilterChange={setActiveListFilter}
+                onOpenListModal={() => setShowListModal(true)}
+                onEnrichActiveList={() => {
+                  if (!activeListFilter) return;
+                  const list = importLists.find(l => l.name === activeListFilter);
+                  enrichList(activeListFilter, list?.contact_count || 0);
+                }}
+                isLoadingContacts={contactsLoading}
+              />
+            );
+            return (
+              <Routes>
+                <Route path="/" element={<Navigate to="/contacts" replace />} />
+                <Route path="/import" element={importElement} />
+                <Route path="/contacts" element={contactsElement} />
+                <Route path="/pipeline" element={pipelineElement} />
+                <Route path="/bucketing" element={<BucketingTab view="index" importLists={importLists} />} />
+                <Route path="/bucketing/setup" element={<BucketingTab view="setup" importLists={importLists} />} />
+                <Route path="/bucketing/library" element={<BucketingTab view="library" importLists={importLists} />} />
+                <Route path="/bucketing/taxonomy" element={<BucketingTab view="taxonomy" importLists={importLists} />} />
+                <Route path="/bucketing/runs/:runId" element={<BucketingTab view="detail" importLists={importLists} />} />
+                <Route path="/connectors" element={<ConnectorsTab />} />
+                <Route path="/proxies" element={<ProxyStatsDashboard />} />
+                <Route path="*" element={<Navigate to="/contacts" replace />} />
+              </Routes>
+            );
+          })()}
         </div>
       </main>
 

@@ -11,6 +11,7 @@
  */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import {
   Layers, Loader2, AlertCircle, ArrowLeft, Plus, X, Trash2, Download,
   Play, BookMarked, CheckCircle2, Edit3, Archive, Upload, Square, RotateCcw,
@@ -37,13 +38,26 @@ const TAXONOMY_LAYER_HELP = {
     'SECTOR (Layer 3) — the vertical the company SERVES, if explicitly stated. Independent of identity — a "Marketing Agency for Healthcare" has identity=Agency + sector=Healthcare (not identity=Healthcare). Often blank. Examples: Healthcare, Real Estate, Government, Energy & Utilities, Financial Services.'
 } as const;
 
-export function BucketingTab({ importLists }: {
+export function BucketingTab({ view = 'index', importLists }: {
+  view?: BucketingView;
   importLists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; bucketed?: boolean; bucketing_run_count?: number; manually_bucketed?: boolean }[]
 }) {
-  const [view, setView] = useState<BucketingView>('index');
+  const navigate = useNavigate();
+  const params = useParams<{ runId?: string }>();
+  const activeRunId = params.runId ?? null;
+  const setView = useCallback((next: BucketingView) => {
+    switch (next) {
+      case 'index': navigate('/bucketing'); break;
+      case 'setup': navigate('/bucketing/setup'); break;
+      case 'library': navigate('/bucketing/library'); break;
+      case 'taxonomy': navigate('/bucketing/taxonomy'); break;
+      case 'detail':
+        if (activeRunId) navigate(`/bucketing/runs/${activeRunId}`);
+        break;
+    }
+  }, [navigate, activeRunId]);
   const [runs, setRuns] = useState<BucketingRun[]>([]);
   const [library, setLibrary] = useState<LibraryBucket[]>([]);
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [activeRun, setActiveRun] = useState<BucketingRun | null>(null);
   const [bucketCounts, setBucketCounts] = useState<any[]>([]);
   const [sectorMix, setSectorMix] = useState<any[]>([]);
@@ -109,7 +123,7 @@ export function BucketingTab({ importLists }: {
     return () => clearInterval(t);
   }, [view, runs, refreshRuns]);
 
-  const openRun = (id: string) => { setActiveRunId(id); setView('detail'); };
+  const openRun = (id: string) => { navigate(`/bucketing/runs/${id}`); };
 
   const startNew = async (payload: { name: string; list_names: string[]; apply_identity_dq_cascade: boolean; phase1a_model: string }) => {
     setLoading(true);
@@ -139,7 +153,7 @@ export function BucketingTab({ importLists }: {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || `Failed (${res.status})`);
       }
-      if (activeRunId === id) { setActiveRunId(null); setActiveRun(null); setView('index'); }
+      if (activeRunId === id) { setActiveRun(null); navigate('/bucketing'); }
       await refreshRuns();
     } catch (e: any) {
       setError(e.message);
@@ -249,7 +263,7 @@ export function BucketingTab({ importLists }: {
           <div className="flex gap-2">
             {view !== 'index' && (
               <button
-                onClick={() => { setView('index'); setActiveRunId(null); setActiveRun(null); refreshRuns(); }}
+                onClick={() => { setActiveRun(null); navigate('/bucketing'); refreshRuns(); }}
                 className="px-3 py-1.5 rounded-md text-xs font-bold bg-[#2e2e2e] text-gray-300 hover:bg-[#3e3e3e]"
               >
                 <ArrowLeft className="w-3 h-3 inline mr-1" /> All runs
