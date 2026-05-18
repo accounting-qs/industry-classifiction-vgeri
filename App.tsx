@@ -20,7 +20,8 @@ function tabFromPath(pathname: string): AppTab {
   if (pathname.startsWith('/bucketing')) return AppTab.BUCKETING;
   if (pathname.startsWith('/connectors')) return AppTab.CONNECTORS;
   if (pathname.startsWith('/proxies')) return AppTab.PROXIES;
-  return AppTab.MANAGER;
+  if (pathname.startsWith('/contacts')) return AppTab.MANAGER;
+  return AppTab.IMPORT;
 }
 import { db } from './services/supabaseClient';
 import { enrichBatch } from './services/enrichmentService';
@@ -892,7 +893,7 @@ export default function App() {
             );
             return (
               <Routes>
-                <Route path="/" element={<Navigate to="/contacts" replace />} />
+                <Route path="/" element={<Navigate to="/import" replace />} />
                 <Route path="/import" element={importElement} />
                 <Route path="/contacts" element={contactsElement} />
                 <Route path="/pipeline" element={pipelineElement} />
@@ -903,7 +904,7 @@ export default function App() {
                 <Route path="/bucketing/runs/:runId" element={<BucketingTab view="detail" importLists={importLists} />} />
                 <Route path="/connectors" element={<ConnectorsTab />} />
                 <Route path="/proxies" element={<ProxyStatsDashboard />} />
-                <Route path="*" element={<Navigate to="/contacts" replace />} />
+                <Route path="*" element={<Navigate to="/import" replace />} />
               </Routes>
             );
           })()}
