@@ -2199,6 +2199,21 @@ app.get('/api/bucketing/runs/:id/phase1a-stats', async (req, res) => {
     }
 });
 
+// Per-proposed-tag contact counts for the AI-Proposed panel. The UI
+// renders each proposed identity / sub-identity / sector with a "N
+// contacts" badge so the user can decide accept-or-route-to-General
+// against the real number, not just the per-industry usage count.
+app.get('/api/bucketing/runs/:id/proposed-counts', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const { data, error } = await supabase.rpc('get_proposed_tag_contact_counts', { p_run_id: id });
+        if (error) return res.status(500).json({ error: error.message });
+        res.json({ proposals: data || [] });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Coverage summary for a run — single RPC that reports how many of the
 // 293k contacts are represented at each stage. Powers the "Phase 1a
 // coverage" panel in BucketingDetail so the user can pick a rollup

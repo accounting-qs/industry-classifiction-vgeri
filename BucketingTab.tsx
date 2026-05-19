@@ -3323,6 +3323,12 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   lastFinalize?: { at: Date; rerouted: number; nullified: number; failed: number } | null;
 }) {
   const [proposed, setProposed] = useState<{ identities: any[]; sub_identities: any[]; sectors: any[] } | null>(null);
+  // Per-proposal contact counts from /proposed-counts. Keyed by
+  // `${layer}:${name}` so each proposal row can render "N contacts".
+  // Tells the user "this proposal covers 1,247 contacts vs that one
+  // covers 4" — decides accept-vs-reject far better than the existing
+  // per-industry usage count.
+  const [contactCounts, setContactCounts] = useState<Record<string, number>>({});
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [busyAllKind, setBusyAllKind] = useState<string | null>(null);
   const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
@@ -3370,10 +3376,23 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
 
   const refresh = useCallback(async () => {
     try {
-      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/proposed-tags`);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+      const [tagsRes, countsRes] = await Promise.all([
+        fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/proposed-tags`),
+        fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/proposed-counts`),
+      ]);
+      const data = await tagsRes.json();
+      if (!tagsRes.ok) throw new Error(data.error || `Failed (${tagsRes.status})`);
       setProposed(data);
+      // Counts query may legitimately fail on a stale run (RPC not yet
+      // applied) — surface gracefully, render without counts.
+      if (countsRes.ok) {
+        const counts = await countsRes.json().catch(() => ({}));
+        const map: Record<string, number> = {};
+        for (const r of (counts.proposals || [])) {
+          if (r && r.layer && r.name) map[`${r.layer}:${r.name}`] = Number(r.contact_count || 0);
+        }
+        setContactCounts(map);
+      }
       // Drop any selection entries whose item is no longer in the panel
       // (e.g. accepted in a prior pass). Avoids stale checkmarks.
       setSelected(prev => {
@@ -3581,7 +3600,22 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                       <div className="min-w-0 flex-1">
                         <div className={`font-bold truncate ${isAccepted ? 'text-emerald-300' : 'text-white'}`} title={p.name}>{p.name}</div>
                         <div className="text-[10px] text-gray-500 truncate" title={p.samples?.join(' · ')}>
-                          {p.count}× · ex: {(p.samples || []).slice(0, 2).join(' · ')}
+                          {(() => {
+                            const layerKey = kind === 'identities' ? 'identity'
+                              : kind === 'sub_identities' ? 'sub_identity'
+                              : 'sector';
+                            const cc = contactCounts[`${layerKey}:${p.name}`];
+                            return (
+                              <>
+                                {cc !== undefined && (
+                                  <span className="text-amber-300 font-bold">{cc.toLocaleString()} contacts</span>
+                                )}
+                                {cc !== undefined && ' · '}
+                                {p.count}× industries
+                                {(p.samples || []).length > 0 && ` · ex: ${(p.samples || []).slice(0, 2).join(' · ')}`}
+                              </>
+                            );
+                          })()}
                         </div>
                         {kind === 'sub_identities' && p.parent && (
                           <div className="text-[9px] text-gray-600">under {p.parent}</div>
