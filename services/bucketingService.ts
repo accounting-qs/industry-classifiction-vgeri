@@ -2415,6 +2415,51 @@ async function tagIndustries(
                         });
                     }
                 }
+                // Checkpoint to bucket_industry_map immediately. If the
+                // process dies (cancel, OOM, server restart), Resume reads
+                // these rows back and skips them — paid LLM work is never
+                // lost. The end-of-tagging upsert later overwrites these
+                // with consolidated names (same PK), so this is just a
+                // crash-safety draft. Synchronous await so we don't free
+                // the concurrency slot until persistence is durable.
+                try {
+                    const checkpoint = parsed.map(t => ({
+                        bucketing_run_id: runId,
+                        industry_string: t.industry,
+                        raw_industry: t.industry,
+                        // Pre-rollup placeholder. Apply_rollup_bucket_assignments
+                        // sets the final bucket_name; this just satisfies
+                        // the NOT NULL constraint until the post-pass
+                        // upsert writes the proper pre-rollup value.
+                        bucket_name: t.is_disqualified ? RESERVED_DISQUALIFIED : RESERVED_GENERAL,
+                        source: 'llm_phase1a',
+                        primary_identity: t.identity,
+                        sub_identity: t.sub_identity,
+                        sector: t.sector,
+                        is_new_identity: !!t.is_new_identity,
+                        is_new_sub_identity: !!t.is_new_sub_identity,
+                        is_new_sector: !!t.is_new_sector,
+                        is_disqualified: !!t.is_disqualified,
+                        is_generic: false,
+                        needs_qa: false,
+                        identity_confidence: t.identity_confidence ? Number(((t.identity_confidence) / 10).toFixed(2)) : null,
+                        sub_identity_confidence: t.sub_identity_confidence ? Number(((t.sub_identity_confidence) / 10).toFixed(2)) : null,
+                        sector_confidence: t.sector_confidence ? Number(((t.sector_confidence) / 10).toFixed(2)) : null,
+                        confidence: t.confidence ? Number(((t.confidence) / 10).toFixed(2)) : null,
+                        llm_reason: (t.reason || '').slice(0, 500) || null,
+                        canonical_classification: t.sub_identity || t.identity || 'Generic',
+                    }));
+                    const { error: ckErr } = await supabase.from('bucket_industry_map')
+                        .upsert(checkpoint, { onConflict: 'bucketing_run_id,industry_string' });
+                    if (ckErr) {
+                        // Non-fatal: the end-of-tagging upsert will catch
+                        // up if the process survives. But log loudly so we
+                        // notice if checkpoints are silently failing.
+                        ctx.log(`[Bucketing ${runId}] checkpoint write failed (${parsed.length} rows): ${ckErr.message}`, 'warn');
+                    }
+                } catch (ckErr: any) {
+                    ctx.log(`[Bucketing ${runId}] checkpoint exception: ${ckErr.message}`, 'warn');
+                }
             }
         } catch (err: any) {
             batchesFailed++;
