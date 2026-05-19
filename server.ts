@@ -1847,21 +1847,71 @@ function buildBucketingCtx(runId: string) {
     const phaseStartedAt = new Map<string, number>();
     const ac = getOrCreateRunAbortController(runId);
 
+    // Sliding-window rate sample: keep timestamped progress points so we
+    // can compute ETA from the last ~60s of throughput instead of the
+    // naive "elapsed / current × remaining" formula. That formula
+    // over-estimates badly during warm-up: at 1k/162k done in 100s of
+    // (mostly warm-up) wall time it gave ETA=4h47m even when sustained
+    // rate was 5× higher. Window-based ETA stabilises within a minute.
+    type Sample = { phase: string; t: number; current: number; total: number };
+    const samples: Sample[] = [];
+    const SAMPLE_WINDOW_MS = 60_000;
+
     const flush = async () => {
         if (!pending) return;
         const snap = pending; pending = null;
-        const elapsed = (Date.now() - (phaseStartedAt.get(snap.phase) || startTime)) / 1000;
+        const now = Date.now();
+        const elapsed = (now - (phaseStartedAt.get(snap.phase) || startTime)) / 1000;
+
+        // Update the rolling sample window for this phase.
+        if (typeof snap.current === 'number' && typeof snap.total === 'number' && snap.total > 0) {
+            samples.push({ phase: snap.phase, t: now, current: snap.current, total: snap.total });
+            // Drop samples older than window OR from a different phase.
+            while (samples.length > 0 && (
+                samples[0].phase !== snap.phase ||
+                now - samples[0].t > SAMPLE_WINDOW_MS
+            )) {
+                samples.shift();
+            }
+        }
+
         const pct = (typeof snap.total === 'number' && snap.total > 0 && typeof snap.current === 'number')
             ? Math.min(100, Math.round((snap.current / snap.total) * 100))
             : null;
-        const eta = (typeof snap.current === 'number' && snap.current > 0
-                && typeof snap.total === 'number' && snap.total > snap.current
-                && elapsed > 1)
-            ? Math.round((elapsed / snap.current) * (snap.total - snap.current))
-            : null;
+
+        // Window-based rate: items / second over the last sample window.
+        // Falls back to overall rate if we don't have ≥2 samples yet.
+        let rate_per_sec: number | null = null;
+        let eta: number | null = null;
+        if (typeof snap.current === 'number' && typeof snap.total === 'number' && snap.total > snap.current) {
+            const remaining = snap.total - snap.current;
+            if (samples.length >= 2) {
+                const first = samples[0];
+                const last = samples[samples.length - 1];
+                const items = last.current - first.current;
+                const secs = (last.t - first.t) / 1000;
+                if (items > 0 && secs > 0) {
+                    rate_per_sec = items / secs;
+                    eta = Math.round(remaining / rate_per_sec);
+                }
+            }
+            // Fallback to overall rate if window-rate isn't usable yet.
+            if (eta === null && snap.current > 0 && elapsed > 1) {
+                rate_per_sec = snap.current / elapsed;
+                eta = Math.round((elapsed / snap.current) * remaining);
+            }
+        }
+
         try {
             await supabase.from('bucketing_runs').update({
-                progress: { ...snap, pct, eta_seconds: eta, elapsed_seconds: Math.round(elapsed), updated_at: new Date().toISOString() }
+                progress: {
+                    ...snap,
+                    pct,
+                    eta_seconds: eta,
+                    rate_per_sec: rate_per_sec === null ? null : Number(rate_per_sec.toFixed(2)),
+                    elapsed_seconds: Math.round(elapsed),
+                    updated_at: new Date().toISOString()
+                }
             }).eq('id', runId);
         } catch (e) { /* swallow — progress is best-effort */ }
     };

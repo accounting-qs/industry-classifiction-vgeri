@@ -185,7 +185,7 @@ const PHASE1A_QA_FLOOR = 6;
 // silently exclude from outreach.
 const PHASE1A_DQ_FLOOR = 7;
 const PHASE1A_BATCH_SIZE = 20;
-const PHASE1A_CONCURRENCY = 40;
+const PHASE1A_CONCURRENCY = 300;
 
 const ANTHROPIC_KEY_NAME = 'ANTHROPIC_API_KEY';
 
@@ -2257,6 +2257,49 @@ async function tagIndustries(
     let firstError: string | null = null;
     const taggings: IndustryTagging[] = [];
 
+    // Telemetry: track 429s and per-batch latency so we can detect when we
+    // hit OpenAI/Anthropic rate-limits. Logged every ~60s while the run is
+    // active so the user can see if concurrency=300 is over-saturating.
+    let rateLimitHits = 0;
+    let lastRateLimitAt = 0;
+    let batchLatenciesMs: number[] = [];   // ring buffer kept ≤ 200 entries
+    const RATE_LIMIT_LOG_INTERVAL_MS = 60_000;
+    let lastTelemetryLogAt = Date.now();
+    const recordLatency = (ms: number) => {
+        batchLatenciesMs.push(ms);
+        if (batchLatenciesMs.length > 200) batchLatenciesMs.shift();
+    };
+    const isRateLimitError = (err: any): boolean => {
+        if (!err) return false;
+        const msg = (err.message || String(err)).toLowerCase();
+        if (err.status === 429 || err.statusCode === 429) return true;
+        return msg.includes('rate limit') || msg.includes('too many requests') ||
+               msg.includes('rate_limit_exceeded') || msg.includes('429');
+    };
+    const maybeLogTelemetry = () => {
+        const now = Date.now();
+        if (now - lastTelemetryLogAt < RATE_LIMIT_LOG_INTERVAL_MS) return;
+        lastTelemetryLogAt = now;
+        if (batchLatenciesMs.length === 0) return;
+        const sorted = [...batchLatenciesMs].sort((a, b) => a - b);
+        const p50 = sorted[Math.floor(sorted.length * 0.5)];
+        const p95 = sorted[Math.floor(sorted.length * 0.95)];
+        const p99 = sorted[Math.floor(sorted.length * 0.99)];
+        const avg = Math.round(sorted.reduce((s, n) => s + n, 0) / sorted.length);
+        const rateLimited = rateLimitHits > 0 ? ` · 429 hits=${rateLimitHits}` : '';
+        ctx.log(
+            `[Bucketing ${runId}] tagger telemetry — batches=${batchesAttempted} done=${done}/${vocab.length}  ` +
+            `latency p50=${p50}ms p95=${p95}ms p99=${p99}ms avg=${avg}ms${rateLimited}`
+        );
+        if (rateLimitHits > 0 && (now - lastRateLimitAt) < RATE_LIMIT_LOG_INTERVAL_MS) {
+            ctx.log(
+                `[Bucketing ${runId}] ⚠ provider rate-limited ${rateLimitHits}× in the last minute. ` +
+                `Consider lowering PHASE1A_CONCURRENCY (currently ${PHASE1A_CONCURRENCY}) if hits keep accumulating.`,
+                'warn'
+            );
+        }
+    };
+
     // In-run proposal reuse. Earlier we used wave boundaries (run 40 in
     // parallel, wait for ALL, gather proposals, start next 40) to give the
     // next wave's prompt a clean snapshot of prior coinings. That fence cost
@@ -2312,6 +2355,7 @@ async function tagIndustries(
                 sample_companies: v.sample_companies?.slice(0, 2) || []
             }))
         });
+        const callStart = Date.now();
         try {
             let text = '';
             if (isAnthropic) {
@@ -2346,6 +2390,10 @@ async function tagIndustries(
                 });
                 if (!resp.ok) {
                     const body = await resp.text();
+                    if (resp.status === 429) {
+                        rateLimitHits++;
+                        lastRateLimitAt = Date.now();
+                    }
                     throw new Error(`OpenAI ${resp.status}: ${body.slice(0, 300)}`);
                 }
                 const json: any = await resp.json();
@@ -2356,6 +2404,8 @@ async function tagIndustries(
                 totalOut += usage.completion_tokens || 0;
                 text = json.choices?.[0]?.message?.content || '';
             }
+            recordLatency(Date.now() - callStart);
+            maybeLogTelemetry();
             const parsedRaw = parseTaggingJson(text, batch);
             // Snap against the effective snapshot (library + in-run proposals
             // visible at batch start). Library matches stay is_new=false.
@@ -2420,9 +2470,17 @@ async function tagIndustries(
                 // these rows back and skips them — paid LLM work is never
                 // lost. The end-of-tagging upsert later overwrites these
                 // with consolidated names (same PK), so this is just a
-                // crash-safety draft. Synchronous await so we don't free
-                // the concurrency slot until persistence is durable.
-                try {
+                // crash-safety draft.
+                //
+                // FIRE-AND-FORGET: don't await — at concurrency=300, awaiting
+                // would queue ~300 simultaneous upserts on Supabase's pooler
+                // and block the concurrency slot. The .then() handler logs
+                // errors so we notice if writes start failing. Risk: a crash
+                // in the ~50-200ms window between LLM-returns and checkpoint-
+                // lands loses at most ~PHASE1A_CONCURRENCY × PHASE1A_BATCH_SIZE
+                // (~6000) industries' worth of work, which the resume filter
+                // would re-tag on the next run start.
+                {
                     const checkpoint = parsed.map(t => ({
                         bucketing_run_id: runId,
                         industry_string: t.industry,
@@ -2449,20 +2507,28 @@ async function tagIndustries(
                         llm_reason: (t.reason || '').slice(0, 500) || null,
                         canonical_classification: t.sub_identity || t.identity || 'Generic',
                     }));
-                    const { error: ckErr } = await supabase.from('bucket_industry_map')
-                        .upsert(checkpoint, { onConflict: 'bucketing_run_id,industry_string' });
-                    if (ckErr) {
-                        // Non-fatal: the end-of-tagging upsert will catch
-                        // up if the process survives. But log loudly so we
-                        // notice if checkpoints are silently failing.
-                        ctx.log(`[Bucketing ${runId}] checkpoint write failed (${parsed.length} rows): ${ckErr.message}`, 'warn');
-                    }
-                } catch (ckErr: any) {
-                    ctx.log(`[Bucketing ${runId}] checkpoint exception: ${ckErr.message}`, 'warn');
+                    supabase.from('bucket_industry_map')
+                        .upsert(checkpoint, { onConflict: 'bucketing_run_id,industry_string' })
+                        .then(({ error: ckErr }) => {
+                            if (ckErr) {
+                                // Non-fatal: the end-of-tagging upsert will catch
+                                // up if the process survives. Log so we notice
+                                // if writes start failing silently.
+                                ctx.log(`[Bucketing ${runId}] checkpoint write failed (${parsed.length} rows): ${ckErr.message}`, 'warn');
+                            }
+                        }, (ckErr: any) => {
+                            ctx.log(`[Bucketing ${runId}] checkpoint exception: ${ckErr.message}`, 'warn');
+                        });
                 }
             }
         } catch (err: any) {
             batchesFailed++;
+            recordLatency(Date.now() - callStart);
+            if (isRateLimitError(err)) {
+                rateLimitHits++;
+                lastRateLimitAt = Date.now();
+            }
+            maybeLogTelemetry();
             if (!firstError) firstError = err.message || String(err);
             ctx.log(`[Bucketing ${runId}] tagging batch error (${batch.length} industries): ${err.message}`, 'error');
             // Fail-open: emit needs_qa rows so we don't lose contacts.

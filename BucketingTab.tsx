@@ -1127,6 +1127,9 @@ function BucketingProgressPanel({ run, title, onError }: {
               ? <> · {p.current.toLocaleString()} / {p.total.toLocaleString()}</>
               : null}
             {elapsedTxt && <> · elapsed {elapsedTxt}</>}
+            {typeof (p as any).rate_per_sec === 'number' && (p as any).rate_per_sec > 0 && (
+              <> · <span className="text-gray-300">{(p as any).rate_per_sec.toFixed(1)}/s</span> (last 60s)</>
+            )}
           </div>
         )}
         {/* Backgrounded-job hint. The run continues server-side regardless
