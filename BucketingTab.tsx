@@ -3763,12 +3763,21 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                     if (kind === 'sub_identities') return (library.sub_identities || []).filter((e: any) => !e.archived).map((e: any) => ({ name: e.name, parent: e.parent_identity }));
                     return (library.sectors || []).filter((e: any) => !e.archived).map((e: any) => ({ name: e.name }));
                   })();
-                  // Suggested match: a library entry whose normalized name
-                  // equals the proposal's normalized name. One-click remap.
+                  // Suggested match: a library entry that's either an exact
+                  // name match (LLM tagged is_new=true before the library
+                  // was populated — one-click "resolve" clears the orphan
+                  // flag) or a normalized match ("Distribution & Wholesale"
+                  // ↔ "Wholesale Distributor"). Exact matches win since
+                  // they're the unambiguous case.
                   const normProp = normalizeProposalName(p.name);
-                  const suggestion = !isActioned && !isEditing && normProp
-                    ? libEntries.find(e => normalizeProposalName(e.name) === normProp && e.name !== p.name)
+                  const exactMatch = !isActioned && !isEditing
+                    ? libEntries.find(e => e.name === p.name)
                     : undefined;
+                  const normMatch = !isActioned && !isEditing && !exactMatch && normProp
+                    ? libEntries.find(e => normalizeProposalName(e.name) === normProp)
+                    : undefined;
+                  const suggestion = exactMatch || normMatch;
+                  const suggestionIsExact = !!exactMatch;
                   return (
                     <li
                       key={key}
@@ -3882,10 +3891,17 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                 onClick={() => remap(kind, p.name, suggestion.name, suggestion.parent)}
                                 disabled={isBusy}
                                 className="mt-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30 hover:bg-amber-500/25 disabled:opacity-50 inline-flex items-center gap-1"
-                                title={`Looks like the existing library entry "${suggestion.name}" — click to remap this proposal's contacts to it.`}
+                                title={
+                                  suggestionIsExact
+                                    ? `"${suggestion.name}" already exists in the library — these contacts were tagged is_new=true before the entry was added. Click to clear the orphan flag.`
+                                    : `Looks like the existing library entry "${suggestion.name}" — click to remap this proposal's contacts to it.`
+                                }
                               >
                                 <Sparkles className="w-2.5 h-2.5" />
-                                <span>Route to "{suggestion.name}"{suggestion.parent ? ` (under ${suggestion.parent})` : ''}</span>
+                                <span>
+                                  {suggestionIsExact ? 'Already in library → resolve' : `Route to "${suggestion.name}"`}
+                                  {suggestion.parent ? ` (under ${suggestion.parent})` : ''}
+                                </span>
                               </button>
                             )}
                           </div>
