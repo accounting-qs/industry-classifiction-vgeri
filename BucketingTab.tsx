@@ -15,7 +15,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import {
   Layers, Loader2, AlertCircle, ArrowLeft, Plus, X, Trash2, Download,
   Play, BookMarked, CheckCircle2, Edit3, Archive, Upload, Square, RotateCcw,
-  ChevronDown, ChevronRight
+  ChevronDown, ChevronRight, ArrowRight, Sparkles
 } from 'lucide-react';
 import Papa from 'papaparse';
 import type { BucketingRun, BucketProposal, LibraryBucket } from './types';
@@ -3314,6 +3314,28 @@ function StatCard({ label, value, color }: { label: string; value: string; color
 
 type TaxKind = 'identities' | 'sub_identities' | 'sectors';
 
+// Lightweight mirror of services/bucketingService.ts normalizeTaxonomyName.
+// Used by the proposed-tags panel to surface "🎯 Looks like <library entry>"
+// suggestions. Strict enough that an exact normalized match is safe to offer
+// as a one-click remap; fuzzy matching is intentionally out of scope.
+function normalizeProposalName(name: string): string {
+  if (!name) return '';
+  let s = name.toLowerCase().trim();
+  s = s.replace(/\s*\([^)]*\)\s*$/g, '').trim();
+  s = s.replace(/^b2b\s+/i, '').trim();
+  s = s.replace(/\s*\/\s*/g, ' and ').replace(/\s*&\s*/g, ' and ').replace(/\s+/g, ' ');
+  const suffixes = [' services', ' solutions', ' group', ' inc', ' inc.', ' llc', ' ltd', ' co.', ' company', ' corp', ' corp.', ' corporation', ' firm'];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const suf of suffixes) {
+      if (s.endsWith(suf)) { s = s.slice(0, -suf.length).trim(); changed = true; break; }
+    }
+  }
+  if (s.endsWith('s') && !s.endsWith('ss') && !s.endsWith('ics')) s = s.slice(0, -1);
+  return s;
+}
+
 function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, finalizing, finalizeProgress, lastFinalize }: {
   runId: string;
   onError: (m: string | null) => void;
@@ -3337,6 +3359,13 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   // covers 4" — decides accept-vs-reject far better than the existing
   // per-industry usage count.
   const [contactCounts, setContactCounts] = useState<Record<string, number>>({});
+  // Live library snapshot — populates the Route-to-existing dropdowns and
+  // the suggested-match chip. Refetched on mount and after every accept /
+  // remap so the dropdowns reflect entries the user just added.
+  const [library, setLibrary] = useState<{ identities: any[]; sub_identities: any[]; sectors: any[] } | null>(null);
+  // Inline-edit state. Only one row at a time; storing the original key
+  // lets the row know which proposal it's editing across re-renders.
+  const [editing, setEditing] = useState<{ kind: TaxKind; origName: string; name: string; parent: string } | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [busyAllKind, setBusyAllKind] = useState<string | null>(null);
   const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
@@ -3384,10 +3413,15 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
 
   const refresh = useCallback(async () => {
     try {
-      const [tagsRes, countsRes] = await Promise.all([
+      const [tagsRes, countsRes, libRes] = await Promise.all([
         fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/proposed-tags`),
         fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/proposed-counts`),
+        fetch(`/api/bucketing/taxonomy`),
       ]);
+      if (libRes.ok) {
+        const lib = await libRes.json().catch(() => null);
+        if (lib) setLibrary(lib);
+      }
       const data = await tagsRes.json();
       if (!tagsRes.ok) throw new Error(data.error || `Failed (${tagsRes.status})`);
       setProposed(data);
@@ -3416,8 +3450,18 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
 
   useEffect(() => { refresh(); }, [refresh]);
 
-  const acceptOne = async (kind: TaxKind, name: string, parent?: string): Promise<void> => {
-    const body: any = { name, created_by: 'ai' };
+  // acceptOne is shared by single Accept, bulk Apply-selected, and the
+  // Save & Accept path on the edit form. When `origName` differs from `name`
+  // the server treats it as a rename and rewrites the run's bucket_industry_map
+  // rows from origName → name. When `origName === name` (the common case),
+  // it's still passed so the orphan flag clears immediately on accept.
+  const acceptOne = async (
+    kind: TaxKind,
+    name: string,
+    parent?: string,
+    origName?: string,
+  ): Promise<void> => {
+    const body: any = { name, created_by: 'ai', run_id: runId, original_name: origName ?? name };
     if (kind === 'sub_identities' && parent) body.parent_identity = parent;
     const res = await fetch(`/api/bucketing/taxonomy/${kind}`, {
       method: 'POST',
@@ -3432,11 +3476,54 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
     setBusyKey(`${kind}:${name}`);
     onError(null);
     try {
-      await acceptOne(kind, name, parent);
+      await acceptOne(kind, name, parent, name);
       // Mark accepted FIRST so the refresh-driven re-render reflects the
       // accepted state immediately (otherwise the item flickers back to
       // its un-accepted style for a tick).
       markAccepted(kind, [name]);
+      await refresh();
+    } catch (e: any) { onError(e.message); }
+    finally { setBusyKey(null); }
+  };
+
+  // Save the edit form: accept with rename + (for sub_identities) re-parent.
+  // Marks the FINAL name as accepted so the row shows the accepted state on
+  // the next refresh — the original orphan name is gone, rewritten on the
+  // server. If the new name + parent already exist in the library the server
+  // upsert is a no-op on the library row but the run-rewrite still runs.
+  const saveEdit = async () => {
+    if (!editing) return;
+    const finalName = editing.name.trim();
+    if (!finalName) { onError('Name is required'); return; }
+    if (editing.kind === 'sub_identities' && !editing.parent.trim()) {
+      onError('Parent identity is required for sub-identities'); return;
+    }
+    setBusyKey(`${editing.kind}:${editing.origName}`);
+    onError(null);
+    try {
+      await acceptOne(editing.kind, finalName, editing.parent.trim(), editing.origName);
+      markAccepted(editing.kind, [finalName]);
+      setEditing(null);
+      await refresh();
+    } catch (e: any) { onError(e.message); }
+    finally { setBusyKey(null); }
+  };
+
+  // Route the orphans for `fromName` to an existing library entry. Does NOT
+  // add anything to the library — the picked target must already exist. The
+  // proposal disappears from the panel after refresh because its is_new_*
+  // flags are gone server-side.
+  const remap = async (kind: TaxKind, fromName: string, toName: string, toParent?: string) => {
+    setBusyKey(`${kind}:${fromName}`);
+    onError(null);
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/proposed-tags/${kind}/remap`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from_name: fromName, to_name: toName, to_parent: toParent })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
       await refresh();
     } catch (e: any) { onError(e.message); }
     finally { setBusyKey(null); }
@@ -3588,63 +3675,164 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                   const key = `${kind}:${p.name}`;
                   const isChecked = sel.has(p.name);
                   const isAccepted = accepted[kind].has(p.name);
+                  const isEditing = !!editing && editing.kind === kind && editing.origName === p.name;
+                  const isBusy = busyKey === key;
+                  // Library entries available as Route-to-existing targets.
+                  // For sub-identities we keep parent_identity so the remap
+                  // can rewrite both columns atomically.
+                  const libEntries: { name: string; parent?: string }[] = (() => {
+                    if (!library) return [];
+                    if (kind === 'identities') return (library.identities || []).filter((e: any) => !e.archived).map((e: any) => ({ name: e.name }));
+                    if (kind === 'sub_identities') return (library.sub_identities || []).filter((e: any) => !e.archived).map((e: any) => ({ name: e.name, parent: e.parent_identity }));
+                    return (library.sectors || []).filter((e: any) => !e.archived).map((e: any) => ({ name: e.name }));
+                  })();
+                  // Suggested match: a library entry whose normalized name
+                  // equals the proposal's normalized name. One-click remap.
+                  const normProp = normalizeProposalName(p.name);
+                  const suggestion = !isAccepted && !isEditing && normProp
+                    ? libEntries.find(e => normalizeProposalName(e.name) === normProp && e.name !== p.name)
+                    : undefined;
                   return (
                     <li
                       key={key}
-                      className={`flex items-center justify-between gap-2 px-2 py-1.5 border rounded text-[11px] transition-colors ${
+                      className={`px-2 py-1.5 border rounded text-[11px] transition-colors ${
                         isAccepted ? 'bg-emerald-500/10 border-emerald-500/40'
+                          : isEditing ? 'bg-amber-500/10 border-amber-500/40'
                           : isChecked ? 'bg-[#3ecf8e]/10 border-[#3ecf8e]/40'
                           : 'bg-[#1c1c1c] border-[#2e2e2e]'
                       }`}
                       title={isAccepted ? 'Accepted in this session — added to the library. Run Finalize Taxonomy / Recalculate to clear it from this list.' : undefined}
                     >
-                      <input
-                        type="checkbox"
-                        checked={isChecked}
-                        onChange={() => toggleSelect(kind, p.name)}
-                        disabled={isAccepted}
-                        className="w-3 h-3 accent-[#3ecf8e] shrink-0 disabled:opacity-30"
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className={`font-bold truncate ${isAccepted ? 'text-emerald-300' : 'text-white'}`} title={p.name}>{p.name}</div>
-                        <div className="text-[10px] text-gray-500 truncate" title={p.samples?.join(' · ')}>
-                          {(() => {
-                            const layerKey = kind === 'identities' ? 'identity'
-                              : kind === 'sub_identities' ? 'sub_identity'
-                              : 'sector';
-                            const cc = contactCounts[`${layerKey}:${p.name}`];
-                            return (
-                              <>
-                                {cc !== undefined && (
-                                  <span className="text-amber-300 font-bold">{cc.toLocaleString()} contacts</span>
-                                )}
-                                {cc !== undefined && ' · '}
-                                {p.count}× industries
-                                {(p.samples || []).length > 0 && ` · ex: ${(p.samples || []).slice(0, 2).join(' · ')}`}
-                              </>
-                            );
-                          })()}
+                      {isEditing ? (
+                        <div className="space-y-1.5">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[9px] text-gray-500 uppercase shrink-0">Name</span>
+                            <input
+                              type="text"
+                              value={editing!.name}
+                              onChange={e => setEditing(prev => prev ? { ...prev, name: e.target.value } : prev)}
+                              className="flex-1 min-w-0 px-1.5 py-0.5 bg-[#0f0f0f] border border-amber-500/40 rounded text-white text-[11px]"
+                              autoFocus
+                            />
+                          </div>
+                          {kind === 'sub_identities' && (
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-[9px] text-gray-500 uppercase shrink-0">Parent</span>
+                              <select
+                                value={editing!.parent}
+                                onChange={e => setEditing(prev => prev ? { ...prev, parent: e.target.value } : prev)}
+                                className="flex-1 min-w-0 px-1.5 py-0.5 bg-[#0f0f0f] border border-amber-500/40 rounded text-white text-[11px]"
+                              >
+                                <option value="">— pick parent identity —</option>
+                                {(library?.identities || []).filter((e: any) => !e.archived).map((e: any) => (
+                                  <option key={e.name} value={e.name}>{e.name}</option>
+                                ))}
+                              </select>
+                            </div>
+                          )}
+                          <div className="flex items-center justify-end gap-1.5">
+                            <button
+                              onClick={() => setEditing(null)}
+                              disabled={isBusy}
+                              className="px-2 py-1 rounded text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:text-white disabled:opacity-50"
+                            >Cancel</button>
+                            <button
+                              onClick={saveEdit}
+                              disabled={isBusy}
+                              className="px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
+                            >{isBusy ? '…' : 'Save & Accept'}</button>
+                          </div>
                         </div>
-                        {kind === 'sub_identities' && p.parent && (
-                          <div className="text-[9px] text-gray-600">under {p.parent}</div>
-                        )}
-                      </div>
-                      {isAccepted ? (
-                        <span
-                          className="shrink-0 px-2 py-1 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1"
-                          title="Already added to the taxonomy library in this session"
-                        >
-                          <CheckCircle2 className="w-3 h-3" />
-                          Accepted
-                        </span>
                       ) : (
-                        <button
-                          onClick={() => accept(kind, p.name, p.parent)}
-                          disabled={busyKey === key}
-                          className="shrink-0 px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
-                        >
-                          {busyKey === key ? '…' : 'Accept'}
-                        </button>
+                        <div className="flex items-center justify-between gap-2">
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            onChange={() => toggleSelect(kind, p.name)}
+                            disabled={isAccepted}
+                            className="w-3 h-3 accent-[#3ecf8e] shrink-0 disabled:opacity-30"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className={`font-bold truncate ${isAccepted ? 'text-emerald-300' : 'text-white'}`} title={p.name}>{p.name}</div>
+                            <div className="text-[10px] text-gray-500 truncate" title={p.samples?.join(' · ')}>
+                              {(() => {
+                                const layerKey = kind === 'identities' ? 'identity'
+                                  : kind === 'sub_identities' ? 'sub_identity'
+                                  : 'sector';
+                                const cc = contactCounts[`${layerKey}:${p.name}`];
+                                return (
+                                  <>
+                                    {cc !== undefined && (
+                                      <span className="text-amber-300 font-bold">{cc.toLocaleString()} contacts</span>
+                                    )}
+                                    {cc !== undefined && ' · '}
+                                    {p.count}× industries
+                                    {(p.samples || []).length > 0 && ` · ex: ${(p.samples || []).slice(0, 2).join(' · ')}`}
+                                  </>
+                                );
+                              })()}
+                            </div>
+                            {kind === 'sub_identities' && p.parent && (
+                              <div className="text-[9px] text-gray-600">under {p.parent}</div>
+                            )}
+                            {suggestion && (
+                              <button
+                                onClick={() => remap(kind, p.name, suggestion.name, suggestion.parent)}
+                                disabled={isBusy}
+                                className="mt-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30 hover:bg-amber-500/25 disabled:opacity-50 inline-flex items-center gap-1"
+                                title={`Looks like the existing library entry "${suggestion.name}" — click to remap this proposal's contacts to it.`}
+                              >
+                                <Sparkles className="w-2.5 h-2.5" />
+                                <span>Route to "{suggestion.name}"{suggestion.parent ? ` (under ${suggestion.parent})` : ''}</span>
+                              </button>
+                            )}
+                          </div>
+                          {isAccepted ? (
+                            <span
+                              className="shrink-0 px-2 py-1 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1"
+                              title="Already added to the taxonomy library in this session"
+                            >
+                              <CheckCircle2 className="w-3 h-3" />
+                              Accepted
+                            </span>
+                          ) : (
+                            <div className="shrink-0 flex items-center gap-1">
+                              <button
+                                onClick={() => setEditing({ kind, origName: p.name, name: p.name, parent: p.parent || '' })}
+                                disabled={isBusy}
+                                className="p-1 rounded bg-[#1c1c1c] border border-[#2e2e2e] text-gray-400 hover:text-amber-300 disabled:opacity-50"
+                                title="Rename / change parent before accepting"
+                              ><Edit3 className="w-3 h-3" /></button>
+                              <select
+                                value=""
+                                disabled={isBusy || libEntries.length === 0}
+                                onChange={e => {
+                                  const v = e.target.value;
+                                  if (!v) return;
+                                  const target = libEntries.find(le => `${le.name}::${le.parent || ''}` === v);
+                                  if (target) remap(kind, p.name, target.name, target.parent);
+                                  e.target.value = '';
+                                }}
+                                className="px-1 py-1 rounded text-[10px] bg-[#1c1c1c] border border-[#2e2e2e] text-gray-400 hover:text-white max-w-[110px] disabled:opacity-50"
+                                title="Route this proposal's contacts to an existing library entry instead of adding a new one"
+                              >
+                                <option value="">Route to…</option>
+                                {libEntries.map(le => (
+                                  <option key={`${le.name}::${le.parent || ''}`} value={`${le.name}::${le.parent || ''}`}>
+                                    {kind === 'sub_identities' ? `${le.name} (under ${le.parent})` : le.name}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                onClick={() => accept(kind, p.name, p.parent)}
+                                disabled={isBusy}
+                                className="px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
+                              >
+                                {isBusy ? '…' : 'Accept'}
+                              </button>
+                            </div>
+                          )}
+                        </div>
                       )}
                     </li>
                   );

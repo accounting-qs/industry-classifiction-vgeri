@@ -3464,6 +3464,16 @@ function pickTaxonomyTable(kind: string): string | null {
     return (TAXONOMY_TABLES as any)[kind] || null;
 }
 
+// Map a taxonomy kind to (column on bucket_industry_map, is_new_* flag).
+// Used by accept-with-edit and Route-to-existing to rewrite a run's
+// orphan rows so the rejected/renamed name no longer surfaces as a
+// pending proposal.
+const TAXONOMY_LAYER_COLS: Record<string, { col: string; flag: string }> = {
+    identities:     { col: 'primary_identity', flag: 'is_new_identity' },
+    sub_identities: { col: 'sub_identity',     flag: 'is_new_sub_identity' },
+    sectors:        { col: 'sector',           flag: 'is_new_sector' }
+};
+
 app.get('/api/bucketing/taxonomy', async (_req, res) => {
     try {
         const [idRes, chRes, secRes] = await Promise.all([
@@ -3486,7 +3496,8 @@ app.get('/api/bucketing/taxonomy', async (_req, res) => {
 
 app.post('/api/bucketing/taxonomy/:kind', async (req, res) => {
     try {
-        const table = pickTaxonomyTable(req.params.kind);
+        const kind = req.params.kind;
+        const table = pickTaxonomyTable(kind);
         if (!table) return res.status(400).json({ error: 'unknown taxonomy kind' });
         const body = req.body || {};
         const name = String(body.name || '').trim();
@@ -3499,20 +3510,53 @@ app.post('/api/bucketing/taxonomy/:kind', async (req, res) => {
             archived: false,
             updated_at: new Date().toISOString()
         };
-        if (req.params.kind === 'identities') {
+        let parentIdentity: string | null = null;
+        if (kind === 'identities') {
             row.is_disqualified = !!body.is_disqualified;
         }
-        if (req.params.kind === 'sub_identities') {
-            const parent = String(body.parent_identity || '').trim();
-            if (!parent) return res.status(400).json({ error: 'parent_identity is required for sub-identities' });
-            row.parent_identity = parent;
+        if (kind === 'sub_identities') {
+            parentIdentity = String(body.parent_identity || '').trim();
+            if (!parentIdentity) return res.status(400).json({ error: 'parent_identity is required for sub-identities' });
+            row.parent_identity = parentIdentity;
         }
-        if (req.params.kind === 'sectors') {
+        if (kind === 'sectors') {
             row.synonyms = typeof body.synonyms === 'string' ? body.synonyms : null;
         }
         const { data, error } = await supabase.from(table).upsert(row, { onConflict: 'name' }).select().single();
         if (error) return res.status(400).json({ error: error.message });
-        res.json(data);
+
+        // Accept-with-edit: when called with run_id, also rewrite the run's
+        // bucket_industry_map rows so the orphan flag clears immediately.
+        // original_name is the proposal's name as it appears in the panel
+        // (may differ from `name` if the user renamed on accept). When
+        // omitted, falls back to `name` — accept-without-rename still gets
+        // the orphan-clearing rewrite, which is the right behavior.
+        const runId = typeof body.run_id === 'string' ? body.run_id.trim() : '';
+        let rewritten = 0;
+        if (runId) {
+            const layer = TAXONOMY_LAYER_COLS[kind];
+            const fromName = String(body.original_name || name).trim();
+            const update: Record<string, any> = { [layer.col]: name, [layer.flag]: false };
+            // Sub-identity rename/re-parent: rewrite primary_identity too so
+            // the (identity, sub_identity) pair stays consistent. For pure
+            // identity / sector accepts the parent column on the row is
+            // unrelated and we leave it alone.
+            if (kind === 'sub_identities' && parentIdentity) {
+                update.primary_identity = parentIdentity;
+            }
+            const { data: rewrittenRows, error: rewriteErr } = await supabase
+                .from('bucket_industry_map')
+                .update(update)
+                .eq('bucketing_run_id', runId)
+                .eq(layer.col, fromName)
+                .eq(layer.flag, true)
+                .select('contact_id');
+            if (rewriteErr) {
+                return res.status(400).json({ error: `library row saved but run rewrite failed: ${rewriteErr.message}` });
+            }
+            rewritten = (rewrittenRows || []).length;
+        }
+        res.json({ ...data, rewritten });
     } catch (err: any) {
         res.status(400).json({ error: err.message });
     }
@@ -3552,6 +3596,56 @@ app.delete('/api/bucketing/taxonomy/:kind/:id', async (req, res) => {
         const { error } = await supabase.from(table).delete().eq('id', req.params.id);
         if (error) return res.status(400).json({ error: error.message });
         res.json({ ok: true });
+    } catch (err: any) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+// Route-to-existing: rewrite a run's orphan rows for a proposed name to
+// point at an existing library entry instead. Doesn't touch the library —
+// purely a per-run mapping so the contacts stop being orphans without
+// inflating the library with a near-duplicate.
+app.post('/api/bucketing/runs/:runId/proposed-tags/:layer/remap', async (req, res) => {
+    try {
+        const layer = TAXONOMY_LAYER_COLS[req.params.layer];
+        const table = pickTaxonomyTable(req.params.layer);
+        if (!layer || !table) return res.status(400).json({ error: 'unknown layer' });
+        const body = req.body || {};
+        const fromName = String(body.from_name || '').trim();
+        const toName = String(body.to_name || '').trim();
+        if (!fromName || !toName) return res.status(400).json({ error: 'from_name and to_name are required' });
+
+        const { data: libRowData, error: libErr } = await supabase
+            .from(table)
+            .select('name,archived' + (req.params.layer === 'sub_identities' ? ',parent_identity' : ''))
+            .eq('name', toName)
+            .maybeSingle();
+        if (libErr) return res.status(400).json({ error: libErr.message });
+        const libRow = libRowData as { name?: string; archived?: boolean; parent_identity?: string } | null;
+        if (!libRow || libRow.archived) {
+            return res.status(404).json({ error: `target "${toName}" is not in the ${req.params.layer} library` });
+        }
+
+        const update: Record<string, any> = { [layer.col]: toName, [layer.flag]: false };
+        if (req.params.layer === 'sub_identities') {
+            // Sub-identities must stay consistent with their parent on the
+            // row — use the library entry's canonical parent unless the
+            // caller overrode it (rare; reserved for edge cases where the
+            // user wants a specific parent override).
+            const targetParent = String(body.to_parent || libRow.parent_identity || '').trim();
+            if (!targetParent) return res.status(400).json({ error: 'to_parent missing and library entry has no parent_identity' });
+            update.primary_identity = targetParent;
+        }
+
+        const { data, error } = await supabase
+            .from('bucket_industry_map')
+            .update(update)
+            .eq('bucketing_run_id', req.params.runId)
+            .eq(layer.col, fromName)
+            .eq(layer.flag, true)
+            .select('contact_id');
+        if (error) return res.status(400).json({ error: error.message });
+        res.json({ ok: true, rewritten: (data || []).length, to_name: toName });
     } catch (err: any) {
         res.status(400).json({ error: err.message });
     }
