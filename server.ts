@@ -2416,7 +2416,14 @@ app.post('/api/bucketing/runs/:id/resume', async (req, res) => {
         const { data: run, error } = await supabase
             .from('bucketing_runs').select('*').eq('id', id).single();
         if (error || !run) return res.status(404).json({ error: error?.message || 'Run not found' });
-        if (run.status !== 'cancelled') {
+        // Allow resume from cancelled, failed, OR stalled non-terminal states
+        // (taxonomy_pending / assigning). The Phase 1a tagger is idempotent
+        // — it skips industries already in bucket_industry_map — so resuming
+        // after a server restart or OOM costs nothing for already-paid LLM
+        // work. Phase 1b is now deterministic SQL, so resuming there just
+        // re-runs the rollup in seconds.
+        const resumable = new Set(['cancelled', 'failed', 'taxonomy_pending', 'assigning']);
+        if (!resumable.has(run.status)) {
             return res.status(400).json({ error: `Cannot resume from status: ${run.status}` });
         }
 
@@ -3628,6 +3635,37 @@ app.listen(PORT, async () => {
 
     // Resume any stale jobs from previous unexpected crashes
     await JobProcessor.recoverStaleJobs();
+
+    // Bucketing runs: a server restart mid-Phase-1a leaves the run row in
+    // status='taxonomy_pending' / 'assigning' with no worker attached.
+    // Flip those to 'cancelled' so the UI surfaces the Resume button.
+    // Phase 1a's tagger is idempotent (skips industries already in
+    // bucket_industry_map), so Resume costs nothing for paid work. Stale =
+    // progress.updated_at older than 3 minutes (workers heartbeat every
+    // ~700 ms when alive).
+    try {
+        const staleCutoff = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+        const { data: staleRuns } = await supabase
+            .from('bucketing_runs')
+            .select('id,name,status,progress')
+            .in('status', ['taxonomy_pending', 'assigning']);
+        const toMark = (staleRuns || []).filter((r: any) => {
+            const updatedAt = r?.progress?.updated_at;
+            // No progress at all = run never started (or just created); skip.
+            // Otherwise compare updated_at against the cutoff.
+            return updatedAt && updatedAt < staleCutoff;
+        });
+        if (toMark.length > 0) {
+            const ids = toMark.map((r: any) => r.id);
+            await supabase.from('bucketing_runs').update({
+                status: 'cancelled',
+                error_message: 'Worker stalled (server restart?) — click Resume to continue. Phase 1a skips already-tagged industries.'
+            }).in('id', ids);
+            console.log(`🟡 Marked ${toMark.length} stale bucketing run(s) as cancelled (resumable):`, toMark.map((r: any) => `${r.id} (${r.status})`));
+        }
+    } catch (e: any) {
+        console.warn('[startup] stale bucketing-run check failed:', e?.message || e);
+    }
 
     // TRUTH CHECK: Verify isProcessing against the actual DB state.
     // If pipeline_state says "processing" but there are no active jobs/items,

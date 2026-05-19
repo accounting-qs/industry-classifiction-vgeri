@@ -899,8 +899,23 @@ export async function runTaxonomyProposal(
         throw new Error('Empty vocabulary — selected lists have no contacts.');
     }
 
-    // Wipe any prior preview/proposal map rows (idempotent on re-run).
-    await supabase.from('bucket_industry_map').delete().eq('bucketing_run_id', runId);
+    // Resume support: don't wipe. Read existing rows so we know which
+    // industries are already tagged (LLM cost paid) and which DQ-passthrough
+    // rows are already inserted. A server restart / OOM mid-tag would
+    // otherwise force a full re-tag at ~$20-30 per run. The (run_id,
+    // industry_string) PK keeps the upsert idempotent for overlaps.
+    const { data: existingRowsData, error: existingErr } = await supabase
+        .from('bucket_industry_map')
+        .select('industry_string,source')
+        .eq('bucketing_run_id', runId);
+    if (existingErr) throw new Error(`existing bucket_industry_map read failed: ${existingErr.message}`);
+    const existingByIndustry = new Set((existingRowsData || []).map((r: any) => r.industry_string as string));
+    const existingLLMTagged = new Set((existingRowsData || [])
+        .filter((r: any) => r.source === 'llm_phase1a')
+        .map((r: any) => r.industry_string as string));
+    if (existingByIndustry.size > 0) {
+        ctx.log(`[Bucketing ${runId}] resume — ${existingByIndustry.size.toLocaleString()} existing rows in map (${existingLLMTagged.size.toLocaleString()} already LLM-tagged). Skipping those to avoid re-spending.`);
+    }
 
     // ── Partition vocabulary by enrichment status ────────────────────
     // Only `completed` rows go to the LLM. Everything else (scrape_error,
@@ -948,6 +963,8 @@ export async function runTaxonomyProposal(
     // General so the user sees them as "couldn't classify" rather than
     // "we deliberately excluded them".
     for (const v of dqVocab) {
+        // Resume: skip DQ-passthrough rows already inserted.
+        if (existingByIndustry.has(v.industry)) continue;
         const reason = v.enrichment_status || 'unknown';
         preMapRows.push({
             bucketing_run_id: runId,
@@ -974,7 +991,14 @@ export async function runTaxonomyProposal(
     const snapshot = await loadTaxonomySnapshot(supabase);
     ctx.log(`[Bucketing ${runId}] taxonomy library: ${snapshot.identities.length} identities, ${snapshot.sub_identities.length} sub-identities, ${snapshot.sectors.length} sectors`);
 
-    if (completedVocab.length > 0) {
+    // Resume filter: skip industries that already have an llm_phase1a row.
+    const completedVocabToTag = completedVocab.filter(v => !existingLLMTagged.has(v.industry));
+    const skippedTaggedCount = completedVocab.length - completedVocabToTag.length;
+    if (skippedTaggedCount > 0) {
+        ctx.log(`[Bucketing ${runId}] resume — ${skippedTaggedCount.toLocaleString()} industries already tagged, ${completedVocabToTag.length.toLocaleString()} remaining`);
+    }
+
+    if (completedVocabToTag.length > 0) {
         // ── Tag completed industries (batched, model selected at Setup) ────
         await ctx.checkCancel();
         // Per-run model choice from the Setup screen, written to
@@ -985,12 +1009,12 @@ export async function runTaxonomyProposal(
             phase: 'phase1a',
             step: 'tagging',
             current: 0,
-            total: completedVocab.length,
-            note: `Tagging ${completedVocab.length} industries with ${phase1aModel}…`
+            total: completedVocabToTag.length,
+            note: `Tagging ${completedVocabToTag.length} industries with ${phase1aModel}…`
         });
         const tagResult = await withHeartbeat(
-            `${phase1aModel} tagging (${completedVocab.length} industries)`,
-            () => tagIndustries(supabase, phase1aModel, completedVocab, snapshot, runId, ctx),
+            `${phase1aModel} tagging (${completedVocabToTag.length} industries)`,
+            () => tagIndustries(supabase, phase1aModel, completedVocabToTag, snapshot, runId, ctx),
             ctx
         );
         totalCost += tagResult.costUsd;
@@ -1215,13 +1239,31 @@ export async function runTaxonomyProposal(
 
     // ── Build a synthetic taxonomy_proposal for the existing UI ──────
     // The Review screen reads taxonomy_proposal.{primary_identities, buckets}
-    // — we synthesize them from the unique tags actually used so the user
-    // sees a familiar tree (Identity → Sub-Identity) backed by the new
-    // tag-based classification.
+    // — we synthesize them from the unique tags actually used.
+    //
+    // Resume-aware: read the full bucket_industry_map for this run from DB
+    // instead of using the in-memory preMapRows. This way a resumed run that
+    // only re-tagged a few thousand new industries still sees the full
+    // historical set in the proposal.
+    const proposalRows: any[] = [];
+    {
+        const PAGE = 1000;
+        for (let off = 0; off < 500_000; off += PAGE) {
+            const { data, error } = await supabase
+                .from('bucket_industry_map')
+                .select('industry_string,primary_identity,sub_identity,sector')
+                .eq('bucketing_run_id', runId)
+                .range(off, off + PAGE - 1);
+            if (error) throw new Error(`taxonomy_proposal rebuild fetch failed at offset ${off}: ${error.message}`);
+            const rows = (data || []);
+            proposalRows.push(...rows);
+            if (rows.length < PAGE) break;
+        }
+    }
     const usedIdentitySet = new Set<string>();
     const usedCharByKey = new Map<string, { spec: string; identity: string; description: string }>();
     const usedSectors = new Set<string>();
-    for (const r of finalRows) {
+    for (const r of proposalRows) {
         if (r.primary_identity) usedIdentitySet.add(r.primary_identity);
         if (r.sub_identity && r.primary_identity) {
             const key = `${r.primary_identity}::${r.sub_identity}`;
@@ -1290,7 +1332,7 @@ export async function runTaxonomyProposal(
             phase1a_coverage_pct: totalContacts > 0
                 ? Number(((phase1aCoveredContacts / totalContacts) * 100).toFixed(2))
                 : 0,
-            distinct_classifications: finalRows.length,
+            distinct_classifications: proposalRows.length,
             taggable_classifications: completedVocab.length,
             passthrough_classifications: dqVocab.length
         },
@@ -1926,311 +1968,62 @@ export async function runBucketAssignment(
     failed: number;
     costUsd: number;
 }> {
+    // Phase 1b v2: there is no separate "Bucket Assignment" LLM step anymore —
+    // bucket name is derived deterministically from taxonomy + volume rollup
+    // by apply_rollup_bucket_assignments. This endpoint stays as an alias for
+    // backwards-compat with the existing UI button; it just runs the rollup
+    // and returns counts shaped to match the v1 response contract.
+
     const { data: run, error: runErr } = await supabase
         .from('bucketing_runs').select('*').eq('id', runId).single();
     if (runErr || !run) throw new Error(`Run not found: ${runErr?.message}`);
-    if (run.status !== 'taxonomy_ready' && run.status !== 'completed') {
-        throw new Error(`Cannot assign buckets from status "${run.status}" — run must be in taxonomy_ready or completed`);
+    if (run.status !== 'taxonomy_ready' && run.status !== 'completed' && run.status !== 'assigning') {
+        throw new Error(`Cannot assign buckets from status "${run.status}" — run must be in taxonomy_ready, assigning, or completed`);
     }
 
-    const phase1aModel = (run.taxonomy_model as string) || 'gpt-4.1-mini';
-    const isAnthropic = phase1aModel.startsWith('claude-');
-    const anthropic = isAnthropic ? await getAnthropic(supabase) : null;
-    if (isAnthropic && !anthropic) {
-        throw new Error('Anthropic API key not configured.');
+    const minVolume = Number(run.min_volume) > 0 ? Number(run.min_volume) : 1;
+
+    ctx.log(`[BucketAssign ${runId}] v2 deterministic rollup, min_volume=${minVolume}`, 'phase');
+    const t0 = Date.now();
+    const { data: result, error: rpcErr } = await supabase.rpc('apply_rollup_bucket_assignments', {
+        p_run_id: runId,
+        p_min_volume: minVolume
+    });
+    const ms = Date.now() - t0;
+    if (rpcErr) {
+        ctx.log(`[BucketAssign ${runId}] rollup RPC failed after ${ms}ms: ${rpcErr.message}`, 'error');
+        throw new Error(`rollup failed: ${rpcErr.message}`);
     }
 
-    const [snapshot, bucketLib] = await Promise.all([
-        loadTaxonomySnapshot(supabase),
-        loadBucketLibrarySnapshot(supabase)
-    ]);
-    ctx.log(`[BucketAssign ${runId}] library: ${bucketLib.length} buckets, taxonomy: ${snapshot.identities.length} identities`);
+    const r = (result || {}) as {
+        total_contacts?: number;
+        at_sub_identity?: number;
+        rolled_up_to_identity?: number;
+        general?: number;
+        disqualified?: number;
+    };
+    const total = r.total_contacts || 0;
+    const general = r.general || 0;
+    const disqualified = r.disqualified || 0;
+    const matchedAtSubOrIdentity = (r.at_sub_identity || 0) + (r.rolled_up_to_identity || 0);
 
-    // Pull every Phase 1a row, paginated.
-    const allRows: any[] = [];
-    {
-        const PAGE = 1000;
-        for (let off = 0; off < 200_000; off += PAGE) {
-            const { data, error } = await supabase
-                .from('bucket_industry_map')
-                .select('industry_string,primary_identity,sub_identity,sector,is_disqualified,source')
-                .eq('bucketing_run_id', runId)
-                .range(off, off + PAGE - 1);
-            if (error) throw new Error(`bucket_industry_map fetch failed at offset ${off}: ${error.message}`);
-            const rows = (data || []) as any[];
-            allRows.push(...rows);
-            if (rows.length < PAGE) break;
-        }
-    }
-    // Skip disqualified passthrough rows (no taxonomy on them) and rows the
-    // tagger already disqualified (they route to Disqualified, not a bucket).
-    const candidates = allRows.filter(r => r.source === 'llm_phase1a' && !r.is_disqualified);
-    ctx.log(`[BucketAssign ${runId}] ${candidates.length} taxonomy-tagged rows to bucket-assign (skipping ${allRows.length - candidates.length} disqualified / passthrough)`);
-
-    if (candidates.length === 0) {
-        return { candidates: 0, matched: 0, proposed: 0, nullified: 0, failed: 0, costUsd: 0 };
-    }
-
-    const libByName = new Map<string, BucketLibraryEntry>();
-    for (const b of bucketLib) libByName.set(b.bucket_name, b);
-    const libNames = Array.from(libByName.keys());
-    const validIdentityNames = new Set(snapshot.identities.map(i => i.name));
-    // Identities that already have ≥1 library bucket — used to reject
-    // proposals where the LLM lazily used the identity name as bucket_name.
-    const identitiesWithLibBuckets = new Set(
-        bucketLib.map(b => b.primary_identity).filter((p): p is string => !!p)
+    ctx.log(
+        `[BucketAssign ${runId}] done in ${(ms / 1000).toFixed(2)}s — ` +
+        `${total.toLocaleString()} contacts: ` +
+        `${(r.at_sub_identity || 0).toLocaleString()} sub-identity buckets, ` +
+        `${(r.rolled_up_to_identity || 0).toLocaleString()} rolled up to identity, ` +
+        `${general.toLocaleString()} → General, ` +
+        `${disqualified.toLocaleString()} → Disqualified`,
+        'phase'
     );
-    let snappedToLibrary = 0;
-    let rejectedIdentityName = 0;
-
-    const systemPrompt = buildBucketAssignmentPrompt(bucketLib, snapshot);
-
-    const limit = pLimit(BUCKET_CONCURRENCY);
-    const batches: any[][] = [];
-    for (let i = 0; i < candidates.length; i += BUCKET_BATCH_SIZE) {
-        batches.push(candidates.slice(i, i + BUCKET_BATCH_SIZE));
-    }
-
-    let totalIn = 0;
-    let totalOut = 0;
-    let totalCachedIn = 0;
-    let done = 0;
-    let batchesFailed = 0;
-    const decisions: BucketDecision[] = [];
-
-    await Promise.all(batches.map((batch) => limit(async () => {
-        await ctx.checkCancel();
-        const userPrompt = JSON.stringify({
-            industries: batch.map((r, i) => ({
-                id: i,
-                industry: r.industry_string,
-                identity: r.primary_identity,
-                sub_identity: r.sub_identity,
-                sector: r.sector
-            }))
-        });
-        // Single LLM call wrapped in a retry-once that fires only on
-        // transient OpenAI-side errors (5xx, abort/network, timeouts).
-        // Real 4xx errors and parse failures aren't retried — they're
-        // batch-content problems, not network blips. Real-world impact:
-        // OpenAI's intermittent 502s used to leak ~30 batches per ~6k-batch
-        // run as failed; with one retry that drops to ~2-3.
-        const callOnce = async (): Promise<string> => {
-            if (isAnthropic) {
-                const resp = await anthropic!.messages.create({
-                    model: phase1aModel,
-                    max_tokens: 2500,
-                    system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
-                    messages: [{ role: 'user', content: userPrompt }]
-                }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
-                const usage: any = (resp as any).usage || {};
-                totalIn += usage.input_tokens || 0;
-                totalOut += usage.output_tokens || 0;
-                totalCachedIn += usage.cache_read_input_tokens || 0;
-                return (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
-            } else {
-                const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-                    method: 'POST',
-                    headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        model: phase1aModel,
-                        max_tokens: 2500,
-                        response_format: { type: 'json_object' },
-                        messages: [
-                            { role: 'system', content: systemPrompt },
-                            { role: 'user', content: userPrompt }
-                        ]
-                    }),
-                    signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal)
-                });
-                if (!resp.ok) throw new Error(`OpenAI ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
-                const json: any = await resp.json();
-                const usage = json.usage || {};
-                const cached = usage.prompt_tokens_details?.cached_tokens || 0;
-                totalIn += (usage.prompt_tokens || 0);
-                totalCachedIn += cached;
-                totalOut += usage.completion_tokens || 0;
-                return json.choices?.[0]?.message?.content || '';
-            }
-        };
-        const isRetryable = (msg: string) =>
-            /OpenAI 5\d\d/.test(msg) || /OpenAI 429/.test(msg)
-            || /fetch failed|ECONNRESET|ETIMEDOUT|socket hang up|network/i.test(msg);
-
-        try {
-            let text = '';
-            try { text = await callOnce(); }
-            catch (e: any) {
-                if (ctx.abortSignal?.aborted || e?.name === 'AbortError') throw e;
-                if (!isRetryable(e?.message || '')) throw e;
-                // Brief jittered backoff so a wave of concurrent batches
-                // hitting the same upstream blip doesn't all retry in lockstep.
-                await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 700)));
-                text = await callOnce();
-            }
-
-            // Parse — tolerant of the same key variations as the Phase 1a tagger.
-            const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-            const cleaned = (fence ? fence[1] : text).trim();
-            const parsed = JSON.parse(cleaned);
-            let arr: any[] = [];
-            if (Array.isArray(parsed)) arr = parsed;
-            else if (parsed && typeof parsed === 'object') {
-                for (const k of ['results', 'industries', 'assignments', 'output', 'data']) {
-                    if (Array.isArray(parsed[k])) { arr = parsed[k]; break; }
-                }
-                if (arr.length === 0) {
-                    for (const k of Object.keys(parsed)) {
-                        if (Array.isArray(parsed[k]) && parsed[k].length > 0) { arr = parsed[k]; break; }
-                    }
-                }
-            }
-            for (let i = 0; i < arr.length; i++) {
-                const item = arr[i];
-                let idx = -1;
-                if (typeof item.id === 'number') idx = item.id;
-                else if (typeof item.id === 'string' && /^\d+$/.test(item.id)) idx = parseInt(item.id, 10);
-                else idx = i;
-                if (idx < 0 || idx >= batch.length) continue;
-                const v = batch[idx];
-                const rawName = typeof item.bucket_name === 'string' ? item.bucket_name.trim() : '';
-                const rawIdent = typeof item.primary_identity === 'string' ? item.primary_identity.trim() : '';
-                decisions.push({
-                    industry: v.industry_string,
-                    bucket_name: rawName || null,
-                    primary_identity: rawIdent || null,
-                    is_new: !!item.is_new,
-                    confidence: typeof item.confidence === 'number' ? item.confidence : 0,
-                    reason: typeof item.reason === 'string' ? item.reason.slice(0, 500) : ''
-                });
-            }
-        } catch (err: any) {
-            batchesFailed++;
-            ctx.log(`[BucketAssign ${runId}] batch error (${batch.length} industries): ${err.message}`, 'error');
-        }
-        done += batch.length;
-        if (done % (BUCKET_BATCH_SIZE * 5) === 0 || done === candidates.length) {
-            ctx.progress({
-                phase: 'phase1a', step: 'bucket_assign',
-                current: done, total: candidates.length,
-                note: `Bucket-assigned ${done}/${candidates.length} industries…`
-            });
-        }
-    })));
-
-    if (batchesFailed > batches.length / 2) {
-        throw new Error(`Bucket assignment failed for >50% of batches (${batchesFailed}/${batches.length}). Check API key + rate limits.`);
-    }
-
-    const costUsd = isAnthropic
-        ? computeAnthropicCost(phase1aModel, totalIn, totalOut)
-            + (totalCachedIn / 1_000_000) * (ANTHROPIC_PRICING[phase1aModel]?.input || 3) * 0.1
-        : computeOpenAICost(phase1aModel, totalIn - totalCachedIn, totalCachedIn, totalOut);
-
-    // Apply: enforce library + identity validity, count outcomes, build updates.
-    const decisionByIndustry = new Map<string, BucketDecision>();
-    for (const d of decisions) decisionByIndustry.set(d.industry, d);
-
-    let matched = 0;
-    let proposed = 0;
-    let nullified = 0;
-    let failed = 0;
-    const updates: any[] = [];
-
-    for (const row of candidates) {
-        const d = decisionByIndustry.get(row.industry_string);
-        if (!d) {
-            // LLM failed for this row — leave it without a bucket assignment;
-            // it'll fall back to the legacy rollup at Phase 1b time.
-            failed++;
-            continue;
-        }
-
-        let bucketName: string | null = d.bucket_name;
-        let primaryIdent: string | null = d.primary_identity;
-        let isNew = d.is_new;
-
-        if (bucketName) {
-            // Snap fuzzy LLM names ("CPA Firms", "Accounting & Tax Firms") to
-            // the canonical library entry when they semantically overlap. Same
-            // token-intersection rule as Phase 1a's snapTaggingsToLibrary —
-            // requires ≥50% overlap in both directions so we don't snap
-            // "Agency" → "Full-Service Marketing Agencies" on one token.
-            if (!libByName.has(bucketName)) {
-                const snap = snapToLibraryName(bucketName, libNames);
-                if (snap) {
-                    bucketName = snap;
-                    snappedToLibrary++;
-                }
-            }
-            // Library-existing? Use library's primary_identity as canonical
-            // (defends against the LLM hallucinating a different parent
-            // identity for an existing entry).
-            const lib = libByName.get(bucketName);
-            if (lib) {
-                isNew = false;
-                primaryIdent = lib.primary_identity || primaryIdent;
-            } else {
-                // It's a new proposal — must have a valid primary_identity
-                // from the taxonomy library. If the LLM set is_new=false
-                // for a name not in the library, treat it as a proposal.
-                isNew = true;
-                if (!primaryIdent || !validIdentityNames.has(primaryIdent)) {
-                    // Reject — invalid parent identity; route to General.
-                    bucketName = null;
-                    primaryIdent = null;
-                    isNew = false;
-                } else if (bucketName === primaryIdent && identitiesWithLibBuckets.has(primaryIdent)) {
-                    // Reject lazy identity-name proposals when that identity
-                    // already has specific buckets in the library — the LLM
-                    // is supposed to pick one or propose a sub-specific name.
-                    // Route to General so the user notices and curates.
-                    bucketName = null;
-                    primaryIdent = null;
-                    isNew = false;
-                    rejectedIdentityName++;
-                }
-            }
-        }
-
-        if (!bucketName) nullified++;
-        else if (isNew) proposed++;
-        else matched++;
-
-        updates.push({
-            bucketing_run_id: runId,
-            industry_string: row.industry_string,
-            // NOT NULL columns echoed through (PG validates on INSERT path
-            // before the ON CONFLICT redirect — same gotcha as recalc/finalize).
-            source: 'llm_phase1a',
-            raw_industry: row.industry_string,
-            bucket_name: row.bucket_name || RESERVED_GENERAL,
-            // New bucket-assignment fields
-            assigned_bucket_id: (bucketName && !isNew && libByName.get(bucketName)?.id) || null,
-            assigned_bucket_name: bucketName,
-            assigned_bucket_primary_identity: primaryIdent,
-            is_new_bucket: isNew,
-            bucket_assignment_reason: d.reason || null,
-            bucket_assignment_confidence: Number((((d.confidence || 0) / 10)).toFixed(2))
-        });
-    }
-
-    for (let i = 0; i < updates.length; i += 1000) {
-        const chunk = updates.slice(i, i + 1000);
-        const { error } = await supabase.from('bucket_industry_map')
-            .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
-        if (error) throw new Error(`bucket-assign upsert failed: ${error.message}`);
-    }
-
-    await supabase.from('bucketing_runs').update({
-        cost_usd: (Number(run.cost_usd) || 0) + costUsd
-    }).eq('id', runId);
-
-    ctx.log(`[BucketAssign ${runId}] done — ${matched} matched library (${snappedToLibrary} via snap), ${proposed} new proposals, ${nullified} → General (${rejectedIdentityName} were lazy identity-name proposals), ${failed} batch failures, $${costUsd.toFixed(4)}`, 'phase');
 
     return {
-        candidates: candidates.length,
-        matched, proposed, nullified, failed, costUsd
+        candidates: total,
+        matched: matchedAtSubOrIdentity,
+        proposed: 0,                 // v2 never proposes new buckets — they ARE taxonomy
+        nullified: general,          // legacy field name; conceptually "routed to General"
+        failed: 0,
+        costUsd: 0,
     };
 }
 
@@ -2654,6 +2447,13 @@ async function tagIndustries(
                 });
             }
         }
+
+        // Drop the per-wave prompt string and request/response buffers V8
+        // is still holding. --expose-gc in the start script gates this; if
+        // unavailable, falls through silently. On a 2GB Render instance with
+        // 100k+ vocab this keeps heap pressure flat across waves instead of
+        // climbing until the auto-tuned old-space-size limit hits.
+        if (typeof global.gc === 'function') global.gc();
     }
 
     // Catastrophic failure detection: if more than half of all batches
@@ -4030,410 +3830,89 @@ export async function runAssignment(
     supabase: SupabaseClient,
     runId: string,
     ctx: BucketingCtx,
-    opts?: { resume?: boolean }
+    _opts?: { resume?: boolean }   // resume is a no-op now; single-transaction rollup
 ): Promise<void> {
-    // Same pre-flight as Phase 1a — covers cases where the user retries
-    // assignment after a schema migration ran mid-cycle. Cheap probe.
+    // Phase 1b v2: deterministic, SQL-only.
+    //
+    // Old v1 ran a 4-stage cascade (JOIN → library → embedding → LLM) over
+    // every contact + an in-memory assignedRows[] accumulator. That OOMed the
+    // 2GB Render plan on 293k-contact runs and racked up unnecessary LLM cost.
+    //
+    // v2 reads taxonomy from Phase 1a (bucket_industry_map), applies volume
+    // rollup (sub-identity if it has ≥ min_volume, else identity, else
+    // General; is_disqualified → Disqualified), and writes bucket_contact_map
+    // + bucket_assignments + bucket_industry_map.assigned_bucket_name in a
+    // single transaction. Runs in seconds. Zero LLM calls.
+
     const schemaRes = await checkBucketingSchema(supabase);
     if (!schemaRes.ok) {
         ctx.log(`[Bucketing ${runId}] schema check failed:\n${schemaRes.summary}`, 'error');
         throw new Error(schemaRes.summary);
     }
 
-    const { data: run, error } = await supabase.from('bucketing_runs').select('*').eq('id', runId).single();
+    const { data: run, error } = await supabase
+        .from('bucketing_runs').select('*').eq('id', runId).single();
     if (error || !run) throw new Error(`Run not found: ${error?.message}`);
 
-    const final = (run.taxonomy_final || run.taxonomy_proposal) as DiscoveryOutput | null;
-    // Empty buckets[] is a legitimate state when the entire selected
-    // list is unenriched / scrape-errored — every contact will route to
-    // Disqualified via the catchall in the rollup. Don't refuse the run
-    // just because there are no campaign buckets to fan out to.
-    const leaves = final?.buckets || [];
-    if (leaves.length === 0) {
-        ctx.log(`[Bucketing ${runId}] no proposal buckets — every contact will route to General/Disqualified per fallback rules`, 'warn');
-    }
-    const sectorVocab: string[] = (final as any)?.sector_vocabulary || [];
-    const finalSpecNames = new Set(leaves.map(l => l.sub_identity));
-
-    // Library buckets the user opted into for this run. Only keep library
-    // specs that survived Review; a dropped library spec must not reappear
-    // during assignment.
-    const preferredIds: string[] = Array.isArray(run.preferred_library_ids) ? run.preferred_library_ids : [];
-    let libraryBuckets: any[] = [];
-    if (preferredIds.length > 0) {
-        const { data } = await supabase
-            .from('bucket_library').select('*').in('id', preferredIds);
-        libraryBuckets = (data || []).filter((b: any) =>
-            (b.sub_identity || b.bucket_name) && (b.primary_identity || b.direct_ancestor)
-            && finalSpecNames.has(b.sub_identity || b.bucket_name)
-        );
-    }
-
-    await supabase.from('bucketing_runs').update({ status: 'assigning' }).eq('id', runId);
-
-    let totalCost = Number(run.cost_usd || 0);
-    // Step-level timing telemetry. Each step pushes its elapsed ms into
-    // `timings` so the run-end summary tells us exactly where the seconds
-    // went, and any future timeout pinpoints the slow step at a glance.
-    const runStart = Date.now();
-    const timings: { step: string; ms: number }[] = [];
-    const timeStep = async <T>(label: string, fn: () => Promise<T>): Promise<T> => {
-        const t0 = Date.now();
-        try {
-            const out = await fn();
-            const ms = Date.now() - t0;
-            timings.push({ step: label, ms });
-            ctx.log(`[Bucketing ${runId}] ⏱  ${label}: ${(ms / 1000).toFixed(2)}s`);
-            return out;
-        } catch (err: any) {
-            const ms = Date.now() - t0;
-            timings.push({ step: `${label} (FAILED)`, ms });
-            ctx.log(`[Bucketing ${runId}] ⏱  ${label} FAILED after ${(ms / 1000).toFixed(2)}s: ${err.message}`, 'error');
-            throw err;
-        }
-    };
-
-    // Chunk-level resume support. The streaming routing below writes each
-    // chunk to bucket_contact_map immediately so a cancellation preserves
-    // work. On a /resume call, opts.resume=true → we skip the clear,
-    // hydrate the in-memory assignedRows[] from the existing rows, and
-    // seed the keyset paginator from the highest contact_id already
-    // routed so the loop picks up after the last persisted chunk.
-    const isResume = !!opts?.resume;
-    const assignedRows: ContactMapRow[] = [];
-    let lastContactId: string | null = null;
-    let chunkNum = 0;
-    let totalLoaded = 0;
-    let totalUsable = 0;
-    let totalDqEarly = 0;
-    let phase1aJoined = 0;
-    let libraryMatched = 0;
-    let embeddingMatched = 0;
-    let llmRouted = 0;
-    let hydratedCount = 0;
-
-    if (isResume) {
-        const hydrated = await timeStep('hydrate_resume_state', async () =>
-            fetchPreRollupContactMap(supabase, runId)
-        );
-        if (hydrated.length > 0) {
-            for (const r of hydrated) assignedRows.push(r);
-            hydratedCount = hydrated.length;
-            // Cursor: max contact_id across hydrated rows. The paginator
-            // skips contacts whose id <= lastContactId, so picking the
-            // max guarantees we don't re-route anyone.
-            lastContactId = hydrated[0].contact_id;
-            for (const r of hydrated) if (r.contact_id > lastContactId!) lastContactId = r.contact_id;
-            totalLoaded = hydrated.length;
-            chunkNum = Math.ceil(totalLoaded / CONTACT_PAGE_SIZE);
-            // Restore per-source counters from the hydrated rows so the
-            // per-chunk log line + final summary stay accurate. Source
-            // strings match the canonical values written by the matchers:
-            //   makeGeneralContactRow → 'unclassifiable' (early-DQ)
-            //   makeJoinedContactRow  → 'phase1a_taxonomy' (JOIN-first)
-            //   runContactLibraryFirstMatch → 'library_match'
-            //   runContactEmbeddingPrefilter → 'embedding' / 'embedding_high_confidence'
-            //   runContactMatchingLLM → 'llm_phase1b'
-            for (const r of hydrated) {
-                const src = r.source || '';
-                if (src === 'unclassifiable') {
-                    totalDqEarly++;
-                } else if (src === 'phase1a_taxonomy') {
-                    phase1aJoined++;
-                } else if (src === 'library_match') {
-                    libraryMatched++;
-                } else if (src === 'embedding' || src === 'embedding_high_confidence') {
-                    embeddingMatched++;
-                } else if (src === 'llm_phase1b') {
-                    llmRouted++;
-                }
-            }
-            totalUsable = phase1aJoined + libraryMatched + embeddingMatched + llmRouted;
-            ctx.log(`[Bucketing ${runId}] RESUME — hydrated ${hydrated.length.toLocaleString()} rows; continuing from contact_id > ${lastContactId}`, 'phase');
-        } else {
-            ctx.log(`[Bucketing ${runId}] resume requested but no existing rows in bucket_contact_map — treating as fresh start`, 'warn');
-        }
-    }
-
-    if (!isResume || hydratedCount === 0) {
-        await timeStep('clear_previous_assignments', async () => {
-            const { error: clearContactMapError } = await supabase
-                .from('bucket_contact_map')
-                .delete()
-                .eq('bucketing_run_id', runId);
-            if (clearContactMapError) throw new Error(`contact map cleanup failed: ${clearContactMapError.message}`);
-            const { error: clearAssignmentsError } = await supabase
-                .from('bucket_assignments')
-                .delete()
-                .eq('bucketing_run_id', runId);
-            if (clearAssignmentsError) throw new Error(`assignment cleanup failed: ${clearAssignmentsError.message}`);
-        });
-    } else {
-        // On a resume that actually hydrated rows, bucket_assignments may
-        // still hold stale entries from a prior FINISHED run on the same
-        // id (resume of a cancelled run is a no-op for bucket_assignments
-        // since we only write that table at the end). Wipe just that
-        // table to keep the final write clean.
-        const { error } = await supabase.from('bucket_assignments').delete().eq('bucketing_run_id', runId);
-        if (error) throw new Error(`assignment cleanup failed on resume: ${error.message}`);
-        ctx.log(`[Bucketing ${runId}] skipping bucket_contact_map clear on resume; cleared stale bucket_assignments`);
-    }
-
-    // Streaming Phase 1b: load contacts in keyset chunks, route each
-    // chunk through library / embedding / LLM matchers, append to the
-    // persistent assignedRows[] array, persist the new rows to
-    // bucket_contact_map immediately (so cancellations preserve work),
-    // then drop the chunk from memory.
-    await ctx.checkCancel();
-    ctx.log(`[Bucketing ${runId}] step 1-4/5: streaming routing in chunks of ${CONTACT_PAGE_SIZE.toLocaleString()}${isResume && hydratedCount > 0 ? ` (resuming after ${hydratedCount.toLocaleString()} rows)` : ''}`, 'phase');
-    ctx.progress({ phase: 'phase1b', step: 'streaming_route', note: 'Loading + routing contacts in chunks…' });
-
-    // Load Phase 1a's per-industry-string taxonomy once and reuse it for
-    // every chunk. The JOIN-first step below short-circuits the LLM for any
-    // contact whose enriched classification text is already in the map —
-    // typically 90%+ of usable contacts, since the vocab IS the deduped
-    // set of classification strings. Cuts Phase 1b LLM cost by ~40x.
-    const taxonomyMap = await fetchPhase1aTaxonomyMap(supabase, runId, ctx);
-    ctx.log(`[Bucketing ${runId}] Phase 1a taxonomy: ${taxonomyMap.size.toLocaleString()} mapped industry strings ready for JOIN-first lookup`);
-
-    await timeStep('streaming_route_all_chunks', async () => {
-        while (true) {
-            await ctx.checkCancel();
-            chunkNum++;
-
-            // Snapshot assignedRows length so we can slice off ONLY this
-            // chunk's new rows for the per-chunk pre-rollup write.
-            const chunkInsertStart = assignedRows.length;
-
-            const chunk = await fetchContactsChunk(supabase, run.list_names, lastContactId, CONTACT_PAGE_SIZE, ctx);
-            if (chunk.rows.length === 0) break;
-            totalLoaded += chunk.rows.length;
-            lastContactId = chunk.nextLastId;
-
-            // Filter unclassifiable rows from the chunk straight to
-            // Disqualified — never sent to LLM, just pushed to output.
-            const usableInChunk: ContactRouteInput[] = [];
-            for (const c of chunk.rows) {
-                const reason = getUnclassifiableReason(c);
-                if (reason) {
-                    assignedRows.push(makeGeneralContactRow(runId, c, reason));
-                    totalDqEarly++;
-                } else {
-                    usableInChunk.push(c);
-                }
-            }
-            totalUsable += usableInChunk.length;
-
-            let pending: ContactRouteInput[] = usableInChunk;
-
-            // JOIN-first: short-circuit using Phase 1a's per-industry-string
-            // tag. If the contact's enriched classification text is already
-            // in taxonomyMap, copy that tag straight onto the contact and
-            // skip every downstream matcher (library / embedding / LLM).
-            // Empty-tag rows (very rare — taxonomy edits dropped the spec
-            // since 1a wrote the map) fall through to the cascade.
-            if (pending.length > 0 && taxonomyMap.size > 0) {
-                const stillPending: ContactRouteInput[] = [];
-                for (const c of pending) {
-                    const industryKey = (c.classification || c.industry || '').trim();
-                    const tax = industryKey ? taxonomyMap.get(industryKey) : null;
-                    const usable = tax && (
-                        tax.is_disqualified || tax.primary_identity || tax.sub_identity
-                    );
-                    if (usable) {
-                        assignedRows.push(makeJoinedContactRow(runId, c, tax));
-                        phase1aJoined++;
-                    } else {
-                        stillPending.push(c);
-                    }
-                }
-                pending = stillPending;
-            }
-
-            // Library match (per chunk).
-            if (libraryBuckets.length > 0 && pending.length > 0) {
-                await ctx.checkCancel();
-                const libRes = await runContactLibraryFirstMatch(pending, libraryBuckets, sectorVocab, runId);
-                totalCost += libRes.costUsd;
-                assignedRows.push(...libRes.autoAssigned);
-                libraryMatched += libRes.autoAssigned.length;
-                pending = libRes.pending;
-            }
-
-            // Embedding pre-filter (per chunk). Re-embeds leaves each
-            // chunk — small constant cost vs the savings from streaming.
-            if (EMBED_PREFILTER_ENABLED && pending.length > 0 && leaves.length > 0) {
-                await ctx.checkCancel();
-                const embedRes = await runContactEmbeddingPrefilter(pending, leaves, sectorVocab, runId);
-                totalCost += embedRes.costUsd;
-                assignedRows.push(...embedRes.autoAssigned);
-                embeddingMatched += embedRes.autoAssigned.length;
-                pending = embedRes.pending;
-            }
-
-            // LLM routing (per chunk). Skipped when leaves=[] because
-            // the LLM has no candidate set to choose from — those
-            // contacts fall through to the rollup which routes them to
-            // General with reason=LOW_VOLUME.
-            if (pending.length > 0 && leaves.length > 0) {
-                await ctx.checkCancel();
-                const llmRes = await runContactMatchingLLM(supabase, pending, leaves, sectorVocab, runId, ctx);
-                totalCost += llmRes.costUsd;
-                assignedRows.push(...llmRes.rows);
-                llmRouted += llmRes.rows.length;
-            } else if (pending.length > 0) {
-                // No buckets defined — synthesize General rows per the
-                // user's "if you can't decide, send to General" rule.
-                for (const c of pending) {
-                    const row = makeGeneralContactRow(runId, c, REASON.NO_BUCKETS_DEFINED);
-                    row.bucket_reason = 'No buckets defined for this run — defaulted to General';
-                    assignedRows.push(row);
-                }
-            }
-
-            // Checkpoint: persist this chunk's new pre-rollup rows to
-            // bucket_contact_map immediately. If the run is cancelled
-            // before completion, /resume hydrates these back instead of
-            // re-routing the contacts. bucket_name here is the
-            // tentative pre-rollup value; the final rollup writes the
-            // canonical bucket_name in the same row via upsert.
-            const newChunkRows = assignedRows.slice(chunkInsertStart);
-            if (newChunkRows.length > 0) {
-                await writeContactMapRows(supabase, newChunkRows);
-            }
-
-            ctx.log(
-                `[Bucketing ${runId}] chunk ${chunkNum}: ` +
-                `loaded ${chunk.rows.length} (${chunk.pageMs}ms+${chunk.enrichmentMs}ms enrich), ` +
-                `total assignedRows=${assignedRows.length.toLocaleString()}`
-            );
-            ctx.progress({
-                phase: 'phase1b',
-                step: 'streaming_route',
-                current: totalLoaded,
-                note: `Routed ${assignedRows.length.toLocaleString()} contacts (chunk ${chunkNum}, phase1a=${phase1aJoined}, library=${libraryMatched}, embed=${embeddingMatched}, llm=${llmRouted}, dq=${totalDqEarly})`
-            });
-
-            if (!chunk.hasMore) break;
-        }
-    });
-
-    ctx.log(
-        `[Bucketing ${runId}] streaming complete — ${totalLoaded.toLocaleString()} loaded, ` +
-        `${totalUsable.toLocaleString()} usable, ${totalDqEarly.toLocaleString()} early-DQ; ` +
-        `phase1a=${phase1aJoined}, library=${libraryMatched}, embed=${embeddingMatched}, llm=${llmRouted}, $${totalCost.toFixed(4)}`,
-        'phase'
-    );
-    ctx.progress({
-        phase: 'phase1b',
-        step: 'streaming_route_done',
-        current: totalLoaded,
-        total: totalLoaded,
-        note: `Streaming complete — ${assignedRows.length.toLocaleString()} contacts in ${chunkNum} chunks, $${totalCost.toFixed(4)}`,
-    });
-
-    // Build a `contacts` reference for downstream coverage analytics.
-    // We don't need every field anymore — just the ids — but the
-    // existing buildCoverageSummary signature wants ContactRouteInput[].
-    // Reconstructing skeleton rows from assignedRows keeps memory tight.
-    const contacts: ContactRouteInput[] = assignedRows.map(r => ({
-        contact_id: r.contact_id,
-        company_name: null,
-        company_website: null,
-        industry: r.industry_string || null,
-        lead_list_name: null,
-        enrichment_status: r.is_disqualified ? 'failed' : 'completed',
-        classification: r.industry_string || null,
-        confidence: null,
-        reasoning: null,
-        error_message: null,
-    }));
-
-    await ctx.checkCancel();
-    ctx.log(`[Bucketing ${runId}] step 5/5: contact-level volume rollup + write`, 'phase');
-    ctx.progress({ phase: 'phase1b', step: 'rollup_write', note: 'Computing contact-level campaign buckets…' });
-
-    // Pull per-industry per-tag confidences from Phase 1a's bucket_industry_map
-    // so the rollup can gate which layer each row may enter at. Phase 1b
-    // matchers (library, embedding, LLM) currently only return one overall
-    // score; here we backfill the per-tag scores from the source-of-truth.
-    const industryStrings = Array.from(new Set(assignedRows.map(r => r.industry_string).filter(Boolean)));
-    const confByIndustry = new Map<string, { id?: number; ch?: number; sec?: number }>();
-    if (industryStrings.length > 0) {
-        // Chunked fetch — `.in()` blows up on >1000 long strings.
-        for (let i = 0; i < industryStrings.length; i += 200) {
-            const slice = industryStrings.slice(i, i + 200);
-            const { data: confRows } = await supabase
-                .from('bucket_industry_map')
-                .select('industry_string,identity_confidence,sub_identity_confidence,sector_confidence')
-                .eq('bucketing_run_id', runId)
-                .in('industry_string', slice);
-            for (const cr of (confRows || []) as any[]) {
-                confByIndustry.set(cr.industry_string, {
-                    id: typeof cr.identity_confidence === 'number' ? cr.identity_confidence : undefined,
-                    ch: typeof cr.sub_identity_confidence === 'number' ? cr.sub_identity_confidence : undefined,
-                    sec: typeof cr.sector_confidence === 'number' ? cr.sector_confidence : undefined
-                });
-            }
-        }
-    }
-    for (const r of assignedRows) {
-        const c = confByIndustry.get(r.industry_string || '');
-        if (c) {
-            if (typeof c.id === 'number' && (r.identity_confidence == null || r.identity_confidence === 0)) r.identity_confidence = c.id;
-            if (typeof c.ch === 'number' && (r.sub_identity_confidence == null || r.sub_identity_confidence === 0)) r.sub_identity_confidence = c.ch;
-            if (typeof c.sec === 'number' && (r.sector_confidence == null || r.sector_confidence === 0)) r.sector_confidence = c.sec;
-        }
-    }
-
-    let rolledRows = await timeStep('rollup', async () =>
-        computeContactRollup(assignedRows, Number(run.min_volume || 0), Number(run.bucket_budget || 30))
-    );
-
-    // Generic Audit — always runs after rollup. Pattern-recovers rows
-    // from General by re-routing groups of ≥ min_volume/4 rows up the
-    // chain to sub-identity or identity buckets that already exist.
-    const auditRes = await timeStep('generic_audit', async () =>
-        runGenericAudit(rolledRows, Number(run.min_volume || 0))
-    );
-    rolledRows = auditRes.rows;
-    ctx.log(`[Bucketing ${runId}] Generic Audit: reclaimed ${auditRes.reclaimed} rows from General into ${auditRes.targets.length} target bucket(s)${auditRes.targets.length > 0 ? ` (${auditRes.targets.slice(0, 3).map(t => `${t.bucket}+${t.count}`).join(', ')}${auditRes.targets.length > 3 ? '…' : ''})` : ''}`, 'phase');
-
-    await timeStep('write_contact_map_and_assignments', () =>
-        writeContactMapAndAssignments(supabase, runId, rolledRows)
-    );
-
-    const assignedCount = rolledRows.length;
-    const coverageSummary = buildCoverageSummary(contacts, rolledRows);
-    const qualityWarnings = buildQualityWarnings(coverageSummary, rolledRows);
+    // min_volume comes from the run row. If user left it null/0, fall back to
+    // 1 so every distinct (identity, sub-identity) pair becomes its own
+    // bucket (no rollup). UI defaults the new-run form to 500.
+    const minVolume = Number(run.min_volume) > 0 ? Number(run.min_volume) : 1;
 
     await supabase.from('bucketing_runs').update({
-        status: 'completed',
-        assigned_contacts: assignedCount,
-        cost_usd: totalCost,
-        coverage_summary: coverageSummary,
-        quality_warnings: qualityWarnings,
-        generic_audit: {
-            reclaimed: auditRes.reclaimed,
-            targets: auditRes.targets,
-            ran_at: new Date().toISOString()
-        },
-        assignment_completed_at: new Date().toISOString()
+        status: 'assigning',
+        cancel_requested: false,
+        error_message: null,
+        progress: {
+            phase: 'phase1b',
+            step: 'rollup',
+            note: `Computing deterministic rollup at min_volume=${minVolume}…`,
+            current: 0,
+            total: Number(run.total_contacts || 0),
+            elapsed_seconds: 0,
+            updated_at: new Date().toISOString()
+        }
     }).eq('id', runId);
 
-    for (const warning of qualityWarnings) ctx.log(`[Bucketing ${runId}] warning: ${warning}`, 'warn');
+    ctx.log(`[Bucketing ${runId}] Phase 1b v2 — deterministic rollup, min_volume=${minVolume}`, 'phase');
+    const t0 = Date.now();
+    const { data: result, error: rpcErr } = await supabase.rpc('apply_rollup_bucket_assignments', {
+        p_run_id: runId,
+        p_min_volume: minVolume
+    });
+    const ms = Date.now() - t0;
+    if (rpcErr) {
+        ctx.log(`[Bucketing ${runId}] rollup RPC failed after ${ms}ms: ${rpcErr.message}`, 'error');
+        throw new Error(`rollup failed: ${rpcErr.message}`);
+    }
 
-    // Final summary: every step's elapsed seconds in one line so a future
-    // slow run is debuggable from the log alone.
-    const totalRunMs = Date.now() - runStart;
-    const sortedTimings = [...timings].sort((a, b) => b.ms - a.ms);
+    const r = (result || {}) as {
+        total_contacts?: number;
+        at_sub_identity?: number;
+        rolled_up_to_identity?: number;
+        general?: number;
+        disqualified?: number;
+        min_volume?: number;
+    };
     ctx.log(
-        `[Bucketing ${runId}] step timings (slowest first): ` +
-        sortedTimings.map(t => `${t.step}=${(t.ms / 1000).toFixed(1)}s`).join(', '),
+        `[Bucketing ${runId}] rollup complete in ${(ms / 1000).toFixed(2)}s — ` +
+        `${(r.total_contacts || 0).toLocaleString()} contacts: ` +
+        `${(r.at_sub_identity || 0).toLocaleString()} at sub-identity, ` +
+        `${(r.rolled_up_to_identity || 0).toLocaleString()} rolled up to identity, ` +
+        `${(r.general || 0).toLocaleString()} → General, ` +
+        `${(r.disqualified || 0).toLocaleString()} → Disqualified`,
         'phase'
     );
-    ctx.log(`[Bucketing ${runId}] DONE — ${assignedCount.toLocaleString()} contacts assigned in ${(totalRunMs / 1000).toFixed(1)}s, total cost $${totalCost.toFixed(4)}`, 'phase');
-    ctx.progress({ phase: 'phase1b', step: 'done', current: assignedCount, total: contacts.length, note: `Assigned ${assignedCount.toLocaleString()} contacts in ${(totalRunMs / 1000).toFixed(1)}s — total cost $${totalCost.toFixed(4)}` });
+
+    // The RPC already set status='completed' and assignment_completed_at, plus
+    // a 100%-progress payload. Nothing else to write here.
+    ctx.progress({
+        phase: 'phase1b',
+        step: 'done',
+        current: r.total_contacts || 0,
+        total: r.total_contacts || 0,
+        note: `Rollup done — ${(r.total_contacts || 0).toLocaleString()} contacts assigned in ${(ms / 1000).toFixed(1)}s (no LLM cost)`
+    });
 }
 
 function getUnclassifiableReason(contact: ContactRouteInput): ReasonCode | null {

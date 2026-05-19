@@ -1503,7 +1503,12 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
   const [newSpec, setNewSpec] = useState('');
   const [newDesc, setNewDesc] = useState('');
   const [newIdentity, setNewIdentity] = useState('');
-  const [minVolume, setMinVolume] = useState<number>(run.min_volume);
+  // Default new-run min_volume to 500 if the row has 0/null. 500 is the
+  // "meaningful campaign segment" floor for typical 100k+ contact lists.
+  // Effective value at rollup time: anything 0/null treated as 1 so every
+  // distinct (identity, sub-identity) pair gets its own bucket — see
+  // apply_rollup_bucket_assignments RPC.
+  const [minVolume, setMinVolume] = useState<number>(Number(run.min_volume) > 0 ? Number(run.min_volume) : 500);
   const [bucketBudget, setBucketBudget] = useState<number>(run.bucket_budget || 30);
   const [busy, setBusy] = useState<'none' | 'saving' | 'assigning'>('none');
   const [showPatterns, setShowPatterns] = useState(false);
