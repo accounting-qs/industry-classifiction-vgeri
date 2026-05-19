@@ -3314,6 +3314,18 @@ function StatCard({ label, value, color }: { label: string; value: string; color
 
 type TaxKind = 'identities' | 'sub_identities' | 'sectors';
 
+// One per proposal the user resolved this session. Used to keep the
+// row visible after the server clears is_new_* (which makes the proposal
+// drop out of /proposed-tags). `action` drives which badge the row
+// renders; `finalName` / `finalParent` describe where the proposal's
+// contacts ended up.
+type ActionRecord = {
+  snapshot: { name: string; parent?: string; count: number; samples: string[] };
+  action: 'accepted' | 'renamed' | 'routed';
+  finalName: string;
+  finalParent?: string;
+};
+
 // Lightweight mirror of services/bucketingService.ts normalizeTaxonomyName.
 // Used by the proposed-tags panel to surface "🎯 Looks like <library entry>"
 // suggestions. Strict enough that an exact normalized match is safe to offer
@@ -3374,42 +3386,50 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   const [selected, setSelected] = useState<Record<TaxKind, Set<string>>>({
     identities: new Set(), sub_identities: new Set(), sectors: new Set()
   });
-  // Per-kind sets of items the user accepted this session. /proposed-tags
-  // keeps returning accepted items until a recalc/finalize clears the
-  // is_new_* flags on bucket_industry_map, so we need local memory to
-  // mark them as Accepted in the UI. Persisted in sessionStorage keyed
-  // by runId so a tab refresh doesn't lose the visual state.
-  const acceptedStorageKey = `bucketing.acceptedTags.${runId}`;
-  const [accepted, setAccepted] = useState<Record<TaxKind, Set<string>>>(() => {
+  // Per-kind log of actions the user took this session, keyed by the
+  // proposal's ORIGINAL name. We need the full snapshot (count, samples,
+  // parent) because accept / route both clear the is_new_* flag on the
+  // server, so the proposal disappears from /proposed-tags on the next
+  // refresh — but the user still wants the row to stay visible with
+  // "Accepted as X" or "Routed to Y" so the audit trail is obvious.
+  // Persisted in sessionStorage keyed by runId so a tab refresh doesn't
+  // lose the visual state.
+  const actionedStorageKey = `bucketing.actionedTags.${runId}`;
+  const [actioned, setActioned] = useState<Record<TaxKind, Record<string, ActionRecord>>>(() => {
+    const empty = { identities: {}, sub_identities: {}, sectors: {} } as Record<TaxKind, Record<string, ActionRecord>>;
     try {
-      const raw = sessionStorage.getItem(acceptedStorageKey);
+      const raw = sessionStorage.getItem(actionedStorageKey);
       if (raw) {
         const parsed = JSON.parse(raw);
         return {
-          identities: new Set(parsed.identities || []),
-          sub_identities: new Set(parsed.sub_identities || []),
-          sectors: new Set(parsed.sectors || [])
+          identities: parsed.identities || {},
+          sub_identities: parsed.sub_identities || {},
+          sectors: parsed.sectors || {},
         };
       }
     } catch { /* fall through */ }
-    return { identities: new Set(), sub_identities: new Set(), sectors: new Set() };
+    return empty;
   });
-  const persistAccepted = useCallback((next: Record<TaxKind, Set<string>>) => {
-    try {
-      sessionStorage.setItem(acceptedStorageKey, JSON.stringify({
-        identities: Array.from(next.identities),
-        sub_identities: Array.from(next.sub_identities),
-        sectors: Array.from(next.sectors)
-      }));
-    } catch { /* quota — non-fatal */ }
-  }, [acceptedStorageKey]);
-  const markAccepted = useCallback((kind: TaxKind, names: string[]) => {
-    setAccepted(prev => {
-      const next = { ...prev, [kind]: new Set([...prev[kind], ...names]) };
-      persistAccepted(next);
+  const persistActioned = useCallback((next: Record<TaxKind, Record<string, ActionRecord>>) => {
+    try { sessionStorage.setItem(actionedStorageKey, JSON.stringify(next)); }
+    catch { /* quota — non-fatal */ }
+  }, [actionedStorageKey]);
+  const recordAction = useCallback((kind: TaxKind, origName: string, record: ActionRecord) => {
+    setActioned(prev => {
+      const next = { ...prev, [kind]: { ...prev[kind], [origName]: record } };
+      persistActioned(next);
       return next;
     });
-  }, [persistAccepted]);
+  }, [persistActioned]);
+  const clearAction = useCallback((kind: TaxKind, origName: string) => {
+    setActioned(prev => {
+      const kindMap = { ...prev[kind] };
+      delete kindMap[origName];
+      const next = { ...prev, [kind]: kindMap };
+      persistActioned(next);
+      return next;
+    });
+  }, [persistActioned]);
 
   const refresh = useCallback(async () => {
     try {
@@ -3472,37 +3492,56 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
     if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
   };
 
+  // Helper: pull the proposal snapshot for a given (kind, name) from the
+  // current /proposed-tags state. Used by action handlers to build the
+  // ActionRecord so the row keeps rendering after the server clears
+  // is_new_* and the proposal drops out of the next refresh.
+  const snapshotFor = useCallback((kind: TaxKind, name: string) => {
+    const found = proposed?.[kind]?.find((p: any) => p.name === name);
+    return found
+      ? { name: found.name, parent: found.parent, count: found.count, samples: found.samples }
+      : { name, count: 0, samples: [] };
+  }, [proposed]);
+
   const accept = async (kind: TaxKind, name: string, parent?: string) => {
     setBusyKey(`${kind}:${name}`);
     onError(null);
     try {
+      const snap = snapshotFor(kind, name);
       await acceptOne(kind, name, parent, name);
-      // Mark accepted FIRST so the refresh-driven re-render reflects the
-      // accepted state immediately (otherwise the item flickers back to
-      // its un-accepted style for a tick).
-      markAccepted(kind, [name]);
+      // Record the action FIRST so the refresh-driven re-render shows the
+      // accepted badge immediately and the row stays visible.
+      recordAction(kind, name, { snapshot: { ...snap, parent }, action: 'accepted', finalName: name, finalParent: parent });
       await refresh();
     } catch (e: any) { onError(e.message); }
     finally { setBusyKey(null); }
   };
 
   // Save the edit form: accept with rename + (for sub_identities) re-parent.
-  // Marks the FINAL name as accepted so the row shows the accepted state on
-  // the next refresh — the original orphan name is gone, rewritten on the
-  // server. If the new name + parent already exist in the library the server
-  // upsert is a no-op on the library row but the run-rewrite still runs.
+  // 'renamed' action when the final name differs from the original — drives
+  // a "Accepted as <new>" badge; otherwise it's a plain accept.
   const saveEdit = async () => {
     if (!editing) return;
     const finalName = editing.name.trim();
+    const finalParent = editing.parent.trim();
     if (!finalName) { onError('Name is required'); return; }
-    if (editing.kind === 'sub_identities' && !editing.parent.trim()) {
+    if (editing.kind === 'sub_identities' && !finalParent) {
       onError('Parent identity is required for sub-identities'); return;
     }
-    setBusyKey(`${editing.kind}:${editing.origName}`);
+    const origName = editing.origName;
+    const kind = editing.kind;
+    setBusyKey(`${kind}:${origName}`);
     onError(null);
     try {
-      await acceptOne(editing.kind, finalName, editing.parent.trim(), editing.origName);
-      markAccepted(editing.kind, [finalName]);
+      const snap = snapshotFor(kind, origName);
+      await acceptOne(kind, finalName, finalParent, origName);
+      const renamed = finalName !== origName || (kind === 'sub_identities' && finalParent !== (snap.parent || ''));
+      recordAction(kind, origName, {
+        snapshot: snap,
+        action: renamed ? 'renamed' : 'accepted',
+        finalName,
+        finalParent: kind === 'sub_identities' ? finalParent : undefined,
+      });
       setEditing(null);
       await refresh();
     } catch (e: any) { onError(e.message); }
@@ -3511,12 +3550,14 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
 
   // Route the orphans for `fromName` to an existing library entry. Does NOT
   // add anything to the library — the picked target must already exist. The
-  // proposal disappears from the panel after refresh because its is_new_*
-  // flags are gone server-side.
+  // proposal disappears from /proposed-tags after refresh because its
+  // is_new_* flags are gone server-side, but the row stays visible as a
+  // "Routed to X" ghost.
   const remap = async (kind: TaxKind, fromName: string, toName: string, toParent?: string) => {
     setBusyKey(`${kind}:${fromName}`);
     onError(null);
     try {
+      const snap = snapshotFor(kind, fromName);
       const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/proposed-tags/${kind}/remap`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3524,6 +3565,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+      recordAction(kind, fromName, { snapshot: snap, action: 'routed', finalName: toName, finalParent: toParent });
       await refresh();
     } catch (e: any) { onError(e.message); }
     finally { setBusyKey(null); }
@@ -3547,11 +3589,11 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
         }
       }
     }
-    const succeeded: string[] = [];
+    const succeeded: { name: string; parent?: string; count: number; samples: string[] }[] = [];
     for (const p of items) {
       try {
-        await acceptOne(kind, p.name, p.parent);
-        succeeded.push(p.name);
+        await acceptOne(kind, p.name, p.parent, p.name);
+        succeeded.push({ name: p.name, parent: p.parent, count: p.count, samples: p.samples });
       } catch (e: any) {
         if (!firstError) firstError = e.message;
       }
@@ -3561,7 +3603,14 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
     setBusyAllKind(null);
     setBulkProgress(null);
     if (firstError) onError(`Some ${kind} couldn't be added: ${firstError}`);
-    if (succeeded.length > 0) markAccepted(kind, succeeded);
+    for (const s of succeeded) {
+      recordAction(kind, s.name, {
+        snapshot: { name: s.name, parent: s.parent, count: s.count, samples: s.samples },
+        action: 'accepted',
+        finalName: s.name,
+        finalParent: s.parent,
+      });
+    }
     setSelected(prev => ({ ...prev, [kind]: new Set() }));
     await refresh();
     // No auto-recalc here — the user runs that explicitly via the
@@ -3587,11 +3636,11 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
 
   const toggleSelectAll = (kind: TaxKind) => {
     if (!proposed) return;
-    // Exclude already-accepted items — selecting them would no-op against
+    // Exclude already-actioned items — selecting them would no-op against
     // the library (unique-constraint conflict) and clutter the count.
     const all = proposed[kind]
       .map((p: any) => p.name as string)
-      .filter((n: string) => !accepted[kind].has(n));
+      .filter((n: string) => !actioned[kind][n]);
     setSelected(prev => {
       const cur = prev[kind];
       const nextSet = cur.size === all.length ? new Set<string>() : new Set(all);
@@ -3600,7 +3649,28 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   };
 
   if (!proposed) return null;
-  const total = proposed.identities.length + proposed.sub_identities.length + proposed.sectors.length;
+  // Merge live proposals with locally-actioned ghosts so resolved rows
+  // stay visible (the server clears is_new_* on accept/remap, which
+  // makes them drop out of /proposed-tags). Ghosts render as read-only
+  // badges showing the disposition the user chose.
+  const mergedByKind: Record<TaxKind, any[]> = {
+    identities: [], sub_identities: [], sectors: [],
+  };
+  for (const kind of ['identities','sub_identities','sectors'] as TaxKind[]) {
+    const live = proposed[kind];
+    const liveNames = new Set(live.map((p: any) => p.name));
+    const ghosts = (Object.entries(actioned[kind]) as [string, ActionRecord][])
+      .filter(([name]) => !liveNames.has(name))
+      .map(([name, rec]) => ({
+        name,
+        parent: rec.snapshot.parent,
+        count: rec.snapshot.count,
+        samples: rec.snapshot.samples,
+        _ghost: true,
+      }));
+    mergedByKind[kind] = [...live, ...ghosts];
+  }
+  const total = mergedByKind.identities.length + mergedByKind.sub_identities.length + mergedByKind.sectors.length;
   if (total === 0) return null;
 
   return (
@@ -3621,14 +3691,16 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
       </p>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {(['identities','sub_identities','sectors'] as const).map(kind => {
-          const items = proposed[kind];
+          const items = mergedByKind[kind];
           const sel = selected[kind];
-          // "All selected" is relative to the un-accepted items only —
-          // accepted items aren't selectable and shouldn't gate the header.
-          const selectableCount = items.filter((p: any) => !accepted[kind].has(p.name)).length;
+          // "All selected" is relative to the un-actioned items only —
+          // already-resolved rows aren't selectable and shouldn't gate the header.
+          const selectableCount = items.filter((p: any) => !actioned[kind][p.name]).length;
           const allSelected = selectableCount > 0 && sel.size === selectableCount;
           const someSelected = sel.size > 0;
-          const acceptedCount = items.filter((p: any) => accepted[kind].has(p.name)).length;
+          const allActions = Object.values(actioned[kind]) as ActionRecord[];
+          const acceptedCount = allActions.filter(a => a.action !== 'routed').length;
+          const routedCount = allActions.filter(a => a.action === 'routed').length;
           // Layer-explanation tooltips. Native title= attribute so the
           // browser's built-in tooltip handles hover (no extra deps).
           const tooltip = TAXONOMY_LAYER_HELP[kind];
@@ -3650,6 +3722,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                   <span>
                     {kind} ({items.length})
                     {acceptedCount > 0 && <span className="text-emerald-400/80 font-normal normal-case"> · {acceptedCount} accepted</span>}
+                    {routedCount > 0 && <span className="text-sky-400/80 font-normal normal-case"> · {routedCount} routed</span>}
                   </span>
                   <span
                     className="text-gray-600 hover:text-amber-400 text-[11px] leading-none"
@@ -3674,7 +3747,11 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                 {items.map((p: any) => {
                   const key = `${kind}:${p.name}`;
                   const isChecked = sel.has(p.name);
-                  const isAccepted = accepted[kind].has(p.name);
+                  const action = actioned[kind][p.name];
+                  const isAccepted = !!action && action.action !== 'routed';
+                  const isRouted = !!action && action.action === 'routed';
+                  const isRenamed = !!action && action.action === 'renamed';
+                  const isActioned = !!action;
                   const isEditing = !!editing && editing.kind === kind && editing.origName === p.name;
                   const isBusy = busyKey === key;
                   // Library entries available as Route-to-existing targets.
@@ -3689,19 +3766,24 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                   // Suggested match: a library entry whose normalized name
                   // equals the proposal's normalized name. One-click remap.
                   const normProp = normalizeProposalName(p.name);
-                  const suggestion = !isAccepted && !isEditing && normProp
+                  const suggestion = !isActioned && !isEditing && normProp
                     ? libEntries.find(e => normalizeProposalName(e.name) === normProp && e.name !== p.name)
                     : undefined;
                   return (
                     <li
                       key={key}
                       className={`px-2 py-1.5 border rounded text-[11px] transition-colors ${
-                        isAccepted ? 'bg-emerald-500/10 border-emerald-500/40'
+                        isRouted ? 'bg-sky-500/10 border-sky-500/40'
+                          : isAccepted ? 'bg-emerald-500/10 border-emerald-500/40'
                           : isEditing ? 'bg-amber-500/10 border-amber-500/40'
                           : isChecked ? 'bg-[#3ecf8e]/10 border-[#3ecf8e]/40'
                           : 'bg-[#1c1c1c] border-[#2e2e2e]'
                       }`}
-                      title={isAccepted ? 'Accepted in this session — added to the library. Run Finalize Taxonomy / Recalculate to clear it from this list.' : undefined}
+                      title={
+                        isRouted ? `Routed to existing library entry "${action!.finalName}" — these contacts now point at the canonical bucket. Click Undo to revert.`
+                        : isAccepted ? `Accepted as "${action!.finalName}" — added to the library. Click Undo to revert.`
+                        : undefined
+                      }
                     >
                       {isEditing ? (
                         <div className="space-y-1.5">
@@ -3749,11 +3831,18 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                             type="checkbox"
                             checked={isChecked}
                             onChange={() => toggleSelect(kind, p.name)}
-                            disabled={isAccepted}
+                            disabled={isActioned}
                             className="w-3 h-3 accent-[#3ecf8e] shrink-0 disabled:opacity-30"
                           />
                           <div className="min-w-0 flex-1">
-                            <div className={`font-bold truncate ${isAccepted ? 'text-emerald-300' : 'text-white'}`} title={p.name}>{p.name}</div>
+                            <div
+                              className={`font-bold truncate ${
+                                isRouted ? 'text-sky-300 line-through decoration-sky-500/40'
+                                : isAccepted ? 'text-emerald-300'
+                                : 'text-white'
+                              }`}
+                              title={p.name}
+                            >{p.name}</div>
                             <div className="text-[10px] text-gray-500 truncate" title={p.samples?.join(' · ')}>
                               {(() => {
                                 const layerKey = kind === 'identities' ? 'identity'
@@ -3772,8 +3861,21 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                 );
                               })()}
                             </div>
-                            {kind === 'sub_identities' && p.parent && (
+                            {kind === 'sub_identities' && p.parent && !isActioned && (
                               <div className="text-[9px] text-gray-600">under {p.parent}</div>
+                            )}
+                            {/* Disposition line: shows what happened to this proposal */}
+                            {isActioned && (
+                              <div className={`text-[10px] mt-0.5 flex items-center gap-1 ${isRouted ? 'text-sky-300' : 'text-emerald-300'}`}>
+                                <ArrowRight className="w-2.5 h-2.5 shrink-0" />
+                                <span className="truncate">
+                                  {isRouted ? 'Routed to' : isRenamed ? 'Accepted as' : 'Accepted'}
+                                  {(isRouted || isRenamed) && <> <span className="font-bold">{action!.finalName}</span></>}
+                                  {kind === 'sub_identities' && action!.finalParent && (
+                                    <span className="text-gray-500"> (under {action!.finalParent})</span>
+                                  )}
+                                </span>
+                              </div>
                             )}
                             {suggestion && (
                               <button
@@ -3787,14 +3889,25 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                               </button>
                             )}
                           </div>
-                          {isAccepted ? (
-                            <span
-                              className="shrink-0 px-2 py-1 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1"
-                              title="Already added to the taxonomy library in this session"
-                            >
-                              <CheckCircle2 className="w-3 h-3" />
-                              Accepted
-                            </span>
+                          {isActioned ? (
+                            <div className="shrink-0 flex items-center gap-1">
+                              <span
+                                className={`px-2 py-1 rounded text-[10px] font-bold border flex items-center gap-1 ${
+                                  isRouted ? 'bg-sky-500/20 text-sky-200 border-sky-500/40'
+                                  : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                                }`}
+                                title={isRouted ? 'Routed to an existing library entry — no new library row was created.' : 'Added to the taxonomy library in this session.'}
+                              >
+                                <CheckCircle2 className="w-3 h-3" />
+                                {isRouted ? 'Routed' : isRenamed ? 'Renamed' : 'Accepted'}
+                              </span>
+                              <button
+                                onClick={() => clearAction(kind, p.name)}
+                                disabled={isBusy}
+                                className="px-1.5 py-1 rounded text-[10px] text-gray-400 hover:text-white border border-[#2e2e2e] hover:border-amber-500/40 bg-[#1c1c1c] disabled:opacity-50"
+                                title="Undo the local UI state for this proposal. NOTE: this doesn't reverse the library write or the bucket_industry_map rewrite — re-run Recalculate Phase 1a to fully revert."
+                              >Undo</button>
+                            </div>
                           ) : (
                             <div className="shrink-0 flex items-center gap-1">
                               <button
