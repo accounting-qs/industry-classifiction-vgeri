@@ -184,7 +184,7 @@ const PHASE1A_QA_FLOOR = 6;
 // identity. A "Consumer & Retail" tag at confidence 5 is too risky to
 // silently exclude from outreach.
 const PHASE1A_DQ_FLOOR = 7;
-const PHASE1A_BATCH_SIZE = 8;
+const PHASE1A_BATCH_SIZE = 20;
 const PHASE1A_CONCURRENCY = 40;
 
 const ANTHROPIC_KEY_NAME = 'ANTHROPIC_API_KEY';
@@ -2257,14 +2257,24 @@ async function tagIndustries(
     let firstError: string | null = null;
     const taggings: IndustryTagging[] = [];
 
-    // Strict in-run proposal reuse. Phase 1a v2 runs batches in WAVES — each
-    // wave's prompt includes the library + every proposal coined by earlier
-    // waves in this run, so subsequent batches snap to existing coinings
-    // instead of drifting ("Healthcare Operator" then "Healthcare Operators"
-    // then "Healthcare Provider").
+    // In-run proposal reuse. Earlier we used wave boundaries (run 40 in
+    // parallel, wait for ALL, gather proposals, start next 40) to give the
+    // next wave's prompt a clean snapshot of prior coinings. That fence cost
+    // 5-6× throughput because each wave waited for the slowest of 40 LLM
+    // calls — a single slow OpenAI response stalled the whole wave.
     //
-    // Cap per-layer count in the prompt so token usage doesn't blow up on
-    // 100k+ vocabs: ranked by frequency so most-reused names persist.
+    // Instead: keep a continuous pool of PHASE1A_CONCURRENCY batches in flight
+    // via pLimit. Each batch, the moment it starts, snapshots the running
+    // proposal maps as they are *now* — so every batch sees every coining
+    // that completed before its own LLM call started. Some overlap will still
+    // produce two near-identical names independently coined at the same time;
+    // the existing post-pass consolidation (consolidateTaggings +
+    // consolidateSubIdentitiesViaLLM + consolidateSectorsViaLLM +
+    // consolidateIdentitiesViaLLM) collapses those.
+    //
+    // Cap per-layer proposals shown in the prompt so token usage doesn't
+    // blow up on 100k+ vocabs: ranked by frequency so most-reused names
+    // persist in the prompt.
     const inRunIdentities = new Map<string, TaxonomyEntry & { _usage: number }>();
     const inRunSubIdentities = new Map<string, TaxonomyEntry & { _usage: number }>();
     const inRunSectors = new Map<string, TaxonomyEntry & { _usage: number }>();
@@ -2276,122 +2286,91 @@ async function tagIndustries(
     const topByUsage = <T extends { _usage: number }>(m: Map<string, T>): T[] =>
         Array.from(m.values()).sort((a, b) => b._usage - a._usage).slice(0, PROPOSALS_PER_LAYER_CAP);
 
-    // Each wave reads cumulative in-run proposals into a fresh "effective"
-    // snapshot. The LLM sees them as VALID values, so it can pick them
-    // verbatim. The snap pass below uses the same effective snapshot to
-    // canonicalize near-misses to whatever was coined first.
+    // Per-batch snapshot — captures whatever proposals were published by
+    // batches that completed before this one started.
     const buildEffectiveSnapshot = (): TaxonomySnapshot => ({
         identities: [...snapshot.identities, ...topByUsage(inRunIdentities)],
         sub_identities: [...snapshot.sub_identities, ...topByUsage(inRunSubIdentities)],
         sectors: [...snapshot.sectors, ...topByUsage(inRunSectors)],
     });
 
-    const WAVE_SIZE = PHASE1A_CONCURRENCY;
-    for (let waveStart = 0; waveStart < batches.length; waveStart += WAVE_SIZE) {
+    let batchesSinceGc = 0;
+
+    await Promise.all(batches.map((batch) => limit(async () => {
         await ctx.checkCancel();
-        const wave = batches.slice(waveStart, waveStart + WAVE_SIZE);
+        batchesAttempted++;
+        // Snapshot proposals at batch-start time. Mutations to the in-run
+        // maps by other batches between now and when this batch's LLM call
+        // returns are intentional — the harvest step at the end of this
+        // batch publishes our own coinings for the next batch to see.
         const effective = buildEffectiveSnapshot();
         const systemPrompt = buildTaggingSystemPrompt(effective);
-
-        await Promise.all(wave.map((batch) => limit(async () => {
-            await ctx.checkCancel();
-            batchesAttempted++;
-            const userPrompt = JSON.stringify({
-                industries: batch.map((v, i) => ({
-                    id: i,
-                    industry: v.industry,
-                    sample_companies: v.sample_companies?.slice(0, 2) || []
-                }))
-            });
-            try {
-                let text = '';
-                if (isAnthropic) {
-                    const resp = await anthropic!.messages.create({
+        const userPrompt = JSON.stringify({
+            industries: batch.map((v, i) => ({
+                id: i,
+                industry: v.industry,
+                sample_companies: v.sample_companies?.slice(0, 2) || []
+            }))
+        });
+        try {
+            let text = '';
+            if (isAnthropic) {
+                const resp = await anthropic!.messages.create({
+                    model,
+                    max_tokens: 4000,
+                    system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+                    messages: [{ role: 'user', content: userPrompt }]
+                }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
+                const usage: any = (resp as any).usage || {};
+                totalIn += usage.input_tokens || 0;
+                totalOut += usage.output_tokens || 0;
+                totalCachedIn += usage.cache_read_input_tokens || 0;
+                text = (resp.content as any[])
+                    .filter(b => b.type === 'text').map(b => b.text).join('\n');
+            } else {
+                // OpenAI chat completions with json_object response_format
+                // forces valid JSON without us hand-rolling a schema.
+                const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
                         model,
-                        max_tokens: 2000,
-                        system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
-                        messages: [{ role: 'user', content: userPrompt }]
-                    }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
-                    const usage: any = (resp as any).usage || {};
-                    totalIn += usage.input_tokens || 0;
-                    totalOut += usage.output_tokens || 0;
-                    totalCachedIn += usage.cache_read_input_tokens || 0;
-                    text = (resp.content as any[])
-                        .filter(b => b.type === 'text').map(b => b.text).join('\n');
-                } else {
-                    // OpenAI chat completions with json_object response_format
-                    // forces valid JSON without us hand-rolling a schema.
-                    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-                        method: 'POST',
-                        headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            model,
-                            max_tokens: 2000,
-                            response_format: { type: 'json_object' },
-                            messages: [
-                                { role: 'system', content: systemPrompt },
-                                { role: 'user', content: userPrompt }
-                            ]
-                        }),
-                        signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal)
-                    });
-                    if (!resp.ok) {
-                        const body = await resp.text();
-                        throw new Error(`OpenAI ${resp.status}: ${body.slice(0, 300)}`);
-                    }
-                    const json: any = await resp.json();
-                    const usage = json.usage || {};
-                    const cached = usage.prompt_tokens_details?.cached_tokens || 0;
-                    totalIn += (usage.prompt_tokens || 0);
-                    totalCachedIn += cached;
-                    totalOut += usage.completion_tokens || 0;
-                    text = json.choices?.[0]?.message?.content || '';
-                }
-                const parsedRaw = parseTaggingJson(text, batch);
-                // Snap against the effective snapshot (library + in-run proposals).
-                // Matches to the library are real existing entries — is_new=false.
-                // Matches to in-run proposals are still proposals — re-flag is_new=true
-                // so the AI-Proposed panel surfaces them for approval.
-                const parsed = snapTaggingsToLibrary(parsedRaw, effective).map(t => {
-                    if (t.identity && !originalIdNames.has(t.identity)) t.is_new_identity = true;
-                    if (t.sub_identity && !originalSubNames.has(t.sub_identity)) t.is_new_sub_identity = true;
-                    if (t.sector && !originalSecNames.has(t.sector)) t.is_new_sector = true;
-                    return t;
+                        max_tokens: 4000,
+                        response_format: { type: 'json_object' },
+                        messages: [
+                            { role: 'system', content: systemPrompt },
+                            { role: 'user', content: userPrompt }
+                        ]
+                    }),
+                    signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal)
                 });
-                // An empty parse means the LLM produced JSON we couldn't extract
-                // taggings from (wrong key, missing items, malformed shape). Treat
-                // it as a failed batch so (a) catastrophic-failure detection kicks
-                // in if every batch is empty, and (b) we still emit needs_qa rows
-                // so the contacts aren't silently lost.
-                if (parsed.length === 0) {
-                    batchesFailed++;
-                    if (!firstError) firstError = `LLM returned a valid JSON shape but no parseable taggings. Sample: ${text.slice(0, 200)}`;
-                    ctx.log(`[Bucketing ${runId}] tagging batch parsed to 0 results (${batch.length} industries) — output: ${text.slice(0, 200)}`, 'warn');
-                    for (const v of batch) {
-                        taggings.push({
-                            industry: v.industry,
-                            identity: null,
-                            is_new_identity: false,
-                            sub_identity: null,
-                            is_new_sub_identity: false,
-                            sector: null,
-                            is_new_sector: false,
-                            is_disqualified: false,
-                            identity_confidence: 0,
-                            sub_identity_confidence: 0,
-                            sector_confidence: 0,
-                            confidence: 0,
-                            reason: `parse_empty: ${text.slice(0, 100)}`
-                        });
-                    }
-                } else {
-                    for (const t of parsed) taggings.push(t);
+                if (!resp.ok) {
+                    const body = await resp.text();
+                    throw new Error(`OpenAI ${resp.status}: ${body.slice(0, 300)}`);
                 }
-            } catch (err: any) {
+                const json: any = await resp.json();
+                const usage = json.usage || {};
+                const cached = usage.prompt_tokens_details?.cached_tokens || 0;
+                totalIn += (usage.prompt_tokens || 0);
+                totalCachedIn += cached;
+                totalOut += usage.completion_tokens || 0;
+                text = json.choices?.[0]?.message?.content || '';
+            }
+            const parsedRaw = parseTaggingJson(text, batch);
+            // Snap against the effective snapshot (library + in-run proposals
+            // visible at batch start). Library matches stay is_new=false.
+            // Matches to in-run proposals are still proposals — re-flag
+            // is_new=true so the AI-Proposed panel surfaces them.
+            const parsed = snapTaggingsToLibrary(parsedRaw, effective).map(t => {
+                if (t.identity && !originalIdNames.has(t.identity)) t.is_new_identity = true;
+                if (t.sub_identity && !originalSubNames.has(t.sub_identity)) t.is_new_sub_identity = true;
+                if (t.sector && !originalSecNames.has(t.sector)) t.is_new_sector = true;
+                return t;
+            });
+            if (parsed.length === 0) {
                 batchesFailed++;
-                if (!firstError) firstError = err.message || String(err);
-                ctx.log(`[Bucketing ${runId}] tagging batch error (${batch.length} industries): ${err.message}`, 'error');
-                // Fail-open: emit needs_qa rows so we don't lose contacts.
+                if (!firstError) firstError = `LLM returned a valid JSON shape but no parseable taggings. Sample: ${text.slice(0, 200)}`;
+                ctx.log(`[Bucketing ${runId}] tagging batch parsed to 0 results (${batch.length} industries) — output: ${text.slice(0, 200)}`, 'warn');
                 for (const v of batch) {
                     taggings.push({
                         industry: v.industry,
@@ -2406,55 +2385,78 @@ async function tagIndustries(
                         sub_identity_confidence: 0,
                         sector_confidence: 0,
                         confidence: 0,
-                        reason: `tagging_error: ${err.message?.slice(0, 200)}`
+                        reason: `parse_empty: ${text.slice(0, 100)}`
                     });
                 }
+            } else {
+                for (const t of parsed) taggings.push(t);
+                // Publish this batch's new coinings into the running maps
+                // immediately so the NEXT batch to start sees them.
+                for (const t of parsed) {
+                    if (t.is_new_identity && t.identity) {
+                        const cur = inRunIdentities.get(t.identity);
+                        if (cur) cur._usage++;
+                        else inRunIdentities.set(t.identity, {
+                            id: '', name: t.identity, archived: false, _usage: 1
+                        });
+                    }
+                    if (t.is_new_sub_identity && t.sub_identity && t.identity) {
+                        const cur = inRunSubIdentities.get(t.sub_identity);
+                        if (cur) cur._usage++;
+                        else inRunSubIdentities.set(t.sub_identity, {
+                            id: '', name: t.sub_identity, parent_identity: t.identity, archived: false, _usage: 1
+                        });
+                    }
+                    if (t.is_new_sector && t.sector) {
+                        const cur = inRunSectors.get(t.sector);
+                        if (cur) cur._usage++;
+                        else inRunSectors.set(t.sector, {
+                            id: '', name: t.sector, archived: false, _usage: 1
+                        });
+                    }
+                }
             }
-            done += batch.length;
-            if (done % (PHASE1A_BATCH_SIZE * 10) === 0 || done === vocab.length) {
-                ctx.progress({
-                    phase: 'phase1a',
-                    step: 'tagging',
-                    current: done,
-                    total: vocab.length,
-                    note: `Tagged ${done}/${vocab.length} industries…`
-                });
-            }
-        })));
-
-        // Harvest new proposals from this wave into the running maps so the
-        // next wave's prompt + snap target include them.
-        for (const t of taggings.slice(-wave.length * PHASE1A_BATCH_SIZE)) {
-            if (t.is_new_identity && t.identity) {
-                const cur = inRunIdentities.get(t.identity);
-                if (cur) cur._usage++;
-                else inRunIdentities.set(t.identity, {
-                    id: '', name: t.identity, archived: false, _usage: 1
-                });
-            }
-            if (t.is_new_sub_identity && t.sub_identity && t.identity) {
-                const cur = inRunSubIdentities.get(t.sub_identity);
-                if (cur) cur._usage++;
-                else inRunSubIdentities.set(t.sub_identity, {
-                    id: '', name: t.sub_identity, parent_identity: t.identity, archived: false, _usage: 1
-                });
-            }
-            if (t.is_new_sector && t.sector) {
-                const cur = inRunSectors.get(t.sector);
-                if (cur) cur._usage++;
-                else inRunSectors.set(t.sector, {
-                    id: '', name: t.sector, archived: false, _usage: 1
+        } catch (err: any) {
+            batchesFailed++;
+            if (!firstError) firstError = err.message || String(err);
+            ctx.log(`[Bucketing ${runId}] tagging batch error (${batch.length} industries): ${err.message}`, 'error');
+            // Fail-open: emit needs_qa rows so we don't lose contacts.
+            for (const v of batch) {
+                taggings.push({
+                    industry: v.industry,
+                    identity: null,
+                    is_new_identity: false,
+                    sub_identity: null,
+                    is_new_sub_identity: false,
+                    sector: null,
+                    is_new_sector: false,
+                    is_disqualified: false,
+                    identity_confidence: 0,
+                    sub_identity_confidence: 0,
+                    sector_confidence: 0,
+                    confidence: 0,
+                    reason: `tagging_error: ${err.message?.slice(0, 200)}`
                 });
             }
         }
-
-        // Drop the per-wave prompt string and request/response buffers V8
-        // is still holding. --expose-gc in the start script gates this; if
-        // unavailable, falls through silently. On a 2GB Render instance with
-        // 100k+ vocab this keeps heap pressure flat across waves instead of
-        // climbing until the auto-tuned old-space-size limit hits.
-        if (typeof global.gc === 'function') global.gc();
-    }
+        done += batch.length;
+        if (done % (PHASE1A_BATCH_SIZE * 10) === 0 || done === vocab.length) {
+            ctx.progress({
+                phase: 'phase1a',
+                step: 'tagging',
+                current: done,
+                total: vocab.length,
+                note: `Tagged ${done}/${vocab.length} industries…`
+            });
+        }
+        // Periodic GC hint — drop prompt + response buffers V8 hasn't
+        // compacted yet. Every PHASE1A_CONCURRENCY batches ≈ once per
+        // "wave-equivalent". --expose-gc gates this; no-op if unavailable.
+        if (++batchesSinceGc >= PHASE1A_CONCURRENCY) {
+            batchesSinceGc = 0;
+            if (typeof global.gc === 'function') global.gc();
+        }
+    })));
 
     // Catastrophic failure detection: if more than half of all batches
     // failed, the run is producing garbage (almost certainly an API auth /
