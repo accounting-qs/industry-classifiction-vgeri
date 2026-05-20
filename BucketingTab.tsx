@@ -3375,6 +3375,29 @@ type ActionRecord = {
   finalParent?: string;
 };
 
+// Server-generated AI suggestions for the proposed-tags panel. Mirrors
+// ProposalSuggestion / ProposalSuggestionsBlob in services/bucketingService.ts.
+// Sub-identity keys are `${name}|${parent}` (the "|" is illegal in identity
+// names, so it can't collide with the "::" routeDraft uses internally).
+type ProposalSuggestion = {
+  route_to?: string;
+  route_to_parent?: string;
+  accept_as_new?: boolean;
+  confidence: number;
+  reason: string;
+};
+type ProposalSuggestionsBlob = {
+  identities?: Record<string, ProposalSuggestion>;
+  sub_identities?: Record<string, ProposalSuggestion>;
+  sectors?: Record<string, ProposalSuggestion>;
+  _meta?: {
+    model: string;
+    cost_usd: number;
+    generated_at: string;
+    counts: { identities: number; sub_identities: number; sectors: number };
+  };
+};
+
 // Lightweight mirror of services/bucketingService.ts normalizeTaxonomyName.
 // Used by the proposed-tags panel to surface "🎯 Looks like <library entry>"
 // suggestions. Strict enough that an exact normalized match is safe to offer
@@ -3436,6 +3459,13 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [busyAllKind, setBusyAllKind] = useState<string | null>(null);
   const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
+  // AI-suggested routings, populated by the "Suggest routings with AI"
+  // button (POST /api/bucketing/runs/:id/suggest-routings). Surfaced
+  // inline by /proposed-tags so we don't need a second round-trip.
+  const [aiSuggestions, setAiSuggestions] = useState<ProposalSuggestionsBlob | null>(null);
+  const [aiSuggestionsStatus, setAiSuggestionsStatus] = useState<string | null>(null);
+  const [suggestingRoutings, setSuggestingRoutings] = useState(false);
+  const [lastSuggest, setLastSuggest] = useState<{ count: number; costUsd: number; model: string } | null>(null);
   // Per-kind selection sets — drives the "Apply selected (N)" buttons.
   // Stored as Sets keyed by item name; reset whenever proposals change.
   const [selected, setSelected] = useState<Record<TaxKind, Set<string>>>({
@@ -3500,6 +3530,8 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
       const data = await tagsRes.json();
       if (!tagsRes.ok) throw new Error(data.error || `Failed (${tagsRes.status})`);
       setProposed(data);
+      setAiSuggestions(data.ai_suggestions ?? null);
+      setAiSuggestionsStatus(data.ai_suggestions_status ?? null);
       // Counts query may legitimately fail on a stale run (RPC not yet
       // applied) — surface gracefully, render without counts.
       if (countsRes.ok) {
@@ -3703,6 +3735,74 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
     });
   };
 
+  // Trigger the AI route-suggestion pass. Calls Claude Opus 4.7 server-
+  // side via POST /suggest-routings, which persists the result on the
+  // run and we refresh to pick up the inline ai_suggestions field.
+  // The pre-fill effect below auto-applies suggestions to routeDraft /
+  // selected, so the user can immediately click Accept-routing /
+  // Apply-selected without touching the dropdowns first.
+  const suggestRoutings = useCallback(async () => {
+    setSuggestingRoutings(true);
+    onError(null);
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/suggest-routings`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
+      const c = data.counts || {};
+      const n = (c.identities || 0) + (c.sub_identities || 0) + (c.sectors || 0);
+      setLastSuggest({ count: n, costUsd: Number(data.cost_usd || 0), model: String(data.model || '') });
+      console.log(`[suggest-routings] ${n} suggestions, $${(Number(data.cost_usd || 0)).toFixed(4)} (${data.model})`);
+      await refresh();
+    } catch (e: any) { onError(e.message); }
+    finally { setSuggestingRoutings(false); }
+  }, [runId, refresh, onError]);
+
+  // Pre-fill effect — runs whenever the AI blob, proposals, library, or
+  // local actioned-state changes. Pushes high-confidence AI choices into
+  // the existing routeDraft / selected state so a single click commits.
+  // Never touches a row the user already actioned or a draft the user
+  // already picked. Skips route suggestions whose target is no longer
+  // in the live non-archived library (stale-target guard).
+  useEffect(() => {
+    if (!aiSuggestions || !proposed || !library) return;
+    setRouteDraft(prev => {
+      const next = { ...prev };
+      for (const kind of ['identities', 'sub_identities', 'sectors'] as TaxKind[]) {
+        const lib = ((library as any)[kind] || []).filter((e: any) => !e.archived);
+        for (const p of (proposed[kind] || [])) {
+          const k = `${kind}:${p.name}`;
+          if (actioned[kind]?.[p.name]) continue;
+          if (next[k]) continue;
+          const sKey = kind === 'sub_identities' ? `${p.name}|${(p as any).parent || ''}` : p.name;
+          const sug = (aiSuggestions as any)[kind]?.[sKey] as ProposalSuggestion | undefined;
+          if (!sug?.route_to) continue;
+          const exists = lib.some((e: any) =>
+            e.name === sug.route_to &&
+            (kind !== 'sub_identities' || e.parent_identity === sug.route_to_parent)
+          );
+          if (exists) next[k] = `${sug.route_to}::${sug.route_to_parent || ''}`;
+        }
+      }
+      return next;
+    });
+    setSelected(prev => {
+      const next: Record<TaxKind, Set<string>> = {
+        identities: new Set(prev.identities),
+        sub_identities: new Set(prev.sub_identities),
+        sectors: new Set(prev.sectors),
+      };
+      for (const kind of ['identities', 'sub_identities', 'sectors'] as TaxKind[]) {
+        for (const p of (proposed[kind] || [])) {
+          if (actioned[kind]?.[p.name]) continue;
+          const sKey = kind === 'sub_identities' ? `${p.name}|${(p as any).parent || ''}` : p.name;
+          const sug = (aiSuggestions as any)[kind]?.[sKey] as ProposalSuggestion | undefined;
+          if (sug?.accept_as_new) next[kind].add(p.name);
+        }
+      }
+      return next;
+    });
+  }, [aiSuggestions, proposed, library, actioned]);
+
   if (!proposed) return null;
   // Merge live proposals with locally-actioned ghosts so resolved rows
   // stay visible (the server clears is_new_* on accept/remap, which
@@ -3730,16 +3830,40 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
 
   return (
     <div className="border border-amber-500/30 rounded-xl bg-amber-500/5 p-4">
-      <div className="flex items-center justify-between gap-2 mb-2">
+      <div className="flex items-center justify-between gap-2 mb-2 flex-wrap">
         <div className="text-[10px] font-bold text-amber-400 uppercase tracking-widest">
           AI-proposed taxonomy additions ({total})
         </div>
-        {recalcing && (
-          <div className="flex items-center gap-1.5 text-[10px] text-amber-200/70">
-            <Loader2 className="w-3 h-3 animate-spin" />
-            <span>Recalculating taxonomy with updated library…</span>
-          </div>
-        )}
+        <div className="flex items-center gap-3 flex-wrap">
+          {recalcing && (
+            <div className="flex items-center gap-1.5 text-[10px] text-amber-200/70">
+              <Loader2 className="w-3 h-3 animate-spin" />
+              <span>Recalculating taxonomy with updated library…</span>
+            </div>
+          )}
+          {aiSuggestionsStatus && aiSuggestionsStatus.startsWith('failed:') && !suggestingRoutings && (
+            <div className="text-[10px] text-red-300/80" title={aiSuggestionsStatus}>
+              Last AI suggestion failed — click again to retry
+            </div>
+          )}
+          {lastSuggest && !suggestingRoutings && (
+            <div className="text-[10px] text-gray-500 font-mono">
+              {lastSuggest.count} suggestions · ${lastSuggest.costUsd.toFixed(3)} · {lastSuggest.model}
+            </div>
+          )}
+          <button
+            onClick={suggestRoutings}
+            disabled={suggestingRoutings || !!recalcing || total === 0}
+            className="px-2.5 py-1 rounded text-[10px] font-bold bg-purple-500/20 text-purple-200 border border-purple-500/40 hover:bg-purple-500/30 disabled:opacity-40 flex items-center gap-1.5"
+            title={aiSuggestions
+              ? 'Re-run: ask Claude Opus 4.7 to re-suggest a route_to / accept_as_new for every proposal, overwriting the current suggestions.'
+              : 'Ask Claude Opus 4.7 to pre-fill a route_to or accept_as_new decision for every proposal. You still confirm each row before it commits.'}
+          >
+            {suggestingRoutings
+              ? (<><Loader2 className="w-3 h-3 animate-spin" /><span>Suggesting…</span></>)
+              : (<><Sparkles className="w-3 h-3" /><span>{aiSuggestions ? 'Re-suggest routings with AI' : 'Suggest routings with AI'}</span></>)}
+          </button>
+        </div>
       </div>
       <p className="text-[11px] text-gray-400 mb-3">
         The tagger proposed entries that aren't in the library. Tick the ones you want to keep (use the column header checkbox to tick all at once) and click "Apply selected", or use the per-row "Accept" button. Accepted entries are saved to the library; click "Finalize taxonomy" once you're done so the remaining proposals get re-tagged against the library only.
@@ -3833,6 +3957,37 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                     : undefined;
                   const suggestion = exactMatch || normMatch;
                   const suggestionIsExact = !!exactMatch;
+                  // AI suggestion for this row (from the suggest-routings
+                  // pass). aiState collapses three cases:
+                  //   'route' → AI picked an existing library entry,
+                  //             and that target still lives in the
+                  //             non-archived library;
+                  //   'new'   → AI says accept as new;
+                  //   'stale' → AI picked a target that no longer exists
+                  //             (target archived after the suggestion was
+                  //             generated). UI shows the stale notice but
+                  //             does NOT pre-fill the dropdown.
+                  const aiSuggKey = kind === 'sub_identities' ? `${p.name}|${p.parent || ''}` : p.name;
+                  const aiSugg: ProposalSuggestion | undefined = (aiSuggestions as any)?.[kind]?.[aiSuggKey];
+                  let aiState: 'route' | 'new' | 'stale' | null = null;
+                  let aiTarget: { name: string; parent?: string } | null = null;
+                  if (aiSugg && !isActioned && !isEditing) {
+                    if (aiSugg.route_to) {
+                      const target = libEntries.find(le =>
+                        le.name === aiSugg.route_to &&
+                        (kind !== 'sub_identities' || le.parent === aiSugg.route_to_parent)
+                      );
+                      if (target) { aiState = 'route'; aiTarget = target; }
+                      else aiState = 'stale';
+                    } else if (aiSugg.accept_as_new) {
+                      aiState = 'new';
+                    }
+                  }
+                  const aiConfColor = aiSugg
+                    ? aiSugg.confidence >= 8 ? 'emerald'
+                    : aiSugg.confidence >= 5 ? 'amber'
+                    : 'red'
+                    : 'gray';
                   return (
                     <li
                       key={key}
@@ -3941,7 +4096,37 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                 </span>
                               </div>
                             )}
-                            {suggestion && (
+                            {/* AI suggestion chip — takes precedence over
+                                the heuristic chip below when present.
+                                Color-coded by confidence (green ≥8, amber
+                                5-7, red ≤4). Hover-title shows the LLM
+                                reasoning verbatim. */}
+                            {aiSugg && !isActioned && !isEditing && aiState && (
+                              <div
+                                className={`mt-1 px-1.5 py-0.5 rounded text-[9px] font-bold inline-flex items-center gap-1 border ${
+                                  aiState === 'route' && aiConfColor === 'emerald' ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                                  : aiState === 'route' && aiConfColor === 'amber' ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                                  : aiState === 'route' ? 'bg-red-500/15 text-red-300 border-red-500/30'
+                                  : aiState === 'new' ? 'bg-purple-500/15 text-purple-200 border-purple-500/30'
+                                  : 'bg-gray-500/15 text-gray-400 border-gray-500/30'
+                                }`}
+                                title={`Claude Opus 4.7 · confidence ${aiSugg.confidence}/10 — ${aiSugg.reason}`}
+                              >
+                                <Sparkles className="w-2.5 h-2.5" />
+                                <span>
+                                  {aiState === 'route' && aiTarget && (
+                                    <>AI: route to <span className="underline">{aiTarget.name}</span>{aiTarget.parent ? ` (under ${aiTarget.parent})` : ''} · {aiSugg.confidence}/10</>
+                                  )}
+                                  {aiState === 'new' && (<>AI: keep as new · {aiSugg.confidence}/10</>)}
+                                  {aiState === 'stale' && (<>AI suggestion stale (target removed)</>)}
+                                </span>
+                              </div>
+                            )}
+                            {/* Heuristic chip — only shown when there's no
+                                AI suggestion. AI takes precedence because
+                                it's both more accurate and reflects an
+                                explicit user request. */}
+                            {!aiSugg && suggestion && (
                               <button
                                 onClick={() => remap(kind, p.name, suggestion.name, suggestion.parent)}
                                 disabled={isBusy}
@@ -4018,13 +4203,25 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                   </option>
                                 ))}
                               </select>
-                              <button
-                                onClick={() => accept(kind, p.name, p.parent)}
-                                disabled={isBusy}
-                                className="px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
-                              >
-                                {isBusy ? '…' : 'Accept'}
-                              </button>
+                              {aiState === 'route' && aiTarget ? (
+                                <button
+                                  onClick={() => remap(kind, p.name, aiTarget!.name, aiTarget!.parent)}
+                                  disabled={isBusy}
+                                  className="px-2 py-1 rounded text-[10px] font-bold bg-purple-500/30 text-purple-100 border border-purple-500/50 hover:bg-purple-500/40 disabled:opacity-50"
+                                  title={`Routes "${p.name}" → "${aiTarget.name}" using Claude Opus's suggestion (${aiSugg!.confidence}/10): ${aiSugg!.reason}`}
+                                >
+                                  {isBusy ? '…' : 'Accept routing'}
+                                </button>
+                              ) : (
+                                <button
+                                  onClick={() => accept(kind, p.name, p.parent)}
+                                  disabled={isBusy}
+                                  className="px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
+                                  title={aiState === 'new' ? 'AI suggests keeping as new — click to add to the library.' : undefined}
+                                >
+                                  {isBusy ? '…' : 'Accept'}
+                                </button>
+                              )}
                             </div>
                           )}
                         </div>

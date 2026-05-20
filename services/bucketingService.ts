@@ -235,6 +235,34 @@ interface TaxonomySnapshot {
     sectors: TaxonomyEntry[];
 }
 
+// ─── AI proposal-routing suggestions ───────────────────────────────
+// Populated by suggestProposalRoutings(); persisted on
+// bucketing_runs.ai_proposal_suggestions; surfaced through
+// /api/bucketing/runs/:id/proposed-tags so the UI can pre-fill
+// the "Route to…" dropdown / tick the "accept as new" checkbox.
+//
+// Sub-identity keying uses "|" (illegal in identity names) to avoid
+// collisions with the "::" the UI uses inside routeDraft values.
+export interface ProposalSuggestion {
+    route_to?: string;            // existing library entry name (verbatim)
+    route_to_parent?: string;     // sub_identities only — parent identity of route_to
+    accept_as_new?: boolean;      // exactly one of route_to / accept_as_new must be set
+    confidence: number;           // 1-10
+    reason: string;               // <= 30 words, single sentence
+}
+
+export interface ProposalSuggestionsBlob {
+    identities?:     Record<string, ProposalSuggestion>;
+    sub_identities?: Record<string, ProposalSuggestion>;   // key = `${name}|${parent}`
+    sectors?:        Record<string, ProposalSuggestion>;
+    _meta?: {
+        model: string;
+        cost_usd: number;
+        generated_at: string;
+        counts: { identities: number; sub_identities: number; sectors: number };
+    };
+}
+
 interface IndustryTagging {
     industry: string;
     identity: string | null;
@@ -3840,6 +3868,389 @@ Only include entries where from != to (or where to is "" to drop).`;
         }
     }
     return { merges: mergeCount, costUsd };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// AI-PROPOSED-ROUTING SUGGESTIONS  (one-shot per-run, manual trigger)
+// ────────────────────────────────────────────────────────────────────
+//
+// The "AI-proposed taxonomy additions" panel shows the tagger's
+// is_new_* coinings. Today the reviewer decides one row at a time
+// whether to accept-as-new or route-to-existing-library-entry. This
+// function asks Claude Opus 4.7 once per layer to pre-decide every
+// row: route OR accept_as_new, with 1-10 confidence and a one-line
+// reason. Results persist on bucketing_runs.ai_proposal_suggestions
+// and are read back inline by GET /proposed-tags so the UI can
+// pre-fill the dropdown / pre-tick the row checkbox.
+//
+// Conservative model choice: Opus 4.7. Worst-case cost on a ~250-
+// proposal run is well under $1 (3 LLM calls, ~5k input + ~7.5k
+// output tokens total). Cancellation: the per-run AbortController
+// piped via ctx.abortSignal kills the in-flight Anthropic call.
+const SUGGEST_ROUTINGS_MODEL = 'claude-opus-4-7';
+const SUGGEST_ROUTINGS_MAX_TOKENS = 8000;
+
+type SuggestLayer = 'identities' | 'sub_identities' | 'sectors';
+
+interface LoadedProposals {
+    identities: Array<{ name: string; samples: string[]; count: number }>;
+    sub_identities: Array<{ name: string; parent: string; samples: string[]; count: number }>;
+    sectors: Array<{ name: string; samples: string[]; count: number }>;
+}
+
+// Lifted from server.ts GET /proposed-tags so the suggestion service
+// can pull the same shape without duplicating the aggregation. The
+// route handler now delegates here.
+export async function loadRunProposals(
+    supabase: SupabaseClient,
+    runId: string
+): Promise<LoadedProposals> {
+    const { data, error } = await supabase
+        .from('bucket_industry_map')
+        .select('primary_identity,is_new_identity,sub_identity,is_new_sub_identity,sector,is_new_sector,industry_string')
+        .eq('bucketing_run_id', runId)
+        .or('is_new_identity.eq.true,is_new_sub_identity.eq.true,is_new_sector.eq.true');
+    if (error) throw new Error(error.message);
+
+    const ids = new Map<string, { name: string; samples: string[]; count: number }>();
+    const chars = new Map<string, { name: string; parent: string; samples: string[]; count: number }>();
+    const secs = new Map<string, { name: string; samples: string[]; count: number }>();
+    for (const r of (data || []) as any[]) {
+        if (r.is_new_identity && r.primary_identity) {
+            const e = ids.get(r.primary_identity) || { name: r.primary_identity, samples: [], count: 0 };
+            e.count++;
+            if (e.samples.length < 5) e.samples.push(r.industry_string);
+            ids.set(r.primary_identity, e);
+        }
+        if (r.is_new_sub_identity && r.sub_identity) {
+            const e = chars.get(r.sub_identity) || { name: r.sub_identity, parent: r.primary_identity || '', samples: [], count: 0 };
+            e.count++;
+            if (e.samples.length < 5) e.samples.push(r.industry_string);
+            chars.set(r.sub_identity, e);
+        }
+        if (r.is_new_sector && r.sector) {
+            const e = secs.get(r.sector) || { name: r.sector, samples: [], count: 0 };
+            e.count++;
+            if (e.samples.length < 5) e.samples.push(r.industry_string);
+            secs.set(r.sector, e);
+        }
+    }
+    return {
+        identities: Array.from(ids.values()).sort((a, b) => b.count - a.count),
+        sub_identities: Array.from(chars.values()).sort((a, b) => b.count - a.count),
+        sectors: Array.from(secs.values()).sort((a, b) => b.count - a.count),
+    };
+}
+
+async function loadProposedContactCounts(
+    supabase: SupabaseClient,
+    runId: string
+): Promise<Record<string, number>> {
+    const { data, error } = await supabase.rpc('get_proposed_tag_contact_counts', { p_run_id: runId });
+    if (error) return {};
+    const map: Record<string, number> = {};
+    for (const r of (data || []) as any[]) {
+        if (r?.layer && r?.name) map[`${r.layer}:${r.name}`] = Number(r.contact_count || 0);
+    }
+    return map;
+}
+
+interface RawSuggestion {
+    name: string;
+    parent?: string;
+    decision: 'route' | 'new';
+    route_to?: string;
+    route_to_parent?: string;
+    confidence: number;
+    reason: string;
+}
+
+function layerGuidance(layer: SuggestLayer): string {
+    if (layer === 'identities') {
+        return `You are routing IDENTITY proposals (Layer 1 — the company's top-level business model). Prefer route over new — the library was hand-curated to cover the full B2B universe. Map vertical-specific identity names to their generic ("Healthcare Services" → "Healthcare Operator"; "Insurance" / "Insurance Brokerage" → "Insurance Services"). Use the CANONICAL list inside HARD_KEYWORD_ROUTING as guidance — but only route to names that actually appear in the LIBRARY block. Names like "Specialty Services" / "Professional Services" / "B2B" / "Subscription" are NOT valid identities; pick the closest library identity and set confidence ≤ 4.`;
+    }
+    if (layer === 'sub_identities') {
+        return `You are routing SUB-IDENTITY proposals (Layer 2 — the functional subtype under an identity). Each proposal lists a parent identity. Prefer route heavily — sub-identities fragment the worst. Apply the merge patterns from the tagger: "Investment Advisory" / "Wealth Management Firm" / "Asset Management" → Investment Management or Wealth Management; "Private Equity Firm" → Private Equity; "HVAC Services" / "Solar Installation" → Field Services & Maintenance. If a proposal's name is an identity name used as a sub-identity ("Healthcare Operator" under Healthcare Operator), route_to should be the closest in-library sub-identity under the same parent at confidence ≤ 4. route_to_parent SHOULD usually match the proposal's parent, BUT if the library has the right sub-identity under a different parent, use the library's parent (the contacts will be re-parented).`;
+    }
+    return `You are routing SECTOR proposals (Layer 3 — the vertical the company SERVES, not the company's identity). Prefer route. Map: Sports / Athletics / Esports → Media & Entertainment; Recreation / Leisure → Hospitality & Travel; Solar / Oil & Gas / Utilities → Energy & Utilities; Pharma / Biotech → Life Sciences & Biotech; Aviation / Defense → Aerospace & Defense; Insurance → Financial Services; Construction → Construction & Infrastructure. Inputs that are NOT sectors (Marketing, Advertising, IT Services, Consulting, Professional Services, B2B, Corporate, Subscription, Holding Company) — set decision=route at confidence ≤ 3 to the LEAST WRONG library sector. NEVER set decision=new for those identity-bleed inputs.`;
+}
+
+function buildSuggestPrompt(
+    layer: SuggestLayer,
+    proposals: LoadedProposals[SuggestLayer],
+    libEntries: TaxonomyEntry[],
+    contactCounts: Record<string, number>,
+): { system: string; user: string } {
+    const layerCountKey = layer === 'identities' ? 'identity' : layer === 'sub_identities' ? 'sub_identity' : 'sector';
+
+    const system = `You route AI-proposed B2B taxonomy entries to an existing curated library. For each PROPOSAL choose ONE of:
+  - "route" — the proposal is a duplicate / near-synonym / narrower case of an existing LIBRARY entry. Set route_to (and route_to_parent for sub-identities) to the EXACT library name. NEVER paraphrase. NEVER suggest an archived entry (none are listed).
+  - "new" — the proposal is genuinely distinct from everything in the library. The user will accept it verbatim as a new library entry.
+
+PRINCIPLES (match the tagger that produced these proposals):
+${CORE_PRINCIPLES}
+${HARD_KEYWORD_ROUTING}
+
+LAYER-SPECIFIC GUIDANCE: ${layerGuidance(layer)}
+
+CONFIDENCE (1-10):
+  10 — exact synonym ("PE Firm" vs "Private Equity") or clearly novel concept with no plausible library mapping.
+  8-9 — strong match; difference is suffix / pluralization / vertical narrowing.
+  5-7 — defensible match a reviewer might dispute.
+  1-4 — uncertain; both route and new feel wrong. Pick the less-bad option and let the human review.
+
+REASONING:
+  - ≤ 30 words. ONE sentence. Cite the library entry's name when routing.
+
+OUTPUT — strict JSON, single object with key "suggestions":
+{
+  "suggestions": [
+    { "name": "<proposal name verbatim>",
+      "parent": "<parent identity name verbatim>",        // sub_identities only
+      "decision": "route" | "new",
+      "route_to": "<library entry name verbatim>",        // when decision = route
+      "route_to_parent": "<library parent identity>",     // sub_identities + route only
+      "confidence": 1-10,
+      "reason": "..." }
+  ]
+}
+
+HARD RULES:
+  - One object per PROPOSAL in the user message. Do not drop any.
+  - When decision=route, route_to MUST appear in the LIBRARY block. Do NOT invent names.
+  - For sub-identities + route, route_to_parent MUST match the library entry's listed parent_identity.
+  - When decision=new, omit route_to / route_to_parent.
+  - Output ONLY the JSON object. No prose, no markdown fences.`;
+
+    const libBlock = layer === 'sub_identities'
+        ? libEntries.map(e => `  - "${e.name}" (under "${e.parent_identity || ''}")${e.description ? `: ${e.description}` : ''}`).join('\n')
+        : libEntries.map(e => `  - "${e.name}"${e.description ? `: ${e.description}` : ''}`).join('\n');
+
+    const propBlock = (proposals as any[]).map((p: any) => {
+        const cc = contactCounts[`${layerCountKey}:${p.name}`];
+        const ccStr = cc !== undefined ? `${cc.toLocaleString()} contacts · ` : '';
+        const samples = (p.samples || []).slice(0, 3).map((s: string) => `"${s}"`).join(', ');
+        if (layer === 'sub_identities') {
+            return `  - "${p.name}" (proposed under "${p.parent || ''}") — ${ccStr}${p.count}× industries · samples: ${samples}`;
+        }
+        return `  - "${p.name}" — ${ccStr}${p.count}× industries · samples: ${samples}`;
+    }).join('\n');
+
+    const user = `LIBRARY (${layer}, archived entries excluded):
+${libBlock}
+
+PROPOSALS to route (${(proposals as any[]).length} total):
+${propBlock}
+
+Produce one suggestion object per proposal, in the exact order listed.`;
+
+    return { system, user };
+}
+
+async function callSuggestLLM(
+    supabase: SupabaseClient,
+    layer: SuggestLayer,
+    proposals: LoadedProposals[SuggestLayer],
+    libEntries: TaxonomyEntry[],
+    contactCounts: Record<string, number>,
+    signal: AbortSignal | undefined,
+    log: (m: string, level?: 'info' | 'warn') => void,
+): Promise<{ suggestions: RawSuggestion[]; cost: number }> {
+    const anthropic = await getAnthropic(supabase);
+    if (!anthropic) throw new Error('Anthropic API key not configured. Add it on the Connectors page (saved as ANTHROPIC_API_KEY).');
+
+    const { system, user } = buildSuggestPrompt(layer, proposals, libEntries, contactCounts);
+    const resp = await anthropic.messages.create({
+        model: SUGGEST_ROUTINGS_MODEL,
+        max_tokens: SUGGEST_ROUTINGS_MAX_TOKENS,
+        system,
+        messages: [{ role: 'user', content: user }],
+    }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, signal) });
+
+    const usage: any = (resp as any).usage || {};
+    const cost = computeAnthropicCost(SUGGEST_ROUTINGS_MODEL, usage.input_tokens || 0, usage.output_tokens || 0);
+    const text = (resp.content as any[]).filter(b => b.type === 'text').map(b => b.text).join('\n');
+
+    // Strict parse first; regex recovery on truncation — same pattern as
+    // consolidateSubIdentitiesViaLLM above. Pulls complete suggestion
+    // objects out of the prefix even when the trailing array is cut.
+    const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+    const cleaned = (fence ? fence[1] : text).trim();
+    let suggestions: RawSuggestion[] = [];
+    try {
+        const parsed = JSON.parse(cleaned);
+        if (Array.isArray(parsed.suggestions)) suggestions = parsed.suggestions as RawSuggestion[];
+    } catch {
+        // Match balanced { ... } chunks at the top level of the array.
+        // Depth-aware so route_to_parent etc. don't trip a naive regex.
+        const start = cleaned.indexOf('[');
+        if (start >= 0) {
+            let depth = 0;
+            let objStart = -1;
+            const chunks: string[] = [];
+            for (let i = start; i < cleaned.length; i++) {
+                const ch = cleaned[i];
+                if (ch === '{') {
+                    if (depth === 0) objStart = i;
+                    depth++;
+                } else if (ch === '}') {
+                    depth--;
+                    if (depth === 0 && objStart >= 0) {
+                        chunks.push(cleaned.slice(objStart, i + 1));
+                        objStart = -1;
+                    }
+                }
+            }
+            for (const c of chunks) {
+                try {
+                    const obj = JSON.parse(c);
+                    if (obj && typeof obj.name === 'string') suggestions.push(obj as RawSuggestion);
+                } catch { /* skip malformed */ }
+            }
+        }
+        if (suggestions.length === 0) {
+            throw new Error(`unrecoverable parse failure (${cleaned.length} chars)`);
+        }
+        log(`[${layer}] JSON truncated — recovered ${suggestions.length} via regex`, 'warn');
+    }
+    return { suggestions, cost };
+}
+
+function clampConfidence(n: any): number {
+    const v = Number(n);
+    if (!Number.isFinite(v)) return 5;
+    if (v < 1) return 1;
+    if (v > 10) return 10;
+    return Math.round(v);
+}
+
+export async function suggestProposalRoutings(
+    supabase: SupabaseClient,
+    runId: string,
+    ctx?: { log?: (m: string, level?: 'info' | 'warn') => void; abortSignal?: AbortSignal }
+): Promise<{
+    counts: { identities: number; sub_identities: number; sectors: number };
+    costUsd: number;
+    model: string;
+    blob: ProposalSuggestionsBlob;
+}> {
+    const log = ctx?.log ?? ((m: string) => console.log(`[suggest-routings ${runId}] ${m}`));
+    const signal = ctx?.abortSignal;
+
+    const snapshot = await loadTaxonomySnapshot(supabase);
+    const proposals = await loadRunProposals(supabase, runId);
+    const contactCounts = await loadProposedContactCounts(supabase, runId);
+
+    const totalProposals = proposals.identities.length + proposals.sub_identities.length + proposals.sectors.length;
+    if (totalProposals === 0) {
+        log('no proposals — writing empty blob');
+        const empty: ProposalSuggestionsBlob = {
+            identities: {}, sub_identities: {}, sectors: {},
+            _meta: {
+                model: SUGGEST_ROUTINGS_MODEL,
+                cost_usd: 0,
+                generated_at: new Date().toISOString(),
+                counts: { identities: 0, sub_identities: 0, sectors: 0 },
+            },
+        };
+        await persistSuggestionsBlob(supabase, runId, empty);
+        return { counts: empty._meta!.counts, costUsd: 0, model: SUGGEST_ROUTINGS_MODEL, blob: empty };
+    }
+
+    const layers: SuggestLayer[] = ['identities', 'sub_identities', 'sectors'];
+    const results = await Promise.all(layers.map(async (layer) => {
+        const libEntries = snapshot[layer];
+        const layerProposals = proposals[layer] as any[];
+        if (layerProposals.length === 0) {
+            return { layer, suggestions: [] as RawSuggestion[], cost: 0 };
+        }
+        if (libEntries.length === 0) {
+            // No library to route into — force accept_as_new for every proposal.
+            log(`[${layer}] library empty — defaulting all ${layerProposals.length} proposals to accept_as_new`);
+            return {
+                layer,
+                cost: 0,
+                suggestions: layerProposals.map((p: any) => ({
+                    name: p.name,
+                    parent: p.parent,
+                    decision: 'new' as const,
+                    confidence: 10,
+                    reason: 'No library entries exist for this layer yet; accepting as new.',
+                })),
+            };
+        }
+        try {
+            const r = await callSuggestLLM(supabase, layer, layerProposals as any, libEntries, contactCounts, signal, log);
+            log(`[${layer}] ${r.suggestions.length} suggestions for ${layerProposals.length} proposals · $${r.cost.toFixed(4)}`);
+            return { layer, suggestions: r.suggestions, cost: r.cost };
+        } catch (err: any) {
+            log(`[${layer}] LLM call failed: ${err.message}`, 'warn');
+            throw err;
+        }
+    }));
+
+    const blob: ProposalSuggestionsBlob = { identities: {}, sub_identities: {}, sectors: {} };
+    let totalCost = 0;
+    for (const r of results) {
+        totalCost += r.cost;
+        const layerLib = snapshot[r.layer];
+        for (const raw of r.suggestions) {
+            if (!raw || typeof raw.name !== 'string') continue;
+            const out: ProposalSuggestion = {
+                confidence: clampConfidence(raw.confidence),
+                reason: String(raw.reason || '').slice(0, 240),
+            };
+            const wantRoute = raw.decision === 'route' && typeof raw.route_to === 'string' && raw.route_to.trim();
+            if (wantRoute) {
+                const exists = layerLib.some(e =>
+                    e.name === raw.route_to &&
+                    (r.layer !== 'sub_identities' || e.parent_identity === raw.route_to_parent)
+                );
+                if (exists) {
+                    out.route_to = raw.route_to;
+                    if (r.layer === 'sub_identities') out.route_to_parent = raw.route_to_parent;
+                } else {
+                    // Hallucinated target — downgrade to accept_as_new at low confidence.
+                    out.accept_as_new = true;
+                    out.confidence = Math.min(out.confidence, 4);
+                    out.reason = `(invalid route target "${raw.route_to}") ${out.reason}`.slice(0, 240);
+                }
+            } else {
+                out.accept_as_new = true;
+            }
+            const key = r.layer === 'sub_identities'
+                ? `${raw.name}|${raw.parent || ''}`
+                : raw.name;
+            (blob[r.layer] as Record<string, ProposalSuggestion>)[key] = out;
+        }
+    }
+
+    blob._meta = {
+        model: SUGGEST_ROUTINGS_MODEL,
+        cost_usd: totalCost,
+        generated_at: new Date().toISOString(),
+        counts: {
+            identities:     Object.keys(blob.identities || {}).length,
+            sub_identities: Object.keys(blob.sub_identities || {}).length,
+            sectors:        Object.keys(blob.sectors || {}).length,
+        },
+    };
+    await persistSuggestionsBlob(supabase, runId, blob);
+    const n = blob._meta.counts.identities + blob._meta.counts.sub_identities + blob._meta.counts.sectors;
+    log(`done — ${n} suggestions · $${totalCost.toFixed(4)}`);
+    return { counts: blob._meta.counts, costUsd: totalCost, model: SUGGEST_ROUTINGS_MODEL, blob };
+}
+
+async function persistSuggestionsBlob(
+    supabase: SupabaseClient,
+    runId: string,
+    blob: ProposalSuggestionsBlob,
+): Promise<void> {
+    const { error } = await supabase
+        .from('bucketing_runs')
+        .update({ ai_proposal_suggestions: blob, ai_proposal_suggestions_status: null })
+        .eq('id', runId);
+    if (error) throw new Error(`persist suggestions failed: ${error.message}`);
 }
 
 // Deterministic post-pass: any proposed-new identity with count < 3 gets

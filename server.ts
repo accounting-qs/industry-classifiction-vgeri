@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { db } from './services/supabaseClient';
 import { JobProcessor } from './services/jobProcessor';
-import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, recalculateTaxonomyWithLibrary, finalizeTaxonomyAgainstLibrary, runBucketAssignment, BucketingCancelledError, debugTagSingleIndustry } from './services/bucketingService';
+import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, recalculateTaxonomyWithLibrary, finalizeTaxonomyAgainstLibrary, runBucketAssignment, BucketingCancelledError, debugTagSingleIndustry, suggestProposalRoutings, loadRunProposals } from './services/bucketingService';
 import {
     listLibrary,
     upsertLibraryBucket,
@@ -3722,46 +3722,87 @@ app.post('/api/bucketing/runs/:runId/proposed-tags/:layer/remap', async (req, re
 });
 
 // AI-proposed additions surfaced from Phase 1a results — `is_new_*=true`
-// rows in bucket_industry_map for a run. Returns a deduped list per kind.
+// rows in bucket_industry_map for a run. Returns a deduped list per kind,
+// plus any AI-suggested routings stored on the run (for the
+// "Suggest routings with AI" pre-fill UX). The latter two fields are
+// additive — older clients ignore them.
 app.get('/api/bucketing/runs/:id/proposed-tags', async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('bucket_industry_map')
-            .select('primary_identity,is_new_identity,sub_identity,is_new_sub_identity,sector,is_new_sector,industry_string,confidence,llm_reason')
-            .eq('bucketing_run_id', req.params.id)
-            .or('is_new_identity.eq.true,is_new_sub_identity.eq.true,is_new_sector.eq.true');
-        if (error) return res.status(500).json({ error: error.message });
-
-        const ids = new Map<string, { name: string; samples: string[]; count: number }>();
-        const chars = new Map<string, { name: string; parent: string | null; samples: string[]; count: number }>();
-        const secs = new Map<string, { name: string; samples: string[]; count: number }>();
-        for (const r of (data || []) as any[]) {
-            if (r.is_new_identity && r.primary_identity) {
-                const e = ids.get(r.primary_identity) || { name: r.primary_identity, samples: [], count: 0 };
-                e.count++;
-                if (e.samples.length < 5) e.samples.push(r.industry_string);
-                ids.set(r.primary_identity, e);
-            }
-            if (r.is_new_sub_identity && r.sub_identity) {
-                const e = chars.get(r.sub_identity) || { name: r.sub_identity, parent: r.primary_identity || null, samples: [], count: 0 };
-                e.count++;
-                if (e.samples.length < 5) e.samples.push(r.industry_string);
-                chars.set(r.sub_identity, e);
-            }
-            if (r.is_new_sector && r.sector) {
-                const e = secs.get(r.sector) || { name: r.sector, samples: [], count: 0 };
-                e.count++;
-                if (e.samples.length < 5) e.samples.push(r.industry_string);
-                secs.set(r.sector, e);
-            }
-        }
+        const proposals = await loadRunProposals(supabase, req.params.id);
+        const { data: run } = await supabase
+            .from('bucketing_runs')
+            .select('ai_proposal_suggestions, ai_proposal_suggestions_status')
+            .eq('id', req.params.id)
+            .maybeSingle();
         res.json({
-            identities: Array.from(ids.values()).sort((a, b) => b.count - a.count),
-            sub_identities: Array.from(chars.values()).sort((a, b) => b.count - a.count),
-            sectors: Array.from(secs.values()).sort((a, b) => b.count - a.count)
+            ...proposals,
+            ai_suggestions: run?.ai_proposal_suggestions ?? null,
+            ai_suggestions_status: run?.ai_proposal_suggestions_status ?? null,
         });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+// AI route-suggestion pass. Manual button on the proposals panel. Asks
+// Claude Opus 4.7 to decide route_to vs. accept_as_new for every
+// proposal on the run, then persists the result so the panel can
+// pre-fill dropdowns / pre-tick checkboxes. Re-clickable (overwrites
+// the previous suggestion blob). Concurrency lock via an in-memory Set
+// AND a `running` flag on bucketing_runs, so two tabs racing the same
+// run get a clean 409 instead of two parallel LLM calls.
+const suggestRoutingsLocks = new Set<string>();
+app.post('/api/bucketing/runs/:id/suggest-routings', async (req, res) => {
+    const runId = req.params.id;
+    if (!runId) return res.status(400).json({ error: 'runId is required' });
+    try {
+        const { data: run, error: rerr } = await supabase
+            .from('bucketing_runs')
+            .select('id, ai_proposal_suggestions_status')
+            .eq('id', runId)
+            .maybeSingle();
+        if (rerr) return res.status(500).json({ error: rerr.message });
+        if (!run) return res.status(404).json({ error: 'run not found' });
+
+        if (suggestRoutingsLocks.has(runId) || run.ai_proposal_suggestions_status === 'running') {
+            return res.status(409).json({ error: 'suggestion job already running for this run' });
+        }
+        suggestRoutingsLocks.add(runId);
+        await supabase
+            .from('bucketing_runs')
+            .update({ ai_proposal_suggestions_status: 'running' })
+            .eq('id', runId);
+
+        // Reuse the per-run AbortController so "Cancel run" also kills
+        // any in-flight Anthropic call from this job.
+        const ac = getOrCreateRunAbortController(runId);
+        const ctx = {
+            log: (m: string, level?: 'info' | 'warn') => {
+                if (level === 'warn') console.warn(`[suggest-routings ${runId}] ${m}`);
+                else console.log(`[suggest-routings ${runId}] ${m}`);
+            },
+            abortSignal: ac.signal,
+        };
+
+        try {
+            const result = await suggestProposalRoutings(supabase, runId, ctx);
+            res.json({
+                ok: true,
+                counts: result.counts,
+                cost_usd: result.costUsd,
+                model: result.model,
+            });
+        } catch (err: any) {
+            await supabase
+                .from('bucketing_runs')
+                .update({ ai_proposal_suggestions_status: `failed:${(err.message || '').slice(0, 200)}` })
+                .eq('id', runId);
+            throw err;
+        }
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    } finally {
+        suggestRoutingsLocks.delete(runId);
     }
 });
 
