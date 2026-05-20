@@ -2277,12 +2277,15 @@ function BucketChainList({
 // a finished (or failed) run without having to delete it and start
 // over. Each re-run fires the same backend endpoint that ran the
 // phase originally:
-//   - Phase 1a    → POST /retag-phase1a   (LLM re-tag every industry)
-//   - Bucket Assignment → POST /assign-buckets (industry → bucket)
-//   - Phase 1b    → POST /assign           (per-contact routing)
-// Each endpoint flips bucketing_runs.status to its phase-specific
-// "in flight" value before returning 202, so the parent BucketingDetail
-// auto-routes to BucketingProgressPanel within the next 1.5 s poll tick.
+//   - Phase 1a    → POST /retag-phase1a       (LLM re-tag every industry; auto-starts)
+//   - Bucket Assignment → POST /assign-buckets (industry → bucket; auto-starts)
+//   - Phase 1b    → POST /reopen-for-phase1b  (flips completed → taxonomy_ready;
+//                                              user adjusts min_volume / library
+//                                              in BucketingReview, then clicks
+//                                              Apply & Assign to actually run)
+// Phase 1a flips status to its in-flight value before returning, so the
+// parent BucketingDetail auto-routes to BucketingProgressPanel within the
+// next 1.5 s poll tick. Phase 1b instead routes to BucketingReview.
 
 function PipelineRerunPanel({ run, onRefresh, onError }: {
   run: BucketingRun;
@@ -2372,16 +2375,11 @@ function PipelineRerunPanel({ run, onRefresh, onError }: {
   };
 
   const rerunPhase1b = () => {
-    if (!confirm(
-      'Re-run Phase 1b (per-contact routing)?\n\n' +
-      'Wipes bucket_contact_map + bucket_assignments and re-routes every ' +
-      'contact through the library / embedding / LLM cascade using the ' +
-      'current Phase 1a tags + Bucket Assignment + run settings ' +
-      '(min_volume, identity_min_volume, library reuse).\n\n' +
-      'Cost: usually small thanks to the JOIN-first lookup; takes minutes-to-hours ' +
-      'depending on contact count and cache hit rate.'
-    )) return;
-    post('/assign', 'phase1b', 'Phase 1b');
+    // Non-destructive: just flips the run back to taxonomy_ready so the
+    // parent re-renders to BucketingReview. User adjusts min_volume /
+    // identity_min_volume / library selection there, then clicks Apply &
+    // Assign — that's what actually wipes Phase 1b output and re-routes.
+    post('/reopen-for-phase1b', 'phase1b', 'Re-open Phase 1b');
   };
 
   const inFlight = busy !== null;
@@ -2423,7 +2421,7 @@ function PipelineRerunPanel({ run, onRefresh, onError }: {
           onClick={rerunPhase1b}
           disabled={inFlight}
           className="px-3 py-2 rounded text-[11px] font-bold bg-[#3ecf8e]/10 border border-[#3ecf8e]/40 text-[#3ecf8e] hover:bg-[#3ecf8e]/20 disabled:opacity-50 flex items-center justify-center gap-1.5"
-          title="Wipe bucket_contact_map and re-route every contact. Uses current Phase 1a + Bucket Assignment + run settings."
+          title="Re-open the Phase 1b config screen so you can adjust min_volume / identity_min_volume / library selection, then click Apply & Assign to actually re-route."
         >
           {busy === 'phase1b'
             ? <Loader2 className="w-3 h-3 animate-spin" />
@@ -2455,9 +2453,11 @@ function PipelineRerunPanel({ run, onRefresh, onError }: {
         );
       })()}
       <p className="text-[10px] text-gray-600 italic mt-2">
-        After clicking, you'll be switched to the live progress view automatically
-        (Phase 1a / Phase 1b) or see progress here (Bucket Assignment).
-        Safe to close the tab — runs continue server-side.
+        Phase 1a switches to the live progress view automatically (runs continue
+        server-side — safe to close the tab). Bucket Assignment shows progress
+        here. Phase 1b drops you back on the config screen so you can adjust
+        sub-identity / identity min-volume and library selection before clicking
+        Apply &amp; Assign.
       </p>
     </div>
   );

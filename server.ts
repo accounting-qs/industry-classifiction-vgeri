@@ -2126,6 +2126,30 @@ app.post('/api/bucketing/runs/:id/assign', async (req, res) => {
     }
 });
 
+// Re-open a completed run for Phase 1b tweaking. Flips status from
+// 'completed' back to 'taxonomy_ready' without touching bucket_industry_map,
+// bucket_library_run_links, or any Phase 1b artefacts. The UI's Re-run
+// Phase 1b button calls this so the user lands back on BucketingReview
+// (the config screen with sub-identity / identity min-volume + library
+// selection) and can adjust before clicking Apply & Assign. The Apply &
+// Assign click then POSTs /assign, which is what actually wipes
+// bucket_contact_map + bucket_assignments and re-routes.
+app.post('/api/bucketing/runs/:id/reopen-for-phase1b', async (req, res) => {
+    const id = req.params.id;
+    try {
+        const { data: run, error } = await supabase
+            .from('bucketing_runs').select('status').eq('id', id).single();
+        if (error || !run) return res.status(404).json({ error: error?.message || 'Run not found' });
+        if (run.status !== 'completed') {
+            return res.status(400).json({ error: `Cannot reopen from status: ${run.status}` });
+        }
+        await supabase.from('bucketing_runs').update({ status: 'taxonomy_ready' }).eq('id', id);
+        res.json({ ok: true, id });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Recalculate the run's taxonomy against the now-current library. Triggered
 // from the Review screen after the user accepts AI-proposed taxonomy
 // additions (manually or via Apply selected / Accept all). Synchronous
