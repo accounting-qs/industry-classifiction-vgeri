@@ -1955,8 +1955,8 @@ function buildBucketingCtx(runId: string) {
     };
 }
 
-// Create a new run + fire taxonomy proposal in the background. min_volume,
-// bucket_budget, and preferred_library_ids are now collected on the Phase 1b
+// Create a new run + fire taxonomy proposal in the background. The two
+// rollup thresholds + preferred_library_ids are collected on the Phase 1b
 // review screen (after the tagger has proposed a taxonomy), so /determine only
 // needs the bare minimum. The DB column defaults seed the row; the user
 // finalises the values via PATCH /taxonomy before clicking Apply & Assign.
@@ -2056,13 +2056,13 @@ app.get('/api/bucketing/runs/:id', async (req, res) => {
     }
 });
 
-// Apply user edits (rename / drop / add / threshold / bucket_budget /
+// Apply user edits (rename / drop / add / thresholds /
 // preferred_library_ids) to the proposed taxonomy.
 app.patch('/api/bucketing/runs/:id/taxonomy', async (req, res) => {
     const id = req.params.id;
-    const { keep, rename, add, min_volume, identity_min_volume, bucket_budget, preferred_library_ids } = req.body || {};
+    const { keep, rename, add, min_volume, identity_min_volume, preferred_library_ids } = req.body || {};
     try {
-        await applyTaxonomyEdits(supabase, id, { keep, rename, add, min_volume, identity_min_volume, bucket_budget, preferred_library_ids }, buildBucketingCtx(id));
+        await applyTaxonomyEdits(supabase, id, { keep, rename, add, min_volume, identity_min_volume, preferred_library_ids }, buildBucketingCtx(id));
         const { data: run } = await supabase
             .from('bucketing_runs').select('*').eq('id', id).single();
         const { data: counts } = await supabase

@@ -3,7 +3,7 @@
  *
  * Five views:
  *   - Index    : past runs + library shortcut
- *   - Setup    : pick lists, name, min_volume, bucket_budget, optional library
+ *   - Setup    : pick lists, name, both volume thresholds, optional library
  *   - Review   : Phase 1a proposal — observed patterns + sub-identities grouped
  *                under primary identities, keep/drop/rename/add, threshold preview
  *   - Results  : Phase 1b assignments rolled up to campaign buckets, save-to-library
@@ -1563,7 +1563,6 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
   // Default 1 — every identity with ≥1 contact gets a bucket (no rollup
   // unless the user explicitly raises this).
   const [identityMinVolume, setIdentityMinVolume] = useState<number>(Number(run.identity_min_volume) > 0 ? Number(run.identity_min_volume) : 1);
-  const [bucketBudget, setBucketBudget] = useState<number>(run.bucket_budget || 30);
   const [busy, setBusy] = useState<'none' | 'saving' | 'assigning'>('none');
   const [showPatterns, setShowPatterns] = useState(false);
   // Library selection moved here from Setup. Default ON — pre-select every
@@ -1619,7 +1618,6 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
             add: adds,
             min_volume: minVolume,
             identity_min_volume: identityMinVolume,
-            bucket_budget: bucketBudget,
             preferred_library_ids: Array.from(selectedLib)
         })
       });
@@ -2113,18 +2111,6 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
           />
           <p className="text-[10px] text-gray-500 italic mt-1">An identity below this is folded into General. Default 1 — every identity with ≥1 contact gets its own bucket. Raise to ignore tiny identities.</p>
         </div>
-        <div>
-          <span className="block text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">Bucket budget</span>
-          <input
-            type="number"
-            min={5}
-            max={100}
-            value={bucketBudget}
-            onChange={e => setBucketBudget(Math.max(5, Math.min(100, parseInt(e.target.value || '30', 10))))}
-            className="w-28 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
-          />
-          <p className="text-[10px] text-gray-500 italic mt-1">Cap on total campaign buckets. Smallest are rolled up further until the count fits.</p>
-        </div>
       </div>
 
       {/* Inline starting banner — visible during the brief window between
@@ -2391,7 +2377,7 @@ function PipelineRerunPanel({ run, onRefresh, onError }: {
       'Wipes bucket_contact_map + bucket_assignments and re-routes every ' +
       'contact through the library / embedding / LLM cascade using the ' +
       'current Phase 1a tags + Bucket Assignment + run settings ' +
-      '(min_volume, bucket_budget, library reuse).\n\n' +
+      '(min_volume, identity_min_volume, library reuse).\n\n' +
       'Cost: usually small thanks to the JOIN-first lookup; takes minutes-to-hours ' +
       'depending on contact count and cache hit rate.'
     )) return;

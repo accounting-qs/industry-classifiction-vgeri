@@ -58,7 +58,7 @@ const REQUIRED_SCHEMA: Record<string, string[]> = {
     ],
     // Run-level metadata (read + updated by both phases).
     bucketing_runs: [
-        'id', 'name', 'list_names', 'min_volume', 'bucket_budget', 'status',
+        'id', 'name', 'list_names', 'min_volume', 'identity_min_volume', 'status',
         'taxonomy_proposal', 'taxonomy_final', 'taxonomy_model',
         'preferred_library_ids',
         'total_contacts', 'assigned_contacts', 'cost_usd',

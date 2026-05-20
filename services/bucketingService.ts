@@ -107,7 +107,6 @@ export const REASON = {
     GENERIC_AUDIT_RECLAIMED: 'generic_audit_reclaimed',
     // Routed to General:
     LOW_VOLUME: 'no_layer_cleared_threshold',
-    BUDGET_ROLLUP: 'bucket_budget_rollup',
     LOW_IDENTITY_CONFIDENCE: 'low_identity_confidence',
     LOW_OVERALL_CONFIDENCE: 'low_overall_confidence',
     NO_BUCKETS_DEFINED: 'no_buckets_defined',
@@ -3818,7 +3817,6 @@ interface TaxonomyEdits {
     }[];
     min_volume?: number;                          // sub-identity floor (legacy column name)
     identity_min_volume?: number;                 // identity floor — fold tiny identities into General
-    bucket_budget?: number;
     preferred_library_ids?: string[];             // moved from Setup screen — see review screen
 }
 
@@ -3882,9 +3880,6 @@ export async function applyTaxonomyEdits(
     }
     if (typeof edits.identity_min_volume === 'number' && edits.identity_min_volume >= 0) {
         update.identity_min_volume = edits.identity_min_volume;
-    }
-    if (typeof edits.bucket_budget === 'number' && edits.bucket_budget > 0) {
-        update.bucket_budget = Math.floor(edits.bucket_budget);
     }
     if (Array.isArray(edits.preferred_library_ids)) {
         update.preferred_library_ids = edits.preferred_library_ids;
@@ -4279,132 +4274,15 @@ function effectiveTags(row: ContactMapRow): {
     };
 }
 
-function computeContactRollup(rows: ContactMapRow[], minVolume: number, bucketBudget: number): ContactMapRow[] {
-    // Per-row effective view, computed once.
-    const effective = rows.map(r => effectiveTags(r));
-
-    // 3-level rollup cascade: combo (sector + sub-identity) → sub-identity
-    // → identity → General. The two intermediate "core" layers (functional_
-    // core, sector_core) were dropped in v5 — they were rollup-only fallback
-    // buckets that added complexity without sharpening segmentation.
-    //
-    // v6 BUCKET ASSIGNMENT: when assigned_bucket_name is populated (the
-    // user ran the bucket-assignment step), it takes precedence over the
-    // combo/sub-identity layers. The cascade simplifies to:
-    //   assigned_bucket → primary_identity → General
-    // Min_volume still gates: if an assigned bucket has < min_volume
-    // contacts, those contacts roll up to its primary_identity.
-    const assignedBucketCounts = new Map<string, number>();
-    const comboCounts = new Map<string, number>();
-    const subIdentityCounts = new Map<string, number>();
-    const identityCounts = new Map<string, number>();
-
-    for (let i = 0; i < rows.length; i++) {
-        const row = rows[i];
-        if (row.is_generic || row.is_disqualified) continue;
-        const eff = effective[i];
-        if (row.assigned_bucket_name) {
-            assignedBucketCounts.set(row.assigned_bucket_name, (assignedBucketCounts.get(row.assigned_bucket_name) || 0) + 1);
-        }
-        if (eff.sub_identity) {
-            subIdentityCounts.set(eff.sub_identity, (subIdentityCounts.get(eff.sub_identity) || 0) + 1);
-            if (eff.sector && eff.sector !== 'Multi-industry') {
-                const combo = `${eff.sector} ${eff.sub_identity}`;
-                comboCounts.set(combo, (comboCounts.get(combo) || 0) + 1);
-            }
-        }
-        if (eff.primary_identity) {
-            identityCounts.set(eff.primary_identity, (identityCounts.get(eff.primary_identity) || 0) + 1);
-        }
-    }
-
-    const rolled = rows.map((row, i) => {
-        const next = { ...row };
-        next.pre_rollup_bucket_name = preRollupName(next);
-        const eff = effective[i];
-        const maskedSuffix = eff.masked.length > 0
-            ? ` (low-confidence ${eff.masked.join(' + ')} masked)` : '';
-
-        if (next.is_disqualified) {
-            next.bucket_name = RESERVED_DISQUALIFIED;
-            next.rollup_level = 'general';
-            next.general_reason = next.general_reason || REASON.DISQUALIFIED_BY_LLM;
-            next.bucket_reason = next.bucket_reason || 'Disqualified — flagged with high identity confidence';
-        } else if (next.is_generic && !eff.primary_identity) {
-            next.bucket_name = RESERVED_GENERAL;
-            next.rollup_level = 'general';
-            next.general_reason = next.general_reason || REASON.LOW_OVERALL_CONFIDENCE;
-            next.bucket_reason = next.bucket_reason || 'Inviteable but insufficient classification evidence';
-        } else if (next.assigned_bucket_name
-            && (assignedBucketCounts.get(next.assigned_bucket_name) || 0) >= minVolume) {
-            // v6 path: bucket-assignment step decided the bucket; min_volume met.
-            next.bucket_name = next.assigned_bucket_name;
-            next.rollup_level = 'sub_identity'; // bucket-assignment lives at sub-identity-equivalent layer
-            next.general_reason = REASON.SPECIALIZATION_THRESHOLD_MET;
-            next.bucket_reason = `Bucket assignment cleared ${minVolume}-lead threshold${maskedSuffix}`;
-        } else if (next.assigned_bucket_name && eff.primary_identity
-            && (identityCounts.get(eff.primary_identity) || 0) >= minVolume) {
-            // v6 fallback: assigned bucket too small → roll up to its primary_identity.
-            next.bucket_name = eff.primary_identity;
-            next.rollup_level = 'identity';
-            next.general_reason = REASON.IDENTITY_THRESHOLD_MET;
-            next.bucket_reason = `Assigned bucket "${next.assigned_bucket_name}" below ${minVolume}-lead threshold — rolled up to identity${maskedSuffix}`;
-        } else if (eff.sub_identity && eff.sector && eff.sector !== 'Multi-industry'
-            && (comboCounts.get(`${eff.sector} ${eff.sub_identity}`) || 0) >= minVolume) {
-            next.bucket_name = `${eff.sector} ${eff.sub_identity}`;
-            next.rollup_level = 'combo';
-            next.general_reason = REASON.COMBO_THRESHOLD_MET;
-            next.bucket_reason = `Sector + sub-identity combo cleared ${minVolume}-lead threshold${maskedSuffix}`;
-        } else if (eff.sub_identity && (subIdentityCounts.get(eff.sub_identity) || 0) >= minVolume) {
-            next.bucket_name = eff.sub_identity;
-            next.rollup_level = 'sub_identity';
-            next.general_reason = REASON.SPECIALIZATION_THRESHOLD_MET;
-            next.bucket_reason = `Sub-Identity cleared threshold${maskedSuffix}`;
-        } else if (eff.primary_identity && (identityCounts.get(eff.primary_identity) || 0) >= minVolume) {
-            next.bucket_name = eff.primary_identity;
-            next.rollup_level = 'identity';
-            next.general_reason = REASON.IDENTITY_THRESHOLD_MET;
-            next.bucket_reason = `Rolled up to primary_identity; sub-identity too small${maskedSuffix}`;
-        } else {
-            next.bucket_name = RESERVED_GENERAL;
-            next.rollup_level = 'general';
-            next.general_reason = REASON.LOW_VOLUME;
-            next.bucket_reason = `No layer cleared the ${minVolume}-lead threshold${maskedSuffix}`;
-        }
-        return next;
-    });
-
-    const budget = Math.max(1, Math.floor(bucketBudget || 30));
-    let safety = 0;
-    while (safety++ < 300) {
-        const counts = new Map<string, number>();
-        for (const row of rolled) {
-            if (row.bucket_name === RESERVED_GENERAL) continue;
-            if (row.bucket_name === RESERVED_DISQUALIFIED) continue;
-            counts.set(row.bucket_name, (counts.get(row.bucket_name) || 0) + 1);
-        }
-        if (counts.size <= budget) break;
-        const smallest = Array.from(counts.entries()).sort((a, b) => a[1] - b[1])[0]?.[0];
-        if (!smallest) break;
-        for (const row of rolled) {
-            if (row.bucket_name !== smallest) continue;
-            // 3-level demotion: combo → sub-identity → identity → General
-            if (row.rollup_level === 'combo' && row.sub_identity) {
-                row.bucket_name = row.sub_identity;
-                row.rollup_level = 'sub_identity';
-            } else if (row.rollup_level === 'sub_identity' && row.primary_identity) {
-                row.bucket_name = row.primary_identity;
-                row.rollup_level = 'identity';
-            } else {
-                row.bucket_name = RESERVED_GENERAL;
-                row.rollup_level = 'general';
-                row.general_reason = REASON.BUDGET_ROLLUP;
-                row.bucket_reason = row.bucket_reason || 'Bucket budget exceeded — rolled up to General';
-            }
-        }
-    }
-    return rolled;
-}
+// NOTE: a 125-line in-process `computeContactRollup` lived here. It applied a
+// 4-level cascade (combo → sub-identity → identity → General) + a
+// bucket_budget post-pass that demoted the smallest buckets until the total
+// count fit a user-supplied cap (default 30). It hasn't been called by any
+// live code path since the deterministic-rollup RPC took over Phase 1b. The
+// bucket_budget cap was the only consumer of the legacy `bucket_budget`
+// column; the new rollup uses two thresholds (`min_volume`,
+// `identity_min_volume`) and doesn't cap bucket count. The function +
+// REASON.BUDGET_ROLLUP code were removed together with the column.
 
 // Generic Audit — runs after computeContactRollup. Looks at rows currently
 // in the General bucket, groups them by (combo OR sub-identity OR
