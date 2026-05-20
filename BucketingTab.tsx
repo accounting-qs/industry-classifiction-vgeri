@@ -3371,6 +3371,12 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   // covers 4" — decides accept-vs-reject far better than the existing
   // per-industry usage count.
   const [contactCounts, setContactCounts] = useState<Record<string, number>>({});
+  // Per-row draft selection for the Route-to-existing select. Keyed by
+  // `${kind}:${name}`. We mirror the native select value into state so
+  // React doesn't fight the DOM (a permanently controlled `value=""`
+  // can swallow the onChange visibly), and so the picked label stays
+  // visible while the remap POST is in flight.
+  const [routeDraft, setRouteDraft] = useState<Record<string, string>>({});
   // Live library snapshot — populates the Route-to-existing dropdowns and
   // the suggested-match chip. Refetched on mount and after every accept /
   // remap so the dropdowns reflect entries the user just added.
@@ -3933,19 +3939,30 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                 title="Rename / change parent before accepting"
                               ><Edit3 className="w-3 h-3" /></button>
                               <select
-                                value=""
+                                value={routeDraft[key] || ''}
                                 disabled={isBusy || libEntries.length === 0}
                                 onChange={e => {
                                   const v = e.target.value;
+                                  setRouteDraft(prev => ({ ...prev, [key]: v }));
                                   if (!v) return;
                                   const target = libEntries.find(le => `${le.name}::${le.parent || ''}` === v);
-                                  if (target) remap(kind, p.name, target.name, target.parent);
-                                  e.target.value = '';
+                                  if (!target) {
+                                    setRouteDraft(prev => ({ ...prev, [key]: '' }));
+                                    return;
+                                  }
+                                  // Fire the remap then clear the draft so
+                                  // a fresh pick is possible if the row
+                                  // doesn't transition to a ghost (e.g. the
+                                  // user routes, then the next render
+                                  // shows the badge — clearing is harmless).
+                                  Promise.resolve(remap(kind, p.name, target.name, target.parent)).finally(() => {
+                                    setRouteDraft(prev => ({ ...prev, [key]: '' }));
+                                  });
                                 }}
                                 className="px-1 py-1 rounded text-[10px] bg-[#1c1c1c] border border-[#2e2e2e] text-gray-400 hover:text-white max-w-[110px] disabled:opacity-50"
                                 title="Route this proposal's contacts to an existing library entry instead of adding a new one"
                               >
-                                <option value="">Route to…</option>
+                                <option value="">{isBusy && routeDraft[key] ? 'Routing…' : 'Route to…'}</option>
                                 {libEntries.map(le => (
                                   <option key={`${le.name}::${le.parent || ''}`} value={`${le.name}::${le.parent || ''}`}>
                                     {kind === 'sub_identities' ? `${le.name} (under ${le.parent})` : le.name}
