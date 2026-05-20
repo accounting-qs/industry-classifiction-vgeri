@@ -898,9 +898,35 @@ export async function runTaxonomyProposal(
         throw new Error('Empty vocabulary — selected lists have no contacts.');
     }
 
-    // Resume support: don't wipe. Read existing rows so we know which
-    // industries are already tagged (LLM cost paid) and which DQ-passthrough
-    // rows are already inserted. A server restart / OOM mid-tag would
+    // Inherit Phase 1a tags from prior successful runs on byte-exact
+    // industry_string matches. Per-industry tags are a property of the
+    // industry_string itself, so if another run already paid the LLM
+    // cost we copy the row instead of re-tagging. Run this BEFORE the
+    // resume read so inherited rows show up in existingByIndustry and
+    // are skipped by the tagger. Best-effort: failure is non-fatal —
+    // the tagger will tag from scratch in that case.
+    try {
+        ctx.progress({ phase: 'phase1a', step: 'inherit_prior_tags', note: 'Checking for tags from prior runs on the same industries…' });
+        const { data: inhRes, error: inhErr } = await supabase.rpc('inherit_phase1a_tags', { p_new_run_id: runId });
+        if (inhErr) {
+            ctx.log(`[Bucketing ${runId}] inherit_phase1a_tags failed (non-fatal — re-tagging from scratch): ${inhErr.message}`, 'warn');
+        } else {
+            const { inherited_rows, distinct_industries } = (inhRes || {}) as { inherited_rows?: number; distinct_industries?: number };
+            const ih = Number(inherited_rows || 0);
+            const di = Number(distinct_industries || 0);
+            if (ih > 0) {
+                ctx.log(`[Bucketing ${runId}] inherited ${ih.toLocaleString()} of ${di.toLocaleString()} distinct industry tags from prior runs — those skip the LLM`);
+            } else {
+                ctx.log(`[Bucketing ${runId}] inherit step: 0 of ${di.toLocaleString()} distinct industries had a prior-run tag (all will be tagged fresh)`);
+            }
+        }
+    } catch (e: any) {
+        ctx.log(`[Bucketing ${runId}] inherit_phase1a_tags exception (non-fatal): ${e.message}`, 'warn');
+    }
+
+    // Resume support: don't wipe. Read existing rows (including just-inherited
+    // ones from the prior step) so we know which industries are already tagged
+    // and skip them in the tagger loop. A server restart / OOM mid-tag would
     // otherwise force a full re-tag at ~$20-30 per run. The (run_id,
     // industry_string) PK keeps the upsert idempotent for overlaps.
     const { data: existingRowsData, error: existingErr } = await supabase
@@ -910,10 +936,10 @@ export async function runTaxonomyProposal(
     if (existingErr) throw new Error(`existing bucket_industry_map read failed: ${existingErr.message}`);
     const existingByIndustry = new Set((existingRowsData || []).map((r: any) => r.industry_string as string));
     const existingLLMTagged = new Set((existingRowsData || [])
-        .filter((r: any) => r.source === 'llm_phase1a')
+        .filter((r: any) => r.source === 'llm_phase1a' || r.source === 'inherited_phase1a')
         .map((r: any) => r.industry_string as string));
     if (existingByIndustry.size > 0) {
-        ctx.log(`[Bucketing ${runId}] resume — ${existingByIndustry.size.toLocaleString()} existing rows in map (${existingLLMTagged.size.toLocaleString()} already LLM-tagged). Skipping those to avoid re-spending.`);
+        ctx.log(`[Bucketing ${runId}] resume — ${existingByIndustry.size.toLocaleString()} existing rows in map (${existingLLMTagged.size.toLocaleString()} already tagged — LLM or inherited). Skipping those to avoid re-spending.`);
     }
 
     // ── Partition vocabulary by enrichment status ────────────────────
