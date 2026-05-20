@@ -9,8 +9,13 @@ import fs from 'fs';
 import fsp from 'fs/promises';
 import crypto from 'crypto';
 import zlib from 'zlib';
+import { Transform } from 'node:stream';
+import { pipeline as streamPipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
+import { Pool, type PoolClient } from 'pg';
+import pgCopyStreams from 'pg-copy-streams';
+const { to: copyTo } = pgCopyStreams;
 import { db } from './services/supabaseClient';
 import { JobProcessor } from './services/jobProcessor';
 import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, recalculateTaxonomyWithLibrary, finalizeTaxonomyAgainstLibrary, runBucketAssignment, BucketingCancelledError, debugTagSingleIndustry, suggestProposalRoutings, loadRunProposals } from './services/bucketingService';
@@ -62,6 +67,38 @@ console.log('🔍 Server Supabase Config Check:', {
 });
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY || '');
+
+// Direct Postgres connection pool used exclusively by the CSV export
+// streaming path (runCsvExportJob). Everything else goes through
+// PostgREST via the supabase client. Lazy-initialized so the server
+// still boots in environments that don't set DATABASE_URL — exports
+// will fail with a clear error instead of crashing at startup.
+//
+// MUST be the session-mode pooler (port 5432). The transaction-mode
+// pooler (port 6543) closes connections mid-COPY because each query
+// gets its own backend; pg-copy-streams needs a sticky session.
+let pgPoolSingleton: Pool | null = null;
+function getPgPool(): Pool {
+    if (pgPoolSingleton) return pgPoolSingleton;
+    const url = process.env.DATABASE_URL;
+    if (!url) throw new Error('DATABASE_URL is not set — required for CSV streaming export');
+    pgPoolSingleton = new Pool({
+        connectionString: url,
+        max: 2,
+        idleTimeoutMillis: 30_000,
+        connectionTimeoutMillis: 10_000,
+        ssl: { rejectUnauthorized: false }
+    });
+    // Loud startup log so a 6543-misconfig is obvious in Render logs.
+    try {
+        const parsed = new URL(url);
+        console.log(`🔌 pg pool ready: host=${parsed.hostname} port=${parsed.port || '(default)'}`);
+        if (parsed.port === '6543') {
+            console.warn('⚠️  DATABASE_URL is using port 6543 (transaction-mode pooler). COPY streaming requires port 5432 (session-mode). Exports will fail mid-stream.');
+        }
+    } catch { /* not a URL — let the connection error surface */ }
+    return pgPoolSingleton;
+}
 
 // --- Real-time Status Tracking ---
 let currentJobLogs: LogEntry[] = []; // Cache for current session
@@ -2889,33 +2926,6 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts.csv', async (req, res) => {
 // returns a 24-hour signed download URL.
 // ────────────────────────────────────────────────────────────────────
 
-// Full per-contact column set including Phase 1b assignment fields
-// (bucket_name, source, rollup_level) plus the bucketing reasons.
-const ASSIGNMENT_CSV_COLUMNS = [
-    // Contact basics
-    'contact_id', 'email', 'first_name', 'last_name',
-    'company_name', 'company_website', 'lead_list_name',
-    // Raw + enrichment
-    'industry', 'enrichment_status', 'enrichment_classification',
-    'enrichment_confidence', 'enrichment_reasoning',
-    // Final taxonomy (from bucket_assignments — Phase 1b output)
-    'primary_identity', 'sub_identity', 'sector',
-    'canonical_classification',
-    // Final bucket + rollup metadata
-    'bucket_name', 'pre_rollup_bucket_name', 'rollup_level',
-    // Industry → campaign bucket (Bucket Assignment LLM output).
-    // Null on rows whose industry hasn't been bucket-assigned yet.
-    'assigned_bucket_name', 'assigned_bucket_primary_identity',
-    'assignment_source',
-    // Confidence
-    'identity_confidence', 'sub_identity_confidence', 'sector_confidence',
-    'confidence',
-    // Flags
-    'is_disqualified', 'is_generic',
-    // Reasoning (Phase 1a tag reason + Phase 1b bucket reason + general fallback reason)
-    'phase1a_llm_reason', 'bucket_reason', 'general_reason', 'reasons',
-] as const;
-
 // Local disk under EXPORTS_DIR — same pattern as the Phase 0 list export
 // (/api/export-list/*). Render keeps EXPORTS_DIR on its persistent disk so
 // files survive restarts; cleanup TTL is enforced by the hourly cron.
@@ -2923,73 +2933,51 @@ const ASSIGNMENT_CSV_COLUMNS = [
 // bucket needed explicit policies AND a service_role JWT to upload — the
 // local-disk pattern needs neither).
 const CSV_FILES_DIR = path.join(EXPORTS_DIR, 'bucketing-csv');
-// 1000 (not 2000) to stay under PostgREST's default db.maxRows cap.
-// .range(0, 1999) silently returns 1000 rows and the page.length <
-// CSV_PAGE_SIZE break exits after one chunk — capping every export
-// at 1k contacts. Same fix as the Phase 1b CONTACT_PAGE_SIZE bug.
-const CSV_PAGE_SIZE = 1000;
+
+// Only one CSV export runs at a time. The streaming COPY query pins one
+// Postgres backend for the duration (~30 s on a 150k-row run) and the
+// instance is a 2-CPU / 2-GB Small; two concurrent exports would compete
+// with each other and with any live Phase 1b. POST handler returns 429
+// when busy; the worker's finally clears the flag.
+const exportLock = { busy: false };
 
 async function ensureCsvFilesDir() {
     await fsp.mkdir(CSV_FILES_DIR, { recursive: true });
 }
 
-function jsonOrEmpty(v: any): string {
-    if (v === null || v === undefined) return '';
-    if (typeof v === 'string') return v;
-    try { return JSON.stringify(v); } catch { return ''; }
-}
-
-const nonEmptyText = (v: unknown): string | null => {
-    if (v === null || v === undefined) return null;
-    const s = String(v).trim();
-    return s ? s : null;
-};
-
-const firstText = (...values: unknown[]): string | null => {
-    for (const v of values) {
-        const s = nonEmptyText(v);
-        if (s) return s;
-    }
-    return null;
-};
-
 async function updateCsvJob(jobId: string, patch: Record<string, any>) {
     await supabase.from('bucketing_csv_jobs').update(patch).eq('id', jobId);
-}
-
-async function loadPhase1aTaxonomyForCsv(runId: string): Promise<Map<string, any>> {
-    const out = new Map<string, any>();
-    const PAGE = 1000;
-    for (let offset = 0; offset <= 200_000; offset += PAGE) {
-        const { data, error } = await supabase
-            .from('bucket_industry_map')
-            .select('industry_string,primary_identity,sub_identity,sector,canonical_classification,bucket_name,assigned_bucket_name,assigned_bucket_primary_identity,source,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_disqualified,is_generic,llm_reason')
-            .eq('bucketing_run_id', runId)
-            .range(offset, offset + PAGE - 1);
-        if (error) throw new Error(`phase1a taxonomy preload failed at offset ${offset}: ${error.message}`);
-        const rows = (data || []) as any[];
-        for (const row of rows) {
-            const key = nonEmptyText(row.industry_string);
-            if (key) out.set(key, row);
-        }
-        if (rows.length < PAGE) break;
-    }
-    return out;
 }
 
 // Background worker. Runs once per job, no resumability — if the
 // process restarts mid-export the job stays in 'running' state until
 // the cleanup cron flips it to 'failed' (rows older than 30 min with
 // status='running' and no recent progress update).
+//
+// Streaming COPY pipeline:
+//   pg COPY → newline-counter Transform (progress) → gzip → file
+// One Postgres backend, one cursor, one network round-trip. Replaces
+// the previous 148 × keyset RPC loop which paid ~2 s per page in
+// PostgREST JSON encode/decode + per-page replan; dropped a 147k-row
+// export from ~5 min to ~30 s.
 async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
-    const startedAt = new Date().toISOString();
-    await updateCsvJob(jobId, { status: 'running', started_at: startedAt });
-
     const filePath = path.join(CSV_FILES_DIR, `${jobId}.csv.gz`);
     let totalRows = 0;
     let rowsWritten = 0;
+    let client: PoolClient | null = null;
+    let clientReleased = false;
 
     try {
+        await updateCsvJob(jobId, { status: 'running', started_at: new Date().toISOString() });
+
+        // The runId is embedded in the COPY query as a string literal —
+        // pg-copy-streams' query() does not accept parameter binding around
+        // the COPY (…) construct. The id comes from our own POST handler
+        // (Express route param), but cheap to belt-and-brace.
+        if (!/^[0-9a-f-]{36}$/i.test(runId)) {
+            throw new Error(`Invalid runId for export: ${runId}`);
+        }
+
         await ensureCsvFilesDir();
 
         const { data: run, error: runErr } = await supabase
@@ -3008,115 +2996,44 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
         totalRows = Number(totalCount || 0);
         await updateCsvJob(jobId, { total_rows: totalRows });
 
-        // Preload Phase 1a taxonomy once. The SQL RPC also coalesces these
-        // fields, but this server-side fallback makes exports correct while
-        // a deploy is ahead of the Supabase migration.
-        const phase1aByIndustry = await loadPhase1aTaxonomyForCsv(runId);
+        client = await getPgPool().connect();
 
-        // Open gzip-into-file pipeline. Write the header first, then stream
-        // page by page. zlib's createGzip is a Transform stream — pipe it
-        // into a file write stream so we never hold the full 30 MB in RAM.
-        const gzip = zlib.createGzip({ level: 6 });
-        const fileStream = fs.createWriteStream(filePath);
-        gzip.pipe(fileStream);
-        const pipelineDone = new Promise<void>((resolve, reject) => {
-            fileStream.on('finish', () => resolve());
-            fileStream.on('error', reject);
-            gzip.on('error', reject);
-        });
+        const copyQuery =
+            `COPY (SELECT * FROM public.bucketing_run_export_rows('${runId}'::uuid)) ` +
+            `TO STDOUT WITH (FORMAT csv, HEADER true)`;
+        const copyStream = client.query(copyTo(copyQuery));
 
-        const writeLine = (s: string): Promise<void> => new Promise((resolve, reject) => {
-            if (gzip.write(s)) resolve();
-            else gzip.once('drain', () => resolve());
-            gzip.once('error', reject);
-        });
-
-        await writeLine(ASSIGNMENT_CSV_COLUMNS.join(',') + '\n');
-
-        // Single-RPC streaming. The get_contact_export_page RPC
-        // (20260514) joins contacts × enrichments × bucket_assignments ×
-        // bucket_industry_map in SQL and returns one fully-hydrated row
-        // per contact, so each page is ONE round-trip instead of 11.
-        // Keyset paginated via p_after_id; loop exits when a page comes
-        // back smaller than CSV_PAGE_SIZE.
-        let cursor: string | null = null;
-        let pageNum = 0;
         let lastProgressUpdate = Date.now();
-
-        while (true) {
-            pageNum++;
-            const { data: pageData, error: pErr } = await supabase
-                .rpc('get_contact_export_page', {
-                    p_run_id:   runId,
-                    p_after_id: cursor,
-                    p_limit:    CSV_PAGE_SIZE
-                });
-            if (pErr) throw new Error(`export page ${pageNum} failed at cursor=${cursor}: ${pErr.message}`);
-            const page = (pageData || []) as any[];
-            if (page.length === 0) break;
-
-            for (const r of page) {
-                const industryKey = firstText(r.enrichment_classification, r.industry);
-                const phase1a = industryKey ? phase1aByIndustry.get(industryKey) : null;
-                const row: Record<string, any> = {
-                    contact_id:                r.contact_id,
-                    email:                     r.email,
-                    first_name:                r.first_name,
-                    last_name:                 r.last_name,
-                    company_name:              r.company_name,
-                    company_website:           r.company_website,
-                    lead_list_name:            r.lead_list_name,
-                    industry:                  r.industry,
-                    enrichment_status:         r.enrichment_status,
-                    enrichment_classification: r.enrichment_classification,
-                    enrichment_confidence:     r.enrichment_confidence,
-                    enrichment_reasoning:      r.enrichment_reasoning,
-                    primary_identity:          firstText(r.primary_identity, phase1a?.primary_identity),
-                    sub_identity:            firstText(r.sub_identity, phase1a?.sub_identity),
-                    sector:                    firstText(r.sector, phase1a?.sector),
-                    canonical_classification:  firstText(r.canonical_classification, phase1a?.canonical_classification),
-                    bucket_name:               r.bucket_name,
-                    pre_rollup_bucket_name:    firstText(r.pre_rollup_bucket_name, phase1a?.bucket_name),
-                    rollup_level:              r.rollup_level,
-                    // Bucket-Assignment output lives on bucket_industry_map
-                    // (not bucket_assignments) so the only source is the
-                    // phase1a preload map.
-                    assigned_bucket_name:             phase1a?.assigned_bucket_name || null,
-                    assigned_bucket_primary_identity: phase1a?.assigned_bucket_primary_identity || null,
-                    assignment_source:         firstText(r.assignment_source, phase1a?.source),
-                    identity_confidence:       r.identity_confidence ?? phase1a?.identity_confidence,
-                    sub_identity_confidence: r.sub_identity_confidence ?? phase1a?.sub_identity_confidence,
-                    sector_confidence:         r.sector_confidence ?? phase1a?.sector_confidence,
-                    confidence:                r.assignment_confidence ?? phase1a?.confidence,
-                    is_disqualified:           r.is_disqualified ?? phase1a?.is_disqualified,
-                    is_generic:                r.is_generic ?? phase1a?.is_generic,
-                    phase1a_llm_reason:        firstText(r.phase1a_llm_reason, phase1a?.llm_reason),
-                    bucket_reason:             r.bucket_reason,
-                    general_reason:            r.general_reason,
-                    reasons:                   jsonOrEmpty(r.reasons ?? (phase1a ? {
-                        phase1a_source: phase1a.source,
-                        llm_reason: phase1a.llm_reason || null
-                    } : null)),
-                };
-                await writeLine(ASSIGNMENT_CSV_COLUMNS.map(col => csvEscape(row[col])).join(',') + '\n');
-                rowsWritten++;
+        const newlineCounter = new Transform({
+            transform(chunk: Buffer, _enc, cb) {
+                for (let i = 0; i < chunk.length; i++) {
+                    if (chunk[i] === 0x0a /* \n */) rowsWritten++;
+                }
+                // Debounce progress UPDATEs to ~2 s. Fire-and-forget so the
+                // pipe never stalls on Supabase latency.
+                if (Date.now() - lastProgressUpdate > 2000) {
+                    lastProgressUpdate = Date.now();
+                    const dataRows = Math.max(0, rowsWritten - 1); // minus header
+                    updateCsvJob(jobId, { progress_rows: dataRows }).catch(() => {});
+                }
+                cb(null, chunk);
             }
+        });
 
-            cursor = page[page.length - 1].contact_id;
+        await streamPipeline(
+            copyStream,
+            newlineCounter,
+            zlib.createGzip({ level: 6 }),
+            fs.createWriteStream(filePath)
+        );
 
-            // Update progress at most every 2 s to avoid hammering the DB
-            // with one UPDATE per page on very small pages.
-            if (Date.now() - lastProgressUpdate > 2000) {
-                await updateCsvJob(jobId, { progress_rows: rowsWritten });
-                lastProgressUpdate = Date.now();
-            }
+        // Header row inflated the counter by one — strip it for the
+        // final progress_rows so it lines up with total_rows.
+        rowsWritten = Math.max(0, rowsWritten - 1);
 
-            if (page.length < CSV_PAGE_SIZE) break;
-        }
-
-        // Flush + close the gzip pipeline.
-        gzip.end();
-        await pipelineDone;
+        client.release();
+        clientReleased = true;
+        client = null;
 
         const stat = await fsp.stat(filePath);
 
@@ -3143,6 +3060,14 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
             completed_at: new Date().toISOString()
         });
         await fsp.unlink(filePath).catch(() => {});
+    } finally {
+        // Force-drop on any path where the client is still held — pg
+        // discards the connection instead of returning a mid-COPY
+        // backend to the pool in an indeterminate state.
+        if (client && !clientReleased) {
+            try { client.release(new Error('csv export aborted')); } catch { /* already released */ }
+        }
+        exportLock.busy = false;
     }
 }
 
@@ -3264,6 +3189,9 @@ watchdogStuckRuns().catch(() => {});
 app.post('/api/bucketing/runs/:id/csv-jobs', async (req, res) => {
     const id = req.params.id;
     try {
+        if (exportLock.busy) {
+            return res.status(429).json({ error: 'Another export is in progress, retry in a minute' });
+        }
         const { data: run, error: rErr } = await supabase
             .from('bucketing_runs').select('id,status').eq('id', id).single();
         if (rErr || !run) return res.status(404).json({ error: rErr?.message || 'Run not found' });
@@ -3277,6 +3205,7 @@ app.post('/api/bucketing/runs/:id/csv-jobs', async (req, res) => {
             .select('*').single();
         if (jErr || !job) return res.status(500).json({ error: jErr?.message || 'Failed to create job' });
 
+        exportLock.busy = true;
         runCsvExportJob(job.id, id).catch(err => {
             console.error(`[CSV-job ${job.id}] uncaught:`, err);
         });

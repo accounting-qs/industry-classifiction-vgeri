@@ -28,6 +28,8 @@
     "lucide-react": "^0.563.0",
     "p-limit": "^7.3.0",
     "papaparse": "^5.5.3",
+    "pg": "^8.13.0",
+    "pg-copy-streams": "^6.0.6",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "react-router-dom": "^7.15.1",
@@ -37,6 +39,8 @@
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/node": "^22.14.0",
+    "@types/pg": "^8.11.10",
+    "@types/pg-copy-streams": "^1.2.5",
     "@vitejs/plugin-react": "^5.0.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"
