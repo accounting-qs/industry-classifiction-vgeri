@@ -3892,59 +3892,16 @@ export async function applyTaxonomyEdits(
     await supabase.from('bucketing_runs').update(update).eq('id', runId);
     ctx.log(`[Bucketing ${runId}] taxonomy edits applied: ${leaves.length} sub-identities`);
 
-    // Rebuild the preview map so Review counts reflect the edited taxonomy
-    // (renames / drops / new specs all change which industries map where).
-    // Cheap: one batched embedding call against the run's vocab.
-    try {
-        await rebuildPreviewMap(supabase, runId, leaves, sourceTaxonomy.sector_vocabulary || [], run.list_names || [], ctx);
-    } catch (e: any) {
-        ctx.log(`[Bucketing ${runId}] preview rebuild failed (non-fatal): ${e.message}`, 'warn');
-    }
-}
-
-async function rebuildPreviewMap(
-    supabase: SupabaseClient,
-    runId: string,
-    leaves: DiscoveredBucket[],
-    sectorVocab: string[],
-    listNames: string[],
-    ctx: BucketingCtx
-): Promise<void> {
-    if (!Array.isArray(listNames) || listNames.length === 0) return;
-    const vocab = await fetchFullVocabulary(supabase, listNames, ctx);
-    if (vocab.length === 0) return;
-
-    // Drop the LLM-tagged + embedding-tagged rows so the user's taxonomy
-    // edits (rename / drop / add) actually propagate to per-industry
-    // routing. Keep library_match + disqualified_passthrough rows — those
-    // are sticky decisions the user shouldn't lose on a taxonomy tweak.
-    // (Note: source value is 'llm_phase1a' with the trailing 'a'; the old
-    // 'llm_phase1' value here was a typo that silently no-op'd this delete
-    // for years, leaving stale tags on already-LLM-tagged industries.)
-    await supabase.from('bucket_industry_map')
-        .delete()
-        .eq('bucketing_run_id', runId)
-        .in('source', ['preview_embedding', 'llm_phase1a', 'embedding']);
-
-    // Industries still claimed by surviving non-preview rows (e.g. library
-    // matches) shouldn't be re-assigned by the preview pass.
-    const { data: keptRows } = await supabase
-        .from('bucket_industry_map')
-        .select('industry_string')
-        .eq('bucketing_run_id', runId);
-    const keptSet = new Set((keptRows || []).map((r: any) => r.industry_string));
-    const previewVocab = vocab.filter(v => !keptSet.has(v.industry));
-
-    const { rows, costUsd } = await runPreviewEmbedding(previewVocab, leaves, sectorVocab, runId);
-    if (rows.length > 0) {
-        for (let i = 0; i < rows.length; i += 1000) {
-            const chunk = rows.slice(i, i + 1000);
-            const { error } = await supabase.from('bucket_industry_map')
-                .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
-            if (error) throw new Error(error.message);
-        }
-    }
-    ctx.log(`[Bucketing ${runId}] preview rebuilt: ${rows.length} rows, $${costUsd.toFixed(4)}`);
+    // NOTE: a previous "preview rebuild" pass used to fire here. It DELETEd
+    // all llm_phase1a rows for the run and re-routed via embedding
+    // similarity. With the AI-proposed-additions panel (accept / route-to /
+    // rename / re-parent), every per-industry tag rewrite already happens
+    // atomically when the user takes the action — so the rebuild was
+    // duplicative AND destructive (the embedding pass routinely returned
+    // zero confident matches, leaving bucket_industry_map gutted down to
+    // the general_passthrough rows). Removed deliberately; do not bring
+    // it back. The user-defined Finalize step is what propagates accepted
+    // edits to per-contact taxonomy.
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -4745,61 +4702,6 @@ function escapeRegExp(s: string): string {
 //
 // Returns rows for the caller to upsert + the OpenAI embedding cost.
 // Phase 1b clears and rewrites these rows with the full LLM chain.
-async function runPreviewEmbedding(
-    vocab: VocabRow[],
-    leaves: DiscoveredBucket[],
-    sectorVocab: string[],
-    runId: string
-): Promise<{ rows: any[]; costUsd: number }> {
-    if (vocab.length === 0 || leaves.length === 0) return { rows: [], costUsd: 0 };
-
-    const leafTexts = leaves.map(l => {
-        const sig = (l.strong_identity_signals || []).slice(0, 6).join(', ');
-        const inc = (l.include || []).slice(0, 6).join(', ');
-        const examples = (l.example_strings || []).slice(0, 3).join(' | ');
-        return `${l.sub_identity} (under ${l.primary_identity}): ${l.description || ''}. Identity: ${l.identity_type}. Strong signals: ${sig}. Include: ${inc}. Examples: ${examples}.`;
-    });
-    const vocabTexts = vocab.map(v => v.industry);
-
-    const { embeddings, costUsd } = await embedBatch([...leafTexts, ...vocabTexts]);
-    const leafVecs = embeddings.slice(0, leaves.length);
-    const vocabVecs = embeddings.slice(leaves.length);
-
-    const rows: any[] = [];
-    for (let i = 0; i < vocab.length; i++) {
-        const sims = leafVecs.map(lv => cosine(vocabVecs[i], lv));
-        const sorted = sims.map((s, j) => ({ s, j })).sort((a, b) => b.s - a.s);
-        const top = sorted[0];
-        const second = sorted[1] || { s: 0 };
-        if (top.s >= EMBED_AUTO_THRESHOLD && (top.s - second.s) >= EMBED_MARGIN) {
-            const leaf = leaves[top.j];
-            // Skip operator_required specs — operator evidence is an LLM
-            // call, not a similarity check.
-            if (leaf.operator_required) continue;
-            const sector = extractSectorFocus(vocab[i].industry, sectorVocab);
-            rows.push({
-                bucketing_run_id: runId,
-                industry_string: vocab[i].industry,
-                bucket_name: leaf.sub_identity,
-                source: 'preview_embedding',
-                confidence: Number(top.s.toFixed(2)),
-                bucket_leaf: leaf.sub_identity,
-                bucket_ancestor: leaf.primary_identity,
-                bucket_root: leaf.primary_identity,
-                primary_identity: leaf.primary_identity,
-                sub_identity: leaf.sub_identity,
-                sector: sector,
-                leaf_score: Number(top.s.toFixed(2)),
-                ancestor_score: Number(top.s.toFixed(2)),
-                root_score: Number(top.s.toFixed(2)),
-                is_generic: false,
-                is_disqualified: false
-            });
-        }
-    }
-    return { rows, costUsd };
-}
-
 async function runLibraryFirstMatch(
     vocab: VocabRow[],
     libraryBuckets: any[],
