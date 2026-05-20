@@ -3332,10 +3332,56 @@ app.get('/api/bucketing/runs/:id/csv-jobs', async (req, res) => {
     }
 });
 
-// Delete a bucketing run (cascades to map + assignments).
+// Delete a bucketing run. All run-scoped child tables
+// (bucket_industry_map, bucket_assignments, bucket_contact_map,
+// bucket_library_run_links, bucketing_run_logs, bucketing_csv_jobs) have
+// ON DELETE CASCADE on bucketing_run_id, so a single parent DELETE wipes
+// every per-contact taxonomy + bucket assignment for the run. Per-contact
+// data does not live anywhere outside these tables, so the contacts in
+// the run's lists end up with no leftover bucket / taxonomy rows after
+// this — which is the user-defined invariant for the Delete button.
+//
+// We do three things on top of the bare DELETE:
+//   1. Refuse to delete while a worker is mid-flight (status in
+//      taxonomy_pending / assigning). Otherwise we'd race a live write
+//      and could leave the DB in a partially-purged state.
+//   2. Abort the run's AbortController if one exists, so the worker
+//      stops issuing LLM calls the moment the user confirms delete.
+//   3. Unlink any local CSV export files referenced by the run's
+//      bucketing_csv_jobs rows — those live on disk under EXPORTS_DIR
+//      and CASCADE doesn't clean them up.
 app.delete('/api/bucketing/runs/:id', async (req, res) => {
     const id = req.params.id;
     try {
+        const { data: run, error: runErr } = await supabase
+            .from('bucketing_runs').select('status').eq('id', id).maybeSingle();
+        if (runErr) return res.status(500).json({ error: runErr.message });
+        if (!run) return res.status(404).json({ error: 'Run not found' });
+
+        if (run.status === 'taxonomy_pending' || run.status === 'assigning') {
+            return res.status(409).json({
+                error: `Cannot delete a run while ${run.status === 'assigning' ? 'Phase 1b' : 'Phase 1a'} is in progress. Cancel the run first, then delete.`
+            });
+        }
+
+        // Step 2: signal any in-flight worker for this run to stop. Safe
+        // no-op if no controller was registered (e.g. older runs).
+        const ac = runAbortControllers.get(id);
+        if (ac) { try { ac.abort(); } catch { /* ignore */ } runAbortControllers.delete(id); }
+
+        // Step 3: unlink CSV export files BEFORE the cascade nukes the
+        // bucketing_csv_jobs rows we need to read paths from.
+        const { data: csvJobs } = await supabase
+            .from('bucketing_csv_jobs')
+            .select('storage_path')
+            .eq('bucketing_run_id', id);
+        for (const j of (csvJobs || []) as { storage_path: string | null }[]) {
+            if (j.storage_path) {
+                try { await fsp.unlink(j.storage_path); }
+                catch { /* file already gone — fine */ }
+            }
+        }
+
         const { error } = await supabase.from('bucketing_runs').delete().eq('id', id);
         if (error) return res.status(500).json({ error: error.message });
         res.json({ ok: true });
