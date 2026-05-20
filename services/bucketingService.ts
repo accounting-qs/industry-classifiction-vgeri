@@ -1629,6 +1629,10 @@ export async function finalizeTaxonomyAgainstLibrary(
     nullified: number;
     failed: number;
     costUsd: number;
+    per_contact_total?: number;
+    per_contact_with_identity?: number;
+    per_contact_with_sub?: number;
+    per_contact_with_sector?: number;
 }> {
     const { data: run, error: runErr } = await supabase
         .from('bucketing_runs').select('*').eq('id', runId).single();
@@ -1818,7 +1822,56 @@ export async function finalizeTaxonomyAgainstLibrary(
 
     ctx.log(`[Finalize ${runId}] done — ${candidates.length} orphans processed: ${rerouted} kept (proposals accepted into library), ${nullified} → General (proposals rejected). No LLM calls.`, 'phase');
 
-    return { candidates: candidates.length, rerouted, nullified, failed, costUsd };
+    // Phase 1a's terminal step: explode the per-industry taxonomy out to
+    // every contact in the run's lists. Writes bucket_assignments +
+    // bucket_contact_map with bucket_name='Pending' so the user can see
+    // per-contact taxonomy BEFORE clicking Save & Assign. Phase 1b's
+    // apply_rollup_bucket_assignments still DELETE+INSERTs both tables —
+    // so this preview gets overwritten cleanly when the rollup runs.
+    const totalContacts = Number(run.total_contacts || 0);
+    ctx.progress({
+        phase: 'phase1a',
+        step: 'finalize_per_contact',
+        current: 0,
+        total: totalContacts,
+        note: `Writing per-contact taxonomy for ${totalContacts.toLocaleString()} contacts…`
+    });
+    let perContactStats: {
+        total_contacts?: number;
+        with_primary_identity?: number;
+        with_sub_identity?: number;
+        with_sector?: number;
+    } = {};
+    try {
+        const { data: pcRes, error: pcErr } = await supabase.rpc('finalize_per_contact_taxonomy', { p_run_id: runId });
+        if (pcErr) throw new Error(pcErr.message);
+        perContactStats = (pcRes || {}) as typeof perContactStats;
+        const wrote = Number(perContactStats.total_contacts || 0);
+        ctx.progress({
+            phase: 'phase1a',
+            step: 'finalize_per_contact_done',
+            current: wrote,
+            total: totalContacts || wrote,
+            note: `Per-contact taxonomy written — ${wrote.toLocaleString()} contacts, ${(perContactStats.with_primary_identity || 0).toLocaleString()} with identity, ${(perContactStats.with_sub_identity || 0).toLocaleString()} with sub-identity`
+        });
+        ctx.log(`[Finalize ${runId}] per-contact explosion: ${wrote.toLocaleString()} contacts written — ${(perContactStats.with_primary_identity || 0).toLocaleString()} with identity, ${(perContactStats.with_sub_identity || 0).toLocaleString()} with sub-identity, ${(perContactStats.with_sector || 0).toLocaleString()} with sector`, 'phase');
+    } catch (e: any) {
+        // Non-fatal: the per-contact explosion is a preview convenience.
+        // Phase 1b's rollup will populate per-contact rows regardless.
+        ctx.log(`[Finalize ${runId}] per-contact explosion failed (non-fatal — Phase 1b will populate): ${e.message}`, 'warn');
+    }
+
+    return {
+        candidates: candidates.length,
+        rerouted,
+        nullified,
+        failed,
+        costUsd,
+        per_contact_total:         perContactStats.total_contacts,
+        per_contact_with_identity: perContactStats.with_primary_identity,
+        per_contact_with_sub:      perContactStats.with_sub_identity,
+        per_contact_with_sector:   perContactStats.with_sector,
+    };
 }
 
 // ────────────────────────────────────────────────────────────────────
