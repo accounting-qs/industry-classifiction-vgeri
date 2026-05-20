@@ -763,60 +763,102 @@ function parseRunError(s: string | null | undefined): StructuredRunError | null 
   } catch { return null; }
 }
 
-function BucketingFailedPanel({ run }: { run: BucketingRun }) {
+function BucketingFailedPanel({ run, onRefresh, onError }: {
+  run: BucketingRun;
+  onRefresh: () => void;
+  onError: (msg: string | null) => void;
+}) {
   const [showStack, setShowStack] = useState(false);
+  const [resuming, setResuming] = useState(false);
   const parsed = parseRunError(run.error_message);
+  // The /resume endpoint accepts status='failed' and routes by whether
+  // taxonomy_proposal exists: if it does, Phase 1a is preserved and
+  // we re-trigger only Phase 1b's deterministic rollup (seconds, no
+  // LLM cost). If not, it restarts Phase 1a (also idempotent — skips
+  // already-tagged industries via bucket_industry_map).
+  const resumePhase = run.taxonomy_proposal ? 'Phase 1b (matching)' : 'Phase 1a (discovery)';
 
-  if (!parsed) {
-    return (
-      <div className="border border-red-500/30 rounded-xl bg-red-500/5 p-6">
-        <p className="text-sm font-bold text-red-400 flex items-center gap-2">
-          <AlertCircle className="w-4 h-4" /> Run failed
-        </p>
-        <pre className="text-xs text-gray-400 mt-2 whitespace-pre-wrap font-sans">
-          {run.error_message || 'Unknown error.'}
-        </pre>
-      </div>
-    );
-  }
+  const onResume = async () => {
+    setResuming(true);
+    onError(null);
+    try {
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/resume`, { method: 'POST' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Failed (${res.status})`);
+      }
+      onRefresh();
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setResuming(false);
+    }
+  };
 
   const ctxBits: string[] = [];
-  if (parsed.phase) ctxBits.push(`phase=${parsed.phase}`);
-  if (parsed.step) ctxBits.push(`step=${parsed.step}`);
-  if (typeof parsed.current === 'number' && typeof parsed.total === 'number' && parsed.total > 0) {
-    ctxBits.push(`progress=${parsed.current.toLocaleString()}/${parsed.total.toLocaleString()}`);
+  if (parsed) {
+    if (parsed.phase) ctxBits.push(`phase=${parsed.phase}`);
+    if (parsed.step) ctxBits.push(`step=${parsed.step}`);
+    if (typeof parsed.current === 'number' && typeof parsed.total === 'number' && parsed.total > 0) {
+      ctxBits.push(`progress=${parsed.current.toLocaleString()}/${parsed.total.toLocaleString()}`);
+    }
+    if (typeof parsed.elapsed_seconds === 'number') ctxBits.push(`elapsed=${parsed.elapsed_seconds}s`);
   }
-  if (typeof parsed.elapsed_seconds === 'number') ctxBits.push(`elapsed=${parsed.elapsed_seconds}s`);
 
   return (
     <div className="border border-red-500/30 rounded-xl bg-red-500/5 p-6">
       <p className="text-sm font-bold text-red-400 flex items-center gap-2">
         <AlertCircle className="w-4 h-4" /> Run failed
       </p>
-      <pre className="text-xs text-gray-300 mt-3 whitespace-pre-wrap font-sans">{parsed.message}</pre>
-
-      {(ctxBits.length > 0 || parsed.note) && (
-        <div className="mt-3 text-[11px] font-mono text-gray-500 space-y-1">
-          {ctxBits.length > 0 && <div>{ctxBits.join(' · ')}</div>}
-          {parsed.note && <div className="italic">last progress: {parsed.note}</div>}
-          {parsed.at && <div>at: {parsed.at}</div>}
-        </div>
-      )}
-
-      {parsed.stack && (
-        <div className="mt-3">
-          <button
-            type="button"
-            onClick={() => setShowStack(v => !v)}
-            className="text-[11px] font-bold text-gray-400 hover:text-gray-200 underline"
-          >
-            {showStack ? 'Hide' : 'Show'} stack trace
-          </button>
-          {showStack && (
-            <pre className="text-[10px] text-gray-500 mt-2 whitespace-pre-wrap font-mono max-h-72 overflow-y-auto bg-black/30 p-2 rounded border border-[#2e2e2e]">{parsed.stack}</pre>
+      {parsed ? (
+        <>
+          <pre className="text-xs text-gray-300 mt-3 whitespace-pre-wrap font-sans">{parsed.message}</pre>
+          {(ctxBits.length > 0 || parsed.note) && (
+            <div className="mt-3 text-[11px] font-mono text-gray-500 space-y-1">
+              {ctxBits.length > 0 && <div>{ctxBits.join(' · ')}</div>}
+              {parsed.note && <div className="italic">last progress: {parsed.note}</div>}
+              {parsed.at && <div>at: {parsed.at}</div>}
+            </div>
           )}
-        </div>
+          {parsed.stack && (
+            <div className="mt-3">
+              <button
+                type="button"
+                onClick={() => setShowStack(v => !v)}
+                className="text-[11px] font-bold text-gray-400 hover:text-gray-200 underline"
+              >
+                {showStack ? 'Hide' : 'Show'} stack trace
+              </button>
+              {showStack && (
+                <pre className="text-[10px] text-gray-500 mt-2 whitespace-pre-wrap font-mono max-h-72 overflow-y-auto bg-black/30 p-2 rounded border border-[#2e2e2e]">{parsed.stack}</pre>
+              )}
+            </div>
+          )}
+        </>
+      ) : (
+        <pre className="text-xs text-gray-400 mt-2 whitespace-pre-wrap font-sans">
+          {run.error_message || 'Unknown error.'}
+        </pre>
       )}
+
+      <div className="mt-4 pt-3 border-t border-red-500/20 flex items-start gap-3 flex-wrap">
+        <button
+          onClick={onResume}
+          disabled={resuming}
+          className="px-3 py-1.5 rounded text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1"
+          title={run.taxonomy_proposal
+            ? "Re-trigger Phase 1b's deterministic rollup. Phase 1a is preserved — no LLM cost."
+            : "Restart Phase 1a from where it stopped. Idempotent — already-tagged industries are skipped."}
+        >
+          {resuming ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
+          Resume {resumePhase}
+        </button>
+        <p className="text-[10px] text-gray-500 italic flex-1 min-w-[200px]">
+          Resume re-runs only the failed phase. {run.taxonomy_proposal
+            ? 'Phase 1a output is intact in bucket_industry_map — Phase 1b just re-runs the rollup RPC (seconds, no LLM cost).'
+            : 'Phase 1a is idempotent — it skips industries already in bucket_industry_map.'}
+        </p>
+      </div>
     </div>
   );
 }
@@ -1195,7 +1237,7 @@ function BucketingDetail({ run, library, bucketCounts, sectorMix, generalBreakdo
     return <BucketingCancelledPanel run={run} onRefresh={onRefresh} onError={onError} />;
   }
   if (run.status === 'failed') {
-    return <BucketingFailedPanel run={run} />;
+    return <BucketingFailedPanel run={run} onRefresh={onRefresh} onError={onError} />;
   }
   if (run.status === 'assigning') {
     return <BucketingProgressPanel run={run} title="Phase 1b — Matching contacts to buckets" onError={onError} />;
