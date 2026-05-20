@@ -3550,7 +3550,7 @@ app.post('/api/bucketing/taxonomy/:kind', async (req, res) => {
                 .eq('bucketing_run_id', runId)
                 .eq(layer.col, fromName)
                 .eq(layer.flag, true)
-                .select('contact_id');
+                .select('industry_string');
             if (rewriteErr) {
                 return res.status(400).json({ error: `library row saved but run rewrite failed: ${rewriteErr.message}` });
             }
@@ -3643,7 +3643,7 @@ app.post('/api/bucketing/runs/:runId/proposed-tags/:layer/remap', async (req, re
             .eq('bucketing_run_id', req.params.runId)
             .eq(layer.col, fromName)
             .eq(layer.flag, true)
-            .select('contact_id');
+            .select('industry_string');
         if (error) return res.status(400).json({ error: error.message });
         res.json({ ok: true, rewritten: (data || []).length, to_name: toName });
     } catch (err: any) {
