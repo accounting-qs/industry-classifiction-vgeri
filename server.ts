@@ -2060,9 +2060,9 @@ app.get('/api/bucketing/runs/:id', async (req, res) => {
 // preferred_library_ids) to the proposed taxonomy.
 app.patch('/api/bucketing/runs/:id/taxonomy', async (req, res) => {
     const id = req.params.id;
-    const { keep, rename, add, min_volume, bucket_budget, preferred_library_ids } = req.body || {};
+    const { keep, rename, add, min_volume, identity_min_volume, bucket_budget, preferred_library_ids } = req.body || {};
     try {
-        await applyTaxonomyEdits(supabase, id, { keep, rename, add, min_volume, bucket_budget, preferred_library_ids }, buildBucketingCtx(id));
+        await applyTaxonomyEdits(supabase, id, { keep, rename, add, min_volume, identity_min_volume, bucket_budget, preferred_library_ids }, buildBucketingCtx(id));
         const { data: run } = await supabase
             .from('bucketing_runs').select('*').eq('id', id).single();
         const { data: counts } = await supabase

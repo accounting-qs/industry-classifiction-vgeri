@@ -107,7 +107,8 @@ export interface BucketingRun {
   id: string;
   name: string;
   list_names: string[];
-  min_volume: number;
+  min_volume: number;                       // sub-identity rollup floor (legacy column name)
+  identity_min_volume?: number;             // identity rollup floor (default 1 — never fold identities into General)
   bucket_budget?: number;
   status: BucketingRunStatus;
   taxonomy_model?: string | null;

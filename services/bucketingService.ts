@@ -1981,13 +1981,21 @@ export async function runBucketAssignment(
         throw new Error(`Cannot assign buckets from status "${run.status}" — run must be in taxonomy_ready, assigning, or completed`);
     }
 
-    const minVolume = Number(run.min_volume) > 0 ? Number(run.min_volume) : 1;
+    // Two independent thresholds. min_volume is the sub-identity floor
+    // (when (identity, sub) drops below this, roll up to identity-only).
+    // identity_min_volume is the identity floor (when an identity drops
+    // below this, fold it into General). Default identity_min_volume=1
+    // means every non-empty identity gets its own bucket — the original
+    // single-threshold behavior at sub_min=1.
+    const subMin = Number(run.min_volume) > 0 ? Number(run.min_volume) : 1;
+    const idMin  = Number(run.identity_min_volume) > 0 ? Number(run.identity_min_volume) : 1;
 
-    ctx.log(`[BucketAssign ${runId}] v2 deterministic rollup, min_volume=${minVolume}`, 'phase');
+    ctx.log(`[BucketAssign ${runId}] v2 deterministic rollup, sub_min=${subMin}, identity_min=${idMin}`, 'phase');
     const t0 = Date.now();
     const { data: result, error: rpcErr } = await supabase.rpc('apply_rollup_bucket_assignments', {
         p_run_id: runId,
-        p_min_volume: minVolume
+        p_sub_min_volume: subMin,
+        p_identity_min_volume: idMin
     });
     const ms = Date.now() - t0;
     if (rpcErr) {
@@ -3808,7 +3816,8 @@ interface TaxonomyEdits {
         identity_type?: string;
         operator_required?: boolean;
     }[];
-    min_volume?: number;
+    min_volume?: number;                          // sub-identity floor (legacy column name)
+    identity_min_volume?: number;                 // identity floor — fold tiny identities into General
     bucket_budget?: number;
     preferred_library_ids?: string[];             // moved from Setup screen — see review screen
 }
@@ -3870,6 +3879,9 @@ export async function applyTaxonomyEdits(
     };
     if (typeof edits.min_volume === 'number' && edits.min_volume >= 0) {
         update.min_volume = edits.min_volume;
+    }
+    if (typeof edits.identity_min_volume === 'number' && edits.identity_min_volume >= 0) {
+        update.identity_min_volume = edits.identity_min_volume;
     }
     if (typeof edits.bucket_budget === 'number' && edits.bucket_budget > 0) {
         update.bucket_budget = Math.floor(edits.bucket_budget);
@@ -3967,10 +3979,14 @@ export async function runAssignment(
         .from('bucketing_runs').select('*').eq('id', runId).single();
     if (error || !run) throw new Error(`Run not found: ${error?.message}`);
 
-    // min_volume comes from the run row. If user left it null/0, fall back to
-    // 1 so every distinct (identity, sub-identity) pair becomes its own
-    // bucket (no rollup). UI defaults the new-run form to 500.
-    const minVolume = Number(run.min_volume) > 0 ? Number(run.min_volume) : 1;
+    // Two independent thresholds from the run row.
+    //   min_volume          (sub-identity floor) — UI defaults to 500.
+    //   identity_min_volume (identity floor)     — UI defaults to 1.
+    // Either left null/0 falls back to 1 — at sub_min=1 every distinct
+    // (identity, sub-identity) gets its own bucket; at identity_min=1
+    // every identity with ≥1 contact gets its own bucket.
+    const subMin = Number(run.min_volume) > 0 ? Number(run.min_volume) : 1;
+    const idMin  = Number(run.identity_min_volume) > 0 ? Number(run.identity_min_volume) : 1;
 
     await supabase.from('bucketing_runs').update({
         status: 'assigning',
@@ -3979,7 +3995,7 @@ export async function runAssignment(
         progress: {
             phase: 'phase1b',
             step: 'rollup',
-            note: `Computing deterministic rollup at min_volume=${minVolume}…`,
+            note: `Computing deterministic rollup at sub_min=${subMin}, identity_min=${idMin}…`,
             current: 0,
             total: Number(run.total_contacts || 0),
             elapsed_seconds: 0,
@@ -3987,11 +4003,12 @@ export async function runAssignment(
         }
     }).eq('id', runId);
 
-    ctx.log(`[Bucketing ${runId}] Phase 1b v2 — deterministic rollup, min_volume=${minVolume}`, 'phase');
+    ctx.log(`[Bucketing ${runId}] Phase 1b v2 — deterministic rollup, sub_min=${subMin}, identity_min=${idMin}`, 'phase');
     const t0 = Date.now();
     const { data: result, error: rpcErr } = await supabase.rpc('apply_rollup_bucket_assignments', {
         p_run_id: runId,
-        p_min_volume: minVolume
+        p_sub_min_volume: subMin,
+        p_identity_min_volume: idMin
     });
     const ms = Date.now() - t0;
     if (rpcErr) {
