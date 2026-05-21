@@ -1548,21 +1548,18 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
   const [newSpec, setNewSpec] = useState('');
   const [newDesc, setNewDesc] = useState('');
   const [newIdentity, setNewIdentity] = useState('');
-  // Default new-run min_volume to 500 if the row has 0/null. 500 is the
-  // "meaningful campaign segment" floor for typical 100k+ contact lists.
-  // Effective value at rollup time: anything 0/null treated as 1 so every
-  // distinct (identity, sub-identity) pair gets its own bucket — see
-  // apply_rollup_bucket_assignments RPC.
   // Sub-identity floor: minimum contact count for an (identity, sub-identity)
   // pair to earn its own campaign bucket. Below this it rolls up to the
-  // parent identity. Default 500 — meaningful campaign segment for typical
-  // 100k+ lists.
-  const [minVolume, setMinVolume] = useState<number>(Number(run.min_volume) > 0 ? Number(run.min_volume) : 500);
+  // parent identity. Default 1000 — campaign-meaningful segment size on a
+  // typical 100k+ list. Effective value at rollup time: anything 0/null
+  // treated as 1, so every distinct pair gets its own bucket — see
+  // apply_rollup_bucket_assignments RPC.
+  const [minVolume, setMinVolume] = useState<number>(Number(run.min_volume) > 0 ? Number(run.min_volume) : 1000);
   // Identity floor: minimum contact count for an identity to earn its own
   // campaign bucket. Below this the identity is folded into General.
-  // Default 1 — every identity with ≥1 contact gets a bucket (no rollup
-  // unless the user explicitly raises this).
-  const [identityMinVolume, setIdentityMinVolume] = useState<number>(Number(run.identity_min_volume) > 0 ? Number(run.identity_min_volume) : 1);
+  // Default 100 — filters out long-tail identities (one-off / niche tags)
+  // that don't justify their own campaign segment.
+  const [identityMinVolume, setIdentityMinVolume] = useState<number>(Number(run.identity_min_volume) > 0 ? Number(run.identity_min_volume) : 100);
   const [busy, setBusy] = useState<'none' | 'saving' | 'assigning'>('none');
   const [showPatterns, setShowPatterns] = useState(false);
   // Library selection moved here from Setup. Default ON — pre-select every
@@ -2093,10 +2090,10 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
             onChange={e => setMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
             className="w-28 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
           />
-          <p className="text-[10px] text-gray-500 italic mt-1">An (identity, sub-identity) pair below this rolls up to the parent identity bucket.</p>
-          {(run.total_contacts || 0) > 30000 && (
+          <p className="text-[10px] text-gray-500 italic mt-1">An (identity, sub-identity) pair below this rolls up to the parent identity bucket. Default 1000 — campaign-meaningful segment size on a 100k+ list.</p>
+          {(run.total_contacts || 0) > 0 && (run.total_contacts || 0) < 30000 && (
             <p className="text-[10px] text-amber-400 italic mt-1">
-              ↑ For lists this size ({(run.total_contacts || 0).toLocaleString()} contacts), try 250–500 to keep sub-identity buckets meaningful and avoid 100+ small specs.
+              ↑ For lists this size ({(run.total_contacts || 0).toLocaleString()} contacts), 1000 may roll up almost everything — try 100–300 to keep sub-identity buckets viable.
             </p>
           )}
         </div>
@@ -2109,7 +2106,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
             onChange={e => setIdentityMinVolume(Math.max(0, parseInt(e.target.value || '0', 10)))}
             className="w-28 px-2 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded text-xs text-white focus:outline-none focus:border-[#3ecf8e]"
           />
-          <p className="text-[10px] text-gray-500 italic mt-1">An identity below this is folded into General. Default 1 — every identity with ≥1 contact gets its own bucket. Raise to ignore tiny identities.</p>
+          <p className="text-[10px] text-gray-500 italic mt-1">An identity below this is folded into General. Default 100 — filters long-tail identities (one-off or niche tags). Lower to 1 if you want every identity to get its own bucket.</p>
         </div>
       </div>
 

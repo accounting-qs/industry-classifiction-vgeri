@@ -4422,8 +4422,8 @@ export async function runAssignment(
     if (error || !run) throw new Error(`Run not found: ${error?.message}`);
 
     // Two independent thresholds from the run row.
-    //   min_volume          (sub-identity floor) — UI defaults to 500.
-    //   identity_min_volume (identity floor)     — UI defaults to 1.
+    //   min_volume          (sub-identity floor) — UI defaults to 1000.
+    //   identity_min_volume (identity floor)     — UI defaults to 100.
     // Either left null/0 falls back to 1 — at sub_min=1 every distinct
     // (identity, sub-identity) gets its own bucket; at identity_min=1
     // every identity with ≥1 contact gets its own bucket.
