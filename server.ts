@@ -1390,7 +1390,12 @@ app.delete('/api/import-lists/:id', async (req, res) => {
 // ============================================
 
 const EXPORT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-const EXPORTS_DIR = path.join(__dirname, 'exports');
+// EXPORTS_DIR can be overridden via env so the Render Persistent Disk
+// can be mounted at any path (e.g. /var/data, /data) without requiring
+// the mount path to match __dirname. If unset, defaults to ./exports
+// next to the server, which only survives restarts when the disk is
+// mounted there. Set EXPORTS_DIR=<disk mount path> in Render env vars.
+const EXPORTS_DIR = process.env.EXPORTS_DIR || path.join(__dirname, 'exports');
 const JOBS_REGISTRY_PATH = path.join(EXPORTS_DIR, 'jobs.json');
 
 type ExportJobStatus = 'building' | 'ready' | 'failed';
@@ -3123,10 +3128,74 @@ async function cleanupExpiredCsvJobs() {
     }
 }
 
-// Hourly cleanup. Run once on boot too, so a server restart immediately
-// clears anything that became stale during downtime.
-setInterval(cleanupExpiredCsvJobs, 60 * 60 * 1000);
+// Cleanup every 5 min. Combined with the 1 h TTL set on insert, this
+// means files live at most ~1 h 5 min before being purged. Run once
+// on boot too, so a server restart immediately clears anything that
+// became stale during downtime.
+setInterval(cleanupExpiredCsvJobs, 5 * 60 * 1000);
 cleanupExpiredCsvJobs().catch(() => {});
+
+// Manual purge — wipes every non-running CSV job + its file. Lets the
+// user reclaim disk space without waiting for the TTL. Skips
+// status='running' rows so an in-flight export isn't stomped on. Also
+// sweeps orphan files in CSV_FILES_DIR (files with no matching job
+// row — shouldn't normally happen but the disk is the source of truth
+// for "what's taking up space").
+app.post('/api/bucketing/csv-jobs/purge-all', async (_req, res) => {
+    try {
+        // 1. Find every non-running job and its file.
+        const { data: jobs, error: jErr } = await supabase
+            .from('bucketing_csv_jobs')
+            .select('id, storage_path, status')
+            .neq('status', 'running');
+        if (jErr) throw new Error(jErr.message);
+        const rows = (jobs || []) as { id: string; storage_path: string | null; status: string }[];
+
+        let filesDeleted = 0;
+        let bytesFreed = 0;
+        const knownPaths = new Set<string>();
+        for (const r of rows) {
+            const filePath = r.storage_path || path.join(CSV_FILES_DIR, `${r.id}.csv.gz`);
+            knownPaths.add(path.resolve(filePath));
+            try {
+                const stat = await fsp.stat(filePath);
+                bytesFreed += stat.size;
+                await fsp.unlink(filePath);
+                filesDeleted++;
+            } catch { /* file already gone — fine */ }
+        }
+        if (rows.length > 0) {
+            const { error: dErr } = await supabase
+                .from('bucketing_csv_jobs')
+                .delete()
+                .in('id', rows.map(r => r.id));
+            if (dErr) throw new Error(dErr.message);
+        }
+
+        // 2. Sweep orphan files (no matching job row).
+        let orphansDeleted = 0;
+        try {
+            const entries = await fsp.readdir(CSV_FILES_DIR);
+            for (const name of entries) {
+                if (!name.endsWith('.csv.gz')) continue;
+                const abs = path.resolve(CSV_FILES_DIR, name);
+                if (knownPaths.has(abs)) continue;
+                try {
+                    const stat = await fsp.stat(abs);
+                    bytesFreed += stat.size;
+                    await fsp.unlink(abs);
+                    orphansDeleted++;
+                } catch { /* skip */ }
+            }
+        } catch { /* dir doesn't exist — nothing to sweep */ }
+
+        const mb = (bytesFreed / 1024 / 1024).toFixed(1);
+        console.log(`[CSV-purge] removed ${filesDeleted} files + ${orphansDeleted} orphans, freed ${mb} MB, deleted ${rows.length} job rows`);
+        res.json({ jobsDeleted: rows.length, filesDeleted, orphansDeleted, bytesFreed });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
 // Watchdog for stuck bucketing runs.
 //
@@ -3205,9 +3274,14 @@ app.post('/api/bucketing/runs/:id/csv-jobs', async (req, res) => {
         if (!exportable.has(run.status)) {
             return res.status(400).json({ error: `Cannot export: run status is "${run.status}". Wait for taxonomy to finish, or pick a completed/cancelled run.` });
         }
+        // 1 h TTL — files survive on the Render Persistent Disk between
+        // restarts, so we don't need a generous window. Short TTL keeps
+        // the disk small (2 GB) safe even if exports are kicked off in
+        // bursts. Cleanup cron sweeps expired rows every 5 min.
+        const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
         const { data: job, error: jErr } = await supabase
             .from('bucketing_csv_jobs')
-            .insert({ bucketing_run_id: id, status: 'pending' })
+            .insert({ bucketing_run_id: id, status: 'pending', expires_at: expiresAt })
             .select('*').single();
         if (jErr || !job) return res.status(500).json({ error: jErr?.message || 'Failed to create job' });
 

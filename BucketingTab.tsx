@@ -2543,6 +2543,29 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onRe
     }
   };
 
+  // Wipes every non-running CSV job + its file across ALL runs. Used to
+  // reclaim disk space without waiting for the 1 h TTL — useful after a
+  // burst of re-exports or when investigating disk pressure.
+  const [purging, setPurging] = useState(false);
+  const purgeAllCsvs = async () => {
+    if (!confirm('Purge ALL stored CSV exports across every run? In-flight exports are left alone. This cannot be undone — anyone who has a download link to an existing export will need to re-generate.')) return;
+    setPurging(true);
+    onError(null);
+    try {
+      const res = await fetch('/api/bucketing/csv-jobs/purge-all', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Purge failed (${res.status})`);
+      const mb = (Number(data.bytesFreed || 0) / 1024 / 1024).toFixed(1);
+      onError(`Purged ${data.jobsDeleted} job(s) + ${data.orphansDeleted} orphan file(s), freed ${mb} MB.`);
+      // The local job state for THIS run may have been deleted — refresh.
+      await fetchLatestCsvJob();
+    } catch (e: any) {
+      onError(e.message);
+    } finally {
+      setPurging(false);
+    }
+  };
+
   const sorted = [...bucketCounts].sort((a, b) => Number(b.contact_count) - Number(a.contact_count));
   const total = sorted.reduce((s, b) => s + Number(b.contact_count), 0);
   const max = sorted.length > 0 ? Number(sorted[0].contact_count) : 1;
@@ -2747,19 +2770,30 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onRe
               Full CSV export (all contacts × bucket assignments)
             </div>
             <div className="text-[11px] text-gray-400">
-              Streams every contact with its enrichment, taxonomy (identity / sub-identity / sector), final bucket, and bucketing reasoning. Built async + gzipped — link expires after 24 hours.
+              Streams every contact with its enrichment, taxonomy (identity / sub-identity / sector), final bucket, and bucketing reasoning. Built async + gzipped — link expires after 1 hour.
             </div>
           </div>
-          {(!csvJob || csvJob.status === 'failed' || csvJob.status === 'ready') && (
+          <div className="flex items-center gap-2 shrink-0">
             <button
-              onClick={startCsvJob}
-              disabled={csvJobLoading}
-              className="px-3 py-1.5 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1 shrink-0"
+              onClick={purgeAllCsvs}
+              disabled={purging}
+              title="Wipe every stored CSV export across all runs and reclaim disk space. In-flight exports are left alone."
+              className="px-2.5 py-1.5 rounded text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-400 hover:text-red-300 hover:border-red-500/40 disabled:opacity-50 flex items-center gap-1"
             >
-              {csvJobLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
-              {csvJob?.status === 'ready' ? 'Re-export' : csvJob?.status === 'failed' ? 'Retry export' : 'Generate full CSV'}
+              {purging ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+              Purge all
             </button>
-          )}
+            {(!csvJob || csvJob.status === 'failed' || csvJob.status === 'ready') && (
+              <button
+                onClick={startCsvJob}
+                disabled={csvJobLoading}
+                className="px-3 py-1.5 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50 flex items-center gap-1"
+              >
+                {csvJobLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+                {csvJob?.status === 'ready' ? 'Re-export' : csvJob?.status === 'failed' ? 'Retry export' : 'Generate full CSV'}
+              </button>
+            )}
+          </div>
         </div>
 
         {csvJob && (csvJob.status === 'pending' || csvJob.status === 'running') && (() => {
@@ -2789,11 +2823,14 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onRe
         {csvJob && csvJob.status === 'ready' && csvJob.download_url && (() => {
           const sizeMb = csvJob.file_size_bytes ? (csvJob.file_size_bytes / 1024 / 1024).toFixed(1) : null;
           const expiresAt = new Date(csvJob.expires_at);
-          const expiresHrs = Math.max(0, Math.round((expiresAt.getTime() - Date.now()) / 3_600_000));
+          const expiresMin = Math.max(0, Math.round((expiresAt.getTime() - Date.now()) / 60_000));
+          const expiresLabel = expiresMin >= 60
+            ? `~${Math.round(expiresMin / 60)}h`
+            : `~${expiresMin}m`;
           return (
             <div className="mt-3 flex items-center justify-between gap-3 flex-wrap">
               <div className="text-[11px] text-gray-400">
-                Ready · {csvJob.progress_rows.toLocaleString()} rows{sizeMb ? ` · ${sizeMb} MB gzipped` : ''} · expires in ~{expiresHrs}h
+                Ready · {csvJob.progress_rows.toLocaleString()} rows{sizeMb ? ` · ${sizeMb} MB gzipped` : ''} · expires in {expiresLabel}
               </div>
               <a
                 href={csvJob.download_url}
