@@ -82,20 +82,14 @@ function getPgPool(): Pool {
     if (pgPoolSingleton) return pgPoolSingleton;
     const url = process.env.DATABASE_URL;
     if (!url) throw new Error('DATABASE_URL is not set — required for CSV streaming export');
-    // Strip sslmode from the connection string before handing it to pg.
-    // pg's connection-string parser sets ssl:true on `sslmode=require`,
-    // which overrides our explicit { rejectUnauthorized: false } and
-    // triggers "self-signed certificate in certificate chain" against
-    // the Supabase pooler CA (not in Node's default trust store). Our
-    // ssl Pool option below is the single source of truth.
-    let cleanedUrl = url;
-    try {
-        const u = new URL(url);
-        u.searchParams.delete('sslmode');
-        cleanedUrl = u.toString();
-    } catch { /* leave url as-is; pg will report a parse error */ }
+    // DATABASE_URL must NOT include `?sslmode=require` — pg's
+    // connection-string parser turns that into ssl:true, which
+    // overrides this ssl option and triggers a self-signed-cert error
+    // against the Supabase pooler CA (not in Node's default trust).
+    // Leave sslmode off; the option below enables encryption without
+    // CA verification, matching Supabase's docs for direct pg.
     pgPoolSingleton = new Pool({
-        connectionString: cleanedUrl,
+        connectionString: url,
         max: 2,
         idleTimeoutMillis: 30_000,
         connectionTimeoutMillis: 10_000,
