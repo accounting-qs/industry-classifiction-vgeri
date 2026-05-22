@@ -70,7 +70,8 @@ import {
   KeyRound,
   Sun,
   Moon,
-  Monitor
+  Monitor,
+  PieChart,
 } from 'lucide-react';
 
 /**
@@ -989,6 +990,177 @@ function ThemeToggle({ theme, onChange }: { theme: ThemeChoice; onChange: (t: Th
   );
 }
 
+type DedupStats = {
+  import_list_id: string;
+  total_rows: number;
+  inserted: number;
+  updated: number;
+  within_file_dupes: number;
+  cross_list_dupes: number;
+  invalid: number;
+  source_breakdown: Record<string, number>;
+  invalid_breakdown: Record<string, number>;
+  created_at: string;
+  updated_at: string;
+};
+
+function DedupStatsModal({ listId, listName, onClose }: { listId: string; listName: string; onClose: () => void }) {
+  const [stats, setStats] = useState<DedupStats | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await fetch(`/api/import-lists/${encodeURIComponent(listId)}/dedup`);
+        if (cancelled) return;
+        if (res.status === 404) {
+          setStats(null);
+          setError('No dedup stats were recorded for this list. It was likely imported before this feature existed.');
+        } else if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          setError(j.error || `Request failed (${res.status})`);
+        } else {
+          setStats(await res.json());
+        }
+      } catch (e: any) {
+        if (!cancelled) setError(e?.message || 'Failed to load dedup stats');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [listId]);
+
+  const totalDupes = (stats?.within_file_dupes || 0) + (stats?.cross_list_dupes || 0);
+  const denom = stats?.total_rows && stats.total_rows > 0 ? stats.total_rows : 1;
+  const pct = (n: number) => `${((n / denom) * 100).toFixed(1)}%`;
+  const sortedSources: [string, number][] = stats
+    ? (Object.entries(stats.source_breakdown) as [string, number][]).sort((a, b) => b[1] - a[1])
+    : [];
+  const sortedInvalid: [string, number][] = stats
+    ? (Object.entries(stats.invalid_breakdown) as [string, number][]).sort((a, b) => b[1] - a[1])
+    : [];
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-2xl max-h-[85vh] flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-6 py-4 border-b border-[#2e2e2e]">
+          <div>
+            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+              <PieChart className="w-4 h-4 text-[#3ecf8e]" />
+              Dedup breakdown
+            </h3>
+            <p className="text-[10px] text-gray-500 mt-0.5 truncate max-w-[480px]">{listName}</p>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-gray-500 hover:text-white text-lg font-bold w-8 h-8 flex items-center justify-center rounded-lg hover:bg-[#2e2e2e] transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto custom-scrollbar p-6 space-y-5">
+          {loading ? (
+            <div className="flex flex-col items-center justify-center py-10 text-center">
+              <Loader2 className="w-6 h-6 text-[#3ecf8e] animate-spin mb-3" />
+              <p className="text-xs text-gray-500">Loading dedup stats…</p>
+            </div>
+          ) : error ? (
+            <div className="bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[12px] rounded-lg p-4 flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>{error}</span>
+            </div>
+          ) : stats ? (
+            <>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-3">
+                  <p className="text-xl font-bold text-white tabular-nums">{stats.total_rows.toLocaleString()}</p>
+                  <p className="text-[9px] text-gray-500 uppercase tracking-wider font-bold mt-1">Total rows</p>
+                </div>
+                <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-3">
+                  <p className="text-xl font-bold text-[#3ecf8e] tabular-nums">{stats.inserted.toLocaleString()}</p>
+                  <p className="text-[9px] text-gray-500 uppercase tracking-wider font-bold mt-1">Inserted</p>
+                </div>
+                <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-3">
+                  <p className="text-xl font-bold text-amber-400 tabular-nums">{totalDupes.toLocaleString()}</p>
+                  <p className="text-[9px] text-gray-500 uppercase tracking-wider font-bold mt-1">Duplicates</p>
+                  {stats.total_rows > 0 && (
+                    <p className="text-[9px] text-gray-600 mt-0.5">{pct(totalDupes)} of file</p>
+                  )}
+                </div>
+                <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-3">
+                  <p className="text-xl font-bold text-rose-400 tabular-nums">{stats.invalid.toLocaleString()}</p>
+                  <p className="text-[9px] text-gray-500 uppercase tracking-wider font-bold mt-1">Invalid</p>
+                </div>
+              </div>
+
+              <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
+                <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-3">Within this file</p>
+                <div className="flex items-baseline justify-between">
+                  <span className="text-sm text-gray-300">Same email seen more than once in the upload</span>
+                  <span className="text-sm font-mono font-bold text-amber-300 tabular-nums">{stats.within_file_dupes.toLocaleString()}</span>
+                </div>
+              </div>
+
+              <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
+                <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-3">From other lists</p>
+                {sortedSources.length === 0 ? (
+                  <p className="text-[11px] text-gray-500 italic">No duplicates came from other existing lists.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {sortedSources.map(([src, count]) => {
+                      const sliceDenom = stats.cross_list_dupes > 0 ? stats.cross_list_dupes : 1;
+                      const slicePct = ((count / sliceDenom) * 100).toFixed(1);
+                      const widthPct = Math.min(100, (count / sliceDenom) * 100);
+                      return (
+                        <div key={src}>
+                          <div className="flex items-baseline justify-between mb-1">
+                            <span className="text-[12px] text-gray-300 truncate max-w-[60%]" title={src}>{src}</span>
+                            <span className="text-[11px] font-mono text-gray-400 tabular-nums">
+                              {count.toLocaleString()}
+                              <span className="text-gray-600 ml-2">{slicePct}%</span>
+                            </span>
+                          </div>
+                          <div className="h-1.5 bg-[#0e0e0e] rounded-full overflow-hidden">
+                            <div className="h-full bg-[#3ecf8e]/60" style={{ width: `${widthPct}%` }} />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {sortedInvalid.length > 0 && (
+                <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-4">
+                  <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-3">Invalid by reason</p>
+                  <div className="space-y-1.5">
+                    {sortedInvalid.map(([reason, count]) => (
+                      <div key={reason} className="flex items-baseline justify-between">
+                        <span className="text-[12px] text-gray-300 truncate max-w-[70%]" title={reason}>{reason}</span>
+                        <span className="text-[11px] font-mono text-rose-300 tabular-nums">{count.toLocaleString()}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <p className="text-[10px] text-gray-600 text-center">
+                Captured at upload · {new Date(stats.updated_at).toLocaleString()}
+              </p>
+            </>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ImportedListsTable({
   lists,
   loading,
@@ -1052,6 +1224,7 @@ function ImportedListsTable({
   const [editingValue, setEditingValue] = useState('');
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+  const [dedupModalFor, setDedupModalFor] = useState<{ id: string; name: string } | null>(null);
   // React batches state updates within an event tick, so editingId can still
   // read as `l.id` inside the onBlur that fires right after a Save click.
   // The ref short-circuits the second call without waiting for the re-render.
@@ -1343,6 +1516,13 @@ function ImportedListsTable({
                           >
                             <ExternalLink className="w-3 h-3" /> Open
                           </button>
+                          <button
+                            onClick={e => { e.stopPropagation(); setDedupModalFor({ id: l.id, name: l.name }); }}
+                            className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-[#3ecf8e]/40 hover:text-[#3ecf8e] transition-colors flex items-center gap-1"
+                            title="Show dedup breakdown for this upload"
+                          >
+                            <PieChart className="w-3 h-3" /> Dedup
+                          </button>
                           {onRenameList && (
                             <button
                               onClick={e => { e.stopPropagation(); beginRename(l); }}
@@ -1403,6 +1583,13 @@ function ImportedListsTable({
             })}
           </tbody>
         </table>
+      )}
+      {dedupModalFor && (
+        <DedupStatsModal
+          listId={dedupModalFor.id}
+          listName={dedupModalFor.name}
+          onClose={() => setDedupModalFor(null)}
+        />
       )}
     </>
   );
@@ -2840,6 +3027,12 @@ function CSVImportWizard({
     let totalUpdated = 0;
     let totalDuplicates = 0;
     let totalFailed = 0;
+    let totalRowsSent = 0; // Total rows shipped to /api/import (incl. invalid)
+    let totalWithinFileDupes = 0;
+    let totalCrossListDupes = 0;
+    let totalInvalid = 0;
+    const crossListBreakdownAccum: Record<string, number> = {};
+    const invalidByReasonAccum: Record<string, number> = {};
     let sentToServer = 0; // Tracks rows actually sent (after API response), not just parsed
     const errors: string[] = [];
     const allFailedContacts: { email: string; row: number; reason: string }[] = [];
@@ -2883,6 +3076,20 @@ function CSVImportWizard({
           totalUpdated += data.updated || 0;
           totalDuplicates += data.duplicates || 0;
           totalFailed += data.failed || 0;
+          if (!isRetry) totalRowsSent += chunk.length;
+          totalWithinFileDupes += data.withinFileDupes || 0;
+          totalCrossListDupes += data.crossListDupes || 0;
+          totalInvalid += data.invalid || 0;
+          if (data.crossListBreakdown && typeof data.crossListBreakdown === 'object') {
+            for (const [k, v] of Object.entries(data.crossListBreakdown as Record<string, number>)) {
+              crossListBreakdownAccum[k] = (crossListBreakdownAccum[k] || 0) + (Number(v) || 0);
+            }
+          }
+          if (data.invalidByReason && typeof data.invalidByReason === 'object') {
+            for (const [k, v] of Object.entries(data.invalidByReason as Record<string, number>)) {
+              invalidByReasonAccum[k] = (invalidByReasonAccum[k] || 0) + (Number(v) || 0);
+            }
+          }
           if (data.errors?.length) errors.push(...data.errors);
           if (data.failedContacts?.length) allFailedContacts.push(...data.failedContacts);
         }
@@ -2983,7 +3190,20 @@ function CSVImportWizard({
               await fetch('/api/import-lists', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name: listName, contact_count: totalAffected })
+                body: JSON.stringify({
+                  name: listName,
+                  contact_count: totalAffected,
+                  dedup_stats: {
+                    total_rows: totalRowsSent,
+                    inserted: totalInserted,
+                    updated: totalUpdated,
+                    within_file_dupes: totalWithinFileDupes,
+                    cross_list_dupes: totalCrossListDupes,
+                    invalid: totalInvalid,
+                    source_breakdown: crossListBreakdownAccum,
+                    invalid_breakdown: invalidByReasonAccum,
+                  },
+                })
               });
               onRefreshLists();
             } catch {}

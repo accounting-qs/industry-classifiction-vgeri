@@ -843,6 +843,7 @@ app.post('/api/import', async (req, res) => {
         // 1. Validate emails and separate valid from invalid
         const failedContacts: { email: string; row: number; reason: string }[] = [];
         const validContacts: any[] = [];
+        const invalidByReason: Record<string, number> = {};
 
         contacts.forEach((c: any, idx: number) => {
             const email = c.email?.trim();
@@ -850,6 +851,7 @@ app.post('/api/import', async (req, res) => {
                 const validationError = validateEmail(email);
                 if (validationError) {
                     failedContacts.push({ email, row: idx + 1, reason: validationError });
+                    invalidByReason[validationError] = (invalidByReason[validationError] || 0) + 1;
                     return; // Skip invalid
                 }
             }
@@ -876,14 +878,19 @@ app.post('/api/import', async (req, res) => {
         // undercounted "duplicates" tile in the UI. That is *vastly*
         // preferable to throwing (the previous behavior), which surfaced
         // a 500 to the client and dropped all 2000 contacts in the chunk.
-        const existingEmails = new Set<string>();
+        // existingByEmail maps lowercased email → the existing contact's
+        // current lead_list_name. We need the name to attribute each
+        // duplicate to its source list in the dedup-stats breakdown — a
+        // bare set of emails would only let us tell "this is a duplicate,"
+        // not "this duplicate came from List A."
+        const existingByEmail = new Map<string, string | null>();
         let emailCheckChunk = 500;
         let preCheckSkipped = 0;
         for (let i = 0; i < allEmails.length;) {
             const emailBatch = allEmails.slice(i, i + emailCheckChunk);
             const { data: existing, error } = await importSupabaseRetry(
                 'Import.preCheck',
-                () => supabase.from('contacts').select('email').in('email', emailBatch)
+                () => supabase.from('contacts').select('email, lead_list_name').in('email', emailBatch)
             );
             if (error) {
                 if (error.code === '57014' && emailCheckChunk > 50) {
@@ -896,7 +903,10 @@ app.post('/api/import', async (req, res) => {
                 i += emailBatch.length;
                 continue;
             }
-            if (existing) existing.forEach((r: any) => existingEmails.add(r.email?.toLowerCase()));
+            if (existing) existing.forEach((r: any) => {
+                const e = r.email?.toLowerCase();
+                if (e) existingByEmail.set(e, r.lead_list_name ?? null);
+            });
             i += emailBatch.length;
         }
         if (preCheckSkipped > 0) {
@@ -905,6 +915,13 @@ app.post('/api/import', async (req, res) => {
 
         // 4. Separate new vs existing contacts
         let duplicates = 0;
+        let withinFileDupes = 0;
+        let crossListDupes = 0;
+        // breakdown[sourceListName] = count of duplicates whose existing
+        // contact carried that lead_list_name. Excludes within-file dupes
+        // (same email twice in the upload, or already inserted by an
+        // earlier chunk of the same upload) — those go in withinFileDupes.
+        const crossListBreakdown: Record<string, number> = {};
         const newContacts: any[] = [];
         const updateContacts: any[] = [];
 
@@ -923,9 +940,38 @@ app.post('/api/import', async (req, res) => {
             return row;
         };
 
+        // Tracks emails already seen in *this chunk* so two rows of the
+        // same CSV with the same email count as a within-file dupe rather
+        // than getting silently swallowed by the upsert.
+        const seenInChunk = new Set<string>();
+
         validContacts.forEach((c: any) => {
             const email = c.email?.trim()?.toLowerCase();
-            if (email && existingEmails.has(email)) {
+            const currentListName = (c.lead_list_name || '').trim();
+
+            // Within-chunk dupe: same email twice in this CSV chunk.
+            if (email && seenInChunk.has(email)) {
+                withinFileDupes++;
+                duplicates++;
+                return;
+            }
+            if (email) seenInChunk.add(email);
+
+            if (email && existingByEmail.has(email)) {
+                const sourceList = existingByEmail.get(email) || '';
+                // If the existing contact's lead_list_name matches the
+                // CSV's lead_list_name, this is a cross-chunk within-file
+                // dupe: an earlier chunk of *this* upload already inserted
+                // it. Attributing that to "List D had it from before" would
+                // be misleading.
+                const isWithinFile = !!currentListName && sourceList === currentListName;
+                if (isWithinFile) {
+                    withinFileDupes++;
+                } else {
+                    crossListDupes++;
+                    const key = sourceList || '(unknown list)';
+                    crossListBreakdown[key] = (crossListBreakdown[key] || 0) + 1;
+                }
                 if (overwriteDuplicates) {
                     updateContacts.push(buildRow(c));
                 } else {
@@ -1008,7 +1054,20 @@ app.post('/api/import', async (req, res) => {
 
         const totalFailed = failedContacts.length + dbFailed;
         addServerLog(`📥 Import complete: ${inserted} new, ${updated} updated, ${duplicates} duplicates, ${totalFailed} failed (${failedContacts.length} invalid emails).`, 'Sync', 'info');
-        res.json({ inserted, updated, duplicates, failed: totalFailed, errors, failedContacts });
+        res.json({
+            inserted,
+            updated,
+            duplicates,
+            failed: totalFailed,
+            errors,
+            failedContacts,
+            // Dedup-stats extras (consumed by the import-history dedup modal):
+            withinFileDupes,
+            crossListDupes,
+            crossListBreakdown,
+            invalid: failedContacts.length,
+            invalidByReason,
+        });
     } catch (err: any) {
         console.error('Import error:', err);
         res.status(500).json({ error: err.message });
@@ -1131,8 +1190,57 @@ app.get('/api/import-lists/stats', async (_req, res) => {
 });
 
 app.post('/api/import-lists', async (req, res) => {
-    const { name, contact_count } = req.body;
+    const { name, contact_count, dedup_stats } = req.body;
     if (!name) return res.status(400).json({ error: 'Name is required' });
+
+    // Persist dedup stats for a given import_list. Accumulates on top of
+    // any prior row so a re-upload that folds into the same import_lists
+    // record (idempotent-on-name path below) sums the new dedup counts
+    // into the existing breakdown instead of overwriting it. The breakdown
+    // JSON is merged key-by-key.
+    const upsertDedupStats = async (importListId: string) => {
+        if (!dedup_stats || typeof dedup_stats !== 'object') return;
+        try {
+            const { data: prior } = await supabase
+                .from('import_dedup_stats')
+                .select('*')
+                .eq('import_list_id', importListId)
+                .maybeSingle();
+
+            const mergeNum = (a: any, b: any) => (Number(a) || 0) + (Number(b) || 0);
+            const mergeMap = (a: Record<string, any> | null | undefined, b: Record<string, any> | null | undefined): Record<string, number> => {
+                const out: Record<string, number> = {};
+                for (const [k, v] of Object.entries(a || {})) out[k] = (out[k] || 0) + (Number(v) || 0);
+                for (const [k, v] of Object.entries(b || {})) out[k] = (out[k] || 0) + (Number(v) || 0);
+                return out;
+            };
+
+            const row = {
+                import_list_id: importListId,
+                total_rows: mergeNum(prior?.total_rows, dedup_stats.total_rows),
+                inserted: mergeNum(prior?.inserted, dedup_stats.inserted),
+                updated: mergeNum(prior?.updated, dedup_stats.updated),
+                within_file_dupes: mergeNum(prior?.within_file_dupes, dedup_stats.within_file_dupes),
+                cross_list_dupes: mergeNum(prior?.cross_list_dupes, dedup_stats.cross_list_dupes),
+                invalid: mergeNum(prior?.invalid, dedup_stats.invalid),
+                source_breakdown: mergeMap(prior?.source_breakdown, dedup_stats.source_breakdown),
+                invalid_breakdown: mergeMap(prior?.invalid_breakdown, dedup_stats.invalid_breakdown),
+                updated_at: new Date().toISOString(),
+            };
+
+            const { error: upsertErr } = await supabase
+                .from('import_dedup_stats')
+                .upsert(row, { onConflict: 'import_list_id' });
+            if (upsertErr) {
+                console.warn(`[import-lists] dedup-stats upsert failed: ${upsertErr.message}`);
+            }
+        } catch (e: any) {
+            // Soft-fail: never block the import-list registration on a
+            // dedup-stats write. Lists must still appear in history even
+            // if the new table is missing (migration not yet applied).
+            console.warn(`[import-lists] dedup-stats upsert threw: ${e?.message || 'unknown'}`);
+        }
+    };
 
     try {
         // Idempotent on name: if a list with this exact name already
@@ -1166,6 +1274,7 @@ app.post('/api/import-lists', async (req, res) => {
                 .select()
                 .single();
             if (updErr) return res.status(500).json({ error: updErr.message });
+            await upsertDedupStats(existing.id);
             return res.json({ ...updated, merged: true, prior_count: existing.contact_count || 0 });
         }
 
@@ -1176,6 +1285,29 @@ app.post('/api/import-lists', async (req, res) => {
             .single();
 
         if (error) return res.status(500).json({ error: error.message });
+        if (data?.id) await upsertDedupStats(data.id);
+        res.json(data);
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Dedup breakdown for a specific imported list. Returns the frozen-in-time
+// snapshot captured at upload, including how many duplicates came from
+// each existing source list. 404 if the list exists but has no stats row
+// yet (e.g. imported before this feature shipped).
+app.get('/api/import-lists/:id/dedup', async (req, res) => {
+    const id = String(req.params?.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'id is required' });
+
+    try {
+        const { data, error } = await supabase
+            .from('import_dedup_stats')
+            .select('*')
+            .eq('import_list_id', id)
+            .maybeSingle();
+        if (error) return res.status(500).json({ error: error.message });
+        if (!data) return res.status(404).json({ error: 'No dedup stats recorded for this list.' });
         res.json(data);
     } catch (err: any) {
         res.status(500).json({ error: err.message });
