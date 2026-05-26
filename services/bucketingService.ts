@@ -785,8 +785,8 @@ Layer 2 — SUB-IDENTITY (subtype within identity)
               "Growth Equity Firm", "Family Office", "Investment Bank"
      Software & SaaS → "MarTech SaaS", "FinTech SaaS", "PropTech SaaS",
               "Vertical SaaS", "HR SaaS", "Data & Analytics SaaS"
-     IT Services → "Managed IT Services", "Cybersecurity Services",
-              "Cloud Migration Services"
+     IT Services → "Cybersecurity Services", "Custom Software Development",
+              "Data Migration Services" (MSPs are the default — leave sub null)
 
 Layer 3 — SECTOR (optional vertical served, ~10-20 total)
    Who do they MAINLY serve, if explicitly stated?
@@ -1499,6 +1499,37 @@ export async function recalculateTaxonomyWithLibrary(
     const libIdentities = new Set(snapshot.identities.map(i => i.name));
     const libChars = new Set(snapshot.sub_identities.map(c => c.name));
     const libSectors = new Set(snapshot.sectors.map(s => s.name));
+    // Parent-aware sub lookup: a sub is only "established" relative to its
+    // declared parent. "Non-Profit Organization" exists in the library, but
+    // pairing it with identity = Consulting & Advisory is still wrong.
+    const libSubParent = new Map<string, string>();
+    for (const c of snapshot.sub_identities) libSubParent.set(c.name, c.parent_identity || '');
+    const subEstablished = (subName: string | null, identityName: string | null): boolean => {
+        if (!subName) return false;
+        const parent = libSubParent.get(subName);
+        if (!parent) return false;
+        return !identityName || parent === identityName;
+    };
+
+    // Drop sub_identities whose library parent doesn't match the chosen
+    // identity. The Review screen only surfaces new-proposal rows, so these
+    // cross-parent pairs would otherwise survive Finalize. Better to lose
+    // the sub than to write a structurally inconsistent pair.
+    let crossParentDrops = 0;
+    for (const t of taggings) {
+        if (t.sub_identity && t.identity && !t.is_new_identity) {
+            const subParent = libSubParent.get(t.sub_identity);
+            if (subParent && subParent !== t.identity) {
+                t.sub_identity = null;
+                t.is_new_sub_identity = false;
+                t.sub_identity_confidence = 1;
+                crossParentDrops++;
+            }
+        }
+    }
+    if (crossParentDrops > 0) {
+        ctx.log(`[Bucketing ${runId}] recalc: dropped ${crossParentDrops} sub_identity values whose library parent differed from the chosen identity`);
+    }
 
     // Snapshot the original is_new flags so we can count how many flipped.
     const originalFlags = taggings.map(t => ({
@@ -1506,9 +1537,12 @@ export async function recalculateTaxonomyWithLibrary(
     }));
 
     // Step 1 — refresh is_new_* against the now-current library.
+    // sub_identity is "established" only when its library parent matches the
+    // chosen identity; otherwise the LLM mis-paired and we keep is_new=true
+    // so the Review screen surfaces it.
     for (const t of taggings) {
         t.is_new_identity = !!t.is_new_identity && !libIdentities.has(t.identity || '');
-        t.is_new_sub_identity = !!t.is_new_sub_identity && !libChars.has(t.sub_identity || '');
+        t.is_new_sub_identity = !!t.is_new_sub_identity && !subEstablished(t.sub_identity, t.identity);
         t.is_new_sector = !!t.is_new_sector && !libSectors.has(t.sector || '');
     }
 
@@ -1540,12 +1574,12 @@ export async function recalculateTaxonomyWithLibrary(
     consolidateTaggings(taggings, snapshot);
 
     // Step 6 — final flag refresh after consolidation may have rewritten
-    // names INTO library canonicals.
+    // names INTO library canonicals. Same parent-aware sub check as Step 1.
     let flagsRefreshed = 0;
     for (let i = 0; i < taggings.length; i++) {
         const t = taggings[i];
         const newNi = !!t.is_new_identity && !libIdentities.has(t.identity || '');
-        const newNc = !!t.is_new_sub_identity && !libChars.has(t.sub_identity || '');
+        const newNc = !!t.is_new_sub_identity && !subEstablished(t.sub_identity, t.identity);
         const newNs = !!t.is_new_sector && !libSectors.has(t.sector || '');
         const orig = originalFlags[i];
         if (newNi !== orig.ni || newNc !== orig.nc || newNs !== orig.ns) flagsRefreshed++;
@@ -2438,6 +2472,11 @@ async function tagIndustries(
     const originalIdNames = new Set(snapshot.identities.map(i => i.name));
     const originalSubNames = new Set(snapshot.sub_identities.map(i => i.name));
     const originalSecNames = new Set(snapshot.sectors.map(i => i.name));
+    // Parent-aware sub lookup. A sub is "originally established" only when
+    // it is paired with its library parent; cross-parent pairs are treated
+    // as new proposals so the Review screen surfaces them.
+    const originalSubParent = new Map<string, string>();
+    for (const s of snapshot.sub_identities) originalSubParent.set(s.name, s.parent_identity || '');
     const PROPOSALS_PER_LAYER_CAP = 80;
 
     const topByUsage = <T extends { _usage: number }>(m: Map<string, T>): T[] =>
@@ -2527,7 +2566,14 @@ async function tagIndustries(
             // is_new=true so the AI-Proposed panel surfaces them.
             const parsed = snapTaggingsToLibrary(parsedRaw, effective).map(t => {
                 if (t.identity && !originalIdNames.has(t.identity)) t.is_new_identity = true;
-                if (t.sub_identity && !originalSubNames.has(t.sub_identity)) t.is_new_sub_identity = true;
+                // sub is "originally library" only when its library parent
+                // matches the chosen identity. Cross-parent pairs surface as
+                // proposals so the user can reroute on the Review screen.
+                if (t.sub_identity) {
+                    const libParent = originalSubParent.get(t.sub_identity);
+                    const libMatch = !!libParent && (!t.identity || libParent === t.identity);
+                    if (!libMatch) t.is_new_sub_identity = true;
+                }
                 if (t.sector && !originalSecNames.has(t.sector)) t.is_new_sector = true;
                 return t;
             });
@@ -2802,14 +2848,28 @@ Output: identity=Financial Services, sub_identity=Private Equity, sector=null
 Input:  Investment bank focused on healthcare M&A
 Output: identity=Financial Services, sub_identity=Investment Banking, sector=Healthcare
 
+Input:  Community bank serving small businesses
+Output: identity=Financial Services, sub_identity=Banking & Lending, sector=null
+Note:   banks / credit unions / lenders / mortgage brokers collapse into the
+        single combined sub "Banking & Lending".
+
 Input:  Software platform for K-12 schools
 Output: identity=Software & SaaS, sub_identity=Vertical SaaS, sector=Education
+
+Input:  Custom software development shop building bespoke apps
+Output: identity=IT Services, sub_identity=Custom Software Development, sector=null
+Note:   service-delivered ≠ a SaaS product. Custom Software Development's parent
+        is IT Services, NOT Software & SaaS.
 
 Input:  Healthcare staffing agency placing travel nurses
 Output: identity=Staffing & Recruiting, sub_identity=Healthcare Staffing, sector=Healthcare
 
 Input:  Managed IT services provider for small and mid-sized businesses
-Output: identity=IT Services, sub_identity=Managed IT Services, sector=null
+Output: identity=IT Services, sub_identity=null, sector=null
+Note:   MSPs are the default flavor of IT Services — leave sub_identity null.
+        Only set a sub when the input clearly says Cybersecurity Services,
+        Custom Software Development, Data Migration Services, or IT Asset
+        Disposition.
 
 Input:  PE-backed software company building tools for restaurants
 Output: identity=Software & SaaS, sub_identity=Vertical SaaS, sector=Hospitality & Travel
@@ -2823,14 +2883,52 @@ Note:   "fintech startup" → Software & SaaS (X-tech rule 1b). "Venture-backed"
 Input:  Healthtech company building remote patient monitoring tools
 Output: identity=Software & SaaS, sub_identity=Vertical SaaS, sector=Healthcare
 Note:   "healthtech company" → Software & SaaS (X-tech rule 1b), NOT Healthcare
-        Operator. Healthcare is the served vertical → sector.
+        Provider, NOT Life Sciences. Healthcare is the served vertical → sector.
+
+Input:  Multi-location dental group
+Output: identity=Healthcare Provider, sub_identity=null, sector=null
+Note:   treats patients → Healthcare Provider. Dental practice has no dedicated
+        sub — leave sub_identity null.
+
+Input:  Biotech developing CAR-T cell therapies
+Output: identity=Life Sciences, sub_identity=Biotechnology, sector=null
+Note:   develops therapies → Life Sciences, NOT Healthcare Provider.
+
+Input:  Medical device manufacturer specializing in orthopedic implants
+Output: identity=Life Sciences, sub_identity=Medical Device Manufacturer, sector=null
+Note:   medical-device manufacturing → Life Sciences (NOT Manufacturing &
+        Industrial, NOT Healthcare Provider).
+
+Input:  Industrial distributor selling fasteners to OEMs
+Output: identity=Distribution & Wholesale, sub_identity=null, sector=null
+Note:   B2B middleman → Distribution & Wholesale, NOT Retail, NOT Logistics.
 
 Input:  Independent insurance agency for commercial lines
 Output: identity=Insurance Services, sub_identity=Insurance Brokerage, sector=null
 Note:   Insurance Services is its own identity, NOT Financial Services
 
 Input:  Family-owned restaurant in Austin
-Output: identity=Hospitality & Travel, sub_identity=Hospitality Operator, sector=null, is_disqualified=true
+Output: identity=Hospitality & Travel, sub_identity=Hotel & Hospitality Operator, sector=null, is_disqualified=true
+Note:   restaurants now use the merged "Hotel & Hospitality Operator" sub.
+
+Input:  Boutique law firm specializing in employment litigation
+Output: identity=Legal Services, sub_identity=null, sector=null
+Note:   Legal Services has NO sub-identities — always set sub_identity = null
+        regardless of practice area.
+
+Input:  Boutique strategy consulting firm
+Output: identity=Consulting & Advisory, sub_identity=Strategy & Management Consulting, sector=null
+Note:   strategy / management / business / specialty consulting all collapse
+        into "Strategy & Management Consulting".
+
+Input:  Regional CPA firm offering audit and tax services
+Output: identity=Accounting & Tax, sub_identity=Tax & Audit Advisory, sector=null
+Note:   CPAs → Accounting & Tax, NOT Consulting & Advisory.
+
+Input:  Charter / private jet operator managing a fleet of light jets
+Output: identity=Hospitality & Travel, sub_identity=Business Aviation Operator, sector=null
+Note:   business aviation operators (own the jets) live in Hospitality & Travel,
+        NOT Logistics & Transportation.
 
 Input:  Professional services firm  (truly generic, no signal)
 Output: identity=null, sub_identity=null, sector=null  (all confidences 1-3)
@@ -2838,7 +2936,53 @@ Note:   don't over-claim when the input is generic — return nulls.
 
 Input:  Consulting firm  (vague identity, no sub-identity signal)
 Output: identity=Consulting & Advisory, sub_identity=null, sector=null
-Note:   pick the identity when it's clear; leave sub-identity null when not.`;
+Note:   pick the identity when it's clear; leave sub-identity null when not.
+
+Input:  Venture Capital Advisory for Secondary Market Transactions and Pre-IPO Financing
+Output: identity=Financial Services, sub_identity=Venture Capital, sector=null
+Note:   "VC advisory / secondary market / pre-IPO" → Financial Services (rule 4b),
+        NOT Consulting & Advisory. The word "Advisory" attached to investment
+        verbs does NOT make this a consulting firm.
+
+Input:  Digital consulting and technology strategy services for mission-driven organizations
+Output: identity=Consulting & Advisory, sub_identity=Strategy & Management Consulting, sector=Non-Profit & Social Impact
+Note:   "X for Y" — mission-driven/non-profit is the SERVED vertical, so it
+        goes in sector. Never put "Non-Profit Organization" in sub_identity
+        when identity = Consulting & Advisory — that sub's parent is
+        Non-Profit & Association.
+
+Input:  Home health agency providing in-home senior care
+Output: identity=Healthcare Provider, sub_identity=Healthcare Support Services, sector=null
+Note:   Healthcare Support Services' parent is Healthcare Provider. Don't pair
+        it with Consulting & Advisory.
+
+Input:  Boutique film production company shooting commercials and brand content
+Output: identity=Media & Entertainment, sub_identity=Production Company, sector=null
+Note:   production companies belong in Media & Entertainment (rule 22), NOT
+        Agency, even when their clients are brands.
+
+Input:  Educational consulting firm advising K-12 school districts on curriculum
+Output: identity=Consulting & Advisory, sub_identity=Educational Consulting, sector=Education
+Note:   consultants TO schools are Consulting & Advisory, not Education
+        Operator. Education is the served vertical → sector.
+
+Input:  Workforce development nonprofit running job training programs
+Output: identity=Education Operator, sub_identity=Workforce Development Services, sector=null
+Note:   Workforce Development Services' parent is Education Operator (the
+        organization DELIVERS training). If the input only said "non-profit"
+        with no training detail, identity would be Non-Profit & Association
+        instead.
+
+Input:  Managed IT Services with Business Phone and Video Surveillance Solutions
+Output: identity=IT Services, sub_identity=null, sector=null
+Note:   MSP-flavored IT services → identity=IT Services, sub_identity=null
+        (no dedicated MSP sub — it's the default for the identity). PAIRED-
+        OR-EMPTY rule: never ship sub_identity with identity=null.
+
+Input:  Healthcare company  (truly vague — care provider? life sciences? software?)
+Output: identity=null, sub_identity=null, sector=Healthcare  (id confidence 1-3)
+Note:   when input is generic and could be Healthcare Provider OR Life
+        Sciences OR Software & SaaS, return null identity. Don't guess.`;
 }
 
 function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
@@ -3077,11 +3221,13 @@ function snapTaggingsToLibrary(taggings: IndustryTagging[], snapshot: TaxonomySn
     const identityNames = snapshot.identities.map(i => i.name);
     const sectorNames = snapshot.sectors.map(sec => sec.name);
     const subByParent = new Map<string, string[]>();
+    const subParent = new Map<string, string>();
     for (const sub of snapshot.sub_identities) {
         const parent = sub.parent_identity || '';
         const list = subByParent.get(parent) || [];
         list.push(sub.name);
         subByParent.set(parent, list);
+        subParent.set(sub.name, parent);
     }
     return taggings.map(t => {
         const idSnap = applySnap(t.identity, identityNames);
@@ -3090,8 +3236,38 @@ function snapTaggingsToLibrary(taggings: IndustryTagging[], snapshot: TaxonomySn
         const subAllowed = idSnap.value && !idSnap.is_new
             ? (subByParent.get(idSnap.value) || [])
             : snapshot.sub_identities.map(s => s.name);
-        const subSnap = applySnap(t.sub_identity, subAllowed);
+        let subSnap = applySnap(t.sub_identity, subAllowed);
+        // Parent-consistency guard. If the snapped sub is an existing library
+        // entry whose actual parent differs from the chosen identity, the LLM
+        // mis-paired. Drop the sub (null) rather than persist a wrong pair —
+        // Phase 1b will route to identity-level. Without this, ~10% of tagged
+        // rows in observed runs ended up with cross-parent sub/identity pairs.
+        if (
+            !idSnap.is_new && idSnap.value &&
+            !subSnap.is_new && subSnap.value &&
+            subParent.has(subSnap.value) &&
+            subParent.get(subSnap.value) !== idSnap.value
+        ) {
+            subSnap = { value: null, is_new: false };
+        }
+        // Identity-required: if sub_identity is set but identity is null,
+        // promote the sub's library parent to identity. Stops Phase 1b from
+        // dropping the row to "General" just because the LLM hesitated on
+        // identity. Only safe when the sub is a library hit.
+        if (
+            !subSnap.is_new && subSnap.value &&
+            (!idSnap.value || idSnap.is_new) &&
+            subParent.has(subSnap.value)
+        ) {
+            idSnap.value = subParent.get(subSnap.value) || idSnap.value;
+            idSnap.is_new = false;
+        }
         const secSnap = applySnap(t.sector, sectorNames);
+        // Sub-identity must not duplicate the sector value verbatim — that
+        // pattern always means the LLM put the vertical in the wrong field.
+        if (subSnap.value && secSnap.value && subSnap.value === secSnap.value) {
+            subSnap = { value: null, is_new: false };
+        }
         return {
             ...t,
             identity: idSnap.value,
@@ -3329,7 +3505,7 @@ Accounting & Tax: Accounting Services · Tax Advisory · Outsourced Accounting
 Legal Services: Corporate Law · Family Law · Tax Law · Intellectual Property Law · Litigation · Estate Planning Law
 Staffing & Recruiting: Executive Search · Technology Staffing · Healthcare Staffing
 Energy & Utilities: Renewable Energy Services · Energy Project Development · Utility Services
-IT Services: Managed IT Services · Cybersecurity Services · IT Consulting
+IT Services: Cybersecurity Services · Custom Software Development · Data Migration Services
 
 REQUIRED MERGE PATTERNS — APPLY EVERY ONE OF THESE (these are observed in real runs):
 
