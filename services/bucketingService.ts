@@ -92,6 +92,21 @@ const EMBEDDING_PRICE_PER_1M = 0.02;
 const RESERVED_GENERAL = 'General';
 const RESERVED_DISQUALIFIED = 'Disqualified';
 
+// Error sentinel strings the scraper sometimes stores as the literal
+// classification when its enrichment "succeeded" with no usable signal
+// (e.g. "Site Error", "404", "no content"). When enrichment_status='completed'
+// the partition would otherwise pass these to the LLM — wasting tokens on
+// rows that carry zero classification signal. ERROR_SENTINEL_REGEX matches
+// the whole string (after stripping wrapping quotes/whitespace), so a real
+// classification that merely mentions "error" (e.g. "Insurance Brokerage
+// Specializing in Errors & Omissions") is NOT filtered. Case-insensitive.
+//
+// "Unknown" is intentionally left OFF — sometimes it's a legit upstream
+// "we don't know" placeholder rather than an error, and the LLM returning
+// nulls is acceptable. Add it here if a future run shows it's high-volume
+// pure-noise.
+const ERROR_SENTINEL_REGEX = /^(?:(?:site|scrape|html|fetch|page|enrichment|crawler?|http)\s*error|error|failed|failure|timeout|blocked|403|404|500|502|503|504|no\s*data|no\s*content|empty|n\/?a|null|none|undefined)$/i;
+
 // Canonical reason codes for routing decisions. Persist these strings on
 // bucket_assignments / bucket_contact_map.general_reason so a campaign
 // operator can filter "show me everyone who landed in General because the
@@ -998,9 +1013,36 @@ export async function runTaxonomyProposal(
     }
     const dedupedVocab = Array.from(byIndustry.values());
     const phase1aCoveredContacts = dedupedVocab.reduce((sum, row) => sum + Number(row.n || 0), 0);
-    const completedVocab = dedupedVocab.filter(r => (r.enrichment_status || 'completed') === 'completed');
-    const dqVocab = dedupedVocab.filter(r => (r.enrichment_status || 'completed') !== 'completed');
-    ctx.log(`[Bucketing ${runId}] partition: ${completedVocab.length} taggable, ${dqVocab.length} → General (data quality: failed/missing/scrape_error)${vocabRows.length !== dedupedVocab.length ? ` — ${vocabRows.length - dedupedVocab.length} duplicate (industry, status) rows collapsed` : ''}`);
+
+    // Error sentinel strings the scraper sometimes stores as the literal
+    // classification (e.g. "Site Error", "404", "no content"). When
+    // enrichment_status='completed' these would otherwise be sent to the LLM
+    // even though they carry zero signal. Auto-route them to General with the
+    // same passthrough path the failed/pending rows use.
+    const sentinelMatch = (industry: string | null | undefined): string | null => {
+        if (!industry) return 'empty industry';
+        const norm = industry.replace(/["'`]+/g, '').trim();
+        if (!norm) return 'empty industry';
+        return ERROR_SENTINEL_REGEX.test(norm) ? `error sentinel: "${industry}"` : null;
+    };
+
+    const completedVocab: VocabRow[] = [];
+    const dqVocab: VocabRow[] = [];
+    const sentinelReasonByIndustry = new Map<string, string>();
+    let sentinelContacts = 0;
+    for (const v of dedupedVocab) {
+        const status = v.enrichment_status || 'completed';
+        if (status !== 'completed') { dqVocab.push(v); continue; }
+        const sentinel = sentinelMatch(v.industry);
+        if (sentinel) {
+            dqVocab.push(v);
+            sentinelReasonByIndustry.set(v.industry, sentinel);
+            sentinelContacts += Number(v.n || 0);
+        } else {
+            completedVocab.push(v);
+        }
+    }
+    ctx.log(`[Bucketing ${runId}] partition: ${completedVocab.length} taggable, ${dqVocab.length} → General (data quality: failed/missing/scrape_error${sentinelReasonByIndustry.size > 0 ? ` + ${sentinelReasonByIndustry.size} error sentinels covering ${sentinelContacts.toLocaleString()} contacts` : ''})${vocabRows.length !== dedupedVocab.length ? ` — ${vocabRows.length - dedupedVocab.length} duplicate (industry, status) rows collapsed` : ''}`);
     if (phase1aCoveredContacts !== totalContacts) {
         ctx.log(
             `[Bucketing ${runId}] Phase 1a coverage warning: vocabulary accounts for ${phase1aCoveredContacts.toLocaleString()}/${totalContacts.toLocaleString()} selected contacts`,
@@ -1021,7 +1063,10 @@ export async function runTaxonomyProposal(
     for (const v of dqVocab) {
         // Resume: skip DQ-passthrough rows already inserted.
         if (existingByIndustry.has(v.industry)) continue;
-        const reason = v.enrichment_status || 'unknown';
+        const sentinel = sentinelReasonByIndustry.get(v.industry);
+        const reason = sentinel
+            ? sentinel
+            : `enrichment_status=${v.enrichment_status || 'unknown'}`;
         preMapRows.push({
             bucketing_run_id: runId,
             industry_string: v.industry,
@@ -1039,7 +1084,7 @@ export async function runTaxonomyProposal(
             is_generic: true,
             needs_qa: false,
             canonical_classification: 'General',
-            llm_reason: `enrichment_status=${reason}`,
+            llm_reason: reason,
         });
     }
 
