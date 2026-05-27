@@ -3194,8 +3194,21 @@ function parsePhase1bAssignments(raw: string): any[] {
 function nz(v: any): string | null {
     if (v === null || v === undefined) return null;
     const s = String(v).trim();
-    return s.length > 0 ? s : null;
+    if (s.length === 0) return null;
+    // Placeholder strings the LLM sometimes returns as a string instead of
+    // emitting JSON null. Without this guard "null" / "None" / "N/A" leak
+    // through as real values and end up on the proposal Review screen as
+    // "AI-proposed sub-identity = null" — a confusing ghost row that owns
+    // a few hundred contacts.
+    if (PLACEHOLDER_TAG_VALUES.has(s.toLowerCase())) return null;
+    return s;
 }
+
+const PLACEHOLDER_TAG_VALUES = new Set([
+    'null', 'none', 'undefined', 'n/a', 'n.a.', 'na', 'nan',
+    'tbd', 'tba', 'unknown', 'unspecified', 'not specified',
+    'not applicable', 'not available', '-', '--', 'na/a'
+]);
 
 // Reject obvious text-bleed values where the LLM dumped reasoning prose
 // into a tag slot (e.g. primary_identity="The homepage explicitly states
@@ -3319,7 +3332,9 @@ function snapMatchChain(
 
 function snapTaggingsToLibrary(taggings: IndustryTagging[], snapshot: TaxonomySnapshot): IndustryTagging[] {
     const identityNames = snapshot.identities.map(i => i.name);
+    const identityNameSet = new Set(identityNames);
     const sectorNames = snapshot.sectors.map(sec => sec.name);
+    const sectorNameSet = new Set(sectorNames);
     const subByParent = new Map<string, string[]>();
     const subParent = new Map<string, string>();
     for (const sub of snapshot.sub_identities) {
@@ -3371,6 +3386,15 @@ function snapTaggingsToLibrary(taggings: IndustryTagging[], snapshot: TaxonomySn
         // Sub-identity must not duplicate the sector value verbatim — that
         // pattern always means the LLM put the vertical in the wrong field.
         if (subSnap.value && secSnap.value && subSnap.value === secSnap.value) {
+            subSnap = { value: null, is_new: false };
+        }
+        // Wrong-layer guard: if the proposed sub_identity name matches an
+        // existing IDENTITY name ("Real Estate", "Distribution & Wholesale",
+        // "Software & SaaS"), the LLM is using a Layer-1 name as a Layer-2
+        // value — drop it. Same for sub == sector name. Without this the
+        // Review screen surfaces ghost proposals like "AI-proposed sub
+        // = Real Estate (under Education & Training)" that no one wants.
+        if (subSnap.value && (identityNameSet.has(subSnap.value) || sectorNameSet.has(subSnap.value))) {
             subSnap = { value: null, is_new: false };
         }
         return {

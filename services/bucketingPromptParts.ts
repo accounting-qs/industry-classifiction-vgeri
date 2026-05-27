@@ -287,6 +287,27 @@ CORE PRINCIPLES
     ✗ sub_identity="Healthcare", sector="Healthcare"  ← never duplicate
     ✗ sub_identity="Non-Profit & Social Impact", sector="Non-Profit & Social Impact"  ← never duplicate
 
+• Layer names DO NOT cross layers. An identity name MUST NEVER appear as
+  sub_identity. A sector name MUST NEVER appear as sub_identity. Each layer
+  has its own VALID_* menu — pulling a name from the wrong menu is a parsing
+  bug, not a proposal. Observed mistakes the model has made and must NOT
+  repeat:
+    ✗ sub_identity="Real Estate" (under Education & Training)
+       Real Estate is a Layer-1 IDENTITY, not a sub. If the company is a
+       real-estate investment education shop, set identity=Education &
+       Training, sub_identity=null, sector=Real Estate.
+    ✗ sub_identity="Distribution & Wholesale" (under Media & Entertainment)
+       Distribution & Wholesale is a Layer-1 IDENTITY. If the company
+       distributes music to labels, set identity=Distribution & Wholesale,
+       sub_identity=null, sector=Media & Entertainment.
+    ✗ sub_identity="Software & SaaS" or sub_identity="IT Services"
+       Both are IDENTITIES. Never use as sub.
+
+• Never use the literal strings "null", "none", "n/a", "unknown",
+  "unspecified", "tbd" as a tag value. To omit a tag, emit JSON null (the
+  bare value null without quotes), not the string. If you cannot pick a
+  value with confidence ≥ 5, return null.
+
 • Operator vs Enabler. An operator IN a vertical (hospital, restaurant, school,
   bank) belongs to that vertical's identity. A service provider TO that vertical
   keeps its own service identity.
