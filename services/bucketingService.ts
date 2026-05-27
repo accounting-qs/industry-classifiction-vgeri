@@ -246,7 +246,10 @@ interface TaxonomySnapshot {
 export interface ProposalSuggestion {
     route_to?: string;            // existing library entry name (verbatim)
     route_to_parent?: string;     // sub_identities only — parent identity of route_to
-    accept_as_new?: boolean;      // exactly one of route_to / accept_as_new must be set
+    accept_as_new?: boolean;      // exactly one of route_to / accept_as_new / wrong_layer is set
+    wrong_layer?: boolean;        // proposal's NAME is from a different layer (identity-as-sub,
+                                  // sector-as-sub, sub-as-sector). Surfaced to the human; route/
+                                  // accept-as-new are both wrong here.
     confidence: number;           // 1-10
     reason: string;               // <= 30 words, single sentence
 }
@@ -4068,15 +4071,45 @@ const SUGGEST_ROUTINGS_MAX_TOKENS = 8000;
 
 type SuggestLayer = 'identities' | 'sub_identities' | 'sectors';
 
+interface LoadedProposalBase {
+    name: string;
+    samples: string[];
+    count: number;
+}
+interface LoadedIdentityProposal extends LoadedProposalBase {
+    // Top-2 sectors / sub-identities most commonly co-occurring with this
+    // proposed identity in this run. Helps the router disambiguate when
+    // the proposal name alone is ambiguous.
+    topSectors: Array<{ name: string; count: number }>;
+    topSubs: Array<{ name: string; count: number }>;
+}
+interface LoadedSubProposal extends LoadedProposalBase {
+    parent: string;
+    topSectors: Array<{ name: string; count: number }>;
+}
+interface LoadedSectorProposal extends LoadedProposalBase {
+    topIdentities: Array<{ name: string; count: number }>;
+    topSubs: Array<{ name: string; parent: string; count: number }>;
+}
+
 interface LoadedProposals {
-    identities: Array<{ name: string; samples: string[]; count: number }>;
-    sub_identities: Array<{ name: string; parent: string; samples: string[]; count: number }>;
-    sectors: Array<{ name: string; samples: string[]; count: number }>;
+    identities: LoadedIdentityProposal[];
+    sub_identities: LoadedSubProposal[];
+    sectors: LoadedSectorProposal[];
+}
+
+function topN<K>(counter: Map<K, number>, n: number): Array<{ key: K; count: number }> {
+    return Array.from(counter.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, n)
+        .map(([key, count]) => ({ key, count }));
 }
 
 // Lifted from server.ts GET /proposed-tags so the suggestion service
 // can pull the same shape without duplicating the aggregation. The
-// route handler now delegates here.
+// route handler now delegates here. Also computes cross-layer
+// co-occurrence (top-2 sectors / identities / subs) per proposal so
+// the router can use it as extra signal — see buildSuggestPrompt.
 export async function loadRunProposals(
     supabase: SupabaseClient,
     runId: string
@@ -4088,33 +4121,78 @@ export async function loadRunProposals(
         .or('is_new_identity.eq.true,is_new_sub_identity.eq.true,is_new_sector.eq.true');
     if (error) throw new Error(error.message);
 
-    const ids = new Map<string, { name: string; samples: string[]; count: number }>();
-    const chars = new Map<string, { name: string; parent: string; samples: string[]; count: number }>();
-    const secs = new Map<string, { name: string; samples: string[]; count: number }>();
+    type IdEntry = LoadedIdentityProposal & { _sectors: Map<string, number>; _subs: Map<string, number> };
+    type SubEntry = LoadedSubProposal & { _sectors: Map<string, number> };
+    type SecEntry = LoadedSectorProposal & { _identities: Map<string, number>; _subs: Map<string, number> };
+
+    const ids = new Map<string, IdEntry>();
+    const chars = new Map<string, SubEntry>();
+    const secs = new Map<string, SecEntry>();
     for (const r of (data || []) as any[]) {
         if (r.is_new_identity && r.primary_identity) {
-            const e = ids.get(r.primary_identity) || { name: r.primary_identity, samples: [], count: 0 };
+            let e = ids.get(r.primary_identity);
+            if (!e) {
+                e = { name: r.primary_identity, samples: [], count: 0,
+                      topSectors: [], topSubs: [],
+                      _sectors: new Map(), _subs: new Map() };
+                ids.set(r.primary_identity, e);
+            }
             e.count++;
             if (e.samples.length < 5) e.samples.push(r.industry_string);
-            ids.set(r.primary_identity, e);
+            if (r.sector) e._sectors.set(r.sector, (e._sectors.get(r.sector) || 0) + 1);
+            if (r.sub_identity) e._subs.set(r.sub_identity, (e._subs.get(r.sub_identity) || 0) + 1);
         }
         if (r.is_new_sub_identity && r.sub_identity) {
-            const e = chars.get(r.sub_identity) || { name: r.sub_identity, parent: r.primary_identity || '', samples: [], count: 0 };
+            let e = chars.get(r.sub_identity);
+            if (!e) {
+                e = { name: r.sub_identity, parent: r.primary_identity || '',
+                      samples: [], count: 0, topSectors: [], _sectors: new Map() };
+                chars.set(r.sub_identity, e);
+            }
             e.count++;
             if (e.samples.length < 5) e.samples.push(r.industry_string);
-            chars.set(r.sub_identity, e);
+            if (r.sector) e._sectors.set(r.sector, (e._sectors.get(r.sector) || 0) + 1);
         }
         if (r.is_new_sector && r.sector) {
-            const e = secs.get(r.sector) || { name: r.sector, samples: [], count: 0 };
+            let e = secs.get(r.sector);
+            if (!e) {
+                e = { name: r.sector, samples: [], count: 0,
+                      topIdentities: [], topSubs: [],
+                      _identities: new Map(), _subs: new Map() };
+                secs.set(r.sector, e);
+            }
             e.count++;
             if (e.samples.length < 5) e.samples.push(r.industry_string);
-            secs.set(r.sector, e);
+            if (r.primary_identity) e._identities.set(r.primary_identity, (e._identities.get(r.primary_identity) || 0) + 1);
+            if (r.sub_identity) {
+                const key = `${r.sub_identity}|${r.primary_identity || ''}`;
+                e._subs.set(key, (e._subs.get(key) || 0) + 1);
+            }
         }
     }
+
+    const idsOut: LoadedIdentityProposal[] = Array.from(ids.values()).map(e => ({
+        name: e.name, samples: e.samples, count: e.count,
+        topSectors: topN(e._sectors, 2).map(t => ({ name: t.key, count: t.count })),
+        topSubs:    topN(e._subs,    2).map(t => ({ name: t.key, count: t.count })),
+    }));
+    const subsOut: LoadedSubProposal[] = Array.from(chars.values()).map(e => ({
+        name: e.name, parent: e.parent, samples: e.samples, count: e.count,
+        topSectors: topN(e._sectors, 2).map(t => ({ name: t.key, count: t.count })),
+    }));
+    const secsOut: LoadedSectorProposal[] = Array.from(secs.values()).map(e => ({
+        name: e.name, samples: e.samples, count: e.count,
+        topIdentities: topN(e._identities, 2).map(t => ({ name: t.key, count: t.count })),
+        topSubs:       topN(e._subs, 2).map(t => {
+            const [name, parent] = t.key.split('|');
+            return { name, parent, count: t.count };
+        }),
+    }));
+
     return {
-        identities: Array.from(ids.values()).sort((a, b) => b.count - a.count),
-        sub_identities: Array.from(chars.values()).sort((a, b) => b.count - a.count),
-        sectors: Array.from(secs.values()).sort((a, b) => b.count - a.count),
+        identities: idsOut.sort((a, b) => b.count - a.count),
+        sub_identities: subsOut.sort((a, b) => b.count - a.count),
+        sectors: secsOut.sort((a, b) => b.count - a.count),
     };
 }
 
@@ -4131,10 +4209,44 @@ async function loadProposedContactCounts(
     return map;
 }
 
+// Up to 3 example industry strings per library entry (identities by
+// name; sub-identities keyed by `${name}|${parent}`; sectors by name).
+// Sampled from past confirmed mappings in bucket_industry_map (where
+// is_new_* = false). Used by buildSuggestPrompt so the router sees
+// concrete usage of each library entry, not just the (often thin)
+// description text. Keeps overhead bounded by sampling the most
+// recent 30k confirmed rows rather than the full table.
+interface LibraryExamples {
+    identities:     Record<string, string[]>;   // key: name
+    sub_identities: Record<string, string[]>;   // key: `${name}|${parent}`
+    sectors:        Record<string, string[]>;   // key: name
+}
+async function loadLibraryExamples(supabase: SupabaseClient): Promise<LibraryExamples> {
+    const out: LibraryExamples = { identities: {}, sub_identities: {}, sectors: {} };
+    const { data, error } = await supabase
+        .from('bucket_industry_map')
+        .select('primary_identity,is_new_identity,sub_identity,is_new_sub_identity,sector,is_new_sector,industry_string')
+        .order('id', { ascending: false })
+        .limit(30000);
+    if (error || !data) return out;
+    const push = (bucket: Record<string, string[]>, key: string, sample: string) => {
+        if (!bucket[key]) bucket[key] = [];
+        if (bucket[key].length < 3 && sample && !bucket[key].includes(sample)) bucket[key].push(sample);
+    };
+    for (const r of data as any[]) {
+        if (!r.is_new_identity && r.primary_identity) push(out.identities, r.primary_identity, r.industry_string);
+        if (!r.is_new_sub_identity && r.sub_identity && r.primary_identity) {
+            push(out.sub_identities, `${r.sub_identity}|${r.primary_identity}`, r.industry_string);
+        }
+        if (!r.is_new_sector && r.sector) push(out.sectors, r.sector, r.industry_string);
+    }
+    return out;
+}
+
 interface RawSuggestion {
     name: string;
     parent?: string;
-    decision: 'route' | 'new';
+    decision: 'route' | 'new' | 'wrong_layer';
     route_to?: string;
     route_to_parent?: string;
     confidence: number;
@@ -4143,12 +4255,12 @@ interface RawSuggestion {
 
 function layerGuidance(layer: SuggestLayer): string {
     if (layer === 'identities') {
-        return `You are routing IDENTITY proposals (Layer 1 — the company's top-level business model). Prefer route over new — the library was hand-curated to cover the full B2B universe. Map vertical-specific identity names to their generic ("Healthcare Services" → "Healthcare Operator"; "Insurance" / "Insurance Brokerage" → "Insurance Services"). Use the CANONICAL list inside HARD_KEYWORD_ROUTING as guidance — but only route to names that actually appear in the LIBRARY block. Names like "Specialty Services" / "Professional Services" / "B2B" / "Subscription" are NOT valid identities; pick the closest library identity and set confidence ≤ 4.`;
+        return `IDENTITY proposals (Layer 1 — the company's top-level business model). Identities are stable, curated, and adding a new one is cheap. Route ONLY when the proposal is an OBVIOUS paraphrase of an existing identity ("Insurance" → "Insurance Services"; "PE Firm" → "Financial Services"). DO NOT route to a "least-wrong" neighbour — return decision=new instead. NEVER route at confidence ≥ 5 unless it's a true synonym. Inputs like "Professional Services" / "B2B" / "Subscription" / "Holding Company" are not identities — return decision=new at confidence ≤ 4 and the human will reject.`;
     }
     if (layer === 'sub_identities') {
-        return `You are routing SUB-IDENTITY proposals (Layer 2 — the functional subtype under an identity). Each proposal lists a parent identity. Prefer route heavily — sub-identities fragment the worst. Apply the merge patterns from the tagger: "Investment Advisory" / "Wealth Management Firm" / "Asset Management" → Investment Management or Wealth Management; "Private Equity Firm" → Private Equity; "HVAC Services" / "Solar Installation" → Field Services & Maintenance. If a proposal's name is an identity name used as a sub-identity ("Healthcare Operator" under Healthcare Operator), route_to should be the closest in-library sub-identity under the same parent at confidence ≤ 4. route_to_parent SHOULD usually match the proposal's parent, BUT if the library has the right sub-identity under a different parent, use the library's parent (the contacts will be re-parented).`;
+        return `SUB-IDENTITY proposals (Layer 2 — functional subtype under an identity). Each proposal lists a parent identity. Sub-identities fragment heavily; prefer route. Same-parent route is the default. Cross-parent routes (route_to_parent ≠ proposal's parent) are allowed but MUST cap confidence ≤ 4 — they silently re-parent contacts and need human review. If the proposal's NAME is itself an identity name ("Manufacturing & Industrial" used as a sub-identity) or a sector name ("Life Sciences & Biotech" used as a sub-identity), return decision=wrong_layer with the reason naming the correct layer — DO NOT route, DO NOT accept_as_new.`;
     }
-    return `You are routing SECTOR proposals (Layer 3 — the vertical the company SERVES, not the company's identity). Prefer route. Map: Sports / Athletics / Esports → Media & Entertainment; Recreation / Leisure → Hospitality & Travel; Solar / Oil & Gas / Utilities → Energy & Utilities; Pharma / Biotech → Life Sciences & Biotech; Aviation / Defense → Aerospace & Defense; Insurance → Financial Services; Construction → Construction & Infrastructure. Inputs that are NOT sectors (Marketing, Advertising, IT Services, Consulting, Professional Services, B2B, Corporate, Subscription, Holding Company) — set decision=route at confidence ≤ 3 to the LEAST WRONG library sector. NEVER set decision=new for those identity-bleed inputs.`;
+    return `SECTOR proposals (Layer 3 — the vertical the company SERVES, not the company's identity). Sector library is curated; prefer route for genuine verticals. NULL or "general" proposals: read the samples — if they're a clear vertical (e.g. CPG → Food & Beverage), route at confidence ≥ 6. Inputs that are NOT sectors (Marketing, Advertising, IT Services, Consulting, Professional Services, B2B, Corporate, Subscription, Holding Company): route to the LEAST WRONG existing sector at confidence ≤ 3 — NEVER decision=new for those. If the proposal's NAME is an identity name ("Software & SaaS" used as a sector) or a sub-identity name used as a sector, return decision=wrong_layer. For genuine verticals not in the library (e.g. a real "Public Safety" or "Mining" with strong vertical samples), decision=new at confidence ≥ 7 is fine.`;
 }
 
 function buildSuggestPrompt(
@@ -4156,34 +4268,41 @@ function buildSuggestPrompt(
     proposals: LoadedProposals[SuggestLayer],
     libEntries: TaxonomyEntry[],
     contactCounts: Record<string, number>,
+    libraryExamples: Record<string, string[]>,
 ): { system: string; user: string } {
     const layerCountKey = layer === 'identities' ? 'identity' : layer === 'sub_identities' ? 'sub_identity' : 'sector';
 
-    const system = `You route AI-proposed B2B taxonomy entries to an existing curated library. For each PROPOSAL choose ONE of:
-  - "route" — the proposal is a duplicate / near-synonym / narrower case of an existing LIBRARY entry. Set route_to (and route_to_parent for sub-identities) to the EXACT library name. NEVER paraphrase. NEVER suggest an archived entry (none are listed).
-  - "new" — the proposal is genuinely distinct from everything in the library. The user will accept it verbatim as a new library entry.
+    const system = `You route AI-proposed B2B taxonomy entries to an existing curated library. For each PROPOSAL choose EXACTLY ONE of:
+  - "route" — the proposal is a paraphrase, spelling variant, or narrower vertical case of an existing LIBRARY entry. Set route_to (and route_to_parent for sub-identities) to the EXACT library name, character-for-character.
+  - "new" — the proposal is a genuine concept missing from the library. The reviewer will accept it as a new library entry.
+  - "wrong_layer" — the proposal's NAME belongs to a different taxonomy layer (e.g. an identity name being used as a sub-identity, a sector name being used as a sub-identity). Do NOT route, do NOT accept_as_new. The reviewer will move it to the right layer manually.
 
-PRINCIPLES (match the tagger that produced these proposals):
-${CORE_PRINCIPLES}
-${HARD_KEYWORD_ROUTING}
+WHEN TO ROUTE vs. NEW:
+  - Route only when the proposal is one of: exact synonym, spelling/suffix variant, narrower vertical case, or the same concept under a different name. "Closest existing entry" is NOT a valid reason to route — if no entry is a paraphrase or narrower case, return "new".
+  - A new library entry is cheap. A wrong route silently mis-tags every contact behind that proposal — that's far worse than asking the human to accept a new entry.
 
-LAYER-SPECIFIC GUIDANCE: ${layerGuidance(layer)}
+LAYER GUIDANCE — read carefully, this overrides general intuition:
+${layerGuidance(layer)}
 
-CONFIDENCE (1-10):
-  10 — exact synonym ("PE Firm" vs "Private Equity") or clearly novel concept with no plausible library mapping.
-  8-9 — strong match; difference is suffix / pluralization / vertical narrowing.
-  5-7 — defensible match a reviewer might dispute.
-  1-4 — uncertain; both route and new feel wrong. Pick the less-bad option and let the human review.
+CROSS-PARENT MOVES (sub-identities only):
+  - Default: route_to_parent equals the proposal's listed parent.
+  - If the library has the right entry under a DIFFERENT parent, you may route there, but cap confidence at 4 — cross-parent routes re-parent contacts and need a human pass.
+
+CONFIDENCE (1-10) — use the full range:
+  9-10 — exact synonym or clearly novel concept with no plausible library mapping.
+  6-8  — strong match; difference is suffix / pluralization / vertical narrowing.
+  3-5  — defensible but disputable. Cross-parent route, or route to a near-but-not-quite entry.
+  1-2  — uncertain; both route and new feel wrong. Last-resort least-wrong route.
 
 REASONING:
-  - ≤ 30 words. ONE sentence. Cite the library entry's name when routing.
+  - ≤ 30 words. ONE sentence. Cite the library entry's name when routing. Name the correct layer when wrong_layer.
 
 OUTPUT — strict JSON, single object with key "suggestions":
 {
   "suggestions": [
     { "name": "<proposal name verbatim>",
       "parent": "<parent identity name verbatim>",        // sub_identities only
-      "decision": "route" | "new",
+      "decision": "route" | "new" | "wrong_layer",
       "route_to": "<library entry name verbatim>",        // when decision = route
       "route_to_parent": "<library parent identity>",     // sub_identities + route only
       "confidence": 1-10,
@@ -4193,29 +4312,54 @@ OUTPUT — strict JSON, single object with key "suggestions":
 
 HARD RULES:
   - One object per PROPOSAL in the user message. Do not drop any.
-  - When decision=route, route_to MUST appear in the LIBRARY block. Do NOT invent names.
-  - For sub-identities + route, route_to_parent MUST match the library entry's listed parent_identity.
-  - When decision=new, omit route_to / route_to_parent.
+  - When decision=route, route_to MUST appear in the LIBRARY block. Copy character-for-character. Do NOT invent names.
+  - For sub-identities + route, route_to_parent MUST match the library entry's listed parent (after the cross-parent confidence cap above).
+  - When decision=new or wrong_layer, omit route_to / route_to_parent.
   - Output ONLY the JSON object. No prose, no markdown fences.`;
 
-    const libBlock = layer === 'sub_identities'
-        ? libEntries.map(e => `  - "${e.name}" (under "${e.parent_identity || ''}")${e.description ? `: ${e.description}` : ''}`).join('\n')
-        : libEntries.map(e => `  - "${e.name}"${e.description ? `: ${e.description}` : ''}`).join('\n');
+    // Library block — each entry gets its description AND up to 3 concrete
+    // example industries from past confirmed mappings, so the router sees
+    // what the entry actually contains rather than just a one-line gloss.
+    const libBlock = libEntries.map(e => {
+        const key = layer === 'sub_identities' ? `${e.name}|${e.parent_identity || ''}` : e.name;
+        const exs = libraryExamples[key] || [];
+        const exsStr = exs.length ? ` · ex: ${exs.map(s => `"${s}"`).join(', ')}` : '';
+        const desc = e.description ? `: ${e.description}` : '';
+        if (layer === 'sub_identities') {
+            return `  - "${e.name}" (under "${e.parent_identity || ''}")${desc}${exsStr}`;
+        }
+        return `  - "${e.name}"${desc}${exsStr}`;
+    }).join('\n');
 
+    // Proposal block — 5 samples (not 3) plus cross-layer co-occurrence so
+    // the router can disambiguate identity-vs-sector confusion. E.g. a sub
+    // proposal "Manufacturing & Industrial" whose top sector is also
+    // "Manufacturing" is almost certainly a Vertical SaaS routing case.
     const propBlock = (proposals as any[]).map((p: any) => {
         const cc = contactCounts[`${layerCountKey}:${p.name}`];
         const ccStr = cc !== undefined ? `${cc.toLocaleString()} contacts · ` : '';
-        const samples = (p.samples || []).slice(0, 3).map((s: string) => `"${s}"`).join(', ');
-        if (layer === 'sub_identities') {
-            return `  - "${p.name}" (proposed under "${p.parent || ''}") — ${ccStr}${p.count}× industries · samples: ${samples}`;
+        const samples = (p.samples || []).slice(0, 5).map((s: string) => `"${s}"`).join(', ');
+        const co: string[] = [];
+        if (layer === 'identities') {
+            if (p.topSectors?.length) co.push(`top sectors: ${p.topSectors.map((x: any) => `${x.name}(${x.count})`).join(', ')}`);
+            if (p.topSubs?.length)    co.push(`top subs: ${p.topSubs.map((x: any) => `${x.name}(${x.count})`).join(', ')}`);
+        } else if (layer === 'sub_identities') {
+            if (p.topSectors?.length) co.push(`top sectors: ${p.topSectors.map((x: any) => `${x.name}(${x.count})`).join(', ')}`);
+        } else {
+            if (p.topIdentities?.length) co.push(`top identities: ${p.topIdentities.map((x: any) => `${x.name}(${x.count})`).join(', ')}`);
+            if (p.topSubs?.length)       co.push(`top subs: ${p.topSubs.map((x: any) => `${x.name}(${x.count})`).join(', ')}`);
         }
-        return `  - "${p.name}" — ${ccStr}${p.count}× industries · samples: ${samples}`;
+        const coStr = co.length ? ` · ${co.join(' · ')}` : '';
+        if (layer === 'sub_identities') {
+            return `  - "${p.name}" (proposed under "${p.parent || ''}") — ${ccStr}${p.count}× industries · samples: ${samples}${coStr}`;
+        }
+        return `  - "${p.name}" — ${ccStr}${p.count}× industries · samples: ${samples}${coStr}`;
     }).join('\n');
 
-    const user = `LIBRARY (${layer}, archived entries excluded):
+    const user = `LIBRARY (${layer}, archived entries excluded — entries marked "ex:" show real industries already mapped there):
 ${libBlock}
 
-PROPOSALS to route (${(proposals as any[]).length} total):
+PROPOSALS to route (${(proposals as any[]).length} total). Each row shows: name, contact count, distinct-industry count, sample industry strings, and top co-occurring values from other layers:
 ${propBlock}
 
 Produce one suggestion object per proposal, in the exact order listed.`;
@@ -4229,13 +4373,14 @@ async function callSuggestLLM(
     proposals: LoadedProposals[SuggestLayer],
     libEntries: TaxonomyEntry[],
     contactCounts: Record<string, number>,
+    libraryExamples: Record<string, string[]>,
     signal: AbortSignal | undefined,
     log: (m: string, level?: 'info' | 'warn') => void,
 ): Promise<{ suggestions: RawSuggestion[]; cost: number }> {
     const anthropic = await getAnthropic(supabase);
     if (!anthropic) throw new Error('Anthropic API key not configured. Add it on the Connectors page (saved as ANTHROPIC_API_KEY).');
 
-    const { system, user } = buildSuggestPrompt(layer, proposals, libEntries, contactCounts);
+    const { system, user } = buildSuggestPrompt(layer, proposals, libEntries, contactCounts, libraryExamples);
     const resp = await anthropic.messages.create({
         model: SUGGEST_ROUTINGS_MODEL,
         max_tokens: SUGGEST_ROUTINGS_MAX_TOKENS,
@@ -4316,6 +4461,7 @@ export async function suggestProposalRoutings(
     const snapshot = await loadTaxonomySnapshot(supabase);
     const proposals = await loadRunProposals(supabase, runId);
     const contactCounts = await loadProposedContactCounts(supabase, runId);
+    const libraryExamples = await loadLibraryExamples(supabase);
 
     const totalProposals = proposals.identities.length + proposals.sub_identities.length + proposals.sectors.length;
     if (totalProposals === 0) {
@@ -4356,7 +4502,8 @@ export async function suggestProposalRoutings(
             };
         }
         try {
-            const r = await callSuggestLLM(supabase, layer, layerProposals as any, libEntries, contactCounts, signal, log);
+            const layerExamples = libraryExamples[layer];
+            const r = await callSuggestLLM(supabase, layer, layerProposals as any, libEntries, contactCounts, layerExamples, signal, log);
             log(`[${layer}] ${r.suggestions.length} suggestions for ${layerProposals.length} proposals · $${r.cost.toFixed(4)}`);
             return { layer, suggestions: r.suggestions, cost: r.cost };
         } catch (err: any) {
@@ -4376,23 +4523,42 @@ export async function suggestProposalRoutings(
                 confidence: clampConfidence(raw.confidence),
                 reason: String(raw.reason || '').slice(0, 240),
             };
-            const wantRoute = raw.decision === 'route' && typeof raw.route_to === 'string' && raw.route_to.trim();
-            if (wantRoute) {
-                const exists = layerLib.some(e =>
-                    e.name === raw.route_to &&
-                    (r.layer !== 'sub_identities' || e.parent_identity === raw.route_to_parent)
-                );
-                if (exists) {
-                    out.route_to = raw.route_to;
-                    if (r.layer === 'sub_identities') out.route_to_parent = raw.route_to_parent;
-                } else {
-                    // Hallucinated target — downgrade to accept_as_new at low confidence.
-                    out.accept_as_new = true;
-                    out.confidence = Math.min(out.confidence, 4);
-                    out.reason = `(invalid route target "${raw.route_to}") ${out.reason}`.slice(0, 240);
-                }
+            if (raw.decision === 'wrong_layer') {
+                // Surface "the proposal name belongs to a different layer"
+                // to the human. No route, no accept_as_new — the UI shows a
+                // distinct badge and leaves the row untouched for manual
+                // handling.
+                out.wrong_layer = true;
             } else {
-                out.accept_as_new = true;
+                const wantRoute = raw.decision === 'route' && typeof raw.route_to === 'string' && raw.route_to.trim();
+                if (wantRoute) {
+                    const exists = layerLib.some(e =>
+                        e.name === raw.route_to &&
+                        (r.layer !== 'sub_identities' || e.parent_identity === raw.route_to_parent)
+                    );
+                    if (exists) {
+                        out.route_to = raw.route_to;
+                        if (r.layer === 'sub_identities') {
+                            out.route_to_parent = raw.route_to_parent;
+                            // Cross-parent routes silently re-parent contacts.
+                            // Cap confidence at 4 so the human reviews even if
+                            // the model returned higher.
+                            if (raw.route_to_parent && raw.parent && raw.route_to_parent !== raw.parent) {
+                                if (out.confidence > 4) {
+                                    out.confidence = 4;
+                                    out.reason = `(cross-parent: ${raw.parent} → ${raw.route_to_parent}) ${out.reason}`.slice(0, 240);
+                                }
+                            }
+                        }
+                    } else {
+                        // Hallucinated target — downgrade to accept_as_new at low confidence.
+                        out.accept_as_new = true;
+                        out.confidence = Math.min(out.confidence, 4);
+                        out.reason = `(invalid route target "${raw.route_to}") ${out.reason}`.slice(0, 240);
+                    }
+                } else {
+                    out.accept_as_new = true;
+                }
             }
             const key = r.layer === 'sub_identities'
                 ? `${raw.name}|${raw.parent || ''}`

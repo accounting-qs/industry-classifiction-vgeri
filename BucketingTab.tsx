@@ -3417,6 +3417,11 @@ type ProposalSuggestion = {
   route_to?: string;
   route_to_parent?: string;
   accept_as_new?: boolean;
+  // wrong_layer: the proposal's NAME is from a different taxonomy layer
+  // (e.g. an identity name used as a sub-identity, a sector name used as
+  // a sub-identity). UI surfaces a distinct badge and skips pre-fill —
+  // the human moves the row to the correct layer manually.
+  wrong_layer?: boolean;
   confidence: number;
   reason: string;
 };
@@ -3992,21 +3997,28 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                   const suggestion = exactMatch || normMatch;
                   const suggestionIsExact = !!exactMatch;
                   // AI suggestion for this row (from the suggest-routings
-                  // pass). aiState collapses three cases:
-                  //   'route' → AI picked an existing library entry,
-                  //             and that target still lives in the
-                  //             non-archived library;
-                  //   'new'   → AI says accept as new;
-                  //   'stale' → AI picked a target that no longer exists
-                  //             (target archived after the suggestion was
-                  //             generated). UI shows the stale notice but
-                  //             does NOT pre-fill the dropdown.
+                  // pass). aiState collapses four cases:
+                  //   'route'       → AI picked an existing library entry,
+                  //                   and that target still lives in the
+                  //                   non-archived library;
+                  //   'new'         → AI says accept as new;
+                  //   'wrong_layer' → AI says the proposal's name belongs
+                  //                   to a different taxonomy layer
+                  //                   (identity-as-sub, sector-as-sub, …).
+                  //                   UI surfaces it but skips pre-fill;
+                  //   'stale'       → AI picked a target that no longer
+                  //                   exists (target archived after the
+                  //                   suggestion was generated). UI shows
+                  //                   the stale notice but does NOT
+                  //                   pre-fill the dropdown.
                   const aiSuggKey = kind === 'sub_identities' ? `${p.name}|${p.parent || ''}` : p.name;
                   const aiSugg: ProposalSuggestion | undefined = (aiSuggestions as any)?.[kind]?.[aiSuggKey];
-                  let aiState: 'route' | 'new' | 'stale' | null = null;
+                  let aiState: 'route' | 'new' | 'wrong_layer' | 'stale' | null = null;
                   let aiTarget: { name: string; parent?: string } | null = null;
                   if (aiSugg && !isActioned && !isEditing) {
-                    if (aiSugg.route_to) {
+                    if (aiSugg.wrong_layer) {
+                      aiState = 'wrong_layer';
+                    } else if (aiSugg.route_to) {
                       const target = libEntries.find(le =>
                         le.name === aiSugg.route_to &&
                         (kind !== 'sub_identities' || le.parent === aiSugg.route_to_parent)
@@ -4142,6 +4154,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                   : aiState === 'route' && aiConfColor === 'amber' ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
                                   : aiState === 'route' ? 'bg-red-500/15 text-red-300 border-red-500/30'
                                   : aiState === 'new' ? 'bg-purple-500/15 text-purple-200 border-purple-500/30'
+                                  : aiState === 'wrong_layer' ? 'bg-orange-500/15 text-orange-300 border-orange-500/30'
                                   : 'bg-gray-500/15 text-gray-400 border-gray-500/30'
                                 }`}
                                 title={`Claude Opus 4.7 · confidence ${aiSugg.confidence}/10 — ${aiSugg.reason}`}
@@ -4152,6 +4165,7 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                     <>AI: route to <span className="underline">{aiTarget.name}</span>{aiTarget.parent ? ` (under ${aiTarget.parent})` : ''} · {aiSugg.confidence}/10</>
                                   )}
                                   {aiState === 'new' && (<>AI: keep as new · {aiSugg.confidence}/10</>)}
+                                  {aiState === 'wrong_layer' && (<>AI: wrong layer — move manually · {aiSugg.confidence}/10</>)}
                                   {aiState === 'stale' && (<>AI suggestion stale (target removed)</>)}
                                 </span>
                               </div>
