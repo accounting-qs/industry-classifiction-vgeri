@@ -113,6 +113,42 @@ The vertical / served market belongs in SECTOR, never the identity.
      Consulting / Risk Management and Insurance Advisory Services) when the
      specialty is explicit.
 
+ 11c. ANTI-CATCH-ALL for Consulting & Advisory. Consulting & Advisory is for
+      firms whose CORE OFFERING is pure advisory — they recommend, they
+      don't build, operate, deliver, or sell software/products.
+        • If they BUILD software / apps / digital products → IT Services
+          (Custom Software Development) or Software & SaaS (if it's a product)
+        • If they OPERATE infrastructure / managed services / cybersecurity
+          monitoring → IT Services (Managed IT / Cybersecurity Services)
+        • If they MARKET / BRAND / advertise → Agency
+        • If they self-identify as a "digital product agency", "design
+          studio", "product studio", "dev shop", "build partner" →
+          IT Services > Custom Software Development, NOT Consulting &
+          Advisory. The word "agency" in these contexts does not mean
+          marketing agency.
+      If you can't put the company in ANY identity confidently, return
+      identity=null with confidence ≤ 3. Do NOT use Consulting & Advisory
+      as a fallback when uncertain — that's the most common past mistake.
+
+ 11d. FIRST-MENTIONED-WINS tiebreaker for IT Services vs Consulting & Advisory.
+      When the input mentions BOTH "consulting / advisory" AND a build-or-
+      operate offering ("software development", "managed services",
+      "cybersecurity services", "cloud services", "implementation",
+      "integration"), pick whichever appears FIRST in the input string.
+      Rationale: the primary offering is usually listed first; the trailing
+      one is a secondary/upsell.
+        ✓ "B2B software development and consulting for ecommerce businesses"
+          → IT Services > Custom Software Development, sector=Retail
+          ("software development" appears before "consulting")
+        ✓ "Strategy consulting and custom development for SaaS founders"
+          → Consulting & Advisory > Strategy & Management Consulting
+          ("strategy consulting" appears before "custom development")
+      Hard exceptions that override first-mention:
+        • Pure word "consulting firm" / "advisory firm" with no build verb
+          → Consulting & Advisory
+        • Explicit "managed services / MSP" anywhere → IT Services
+        • Explicit "SaaS / software platform / product" → Software & SaaS
+
 12. Managed IT / MSP / cybersecurity services / cloud services / network services /
     custom software development services / data migration services /
     IT asset disposition / ITAD

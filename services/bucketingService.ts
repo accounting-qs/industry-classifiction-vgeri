@@ -3030,7 +3030,26 @@ Note:   MSP-flavored IT services → identity=IT Services, sub_identity=null
 Input:  Healthcare company  (truly vague — care provider? life sciences? software?)
 Output: identity=null, sub_identity=null, sector=Healthcare  (id confidence 1-3)
 Note:   when input is generic and could be Healthcare Provider OR Life
-        Sciences OR Software & SaaS, return null identity. Don't guess.`;
+        Sciences OR Software & SaaS, return null identity. Don't guess.
+
+Input:  AI-driven digital product agency for custom software design and development
+Output: identity=IT Services, sub_identity=Custom Software Development, sector=null
+Note:   "digital product agency" reads like marketing but the work described
+        is custom software development — IT Services wins. Per rule 11c, do
+        NOT default to Consulting & Advisory just because "agency" doesn't
+        cleanly fit existing Agency subs.
+
+Input:  B2B software development and consulting for ecommerce businesses
+Output: identity=IT Services, sub_identity=Custom Software Development, sector=Retail
+Note:   first-mentioned-wins (rule 11d): "software development" appears
+        before "consulting" → IT Services, not Consulting & Advisory. Ecommerce
+        is the served vertical → sector=Retail.
+
+Input:  Strategy consulting and custom development for SaaS founders
+Output: identity=Consulting & Advisory, sub_identity=Strategy & Management Consulting, sector=null
+Note:   first-mentioned-wins: "strategy consulting" appears before "custom
+        development" → Consulting & Advisory wins. (sector left null because
+        "SaaS founders" is an audience, not a served vertical.)`;
 }
 
 function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
@@ -3285,14 +3304,19 @@ function snapTaggingsToLibrary(taggings: IndustryTagging[], snapshot: TaxonomySn
             ? (subByParent.get(idSnap.value) || [])
             : snapshot.sub_identities.map(s => s.name);
         let subSnap = applySnap(t.sub_identity, subAllowed);
-        // Parent-consistency guard. If the snapped sub is an existing library
-        // entry whose actual parent differs from the chosen identity, the LLM
-        // mis-paired. Drop the sub (null) rather than persist a wrong pair —
-        // Phase 1b will route to identity-level. Without this, ~10% of tagged
-        // rows in observed runs ended up with cross-parent sub/identity pairs.
+        // Parent-consistency guard. If the sub_identity name exists in the
+        // GLOBAL library under a parent different from the chosen identity,
+        // the LLM mis-paired — drop the sub (null) rather than persist a wrong
+        // pair. Phase 1b will route to identity-level.
+        //
+        // Crucially we check subSnap.is_new=true cases too: applySnap above
+        // only sees the chosen identity's children (a tight allowlist), so a
+        // sub borrowed from another parent gets marked is_new=true even
+        // though the name is already in the library. The earlier version of
+        // this guard required !subSnap.is_new and silently let those through —
+        // 437 fresh mismatches survived in one observed run as a result.
         if (
-            !idSnap.is_new && idSnap.value &&
-            !subSnap.is_new && subSnap.value &&
+            !idSnap.is_new && idSnap.value && subSnap.value &&
             subParent.has(subSnap.value) &&
             subParent.get(subSnap.value) !== idSnap.value
         ) {
