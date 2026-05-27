@@ -4101,14 +4101,14 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                           />
                           <div className="min-w-0 flex-1">
                             <div
-                              className={`font-bold truncate ${
+                              className={`font-bold break-words leading-tight ${
                                 isRouted ? 'text-sky-300 line-through decoration-sky-500/40'
                                 : isAccepted ? 'text-emerald-300'
                                 : 'text-white'
                               }`}
                               title={p.name}
                             >{p.name}</div>
-                            <div className="text-[10px] text-gray-500 truncate" title={p.samples?.join(' · ')}>
+                            <div className="text-[10px] text-gray-500 break-words leading-tight" title={p.samples?.join(' · ')}>
                               {(() => {
                                 const layerKey = kind === 'identities' ? 'identity'
                                   : kind === 'sub_identities' ? 'sub_identity'
