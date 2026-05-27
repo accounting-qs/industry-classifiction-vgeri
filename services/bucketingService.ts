@@ -1953,7 +1953,13 @@ export async function finalizeTaxonomyAgainstLibrary(
             sub_identities: snapshot.sub_identities,
             sectors: snapshot.sectors
         },
-        cost_usd: (Number(run.cost_usd) || 0) + costUsd
+        cost_usd: (Number(run.cost_usd) || 0) + costUsd,
+        // Persist finalize state so the UI can show "already finalized"
+        // after a page reload instead of relying on in-memory React state.
+        finalize_completed_at: new Date().toISOString(),
+        finalize_rerouted_count: rerouted,
+        finalize_nullified_count: nullified,
+        finalize_failed_count: failed
     }).eq('id', runId);
 
     ctx.log(`[Finalize ${runId}] done — ${candidates.length} orphans processed: ${rerouted} kept (proposals accepted into library), ${nullified} → General (proposals rejected). No LLM calls.`, 'phase');

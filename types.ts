@@ -125,6 +125,13 @@ export interface BucketingRun {
   created_at: string;
   taxonomy_completed_at?: string | null;
   assignment_completed_at?: string | null;
+  // Finalize Taxonomy state — set by finalizeTaxonomyAgainstLibrary so the
+  // UI can show "already finalized" without relying on in-memory React
+  // state that's lost on page reload.
+  finalize_completed_at?: string | null;
+  finalize_rerouted_count?: number | null;
+  finalize_nullified_count?: number | null;
+  finalize_failed_count?: number | null;
 }
 
 export interface BucketingLogEntry {

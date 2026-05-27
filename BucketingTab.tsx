@@ -10,7 +10,7 @@
  *   - Library  : CRUD for reusable sub-identities across runs
  */
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
   Layers, Loader2, AlertCircle, ArrowLeft, Plus, X, Trash2, Download,
@@ -1310,7 +1310,27 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
   // Run BEFORE Apply & Assign once the user has decided which proposals
   // to keep.
   const [finalizing, setFinalizing] = useState(false);
-  const [lastFinalize, setLastFinalize] = useState<{ at: Date; rerouted: number; nullified: number; failed: number } | null>(null);
+  // Hydrate from persisted run state on initial load so a page reload still
+  // shows "already finalized". Falls back to null when the run has never
+  // been finalized. Re-syncs whenever the run object changes (e.g. after
+  // onRefresh re-fetches the run row).
+  const persistedFinalize = useMemo<{ at: Date; rerouted: number; nullified: number; failed: number } | null>(() => {
+    const r = run as any;
+    if (!r?.finalize_completed_at) return null;
+    return {
+      at: new Date(r.finalize_completed_at),
+      rerouted: Number(r.finalize_rerouted_count || 0),
+      nullified: Number(r.finalize_nullified_count || 0),
+      failed: Number(r.finalize_failed_count || 0)
+    };
+  }, [(run as any).finalize_completed_at, (run as any).finalize_rerouted_count, (run as any).finalize_nullified_count, (run as any).finalize_failed_count]);
+  const [lastFinalize, setLastFinalize] = useState<{ at: Date; rerouted: number; nullified: number; failed: number } | null>(persistedFinalize);
+  // Keep React state in sync with the persisted value whenever the run
+  // refreshes — covers the case where the user finalizes in one tab and
+  // reloads in another.
+  useEffect(() => {
+    if (persistedFinalize) setLastFinalize(persistedFinalize);
+  }, [persistedFinalize]);
   // Live progress polled while the finalize POST is in flight. The
   // service writes bucketing_runs.progress every 40 industries (debounced
   // to 700 ms server-side), so 1 s polling sees every update without
@@ -4287,25 +4307,38 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
         <div className="mt-4 pt-3 border-t border-amber-500/20">
           <div className="flex items-start justify-between gap-3 flex-wrap">
             <div className="flex-1 min-w-0">
-              <div className="text-[11px] font-bold text-amber-200">
-                Finalize taxonomy — re-tag remaining proposals against the library only
+              <div className="text-[11px] font-bold text-amber-200 flex items-center gap-1.5 flex-wrap">
+                <span>Finalize taxonomy — re-tag remaining proposals against the library only</span>
+                {lastFinalize && !finalizing && (
+                  <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1">
+                    <CheckCircle2 className="w-2.5 h-2.5" />
+                    Finalized
+                  </span>
+                )}
               </div>
               <div className="text-[10px] text-gray-400 mt-0.5">
                 Forces every still-orphan tag to a library entry (or null → General). No new entries are proposed in this pass. Run this once you're done accepting AI suggestions, BEFORE Apply &amp; Assign.
               </div>
               {lastFinalize && !finalizing && (
-                <div className="text-[10px] text-gray-500 mt-1.5 font-mono">
-                  Last finalize {lastFinalize.at.toLocaleTimeString()} · {lastFinalize.rerouted} → library, {lastFinalize.nullified} → General{lastFinalize.failed > 0 ? `, ${lastFinalize.failed} batch failures` : ''}
+                <div className="text-[10px] text-emerald-300/80 mt-1.5 font-mono">
+                  Last finalize {lastFinalize.at.toLocaleString()} · {lastFinalize.rerouted.toLocaleString()} → library, {lastFinalize.nullified.toLocaleString()} → General{lastFinalize.failed > 0 ? `, ${lastFinalize.failed} batch failures` : ''}
                 </div>
               )}
             </div>
             <button
               onClick={onFinalize}
               disabled={!!finalizing || !!recalcing}
-              className="shrink-0 px-3 py-1.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-200 border border-amber-500/40 hover:bg-amber-500/30 disabled:opacity-50 flex items-center gap-1"
+              className={`shrink-0 px-3 py-1.5 rounded text-[10px] font-bold border hover:opacity-90 disabled:opacity-50 flex items-center gap-1 ${
+                lastFinalize && !finalizing
+                  ? 'bg-emerald-500/10 text-emerald-200 border-emerald-500/40 hover:bg-emerald-500/20'
+                  : 'bg-amber-500/20 text-amber-200 border-amber-500/40 hover:bg-amber-500/30'
+              }`}
+              title={lastFinalize && !finalizing
+                ? 'Already finalized — clicking will re-run finalize (useful if you accepted more proposals since).'
+                : 'Re-tag every still-orphan AI proposal against the current library only.'}
             >
               {finalizing ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
-              {finalizing ? 'Finalizing…' : 'Finalize taxonomy'}
+              {finalizing ? 'Finalizing…' : (lastFinalize ? 'Re-finalize taxonomy' : 'Finalize taxonomy')}
             </button>
           </div>
           {finalizing && (() => {
