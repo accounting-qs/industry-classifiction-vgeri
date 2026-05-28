@@ -3700,98 +3700,14 @@ async function consolidateSubIdentitiesViaLLM(
 
 GOAL: collapse near-duplicate / overly narrow entries within the same identity. TARGET: 3–6 sub-identities per identity, TOTAL 50–80 across the whole list. If the input has more than 80 distinct sub-identities, you MUST merge aggressively. Be RUTHLESS — leaving variants separate is the failure mode, merging too much is rare.
 
-LIBRARY PRIORITY (CRITICAL):
-The user prompt for each identity may include a section "EXISTING LIBRARY SUB-IDENTITIES UNDER THIS IDENTITY". Those names are the user's curated taxonomy and are the source of truth — they MUST be your first choice as merge targets. ALWAYS prefer merging proposals INTO a library entry over inventing or picking a canonical from the lists below. NEVER remove or rename a library entry. Only fall back to the canonical lists below when no library entry under the same identity is even loosely applicable.
+LIBRARY IS THE SOURCE OF TRUTH:
+The user prompt for each identity includes a section "EXISTING LIBRARY SUB-IDENTITIES UNDER THIS IDENTITY". Those names are the ONLY canonical merge targets — they are the user's curated taxonomy. Don't coin alternatives. Always prefer merging proposals INTO an existing library entry over coining a new name; only emit a new canonical name when no library entry under the same identity is even loosely applicable. NEVER remove or rename a library entry.
 
-CANONICAL SUB-IDENTITIES BY IDENTITY (fallback when no library match exists — use these names verbatim wherever applicable):
-
-Agency: SEO Agency · Performance Marketing Agency · Creative Agency · Branding Agency · PR Agency · Event Management Agency · Talent Management Agency · Manufacturers' Representative
-Software & SaaS: FinTech SaaS · Vertical SaaS · MarTech SaaS · HR SaaS · CRM / Sales Software · Cybersecurity Software · Custom Software Development · Game Development
-Financial Services: Investment Management · Wealth Management · Private Equity · Venture Capital · Investment Banking · M&A Advisory · Insurance Brokerage · Lending / Credit · Banking · Brokerage · Family Office · Hedge Fund
-Real Estate: Brokerage · Property Management · Real Estate Development · Real Estate Investment · Mortgage Brokerage
-Consulting & Advisory: Business Consulting · Management Consulting · IT Consulting · Engineering Consulting · Strategy Consulting · Financial Advisory · HR Consulting · Specialty Consulting
-Field Services: Field Services & Maintenance · Equipment Rental & Leasing · IT Asset Disposition · Inspection Services
-Manufacturing & Industrial: B2B Product Manufacturer · Custom Manufacturing · Industrial Equipment · Contract Manufacturing
-Construction & Engineering: General Contracting · Construction Management · Civil Engineering · Electrical Contracting · Custom Home Builder
-Non-Profit & Association: Advocacy Organization · Professional Association · Religious Organization · Economic Development Organization
-Healthcare Operator: Medical Clinic / Hospital · Dental Practice · Specialty Practice
-Education Operator: K-12 School · Higher Education · Vocational Training
-Accounting & Tax: Accounting Services · Tax Advisory · Outsourced Accounting
-Legal Services: Corporate Law · Family Law · Tax Law · Intellectual Property Law · Litigation · Estate Planning Law
-Staffing & Recruiting: Executive Search · Technology Staffing · Healthcare Staffing
-Energy & Utilities: Renewable Energy Services · Energy Project Development · Utility Services
-IT Services: Cybersecurity Services · Custom Software Development · Data Migration Services
-
-REQUIRED MERGE PATTERNS — APPLY EVERY ONE OF THESE (these are observed in real runs):
-
-— Investment / Wealth Management cluster:
-  "Investment Advisory" / "Investment Research" / "Investment Research & Advisory" / "Investment" / "Alternative Investment Management" / "Registered Investment Advisory" / "Investment Management Firm" → Investment Management
-  "Wealth Management Firm" / "Private Wealth Management" → Wealth Management
-  "Asset Management" → Investment Management  (or Wealth Management if HNW-focused)
-
-— Banking cluster (all → Banking):
-  "Community Banking" / "Retail Banking" / "Commercial Banking" / "Credit Union" → Banking
-
-— PE/VC firm-suffix cleanup:
-  "Private Equity Firm" / "Private Equity Fund" → Private Equity
-  "Venture Capital Firm" / "Venture Capital Fund" → Venture Capital
-  "Hedge Fund Firm" → Hedge Fund
-
-— Foundation / Non-Profit cluster (collapse aggressively):
-  "Foundation / Grantmaking" / "Educational Foundation" / "Education Foundation" / "Community Development Foundation" / "Philanthropic Foundation" / "Scholarship Foundation" / "Grantmaking Organization" → Foundation
-  "Non-Profit" / "Non-Profit & Association" / "Service Organization" / "Volunteer Organization" / "Educational Nonprofit" / "Community Organization" / "Community Services" / "Social Impact Organization" / "Non-Profit Organization" → drop sub_identity (route to identity Non-Profit & Association only)
-  "Membership Organization" / "Membership Association" / "Industry Association" / "Professional Membership Association" / "Association Management" → Professional Association
-  "Advocacy" / "Health Advocacy" / "Education & Outreach" → Advocacy Organization
-  "Youth Organization" / "Religious Organization" / "Family Support Services" / "Social Services" / "Think Tank" / "Community Development" / "Fundraising" / "Research Funding" / "Leadership Development" → choose closest of [Advocacy Organization, Religious Organization, Economic Development Organization] or drop sub_identity
-
-— Construction cluster:
-  "General Contractor" / "Construction Services" / "Commercial Construction" / "Custom Residential Construction" / "Residential Construction" / "Heavy Civil Construction" / "Construction & Engineering" / "Design-Build Services" / "Electrical and Communication Infrastructure Construction Services" → General Contracting
-  "Custom Home Builder" stays separate (residential luxury niche, has distinct outreach)
-  "Civil Engineering" / "Engineering Services" / "Infrastructure Development" / "Energy Infrastructure Development" / "Project Developer" → Civil Engineering
-  "Electrical Contracting" stays separate
-
-— Field Services cluster (HUGE collapse — all the one-off service variants):
-  "HVAC Services" / "HVAC Contractor" / "Solar Installation Services" / "Solar Installation & Services" / "Energy Systems Installation Services" / "Installation Services" / "Maintenance Services" / "Equipment Repair" / "Equipment Maintenance Services" / "Equipment Sales and Services" / "Facilities Management" / "Facility Maintenance Services" / "Roof Management Services" / "Home Remodeling Services" / "Lawn Care Services" / "Repair Services" / "Print Management Services" / "Environmental Services" / "Flooring Installation Services" / "Elevator Maintenance Services" / "On-Demand Services" / "IT Hardware Support and Maintenance" / "Catering Services" / "Construction Services" → Field Services & Maintenance
-  "Inspection Services" / "Industrial Inspection Services" / "Trade Show Exhibit Services" → Inspection Services  (or Field Services & Maintenance if ambiguous)
-  "Equipment Rental & Maintenance Services" → Equipment Rental & Leasing
-  "IT Asset Disposition Services" → IT Asset Disposition
-
-— Marketing / Creative Agency cluster:
-  "Direct Marketing Agency" / "Direct Mail Agency" / "Out-of-Home Advertising Agency" / "Advertising Agency" / "Media Buying Agency" / "Full Service Marketing Agency" / "Full-Service Marketing Agency" / "Sports Marketing Agency" / "Athlete Marketing Agency" → Performance Marketing Agency
-  "Public Relations Agency" → PR Agency
-  "Experiential Marketing Agency" / "Event Marketing Agency" / "Event Production Agency" / "Event Planning Agency" → Event Management Agency
-  "Casting Agency" / "Literary Agency" / "Talent Agency" → Talent Management Agency
-  "Sales Agency" / "Manufacturers' Representative" / "Manufacturer Sales Representation Agency" → Manufacturers' Representative
-  "Brand Strategy Consulting" / "Personal Branding Consulting" → Branding Agency
-  "Photography & Video Production Services" / "Direct Mail Agency" → Creative Agency
-  "Matchmaking Agency" → Specialty Agency  (or drop to null if count ≤ 2)
-
-— Consulting cluster (the long tail — collapse to ~6 canonical):
-  "Strategy Consulting" / "Innovation Consulting" / "Government Consulting" / "Government Relations Consulting" / "Political Consulting" / "Risk Management Consulting" / "Procurement Consulting" / "Sustainability Consulting" / "Healthcare Consulting" / "Education Consulting" / "Regulatory Consulting" / "Architectural Consulting" / "Architecture & Design Consulting" / "Interior Design" / "Design Consulting" / "Community Engagement Consulting" / "Event Management Consulting" / "Non-Profit & Social Impact Consulting" / "Fundraising Consulting" / "Market Research" / "Market Research Consulting" / "Real Estate Advisory" / "Capital Advisory" / "Strategic Advisory" / "Philanthropic Advisory" / "Employee Benefits Consulting" / "Legal Consulting" / "Tax Consulting" → choose closest of [Business Consulting, Management Consulting, Engineering Consulting, IT Consulting, Strategy Consulting, Specialty Consulting]
-  "Environmental Consulting" stays separate
-
-— Tax / Accounting cluster:
-  "Accounting & Tax" / "Accounting" / "Outsourced Accounting Services" / "Specialized Accounting Services" → Accounting Services  (or Outsourced Accounting if explicitly outsourced)
-  "Tax Advisory" / "Tax Consulting" / "Tax Consulting & Planning" / "Tax Accounting" / "Tax Preparation" / "Tax Preparation & Consulting" → Tax Advisory
-
-— Legal cluster:
-  "Business Law" / "Business / Corporate Law Firm" / "Contract Law Services" → Corporate Law
-  "Estate Planning" / "Estate Planning & Probate" → Estate Planning Law
-  "Entertainment Law" → Intellectual Property Law  (or Specialty Legal)
-  "Legal Aid" → drop to null  (rarely a useful B2B segment)
-
-— Software / SaaS one-offs:
-  "Field Services Software" / "Energy Management Software" / "Industrial Safety Software" / "Compliance Software" / "Media & Publishing SaaS" / "Financial Services SaaS" / "Industrial Software" → Vertical SaaS
-  "Enterprise Software" → CRM / Sales Software  (or Vertical SaaS depending on context)
-  "Professional Networking Platform" / "Online Media Platform" → Vertical SaaS  (or drop to null)
-
-— Manufacturing one-offs:
-  "Industrial Equipment Manufacturing" / "Industrial Manufacturing" / "Manufacturing" / "Specialty Chemicals Manufacturer" / "Medical Equipment Manufacturer" / "Custom Vehicle Manufacturing" / "Bioenergy Manufacturing" / "Industrial Gas Production" / "Precision Manufacturing" → choose closest of [B2B Product Manufacturer, Custom Manufacturing, Industrial Equipment]
-
-— Generic suffix cleanup (apply universally):
-  Strip trailing "Firm" / "Services" / "Solutions" / "Group" / "Inc" / "LLC" / "Corp" unless removing the suffix changes meaning
-  Plural → singular ("Insurance Brokerages" → Insurance Brokerage)
-  "B2B " prefix → strip ("B2B SaaS" → SaaS context-dependent)
+GENERIC MERGE GUIDANCE:
+- Strip trailing "Firm" / "Services" / "Solutions" / "Group" / "Inc" / "LLC" / "Corp" unless removing the suffix changes meaning.
+- Plural → singular ("Insurance Brokerages" → Insurance Brokerage).
+- "B2B " prefix → strip when it doesn't change meaning.
+- Vertical-flavored names ("Healthcare CRM SaaS", "Restaurant POS Software") merge into the closest non-vertical sibling under the same identity, or drop to null and let the contact's sector field carry the vertical.
 
 LOW-COUNT MERGE RULE (count ≤ 2):
 Any sub-identity appearing only 1–2 times in the input list MUST be either:
@@ -3800,7 +3716,7 @@ Any sub-identity appearing only 1–2 times in the input list MUST be either:
 Low-count entries fragment the bucket count without earning their own viable bucket — a 1× sub-identity will roll up to identity-only at min_volume anyway.
 
 IDENTITY-BLEED RULE (CRITICAL):
-If the sub-identity name IS an identity name (e.g. "Healthcare Operator" used as a sub-identity, "Field Services & Maintenance" used as a sub-identity, "Consulting & Advisory" used as a sub-identity, "Legal Services" used as a sub-identity, "Non-Profit & Association" used as a sub-identity, "Hospitality & Travel" used as a sub-identity, "Energy & Utilities" used as a sub-identity, "Staffing & Recruiting" used as a sub-identity, "Operator" used as a sub-identity), drop it to null with {"from": "<name>", "to": ""}. The contact will roll up to identity-only via the cascade. Identity names should never appear as sub-identities.
+If the sub-identity name IS an identity name (any name that appears in VALID_IDENTITIES — e.g. "Healthcare Provider", "Field Services & Maintenance", "Consulting & Advisory", "Legal Services", "Non-Profit & Association", "Hospitality & Travel", "Software & SaaS", "IT Services"), drop it to null with {"from": "<name>", "to": ""}. The contact will roll up to identity-only via the cascade. Identity names must never appear as sub-identities.
 
 QUALITY CHECK before keeping a name as-is. Ask:
   1. Is this sub-identity reusable across multiple companies (≥3 ideally)?
@@ -3812,8 +3728,7 @@ Only keep the name if the answers support it. When in doubt, MERGE.
 
 HARD RULES:
 - Merge ONLY within the same identity. Never cross-identity.
-- "SEO Agency" ≠ "PR Agency" — genuinely different sub-types stay separate.
-- Vertical-specific names ("Healthcare CRM SaaS", "Restaurant POS Software") merge into the generic ("Vertical SaaS").
+- Genuinely different sub-types stay separate (e.g. an advocacy-focused proposal and a religious-focused proposal under Non-Profit & Association are not the same sub).
 
 OUTPUT (strict JSON, key MUST be "merges"):
 {
@@ -3834,9 +3749,9 @@ Only include entries where from != to (or where to="" to drop). Be ruthless — 
         const inputBody = list.map(l => `  - "${l.name}" (${l.count}×)`).join('\n');
         const libUnderId = (libraryByIdentity.get(identity) || []).slice().sort();
         const libBlock = libUnderId.length > 0
-            ? `\n\nEXISTING LIBRARY SUB-IDENTITIES UNDER THIS IDENTITY (source of truth — always prefer these as merge targets, NEVER remove or rename):\n${libUnderId.map(n => `  - "${n}"`).join('\n')}`
-            : '\n\n(No library sub-identities exist yet under this identity — use canonical fallback list from system prompt.)';
-        const userPrompt = `Identity to consolidate: ${identity || '(none)'}${libBlock}\n\nProposed-new sub-identities under this identity (apply LIBRARY PRIORITY rule from system prompt, then REQUIRED MERGE PATTERNS, LOW-COUNT MERGE, and IDENTITY-BLEED rules):\n\n${inputBody}`;
+            ? `\n\nEXISTING LIBRARY SUB-IDENTITIES UNDER THIS IDENTITY (the only canonical merge targets — NEVER remove or rename):\n${libUnderId.map(n => `  - "${n}"`).join('\n')}`
+            : '\n\n(No library sub-identities exist yet under this identity — emit a new canonical only when the proposal is reusable and identity-appropriate; otherwise drop to null.)';
+        const userPrompt = `Identity to consolidate: ${identity || '(none)'}${libBlock}\n\nProposed-new sub-identities under this identity (apply LIBRARY rule, then LOW-COUNT MERGE and IDENTITY-BLEED rules):\n\n${inputBody}`;
 
         const isAnthropic = model.startsWith('claude-');
         let text = '';
@@ -3988,30 +3903,15 @@ async function consolidateSectorsViaLLM(
 
 GOAL: collapse near-duplicates and identity-bleed. TARGET: 10–20 sectors total.
 
-EXISTING LIBRARY SECTORS (the user's curated taxonomy — ALWAYS prefer merging proposals INTO these names verbatim before falling back to the canonical list. These are the source of truth and must NEVER be removed or renamed):
-${libraryList || '  (library is empty — fall back to canonical list below)'}
+LIBRARY IS THE SOURCE OF TRUTH:
+The list below is the user's curated taxonomy. These are the ONLY canonical merge targets — don't coin alternatives. Always prefer merging proposals INTO an existing library sector over coining a new name; only emit a new canonical when no library sector is even loosely applicable. NEVER remove or rename a library entry.
 
-CANONICAL SECTORS (fallback when no library match exists — use these names verbatim wherever applicable):
-  Healthcare · Real Estate · Government · Education · Energy & Utilities ·
-  Financial Services · Manufacturing · Hospitality & Travel · Technology & Software ·
-  Non-Profit & Social Impact · Legal · Retail · Media & Entertainment ·
-  Life Sciences & Biotech · Transportation & Logistics · Construction & Infrastructure ·
-  Agriculture · Telecommunications · Aerospace & Defense · Multi-industry
+EXISTING LIBRARY SECTORS:
+${libraryList || '  (library is empty — emit a new canonical only when the proposal names a clear, broadly-served vertical; otherwise drop to "".)'}
 
-REQUIRED MERGE PATTERNS (apply whenever you see one of these inputs):
-  Sports / Athletics / Sports & Entertainment / Sports & Athletics / Esports → Media & Entertainment
-  Recreational / Recreation & Outdoor / Leisure / Recreational & Leisure → Hospitality & Travel
-  Gaming / Gambling → Media & Entertainment
-  Food Technology / Food & Beverage / Restaurant → Food & Beverage
-  Renewable Energy / Solar Energy / Oil & Gas / Utilities → Energy & Utilities
-  Pharma / Biotech → Life Sciences & Biotech
-  Medical → Healthcare
-  Affordable Housing / Housing / Property → Real Estate
-  Aviation / Defense / Aerospace → Aerospace & Defense
-  Construction → Construction & Infrastructure
-  Insurance → Financial Services
-  Environmental / Climate → Non-Profit & Social Impact (or Energy & Utilities if energy-focused)
-  Plural / singular variants → singular ("Healthcare Services" → Healthcare)
+GENERIC MERGE GUIDANCE:
+- Plural / singular variants collapse to the library entry's form ("Healthcare Services" → "Healthcare").
+- Vertical-flavored variants (e.g. "Solar Energy", "Pharma", "Affordable Housing") merge into the broader library sector when one fits ("Energy & Utilities", "Life Sciences & Biotech", "Real Estate").
 
 MAP TO BLANK (these inputs are NOT sectors — set to ""):
   Marketing · Advertising · Marketing / Advertising · Marketing & Sales ·
@@ -4143,28 +4043,15 @@ async function consolidateIdentitiesViaLLM(
 
 GOAL: collapse near-duplicates and merge proposals INTO existing library identities wherever possible. TARGET: 10–15 identities total across the library + final proposals.
 
-EXISTING LIBRARY IDENTITIES (prefer merging proposals INTO these names verbatim):
-${libraryList || '  (library is empty — fall back to canonical list below)'}
+LIBRARY IS THE SOURCE OF TRUTH:
+The list below is the user's curated taxonomy. These are the ONLY canonical merge targets — don't coin alternatives. Always prefer merging proposals INTO an existing library identity over coining a new name; only emit a new canonical when no library identity is even loosely applicable. NEVER remove or rename a library entry.
 
-CANONICAL IDENTITIES (use these names verbatim — do NOT invent variants):
-  Agency · Software & SaaS · Financial Services · Real Estate · Consulting & Advisory ·
-  Field Services & Maintenance · Manufacturing & Industrial · Construction & Engineering ·
-  Non-Profit & Association · Healthcare Operator · Education Operator ·
-  Accounting & Tax · Legal Services · Staffing & Recruiting · Energy & Utilities ·
-  IT Services · Hospitality & Travel · Media & Entertainment · Government Contractor ·
-  Logistics & Transportation · Retail · Insurance Services
+EXISTING LIBRARY IDENTITIES:
+${libraryList || '  (library is empty — emit a new canonical only when the proposal names a clear, reusable business model; otherwise drop to "".)'}
 
-REQUIRED MERGE PATTERNS:
-  Plural / singular variants → singular form ("Non-Profit & Associations" → "Non-Profit & Association")
-  Vertical-specific identity names → the generic identity:
-    "Healthcare Services" / "Medical Services" → Healthcare Operator
-    "Real Estate Services" / "Real Estate Investment & Development" → Real Estate
-    "Insurance" / "Insurance Brokerage" / "Insurance Carrier" → Insurance Services
-    "Holding Company" / "Investment Holding Company" → Financial Services (if investment-focused)
-    "Marketplace Platform" / "Online Marketplace" → Software & SaaS
-    "Mining Resources" / "Mining Company" / "Mining" → Manufacturing & Industrial
-    "Agriculture" / "Agribusiness" / "Farming" → Manufacturing & Industrial
-    "Field Services" / "Field Services and Maintenance" → Field Services & Maintenance
+GENERIC MERGE GUIDANCE:
+- Plural / singular variants collapse to the library form ("Non-Profit & Associations" → "Non-Profit & Association").
+- Vertical-flavored variants merge into the broader library identity when one fits ("Insurance" / "Insurance Carrier" → an existing insurance-related library identity; "Marketplace Platform" → an existing software identity; etc.).
 
 MAP TO BLANK (these inputs are NOT valid identities — set to ""):
   Specialty Services · Professional Services · B2B · Subscription Service · Other ·
