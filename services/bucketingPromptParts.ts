@@ -306,8 +306,8 @@ CORE RULES (apply throughout the sequence)
     ✓ "Software platform for K-12 schools" → identity=Software & SaaS, sector=Education
     ✓ "Healthcare PE firm" → identity=Financial Services, sector=Healthcare
     ✗ "Healthcare PE firm" → identity=Healthcare Provider   ← WRONG
-    ✗ "Digital consulting for non-profits" → sub_identity=Non-Profit Organization ← WRONG
-       (Non-Profit Organization's parent is Non-Profit & Association, not
+    ✗ "Digital consulting for non-profits" → sub_identity=Advocacy Organization ← WRONG
+       (Advocacy Organization's parent is Non-Profit & Association, not
         Consulting & Advisory. Set sub_identity=null, sector=Non-Profit.)
 
 • sub_identity ≠ sector, EVER. They are independent fields. If the only
@@ -472,6 +472,11 @@ applicable.
                              SaaS, HR SaaS, MarTech SaaS)
   Managed IT Services      → sub_identity = null (MSP is the default flavor
                              of the IT Services identity; no dedicated sub)
+  Non-Profit Organization  → sub_identity = null (generic non-profits stay
+                             identity-only; use Advocacy Organization /
+                             Professional Association / Religious Organization /
+                             Economic Development Organization only when the
+                             specific flavor is explicit)
   Specialty / Business /
   Strategy Consulting      → Management Consulting (collapsed)
   Any Legal Services sub   → sub_identity = null (Legal Services has no subs)

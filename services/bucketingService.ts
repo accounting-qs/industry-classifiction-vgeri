@@ -3713,7 +3713,7 @@ Consulting & Advisory: Business Consulting · Management Consulting · IT Consul
 Field Services: Field Services & Maintenance · Equipment Rental & Leasing · IT Asset Disposition · Inspection Services
 Manufacturing & Industrial: B2B Product Manufacturer · Custom Manufacturing · Industrial Equipment · Contract Manufacturing
 Construction & Engineering: General Contracting · Construction Management · Civil Engineering · Electrical Contracting · Custom Home Builder
-Non-Profit & Association: Foundation · Trade Association · Non-Profit Organization · Advocacy Organization · Religious Organization
+Non-Profit & Association: Advocacy Organization · Professional Association · Religious Organization · Economic Development Organization
 Healthcare Operator: Medical Clinic / Hospital · Dental Practice · Specialty Practice
 Education Operator: K-12 School · Higher Education · Vocational Training
 Accounting & Tax: Accounting Services · Tax Advisory · Outsourced Accounting
@@ -3739,10 +3739,10 @@ REQUIRED MERGE PATTERNS — APPLY EVERY ONE OF THESE (these are observed in real
 
 — Foundation / Non-Profit cluster (collapse aggressively):
   "Foundation / Grantmaking" / "Educational Foundation" / "Education Foundation" / "Community Development Foundation" / "Philanthropic Foundation" / "Scholarship Foundation" / "Grantmaking Organization" → Foundation
-  "Non-Profit" / "Non-Profit & Association" / "Service Organization" / "Volunteer Organization" / "Educational Nonprofit" / "Community Organization" / "Community Services" / "Social Impact Organization" → Non-Profit Organization
-  "Membership Organization" / "Membership Association" / "Industry Association" / "Professional Association" / "Professional Membership Association" / "Association Management" → Trade Association  (or Professional Association if member-leaning)
+  "Non-Profit" / "Non-Profit & Association" / "Service Organization" / "Volunteer Organization" / "Educational Nonprofit" / "Community Organization" / "Community Services" / "Social Impact Organization" / "Non-Profit Organization" → drop sub_identity (route to identity Non-Profit & Association only)
+  "Membership Organization" / "Membership Association" / "Industry Association" / "Professional Membership Association" / "Association Management" → Professional Association
   "Advocacy" / "Health Advocacy" / "Education & Outreach" → Advocacy Organization
-  "Youth Organization" / "Religious Organization" / "Family Support Services" / "Social Services" / "Think Tank" / "Community Development" / "Community Development Foundation" / "Fundraising" / "Research Funding" / "Leadership Development" → choose closest of [Foundation, Non-Profit Organization, Advocacy Organization, Religious Organization]
+  "Youth Organization" / "Religious Organization" / "Family Support Services" / "Social Services" / "Think Tank" / "Community Development" / "Fundraising" / "Research Funding" / "Leadership Development" → choose closest of [Advocacy Organization, Religious Organization, Economic Development Organization] or drop sub_identity
 
 — Construction cluster:
   "General Contractor" / "Construction Services" / "Commercial Construction" / "Custom Residential Construction" / "Residential Construction" / "Heavy Civil Construction" / "Construction & Engineering" / "Design-Build Services" / "Electrical and Communication Infrastructure Construction Services" → General Contracting
