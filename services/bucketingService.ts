@@ -2537,12 +2537,27 @@ async function tagIndustries(
         Array.from(m.values()).sort((a, b) => b._usage - a._usage).slice(0, PROPOSALS_PER_LAYER_CAP);
 
     // Per-batch snapshot — captures whatever proposals were published by
-    // batches that completed before this one started.
+    // batches that completed before this one started. Still used by
+    // snapTaggingsToLibrary so in-run proposal names snap to "library hit"
+    // (is_new=false) for the second batch onward.
     const buildEffectiveSnapshot = (): TaxonomySnapshot => ({
         identities: [...snapshot.identities, ...topByUsage(inRunIdentities)],
         sub_identities: [...snapshot.sub_identities, ...topByUsage(inRunSubIdentities)],
         sectors: [...snapshot.sectors, ...topByUsage(inRunSectors)],
     });
+
+    // CACHE OPTIMIZATION. The system prompt is split into two parts:
+    //   1. stableSystemPrompt — built ONCE per run from the library snapshot
+    //      captured at run start. Identical across every batch in this run,
+    //      so it serves as the cache prefix (Anthropic prompt cache via
+    //      cache_control / OpenAI automatic prefix cache).
+    //   2. proposalAppendix — built PER BATCH from the in-run proposal pool.
+    //      Differs as proposals accumulate, so it's NOT cached. Sits after
+    //      the cache breakpoint so it doesn't invalidate the prefix.
+    // On a 3000-batch run, this should hit the cache on every batch after
+    // the first (Anthropic) and effectively all batches (OpenAI prefix cache
+    // matches as long as the static prefix is identical).
+    const stableSystemPrompt = buildTaggingSystemPrompt(snapshot);
 
     let batchesSinceGc = 0;
 
@@ -2554,7 +2569,11 @@ async function tagIndustries(
         // returns are intentional — the harvest step at the end of this
         // batch publishes our own coinings for the next batch to see.
         const effective = buildEffectiveSnapshot();
-        const systemPrompt = buildTaggingSystemPrompt(effective);
+        const proposalAppendix = buildInRunProposalAppendix({
+            identities:     topByUsage(inRunIdentities),
+            sub_identities: topByUsage(inRunSubIdentities),
+            sectors:        topByUsage(inRunSectors),
+        });
         const userPrompt = JSON.stringify({
             industries: batch.map((v, i) => ({
                 id: i,
@@ -2566,10 +2585,20 @@ async function tagIndustries(
         try {
             let text = '';
             if (isAnthropic) {
+                // Two system blocks: stable prefix is cached, appendix isn't.
+                // When the appendix is empty (first batch) the stable block is
+                // the entire system; the cache write still happens on this call
+                // and every subsequent batch can read from it.
+                const systemBlocks: any[] = [
+                    { type: 'text', text: stableSystemPrompt, cache_control: { type: 'ephemeral' } }
+                ];
+                if (proposalAppendix) {
+                    systemBlocks.push({ type: 'text', text: proposalAppendix });
+                }
                 const resp = await anthropic!.messages.create({
                     model,
                     max_tokens: 4000,
-                    system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+                    system: systemBlocks,
                     messages: [{ role: 'user', content: userPrompt }]
                 }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
                 const usage: any = (resp as any).usage || {};
@@ -2581,6 +2610,13 @@ async function tagIndustries(
             } else {
                 // OpenAI chat completions with json_object response_format
                 // forces valid JSON without us hand-rolling a schema.
+                // OpenAI's automatic prefix cache matches on the longest
+                // shared prefix across requests, so concatenating stable +
+                // appendix (in that order) keeps every batch's prefix bytes
+                // identical to the previous one's.
+                const systemPrompt = proposalAppendix
+                    ? `${stableSystemPrompt}${proposalAppendix}`
+                    : stableSystemPrompt;
                 const resp = await fetch('https://api.openai.com/v1/chat/completions', {
                     method: 'POST',
                     headers: { Authorization: `Bearer ${getOpenAIKey()}`, 'Content-Type': 'application/json' },
@@ -2805,6 +2841,61 @@ async function tagIndustries(
             + (totalCachedIn / 1_000_000) * (ANTHROPIC_PRICING[model]?.input || 3) * 0.1
         : computeOpenAICost(model, totalIn - totalCachedIn, totalCachedIn, totalOut);
     return { taggings, costUsd, modelUsed: model };
+}
+
+// Render a compact appendix listing taxonomy values that were proposed
+// earlier in this same run (not yet in the library, but already coined by
+// previous batches). Lives at the END of the system prompt so the immutable
+// library-prefix portion can be served from the provider prompt cache
+// (Anthropic cache_control / OpenAI automatic prefix cache). Returns an
+// empty string when no in-run proposals exist, in which case the appendix
+// is omitted entirely.
+function buildInRunProposalAppendix(proposals: {
+    identities: { name: string }[];
+    sub_identities: { name: string; parent_identity?: string }[];
+    sectors: { name: string }[];
+}): string {
+    const haveAny = proposals.identities.length + proposals.sub_identities.length + proposals.sectors.length > 0;
+    if (!haveAny) return '';
+
+    const idLine = proposals.identities.length > 0
+        ? `Additional valid identities (in addition to VALID_IDENTITIES above): ${
+            JSON.stringify(proposals.identities.map(i => i.name))
+          }`
+        : '';
+
+    const subByParent: Record<string, string[]> = {};
+    for (const s of proposals.sub_identities) {
+        const p = s.parent_identity || '(unknown)';
+        if (!subByParent[p]) subByParent[p] = [];
+        subByParent[p].push(s.name);
+    }
+    const subLines = Object.keys(subByParent).length > 0
+        ? `Additional valid sub-identities (extend the parent's children list):\n${
+            Object.entries(subByParent)
+                .map(([p, names]) => `  ${JSON.stringify(p)}: ${JSON.stringify(names)}`)
+                .join(',\n')
+          }`
+        : '';
+
+    const secLine = proposals.sectors.length > 0
+        ? `Additional valid sectors: ${JSON.stringify(proposals.sectors.map(s => s.name))}`
+        : '';
+
+    const body = [idLine, subLines, secLine].filter(Boolean).join('\n\n');
+
+    return `
+
+═══════════════════════════════════════════════════════════════════════════
+IN-RUN PROPOSALS (extend the menus above for this run only)
+═══════════════════════════════════════════════════════════════════════════
+
+The following names were proposed earlier in this same run. Treat them as
+valid values that extend the VALID_* menus above. If your tag matches one of
+these names EXACTLY, set the corresponding is_new_* flag to FALSE — the
+proposal has already been coined this run, so it's not novel anymore.
+
+${body}`;
 }
 
 function buildTaggingSystemPrompt(s: TaxonomySnapshot): string {
