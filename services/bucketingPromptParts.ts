@@ -242,26 +242,46 @@ CORE PRINCIPLES
 ═══════════════════════════════════════════════════════════════════════════
 
 DECISION SEQUENCE — work through these three tags in this exact order. Each
-tag is INDEPENDENT and gets its own confidence score.
+tag is INDEPENDENT and gets its own confidence score. For each step, you have
+THREE possible outcomes: (a) pick a library value, (b) propose a new value
+with is_new_*=true (when nothing in the library is even loosely applicable),
+or (c) return null.
 
 Step 1 — IDENTITY (Layer 1)
   Read the input. Apply HARD_KEYWORD_ROUTING first — when a rule triggers, the
-  identity is fixed. If no rule triggers, decide what the company IS at its
-  core (operator? service provider? software vendor? investor? agency?). Pick
-  from VALID_IDENTITIES. If the input is too vague to identify the company
-  (e.g. "Professional services firm", "Technology company"), set identity=
-  null with identity_confidence ≤ 4 and a short reason.
+  identity is fixed.
+    (a) If a VALID_IDENTITIES entry fits → use it.
+    (b) If nothing in VALID_IDENTITIES is even loosely applicable AND you
+        can describe the company's core business model clearly → propose a
+        new identity by setting is_new_identity=true. The proposal will go
+        to the Review screen for user accept/reroute/rename. Only propose
+        when the name would apply to multiple companies, not a one-off.
+    (c) If the input is too vague to identify the company at all (e.g.
+        "Professional services firm", "Technology company") → identity=null
+        with identity_confidence ≤ 4 and a short reason.
 
 Step 2 — SUB_IDENTITY (Layer 2)  — ONLY when identity is set
-  Look at VALID_SUB_IDENTITIES for the chosen identity's children. If one
-  fits cleanly, set it. If none fits, set sub_identity=null. DO NOT invent a
-  sub to fill the slot, and DO NOT downgrade identity because no sub matches.
-  sub_identity_confidence is scored INDEPENDENTLY of identity_confidence.
+  Look at VALID_SUB_IDENTITIES for the chosen identity's children.
+    (a) If one fits cleanly → use it.
+    (b) If none of the identity's library children fit AND the input names
+        a specific functional sub-type that would apply to multiple companies
+        under that identity → propose new with is_new_sub_identity=true.
+        Don't propose a sub that's really an identity name or a sector name
+        in disguise.
+    (c) If none of the above → sub_identity=null. Do NOT downgrade identity
+        because no sub matches. sub_identity_confidence is scored
+        INDEPENDENTLY of identity_confidence.
 
 Step 3 — SECTOR (Layer 3)
   The vertical the company SERVES, if explicitly named. Sector is independent
   of identity and sub — set it whenever the input names a vertical, even when
-  identity and sub are null. Default to null if no vertical is named.
+  identity and sub are null.
+    (a) If a VALID_SECTORS entry fits → use it.
+    (b) If nothing in VALID_SECTORS fits AND the input names a vertical
+        clearly → propose new with is_new_sector=true. Common reusable
+        verticals only (industries served by multiple companies, not niche
+        sub-segments).
+    (c) Default to sector=null if no vertical is named.
 
 CONFIDENCE GATING (the rule that decides whether a value survives):
   confidence ≥ 5 → KEEP the value
