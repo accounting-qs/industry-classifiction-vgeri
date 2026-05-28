@@ -105,13 +105,20 @@ The vertical / served market belongs in SECTOR, never the identity.
 11b. Management consulting / strategy consulting / business advisory /
      generalist consulting / specialty consulting / engineering consulting /
      environmental consulting / HR consulting / IT consulting / educational
-     consulting / risk management & insurance advisory
+     consulting / risk management & insurance advisory /
+     market research / research services / consumer insights /
+     industry analysis / benchmarking services / strategic research /
+     decision support services / business intelligence advisory /
+     analyst & advisory services / customer insights research
        → identity = Consulting & Advisory  (NOT Accounting & Tax, NOT Agency)
-     Sub-identity hint: generic management/strategy/business/specialty firms
-     all collapse into "Management Consulting" — only set one of the
-     specialist subs (Engineering / Environmental / HR / IT / Educational
-     Consulting / Risk Management and Insurance Advisory Services) when the
-     specialty is explicit.
+     The word "consulting" doesn't have to appear in the input. Any firm
+     whose product is RESEARCH + RECOMMENDATIONS (not software, not creative,
+     not operating something) belongs here.
+     Sub-identity hint: generic management/strategy/business/specialty/market-
+     research firms all collapse into "Management Consulting" — only set one
+     of the specialist subs (Engineering / Environmental / HR / IT /
+     Educational Consulting / Risk & Insurance Advisory) when the specialty
+     is explicit.
 
  11c. ANTI-CATCH-ALL for Consulting & Advisory. Consulting & Advisory is for
       firms whose CORE OFFERING is pure advisory — they recommend, they
@@ -234,42 +241,44 @@ export const CORE_PRINCIPLES = `════════════════
 CORE PRINCIPLES
 ═══════════════════════════════════════════════════════════════════════════
 
-• DECISION ORDER — always identity FIRST, then sub from that identity's
-  children only. Never pick a sub_identity before you've committed to an
-  identity. If you start by spotting "Healthcare Support Services" in the
-  text, that does NOT mean you can write it as sub — first decide whether
-  the company's identity is Healthcare Provider or something else. If the
-  identity ends up being anything OTHER than the sub's parent, you must drop
-  the sub.
+DECISION SEQUENCE — work through these three tags in this exact order. Each
+tag is INDEPENDENT and gets its own confidence score.
 
-• IDENTITY IS REQUIRED. SUB IS OPTIONAL.
-    - Whenever the input clearly matches one of the rules in HARD_KEYWORD_ROUTING
-      (service type / company kind), you MUST set an identity. Don't null
-      identity just because no sub_identity in the library is a perfect fit —
-      that's the most common over-caution failure. Sub = null is FINE; identity
-      = null on a clear input is WRONG.
-    - Examples of the failure mode you must NOT repeat:
-        ✗ "Managed IT Services for Automotive Dealerships including DMS Hosting"
-          → identity=null  ← WRONG. The "Managed IT Services" trigger fixes
-            identity to IT Services (rule 12). Set identity=IT Services,
-            sub_identity=null (no MSP sub exists), sector=Retail.
-        ✗ "Boutique IT consulting and managed IT support for SMBs"
-          → identity=null  ← WRONG. Set identity per rule 11d first-mention
-            (IT consulting first → Consulting & Advisory > IT Consulting).
-        ✗ "Domain registration and web hosting services"
-          → identity=null  ← WRONG. Hosting/cloud is IT Services (rule 12).
-            sub=null, sector=null is OK.
-    - Identity = null is appropriate ONLY when the company's actual nature is
-      genuinely unclear from the input (truly generic "Professional services
-      firm", "Technology company"). In those cases set identity_confidence ≤ 3.
+Step 1 — IDENTITY (Layer 1)
+  Read the input. Apply HARD_KEYWORD_ROUTING first — when a rule triggers, the
+  identity is fixed. If no rule triggers, decide what the company IS at its
+  core (operator? service provider? software vendor? investor? agency?). Pick
+  from VALID_IDENTITIES. If the input is too vague to identify the company
+  (e.g. "Professional services firm", "Technology company"), set identity=
+  null with identity_confidence ≤ 4 and a short reason.
 
-• PAIRED-OR-EMPTY for identity + sub_identity. These two fields move together:
-    - If identity is null, sub_identity MUST be null.
-    - If sub_identity is set, identity MUST be set to that sub's parent in
-      VALID_SUB_IDENTITIES (verify before returning).
-    - This rule is one-directional: identity-without-sub is FINE; sub-without-
-      identity is WRONG. Re-read the previous bullet — don't null identity
-      to satisfy this rule.
+Step 2 — SUB_IDENTITY (Layer 2)  — ONLY when identity is set
+  Look at VALID_SUB_IDENTITIES for the chosen identity's children. If one
+  fits cleanly, set it. If none fits, set sub_identity=null. DO NOT invent a
+  sub to fill the slot, and DO NOT downgrade identity because no sub matches.
+  sub_identity_confidence is scored INDEPENDENTLY of identity_confidence.
+
+Step 3 — SECTOR (Layer 3)
+  The vertical the company SERVES, if explicitly named. Sector is independent
+  of identity and sub — set it whenever the input names a vertical, even when
+  identity and sub are null. Default to null if no vertical is named.
+
+CONFIDENCE GATING (the rule that decides whether a value survives):
+  confidence ≥ 5 → KEEP the value
+  confidence ≤ 4 → NULL the value AND set its confidence to 1
+  Per-tag, not per-row. Identity can be set (confidence 8) while sub is null
+  (confidence 3) — that's the normal, expected outcome when no sub fits.
+
+Paired-or-empty (mechanical check after step 2):
+  - identity null → sub_identity MUST be null
+  - sub_identity set → identity MUST be set to that sub's parent in
+    VALID_SUB_IDENTITIES
+  Sub-without-identity is always wrong. Identity-without-sub is fine — Phase
+  1b rolls those rows up to identity-level cleanly.
+
+═══════════════════════════════════════════════════════════════════════════
+CORE RULES (apply throughout the sequence)
+═══════════════════════════════════════════════════════════════════════════
 
 • "X for Y" means identity=X, sector=Y. NEVER let the served vertical become
   the identity, and NEVER let it become the sub_identity.
@@ -282,76 +291,57 @@ CORE PRINCIPLES
         Consulting & Advisory. Set sub_identity=null, sector=Non-Profit.)
 
 • sub_identity ≠ sector, EVER. They are independent fields. If the only
-  meaningful descriptor you can put in sub_identity is a vertical name,
-  the vertical belongs in sector and sub_identity stays null.
-    ✗ sub_identity="Healthcare", sector="Healthcare"  ← never duplicate
-    ✗ sub_identity="Non-Profit & Social Impact", sector="Non-Profit & Social Impact"  ← never duplicate
+  meaningful descriptor for sub_identity is a vertical name, the vertical
+  belongs in sector and sub_identity stays null.
+    ✗ sub_identity="Healthcare", sector="Healthcare"
+    ✗ sub_identity="Non-Profit & Social Impact", sector="Non-Profit & Social Impact"
 
 • Layer names DO NOT cross layers. An identity name MUST NEVER appear as
   sub_identity. A sector name MUST NEVER appear as sub_identity. Each layer
-  has its own VALID_* menu — pulling a name from the wrong menu is a parsing
-  bug, not a proposal. Observed mistakes the model has made and must NOT
-  repeat:
-    ✗ sub_identity="Real Estate" (under Education & Training)
-       Real Estate is a Layer-1 IDENTITY, not a sub. If the company is a
-       real-estate investment education shop, set identity=Education &
-       Training, sub_identity=null, sector=Real Estate.
-    ✗ sub_identity="Distribution & Wholesale" (under Media & Entertainment)
-       Distribution & Wholesale is a Layer-1 IDENTITY. If the company
-       distributes music to labels, set identity=Distribution & Wholesale,
-       sub_identity=null, sector=Media & Entertainment.
-    ✗ sub_identity="Software & SaaS" or sub_identity="IT Services"
-       Both are IDENTITIES. Never use as sub.
+  has its own VALID_* menu.
+    ✗ sub_identity="Real Estate" — that's a Layer-1 identity, not a sub
+    ✗ sub_identity="Distribution & Wholesale" — Layer-1 identity
+    ✗ sub_identity="Software & SaaS" or "IT Services" — Layer-1 identities
 
-• Never use the literal strings "null", "none", "n/a", "unknown",
+• Never emit the literal strings "null", "none", "n/a", "unknown",
   "unspecified", "tbd" as a tag value. To omit a tag, emit JSON null (the
-  bare value null without quotes), not the string. If you cannot pick a
-  value with confidence ≥ 5, return null.
+  bare value null without quotes), not the string.
 
-• Operator vs Enabler. An operator IN a vertical (hospital, restaurant, school,
-  bank) belongs to that vertical's identity. A service provider TO that vertical
-  keeps its own service identity.
+• Operator vs Enabler. An operator IN a vertical (hospital, restaurant,
+  school, bank) belongs to that vertical's identity. A service provider TO
+  that vertical keeps its own service identity.
 
-• Healthcare Provider vs Life Sciences & MedTech vs Health-software. Three different
-  identities, decided by what the company actually DOES:
+• Healthcare Provider vs Life Sciences & MedTech vs Health-software. Three
+  different identities, decided by what the company actually DOES:
     - Treats patients / delivers care → Healthcare Provider
     - Develops or makes drugs / devices / diagnostics → Life Sciences & MedTech
     - Sells software to either of the above → Software & SaaS (sector=Healthcare)
-  When the input is vague ("healthcare company"), prefer NULL identity over a guess.
 
-• Distribution & Wholesale vs Retail. A B2B distributor / wholesaler / jobber /
-  master distributor / VAR / manufacturers' rep belongs to Distribution &
-  Wholesale. A consumer-facing retailer or DTC brand belongs to Retail (and is
-  usually DQ). Do NOT lump them together.
+• Distribution & Wholesale vs Retail. A B2B distributor / wholesaler / VAR /
+  manufacturers' rep belongs to Distribution & Wholesale. A consumer-facing
+  retailer or DTC brand belongs to Retail (usually DQ).
 
 • Services vs Products. Companies that rent / maintain / repair / operate-as-
-  a-service must NEVER be tagged as a manufacturer sub-identity. Use the
-  relevant services sub-identity, or leave sub-identity null. Custom software
-  development DELIVERED AS A SERVICE → IT Services, not Software & SaaS.
+  a-service must NEVER be tagged as a manufacturer sub-identity. Custom
+  software development DELIVERED AS A SERVICE → IT Services, not Software & SaaS.
 
-• Parent/sub consistency check (do this BEFORE returning a row).
-  After you pick identity X and sub_identity Y, verify that Y's parent in the
-  VALID_SUB_IDENTITIES menu is exactly X. If not, you've made an error — either
-  re-pick the sub_identity from X's children, or set sub_identity = null.
-  Common past-mistake patterns to avoid:
-    - sub_identity "Private Equity" paired with identity ≠ Financial Services
-    - sub_identity "Custom Software Development" paired with identity = Software & SaaS  ← WRONG, parent is IT Services
-    - sub_identity "Management Consulting" paired with identity = Accounting & Tax  ← WRONG, parent is Consulting & Advisory
-    - sub_identity "IT Asset Disposition" paired with identity = Field Services & Maintenance  ← WRONG, parent is IT Services
-    - any sub_identity paired with identity = Legal Services  ← WRONG, Legal Services has no subs
+• Parent/sub consistency check (mechanical, after step 2):
+  After picking identity X and sub_identity Y, verify Y's parent in
+  VALID_SUB_IDENTITIES is exactly X. If not, re-pick from X's children, or
+  set sub_identity=null. Past mistake patterns to avoid:
+    - sub "Private Equity" with identity ≠ Financial Services
+    - sub "Custom Software Development" with identity = Software & SaaS  (parent is IT Services)
+    - sub "Management Consulting" with identity = Accounting & Tax  (parent is Consulting & Advisory)
+    - sub "IT Asset Disposition" with identity = Field Services & Maintenance  (parent is IT Services)
+    - any sub with identity = Legal Services  (Legal Services has no subs)
 
-• Sector defaults to NULL. Only set sector when the input EXPLICITLY states the
-  vertical the company serves. Do not infer.
+• Sector defaults to NULL. Only set sector when the input EXPLICITLY names
+  the vertical the company serves. Do not infer.
     ✓ "Digital marketing agency" → sector=null
     ✓ "Digital marketing agency for restaurants" → sector=Hospitality & Travel
   Do NOT use these as sectors (they are identities or non-verticals):
     Marketing · Advertising · IT Services · Professional Services · Consulting ·
-    Corporate · B2B · Small Business · Subscription · Holding Company
-
-• When uncertain, prefer NULL over a wrong guess. The pipeline gates on
-  per-tag confidence; a wrong tag with high confidence is the worst outcome.
-  Generic inputs like "Professional services firm" or "Technology company"
-  should return identity=null (or low-confidence identity) and sub_identity=null.`;
+    Corporate · B2B · Small Business · Subscription · Holding Company`;
 
 export const DISQUALIFICATION_RULES = `═══════════════════════════════════════════════════════════════════════════
 DISQUALIFICATION (be conservative — false negatives are worse than false positives)
@@ -447,49 +437,24 @@ to avoid:
     library names: Healthcare Provider, Education & Training, Life Sciences
     & MedTech). Check the current VALID_IDENTITIES list before proposing.
 
-REMOVED LIBRARY VALUES — do NOT use these strings; they are not in VALID_*
-and proposing them as new is forbidden. Use the canonical replacement.
+REMOVED LIBRARY VALUES — do NOT use these strings; they are not in VALID_*.
+Listed are the names the model has tried to re-emit recently. For anything
+else not in VALID_*, propose new only if no current entry is loosely
+applicable.
 
-  Removed                          → Use instead
+  Removed                  → Use instead
   ────────────────────────────────────────────────────────────────────────
-  Healthcare Operator              → Healthcare Provider OR Life Sciences & MedTech
-  Education Operator               → Education & Training
-  Life Sciences                    → Life Sciences & MedTech
-  Specialty Consulting             → Management Consulting
-  Business Consulting              → Management Consulting
-  Strategy Consulting              → Management Consulting
-  Management Consulting → Management Consulting
-  Hospitality Operator             → Hotel & Hospitality Operator
-  Hotel Management                 → Hotel & Hospitality Operator
-  Banking                          → Banking & Lending
-  Lending / Credit                 → Banking & Lending
-  Mortgage Brokerage               → Banking & Lending
-  Custom Manufacturing             → B2B / Custom Manufacturer
-  B2B Product Manufacturer         → B2B / Custom Manufacturer
-  Tax Advisory                     → Tax & Audit Advisory
-  Biotech                          → Biotechnology
-  Fleet Leasing                    → Fleet Leasing & Management
-  Manufacturer's Representative    → Manufacturers' Representative
-  Business Aviation Services       → Business Aviation Operator (under Hospitality & Travel)
-  CRM / Sales Software             → CRM / Sales SaaS
-  Cybersecurity Software           → Cybersecurity SaaS
-  Managed IT Services              → sub_identity = null (MSPs are the default
-                                     flavor of IT Services — no dedicated sub.
-                                     Only use Cybersecurity Services / Custom
-                                     Software Development / Data Migration
-                                     Services / IT Asset Disposition for the
-                                     non-MSP flavors.)
-  Vertical SaaS                    → sub_identity = null (Vertical SaaS was the
-                                     SaaS-for-X catch-all and got over-used;
-                                     it has been removed. Prefer the more
-                                     specific SaaS subs when applicable —
-                                     CRM / Sales SaaS · Cybersecurity SaaS ·
-                                     FinTech SaaS · HR SaaS · MarTech SaaS —
-                                     otherwise leave sub_identity = null and
-                                     put the served vertical in sector.)
-  (any Legal Services sub-identity — Corporate Law, Estate Planning Law, etc.)
-                                   → sub_identity = null (Legal Services has no subs)
+  Healthcare Operator      → Healthcare Provider OR Life Sciences & MedTech
+  Education Operator       → Education & Training
+  Life Sciences            → Life Sciences & MedTech
+  Vertical SaaS            → sub_identity = null (or specific SaaS sub:
+                             CRM / Sales SaaS, Cybersecurity SaaS, FinTech
+                             SaaS, HR SaaS, MarTech SaaS)
+  Managed IT Services      → sub_identity = null (MSP is the default flavor
+                             of the IT Services identity; no dedicated sub)
+  Specialty / Business /
+  Strategy Consulting      → Management Consulting (collapsed)
+  Any Legal Services sub   → sub_identity = null (Legal Services has no subs)
 
-If no listed value is even loosely applicable, set is_new_*=true with your
-proposed name. Do NOT propose a new value that is a near-rewrite of an
-existing library entry, and do NOT propose any of the removed values above.`;
+If no VALID_* value is even loosely applicable, set is_new_*=true with your
+proposed name. Do NOT propose a near-rewrite of an existing entry.`;

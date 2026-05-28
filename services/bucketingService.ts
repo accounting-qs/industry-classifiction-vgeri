@@ -2826,18 +2826,28 @@ ${CORE_PRINCIPLES}
 ${DISQUALIFICATION_RULES}
 
 ═══════════════════════════════════════════════════════════════════════════
-CONFIDENCE SCORING (per tag, integer 1-10)
+CONFIDENCE SCORING (per tag, integer 1-10) — gates the value
 ═══════════════════════════════════════════════════════════════════════════
 
 Return THREE independent scores: identity_confidence, sub_identity_confidence,
-sector_confidence. Each scores ONE tag, not the whole row.
+sector_confidence. Score each tag on its OWN — high identity confidence does
+not depend on sub or sector being set.
 
-  9-10  explicit, unambiguous match
-  7-8   strong inference from context
-  5-6   weak signal; downstream may ignore
-  1-4   guessing — prefer setting the tag to null + confidence 1-3
+  9-10  explicit, unambiguous (rule triggers, exact name in the input)
+  7-8   strong inference from clear context
+  5-6   reasonable inference — you would defend the pick under review
+   ≤ 4  below the threshold — NULL this tag and set its confidence to 1
 
-If you set a tag to null, its confidence MUST be 1.
+The 5/4 line is the gate. Confidence ≥ 5 → keep the value. Confidence ≤ 4 →
+null the value. This is PER-TAG:
+  - identity_confidence=8, sub_identity_confidence=3 → identity set, sub=null.
+    Identity-without-sub is the normal outcome when no library sub fits.
+  - identity_confidence=3, sub_identity_confidence anything → both null. Sector
+    is still independently set if its own confidence ≥ 5.
+  - All three confidences ≥ 5 → all three set.
+
+If you set a tag to null, its confidence MUST be 1. Always include a one-line
+"reason" explaining the identity choice (or why identity is null).
 
 ═══════════════════════════════════════════════════════════════════════════
 NEW-VALUE PROPOSALS
@@ -2888,13 +2898,14 @@ ${renderLibraryReference(s)}
 WORKED EXAMPLES (illustrative — always pick from the VALID_* lists above)
 ═══════════════════════════════════════════════════════════════════════════
 
+─── Basic identity recognition ────────────────────────────────────────
+
 Input:  Digital marketing agency
 Output: identity=Agency, sub_identity=Performance Marketing Agency, sector=null
-Note:   generic agency, no vertical mentioned → sector blank
 
 Input:  SEO agency for healthcare clinics
 Output: identity=Agency, sub_identity=Performance Marketing Agency, sector=Healthcare
-Note:   "X for Y" — Y is the served vertical, becomes the sector
+Note:   "X for Y" — Y is the served vertical, becomes the sector.
 
 Input:  Private equity firm focused on lower-middle market buyouts
 Output: identity=Financial Services, sub_identity=Private Equity, sector=null
@@ -2904,50 +2915,94 @@ Output: identity=Financial Services, sub_identity=Investment Banking, sector=Hea
 
 Input:  Community bank serving small businesses
 Output: identity=Financial Services, sub_identity=Banking & Lending, sector=null
-Note:   banks / credit unions / lenders / mortgage brokers collapse into the
-        single combined sub "Banking & Lending".
-
-Input:  Software platform for K-12 schools
-Output: identity=Software & SaaS, sub_identity=null, sector=Education
-Note:   the served vertical is what the SaaS serves (Education); sub stays
-        null unless the input matches a specific SaaS sub (CRM / Sales SaaS ·
-        Cybersecurity SaaS · FinTech SaaS · HR SaaS · MarTech SaaS).
+Note:   banks / credit unions / lenders / mortgage brokers all collapse into
+        the single combined sub "Banking & Lending".
 
 Input:  Custom software development shop building bespoke apps
 Output: identity=IT Services, sub_identity=Custom Software Development, sector=null
-Note:   service-delivered ≠ a SaaS product. Custom Software Development's parent
-        is IT Services, NOT Software & SaaS.
+Note:   service-delivered, NOT a SaaS product. Parent of Custom Software
+        Development is IT Services, not Software & SaaS.
 
-Input:  Healthcare staffing agency placing travel nurses
-Output: identity=Staffing & Recruiting, sub_identity=Healthcare Staffing, sector=Healthcare
-
-Input:  Managed IT services provider for small and mid-sized businesses
-Output: identity=IT Services, sub_identity=null, sector=null
-Note:   MSPs are the default flavor of IT Services — leave sub_identity null.
-        Only set a sub when the input clearly says Cybersecurity Services,
-        Custom Software Development, Data Migration Services, or IT Asset
-        Disposition.
-
-Input:  PE-backed software company building tools for restaurants
-Output: identity=Software & SaaS, sub_identity=null, sector=Hospitality & Travel
-Note:   "PE-backed" is a financing status, NOT the identity. No specific SaaS
-        sub fits → leave sub null.
+Input:  Software platform for K-12 schools
+Output: identity=Software & SaaS, sub_identity=null, sector=Education
+Note:   no specific SaaS sub (CRM/Sales/Cybersecurity/FinTech/HR/MarTech)
+        fits → sub stays null. Identity-without-sub is fine.
 
 Input:  Venture-backed fintech startup automating B2B payments
 Output: identity=Software & SaaS, sub_identity=FinTech SaaS, sector=null
-Note:   "fintech startup" → Software & SaaS (X-tech rule 1b). "Venture-backed"
-        is a financing status, NOT Financial Services.
+Note:   "fintech startup" → Software & SaaS (X-tech rule 1b). "Venture-
+        backed" is a financing status, NOT Financial Services.
 
-Input:  Healthtech company building remote patient monitoring tools
-Output: identity=Software & SaaS, sub_identity=null, sector=Healthcare
-Note:   "healthtech company" → Software & SaaS (X-tech rule 1b), NOT Healthcare
-        Provider, NOT Life Sciences & MedTech. Healthcare is the served
-        vertical → sector. No specific SaaS sub fits → leave sub null.
+─── Identity-without-sub: the common case the model used to over-null ───
+
+Input:  Managed IT Services provider for small and mid-sized businesses
+Output: identity=IT Services, sub_identity=null, sector=null
+Note:   MSPs are the DEFAULT flavor of IT Services — no dedicated sub. Set
+        identity, leave sub null. Only set a sub when the input clearly says
+        Cybersecurity Services, Custom Software Development, Data Migration
+        Services, or IT Asset Disposition.
+
+Input:  Managed IT Services and Office Technology Solutions Provider for SMBs
+Output: identity=IT Services, sub_identity=null, sector=null
+Note:   "Managed IT" triggers rule 12. The "Office Technology" detail does
+        NOT downgrade your confidence — keep identity=IT Services with
+        identity_confidence ≥ 7. Identity-confidence is independent of
+        sub-confidence.
+
+Input:  Managed IT Services for Automotive Dealerships including DMS Hosting and Network Solutions
+Output: identity=IT Services, sub_identity=null, sector=Retail
+Note:   "Managed IT" fixes identity. Auto dealerships are the served
+        vertical → sector=Retail. Identity, sub, and sector are scored
+        independently.
+
+Input:  Domain registration and web hosting services
+Output: identity=IT Services, sub_identity=null, sector=null
+Note:   hosting / domain / cloud / colocation → IT Services (rule 12). No
+        sub fits → sub=null. Do NOT return identity=null.
+
+Input:  Web Design, Web Development, and IT Support Services for SMBs
+Output: identity=IT Services, sub_identity=null, sector=null
+Note:   web design + web dev + IT support are all IT Services work. No
+        single sub captures all three → sub=null.
+
+Input:  Boutique IT consulting and managed IT support for SMBs
+Output: identity=Consulting & Advisory, sub_identity=IT Consulting, sector=null
+Note:   first-mentioned-wins (rule 11d): "IT consulting" appears first →
+        Consulting & Advisory > IT Consulting.
+
+Input:  IT consulting and SAP solutions provider with application development and test automation services
+Output: identity=Consulting & Advisory, sub_identity=IT Consulting, sector=null
+Note:   "IT consulting" first → Consulting & Advisory > IT Consulting. The
+        dev/test work is secondary.
+
+Input:  B2B software development and consulting for ecommerce businesses
+Output: identity=IT Services, sub_identity=Custom Software Development, sector=Retail
+Note:   first-mentioned-wins: "software development" first → IT Services.
+        Ecommerce is the served vertical → sector=Retail.
+
+Input:  Strategy consulting and custom development for SaaS founders
+Output: identity=Consulting & Advisory, sub_identity=Management Consulting, sector=null
+Note:   first-mentioned-wins: "strategy consulting" first → Consulting &
+        Advisory. "SaaS founders" is an audience, not a served vertical.
+
+Input:  Consumer Insights and Market Research Services for Product Development
+Output: identity=Consulting & Advisory, sub_identity=Management Consulting, sector=null
+Note:   research-and-recommend work is Consulting & Advisory even without the
+        word "consulting" (rule 11b expanded). Market research collapses into
+        Management Consulting.
+
+─── "Advisory" attached to investment verbs — NOT consulting ──────────
+
+Input:  Venture Capital Advisory for Secondary Market Transactions and Pre-IPO Financing
+Output: identity=Financial Services, sub_identity=Venture Capital, sector=null
+Note:   "VC advisory / secondary market / pre-IPO" → Financial Services (rule
+        4b), NOT Consulting & Advisory.
+
+─── Healthcare split, layer separation, parent-sub correctness ─────────
 
 Input:  Multi-location dental group
 Output: identity=Healthcare Provider, sub_identity=null, sector=null
-Note:   treats patients → Healthcare Provider. Dental practice has no dedicated
-        sub — leave sub_identity null.
+Note:   treats patients → Healthcare Provider. Dental has no dedicated sub.
 
 Input:  Biotech developing CAR-T cell therapies
 Output: identity=Life Sciences & MedTech, sub_identity=Biotechnology, sector=null
@@ -2955,8 +3010,24 @@ Note:   develops therapies → Life Sciences & MedTech, NOT Healthcare Provider.
 
 Input:  Medical device manufacturer specializing in orthopedic implants
 Output: identity=Life Sciences & MedTech, sub_identity=Medical Device Manufacturer, sector=null
-Note:   medical-device manufacturing → Life Sciences & MedTech (NOT Manufacturing &
-        Industrial, NOT Healthcare Provider).
+Note:   medical-device manufacturing → Life Sciences & MedTech. NOT Manufacturing.
+
+Input:  Healthtech company building remote patient monitoring tools
+Output: identity=Software & SaaS, sub_identity=null, sector=Healthcare
+Note:   "healthtech company" → Software & SaaS (X-tech rule 1b). Healthcare
+        is the served vertical → sector.
+
+Input:  Home health agency providing in-home senior care
+Output: identity=Healthcare Provider, sub_identity=Healthcare Support Services, sector=null
+Note:   Healthcare Support Services' parent is Healthcare Provider — keep
+        the pair consistent.
+
+Input:  Digital consulting and technology strategy services for mission-driven organizations
+Output: identity=Consulting & Advisory, sub_identity=Management Consulting, sector=Non-Profit & Social Impact
+Note:   non-profit is the SERVED vertical → sector. Never put "Non-Profit
+        Organization" in sub_identity when identity = Consulting & Advisory.
+
+─── Edge cases ────────────────────────────────────────────────────────
 
 Input:  Industrial distributor selling fasteners to OEMs
 Output: identity=Distribution & Wholesale, sub_identity=null, sector=null
@@ -2964,21 +3035,18 @@ Note:   B2B middleman → Distribution & Wholesale, NOT Retail, NOT Logistics.
 
 Input:  Independent insurance agency for commercial lines
 Output: identity=Insurance Services, sub_identity=Insurance Brokerage, sector=null
-Note:   Insurance Services is its own identity, NOT Financial Services
+Note:   Insurance Services is its own identity, NOT Financial Services.
 
 Input:  Family-owned restaurant in Austin
 Output: identity=Hospitality & Travel, sub_identity=Hotel & Hospitality Operator, sector=null, is_disqualified=true
-Note:   restaurants now use the merged "Hotel & Hospitality Operator" sub.
 
 Input:  Boutique law firm specializing in employment litigation
 Output: identity=Legal Services, sub_identity=null, sector=null
-Note:   Legal Services has NO sub-identities — always set sub_identity = null
+Note:   Legal Services has NO sub-identities — sub_identity always null
         regardless of practice area.
 
 Input:  Boutique strategy consulting firm
-Output: identity=Consulting & Advisory, sub_identity=Strategy & Management Consulting, sector=null
-Note:   strategy / management / business / specialty consulting all collapse
-        into "Strategy & Management Consulting".
+Output: identity=Consulting & Advisory, sub_identity=Management Consulting, sector=null
 
 Input:  Regional CPA firm offering audit and tax services
 Output: identity=Accounting & Tax, sub_identity=Tax & Audit Advisory, sector=null
@@ -2986,109 +3054,30 @@ Note:   CPAs → Accounting & Tax, NOT Consulting & Advisory.
 
 Input:  Charter / private jet operator managing a fleet of light jets
 Output: identity=Hospitality & Travel, sub_identity=Business Aviation Operator, sector=null
-Note:   business aviation operators (own the jets) live in Hospitality & Travel,
-        NOT Logistics & Transportation.
-
-Input:  Professional services firm  (truly generic, no signal)
-Output: identity=null, sub_identity=null, sector=null  (all confidences 1-3)
-Note:   don't over-claim when the input is generic — return nulls.
-
-Input:  Consulting firm  (vague identity, no sub-identity signal)
-Output: identity=Consulting & Advisory, sub_identity=null, sector=null
-Note:   pick the identity when it's clear; leave sub-identity null when not.
-
-Input:  Venture Capital Advisory for Secondary Market Transactions and Pre-IPO Financing
-Output: identity=Financial Services, sub_identity=Venture Capital, sector=null
-Note:   "VC advisory / secondary market / pre-IPO" → Financial Services (rule 4b),
-        NOT Consulting & Advisory. The word "Advisory" attached to investment
-        verbs does NOT make this a consulting firm.
-
-Input:  Digital consulting and technology strategy services for mission-driven organizations
-Output: identity=Consulting & Advisory, sub_identity=Strategy & Management Consulting, sector=Non-Profit & Social Impact
-Note:   "X for Y" — mission-driven/non-profit is the SERVED vertical, so it
-        goes in sector. Never put "Non-Profit Organization" in sub_identity
-        when identity = Consulting & Advisory — that sub's parent is
-        Non-Profit & Association.
-
-Input:  Home health agency providing in-home senior care
-Output: identity=Healthcare Provider, sub_identity=Healthcare Support Services, sector=null
-Note:   Healthcare Support Services' parent is Healthcare Provider. Don't pair
-        it with Consulting & Advisory.
 
 Input:  Boutique film production company shooting commercials and brand content
 Output: identity=Media & Entertainment, sub_identity=Production Company, sector=null
-Note:   production companies belong in Media & Entertainment (rule 22), NOT
-        Agency, even when their clients are brands.
+Note:   production companies → Media & Entertainment, NOT Agency.
 
 Input:  Educational consulting firm advising K-12 school districts on curriculum
 Output: identity=Consulting & Advisory, sub_identity=Educational Consulting, sector=Education
-Note:   consultants TO schools are Consulting & Advisory, not Education
-        Operator. Education is the served vertical → sector.
-
-Input:  Workforce development nonprofit running job training programs
-Output: identity=Education Operator, sub_identity=Workforce Development Services, sector=null
-Note:   Workforce Development Services' parent is Education Operator (the
-        organization DELIVERS training). If the input only said "non-profit"
-        with no training detail, identity would be Non-Profit & Association
-        instead.
-
-Input:  Managed IT Services with Business Phone and Video Surveillance Solutions
-Output: identity=IT Services, sub_identity=null, sector=null
-Note:   MSP-flavored IT services → identity=IT Services, sub_identity=null
-        (no dedicated MSP sub — it's the default for the identity). PAIRED-
-        OR-EMPTY rule: never ship sub_identity with identity=null.
-
-Input:  Healthcare company  (truly vague — care provider? life sciences? software?)
-Output: identity=null, sub_identity=null, sector=Healthcare  (id confidence 1-3)
-Note:   when input is generic and could be Healthcare Provider OR Life
-        Sciences OR Software & SaaS, return null identity. Don't guess.
 
 Input:  AI-driven digital product agency for custom software design and development
 Output: identity=IT Services, sub_identity=Custom Software Development, sector=null
-Note:   "digital product agency" reads like marketing but the work described
-        is custom software development — IT Services wins. Per rule 11c, do
-        NOT default to Consulting & Advisory just because "agency" doesn't
-        cleanly fit existing Agency subs.
+Note:   "digital product agency" reads like marketing but the work is custom
+        software development — IT Services wins.
 
-Input:  B2B software development and consulting for ecommerce businesses
-Output: identity=IT Services, sub_identity=Custom Software Development, sector=Retail
-Note:   first-mentioned-wins (rule 11d): "software development" appears
-        before "consulting" → IT Services, not Consulting & Advisory. Ecommerce
-        is the served vertical → sector=Retail.
+─── When identity really IS too vague (the rare case) ─────────────────
 
-Input:  Strategy consulting and custom development for SaaS founders
-Output: identity=Consulting & Advisory, sub_identity=Management Consulting, sector=null
-Note:   first-mentioned-wins: "strategy consulting" appears before "custom
-        development" → Consulting & Advisory wins. (sector left null because
-        "SaaS founders" is an audience, not a served vertical.)
+Input:  Professional services firm  (no further description)
+Output: identity=null, sub_identity=null, sector=null  (all confidences ≤ 4)
+Note:   the input names no business model, no service type, no vertical.
+        Genuinely impossible to identify — return nulls with reason.
 
-Input:  Managed IT Services for Automotive Dealerships including DMS Hosting and Network Solutions
-Output: identity=IT Services, sub_identity=null, sector=Retail
-Note:   DO NOT return identity=null just because no MSP sub exists in the
-        library. The "Managed IT" trigger fixes identity to IT Services
-        (rule 12). Auto dealerships are a Retail sector. This is the most
-        common over-caution failure — re-read the IDENTITY IS REQUIRED rule.
-
-Input:  IT consulting and SAP solutions provider with application development and test automation services
-Output: identity=Consulting & Advisory, sub_identity=IT Consulting, sector=null
-Note:   first-mentioned-wins (rule 11d): "IT consulting" appears first →
-        Consulting & Advisory > IT Consulting. Even though dev/test work is
-        mentioned, the consulting framing wins because it's first.
-
-Input:  Domain registration and web hosting services
-Output: identity=IT Services, sub_identity=null, sector=null
-Note:   hosting / domain / cloud / colocation → IT Services (rule 12). No
-        specific sub fits → sub=null. NEVER return identity=null here.
-
-Input:  Boutique IT consulting and managed IT support for SMBs
-Output: identity=Consulting & Advisory, sub_identity=IT Consulting, sector=null
-Note:   "IT consulting" first → Consulting & Advisory. "managed IT" is
-        secondary. Identity MUST be set.
-
-Input:  Web Design, Web Development, and IT Support Services for Small and Medium Businesses
-Output: identity=IT Services, sub_identity=null, sector=null
-Note:   web design + web dev + IT support are all IT Services work. No
-        specific sub captures all three → sub=null. Identity = IT Services.`;
+Input:  Technology company  (no further description)
+Output: identity=null, sub_identity=null, sector=null  (all confidences ≤ 4)
+Note:   could be Software & SaaS, IT Services, Telecommunications, or
+        Manufacturing — the input gives no signal. Null is correct here.`;
 }
 
 function parseTaggingJson(raw: string, batch: VocabRow[]): IndustryTagging[] {
