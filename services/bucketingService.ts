@@ -259,7 +259,7 @@ interface TaxonomySnapshot {
 // Sub-identity keying uses "|" (illegal in identity names) to avoid
 // collisions with the "::" the UI uses inside routeDraft values.
 export interface ProposalSuggestion {
-    route_to?: string;            // existing library entry name (verbatim)
+    route_to?: string;            // existing library entry name (verbatim) — the model's top pick
     route_to_parent?: string;     // sub_identities only — parent identity of route_to
     accept_as_new?: boolean;      // exactly one of route_to / accept_as_new / wrong_layer is set
     wrong_layer?: boolean;        // proposal's NAME is from a different layer (identity-as-sub,
@@ -267,6 +267,17 @@ export interface ProposalSuggestion {
                                   // accept-as-new are both wrong here.
     confidence: number;           // 1-10
     reason: string;               // <= 30 words, single sentence
+    // Up to 2 alternative ranked route candidates (excludes the primary
+    // route_to above; descending confidence). Populated only when decision
+    // = route AND the model genuinely sees multiple plausible library
+    // targets. UI renders each as a clickable chip so the user picks one
+    // instead of being committed to the top pick.
+    alt_routes?: Array<{
+        route_to: string;
+        route_to_parent?: string;
+        confidence: number;
+        reason: string;
+    }>;
 }
 
 export interface ProposalSuggestionsBlob {
@@ -4350,6 +4361,12 @@ interface RawSuggestion {
     route_to_parent?: string;
     confidence: number;
     reason: string;
+    alt_routes?: Array<{
+        route_to: string;
+        route_to_parent?: string;
+        confidence: number;
+        reason: string;
+    }>;
 }
 
 function layerGuidance(layer: SuggestLayer): string {
@@ -4396,16 +4413,30 @@ CONFIDENCE (1-10) — use the full range:
 REASONING:
   - ≤ 30 words. ONE sentence. Cite the library entry's name when routing. Name the correct layer when wrong_layer.
 
+ALTERNATIVE ROUTES (decision=route only):
+  - In addition to your top pick (route_to / confidence), you MAY include up to 2 alternative library targets in alt_routes when more than one library entry is plausibly a paraphrase or narrower case of the proposal. The reviewer will see all of them as clickable picks and choose.
+  - Order alt_routes by descending confidence; each alt's confidence MUST be ≤ the primary's confidence.
+  - Skip alt_routes (omit the field, or empty array) when there is no genuine second-best match — don't pad with "least-wrong" entries. Better to give 1 high-confidence pick than 3 mediocre ones.
+  - Each alt obeys the same validation as the primary: the route_to MUST exist in the LIBRARY block; for sub-identities the route_to_parent MUST be that entry's listed parent (or cap confidence ≤ 4 if cross-parent, same rule as the primary).
+  - Never repeat the primary route_to in alt_routes. Each alt must be a distinct library entry.
+
 OUTPUT — strict JSON, single object with key "suggestions":
 {
   "suggestions": [
     { "name": "<proposal name verbatim>",
       "parent": "<parent identity name verbatim>",        // sub_identities only
       "decision": "route" | "new" | "wrong_layer",
-      "route_to": "<library entry name verbatim>",        // when decision = route
+      "route_to": "<library entry name verbatim>",        // when decision = route (top pick)
       "route_to_parent": "<library parent identity>",     // sub_identities + route only
       "confidence": 1-10,
-      "reason": "..." }
+      "reason": "...",
+      "alt_routes": [                                     // OPTIONAL, decision=route only, max 2 entries
+        { "route_to": "<library entry name verbatim>",
+          "route_to_parent": "<library parent identity>", // sub_identities only
+          "confidence": 1-10,
+          "reason": "..." }
+      ]
+    }
   ]
 }
 
@@ -4413,7 +4444,7 @@ HARD RULES:
   - One object per PROPOSAL in the user message. Do not drop any.
   - When decision=route, route_to MUST appear in the LIBRARY block. Copy character-for-character. Do NOT invent names.
   - For sub-identities + route, route_to_parent MUST match the library entry's listed parent (after the cross-parent confidence cap above).
-  - When decision=new or wrong_layer, omit route_to / route_to_parent.
+  - When decision=new or wrong_layer, omit route_to / route_to_parent / alt_routes.
   - Output ONLY the JSON object. No prose, no markdown fences.`;
 
     // Library block — each entry gets its description AND up to 3 concrete
@@ -4649,8 +4680,52 @@ export async function suggestProposalRoutings(
                                 }
                             }
                         }
+                        // Validate alt_routes — same checks as the primary.
+                        // Drop any alt whose target doesn't exist; dedupe
+                        // against the primary; apply the cross-parent cap.
+                        // Cap to 2 alts even if the model returns more.
+                        if (Array.isArray(raw.alt_routes) && raw.alt_routes.length > 0) {
+                            const seenKeys = new Set<string>([
+                                r.layer === 'sub_identities'
+                                    ? `${out.route_to}|${out.route_to_parent || ''}`
+                                    : out.route_to!
+                            ]);
+                            const alts: NonNullable<ProposalSuggestion['alt_routes']> = [];
+                            for (const a of raw.alt_routes) {
+                                if (alts.length >= 2) break;
+                                if (!a || typeof a.route_to !== 'string' || !a.route_to.trim()) continue;
+                                const altKey = r.layer === 'sub_identities'
+                                    ? `${a.route_to}|${a.route_to_parent || ''}`
+                                    : a.route_to;
+                                if (seenKeys.has(altKey)) continue;
+                                const altExists = layerLib.some(e =>
+                                    e.name === a.route_to &&
+                                    (r.layer !== 'sub_identities' || e.parent_identity === a.route_to_parent)
+                                );
+                                if (!altExists) continue;
+                                let altConf = clampConfidence(a.confidence);
+                                let altReason = String(a.reason || '').slice(0, 240);
+                                if (r.layer === 'sub_identities'
+                                    && a.route_to_parent && raw.parent
+                                    && a.route_to_parent !== raw.parent
+                                    && altConf > 4) {
+                                    altConf = 4;
+                                    altReason = `(cross-parent: ${raw.parent} → ${a.route_to_parent}) ${altReason}`.slice(0, 240);
+                                }
+                                // Alt confidence must not exceed the primary.
+                                altConf = Math.min(altConf, out.confidence);
+                                alts.push({
+                                    route_to: a.route_to,
+                                    route_to_parent: r.layer === 'sub_identities' ? a.route_to_parent : undefined,
+                                    confidence: altConf,
+                                    reason: altReason,
+                                });
+                                seenKeys.add(altKey);
+                            }
+                            if (alts.length > 0) out.alt_routes = alts;
+                        }
                     } else {
-                        // Hallucinated target — downgrade to accept_as_new at low confidence.
+                        // Hallucinated primary target — downgrade to accept_as_new at low confidence.
                         out.accept_as_new = true;
                         out.confidence = Math.min(out.confidence, 4);
                         out.reason = `(invalid route target "${raw.route_to}") ${out.reason}`.slice(0, 240);

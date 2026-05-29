@@ -3444,6 +3444,16 @@ type ProposalSuggestion = {
   wrong_layer?: boolean;
   confidence: number;
   reason: string;
+  // Up to 2 alternative route candidates (excludes the primary route_to;
+  // descending confidence). UI renders each as a clickable chip so the user
+  // can pick from the model's full ranked list instead of being committed
+  // to the top pick alone.
+  alt_routes?: Array<{
+    route_to: string;
+    route_to_parent?: string;
+    confidence: number;
+    reason: string;
+  }>;
 };
 type ProposalSuggestionsBlob = {
   identities?: Record<string, ProposalSuggestion>;
@@ -4294,18 +4304,67 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                 </span>
                               </div>
                             )}
-                            {/* AI suggestion chip — takes precedence over
-                                the heuristic chip below when present.
-                                Color-coded by confidence (green ≥8, amber
-                                5-7, red ≤4). Hover-title shows the LLM
-                                reasoning verbatim. */}
-                            {aiSugg && !isActioned && !isEditing && aiState && (
+                            {/* AI suggestions — when decision=route, render
+                                the primary pick + any alt_routes as stacked
+                                clickable chips. Click any chip to route to
+                                that target. For non-route decisions (new /
+                                wrong_layer / stale), keep the single-chip
+                                summary. Colors by confidence: green ≥8,
+                                amber 5-7, red ≤4. */}
+                            {aiSugg && !isActioned && !isEditing && aiState === 'route' && aiTarget && (() => {
+                              const candidates: Array<{ name: string; parent?: string; confidence: number; reason: string }> = [
+                                { name: aiTarget.name, parent: aiTarget.parent, confidence: aiSugg.confidence, reason: aiSugg.reason }
+                              ];
+                              for (const alt of (aiSugg.alt_routes || [])) {
+                                // Only show alts whose target still lives in the active library.
+                                const stillExists = libEntries.some(le =>
+                                  le.name === alt.route_to &&
+                                  (kind !== 'sub_identities' || le.parent === alt.route_to_parent)
+                                );
+                                if (stillExists) candidates.push({
+                                  name: alt.route_to,
+                                  parent: alt.route_to_parent,
+                                  confidence: alt.confidence,
+                                  reason: alt.reason
+                                });
+                              }
+                              return (
+                                <div className="mt-1 flex flex-col items-start gap-0.5">
+                                  {candidates.map((cand, i) => {
+                                    const color = cand.confidence >= 8 ? 'emerald'
+                                      : cand.confidence >= 5 ? 'amber'
+                                      : 'red';
+                                    const cls = color === 'emerald'
+                                      ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/25'
+                                      : color === 'amber'
+                                        ? 'bg-amber-500/15 text-amber-300 border-amber-500/30 hover:bg-amber-500/25'
+                                        : 'bg-red-500/15 text-red-300 border-red-500/30 hover:bg-red-500/25';
+                                    return (
+                                      <button
+                                        key={`${cand.name}::${cand.parent || ''}`}
+                                        type="button"
+                                        onClick={() => remap(kind, p.name, cand.name, cand.parent)}
+                                        disabled={isBusy}
+                                        className={`px-1.5 py-0.5 rounded text-[9px] font-bold inline-flex items-center gap-1 border disabled:opacity-50 ${cls}`}
+                                        title={`Claude Opus 4.7 · confidence ${cand.confidence}/10 — ${cand.reason}`}
+                                      >
+                                        <Sparkles className="w-2.5 h-2.5" />
+                                        <span>
+                                          {i === 0 ? 'AI: ' : `Alt ${i}: `}
+                                          <span className="underline">{cand.name}</span>
+                                          {cand.parent && kind === 'sub_identities' ? ` (under ${cand.parent})` : ''}
+                                          {` · ${cand.confidence}/10`}
+                                        </span>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              );
+                            })()}
+                            {aiSugg && !isActioned && !isEditing && aiState && aiState !== 'route' && (
                               <div
                                 className={`mt-1 px-1.5 py-0.5 rounded text-[9px] font-bold inline-flex items-center gap-1 border ${
-                                  aiState === 'route' && aiConfColor === 'emerald' ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                                  : aiState === 'route' && aiConfColor === 'amber' ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-                                  : aiState === 'route' ? 'bg-red-500/15 text-red-300 border-red-500/30'
-                                  : aiState === 'new' ? 'bg-purple-500/15 text-purple-200 border-purple-500/30'
+                                  aiState === 'new' ? 'bg-purple-500/15 text-purple-200 border-purple-500/30'
                                   : aiState === 'wrong_layer' ? 'bg-orange-500/15 text-orange-300 border-orange-500/30'
                                   : 'bg-gray-500/15 text-gray-400 border-gray-500/30'
                                 }`}
@@ -4313,9 +4372,6 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                               >
                                 <Sparkles className="w-2.5 h-2.5" />
                                 <span>
-                                  {aiState === 'route' && aiTarget && (
-                                    <>AI: route to <span className="underline">{aiTarget.name}</span>{aiTarget.parent ? ` (under ${aiTarget.parent})` : ''} · {aiSugg.confidence}/10</>
-                                  )}
                                   {aiState === 'new' && (<>AI: keep as new · {aiSugg.confidence}/10</>)}
                                   {aiState === 'wrong_layer' && (<>AI: wrong layer — move manually · {aiSugg.confidence}/10</>)}
                                   {aiState === 'stale' && (<>AI suggestion stale (target removed)</>)}
@@ -4384,25 +4440,18 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                   });
                                 }}
                               />
-                              {aiState === 'route' && aiTarget ? (
-                                <button
-                                  onClick={() => remap(kind, p.name, aiTarget!.name, aiTarget!.parent)}
-                                  disabled={isBusy}
-                                  className="px-2 py-1 rounded text-[10px] font-bold bg-purple-500/30 text-purple-100 border border-purple-500/50 hover:bg-purple-500/40 disabled:opacity-50"
-                                  title={`Routes "${p.name}" → "${aiTarget.name}" using Claude Opus's suggestion (${aiSugg!.confidence}/10): ${aiSugg!.reason}`}
-                                >
-                                  {isBusy ? '…' : 'Accept routing'}
-                                </button>
-                              ) : (
-                                <button
-                                  onClick={() => accept(kind, p.name, p.parent)}
-                                  disabled={isBusy}
-                                  className="px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
-                                  title={aiState === 'new' ? 'AI suggests keeping as new — click to add to the library.' : undefined}
-                                >
-                                  {isBusy ? '…' : 'Accept'}
-                                </button>
-                              )}
+                              <button
+                                onClick={() => accept(kind, p.name, p.parent)}
+                                disabled={isBusy}
+                                className="px-2 py-1 rounded text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] disabled:opacity-50"
+                                title={
+                                  aiState === 'new' ? 'AI suggests keeping as new — click to add to the library.'
+                                  : aiState === 'route' ? 'Click any of the AI route suggestions above to route. This Accept button adds this proposal as a new library entry instead.'
+                                  : undefined
+                                }
+                              >
+                                {isBusy ? '…' : 'Accept'}
+                              </button>
                             </div>
                           )}
                         </div>
