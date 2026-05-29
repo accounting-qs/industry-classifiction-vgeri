@@ -3457,6 +3457,138 @@ type ProposalSuggestionsBlob = {
   };
 };
 
+// Searchable replacement for the native <select> in the proposal-routing UI.
+// The library can have 130+ entries (identities + subs + sectors) and a
+// native select has no type-to-filter — users had to scroll the whole list.
+// This combobox: substring filter (case-insensitive), keyboard nav (↑↓ Enter
+// Escape), click-outside to close, no autofocus side-effects on parent
+// re-render. Local-only state; the parent only sees onSelect(entry).
+function RouteToCombobox({
+  libEntries,
+  kind,
+  onSelect,
+  disabled,
+  isBusy
+}: {
+  libEntries: { name: string; parent?: string }[];
+  kind: 'identities' | 'sub_identities' | 'sectors';
+  onSelect: (entry: { name: string; parent?: string }) => void;
+  disabled?: boolean;
+  isBusy?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [highlight, setHighlight] = useState(0);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return libEntries;
+    return libEntries.filter(le => {
+      const label = kind === 'sub_identities'
+        ? `${le.name} ${le.parent || ''}`
+        : le.name;
+      return label.toLowerCase().includes(q);
+    });
+  }, [libEntries, kind, query]);
+
+  // Click-outside to close. Only active while open.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+        setOpen(false);
+        setQuery('');
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+
+  // Focus input on open, reset highlight when filter changes.
+  useEffect(() => { if (open && inputRef.current) inputRef.current.focus(); }, [open]);
+  useEffect(() => { setHighlight(0); }, [query]);
+
+  // Keep the highlighted row in view as the user arrows through results.
+  useEffect(() => {
+    if (!open || !listRef.current) return;
+    const el = listRef.current.children[highlight] as HTMLElement | undefined;
+    if (el) el.scrollIntoView({ block: 'nearest' });
+  }, [open, highlight]);
+
+  const choose = (le: { name: string; parent?: string }) => {
+    onSelect(le);
+    setOpen(false);
+    setQuery('');
+  };
+
+  return (
+    <div ref={wrapperRef} className="relative">
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => setOpen(o => !o)}
+        className="px-1 py-1 rounded text-[10px] bg-[#1c1c1c] border border-[#2e2e2e] text-gray-400 hover:text-white max-w-[110px] disabled:opacity-50 truncate text-left"
+        title="Route this proposal's contacts to an existing library entry"
+      >
+        {isBusy ? 'Routing…' : 'Route to…'}
+      </button>
+      {open && (
+        <div className="absolute z-50 right-0 mt-1 w-[280px] bg-[#1c1c1c] border border-[#2e2e2e] rounded shadow-lg overflow-hidden">
+          <input
+            ref={inputRef}
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Escape') { setOpen(false); setQuery(''); return; }
+              if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setHighlight(h => Math.min(filtered.length - 1, h + 1));
+                return;
+              }
+              if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setHighlight(h => Math.max(0, h - 1));
+                return;
+              }
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                if (filtered[highlight]) choose(filtered[highlight]);
+                return;
+              }
+            }}
+            placeholder="Search library…"
+            className="w-full px-2 py-1.5 text-[11px] bg-[#1c1c1c] border-b border-[#2e2e2e] text-white placeholder-gray-600 focus:outline-none"
+          />
+          <div ref={listRef} className="max-h-[260px] overflow-y-auto">
+            {filtered.length === 0 ? (
+              <div className="px-2 py-2 text-[10px] text-gray-500 italic">No matches.</div>
+            ) : filtered.map((le, i) => (
+              <button
+                key={`${le.name}::${le.parent || ''}`}
+                type="button"
+                onClick={() => choose(le)}
+                onMouseEnter={() => setHighlight(i)}
+                className={`block w-full text-left px-2 py-1 text-[10px] truncate ${
+                  i === highlight ? 'bg-[#2e2e2e] text-white' : 'text-gray-300'
+                } hover:bg-[#2e2e2e] hover:text-white`}
+                title={kind === 'sub_identities' ? `${le.name} (under ${le.parent})` : le.name}
+              >
+                <span className="text-white font-medium">{le.name}</span>
+                {kind === 'sub_identities' && le.parent && (
+                  <span className="text-gray-500"> · {le.parent}</span>
+                )}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Lightweight mirror of services/bucketingService.ts normalizeTaxonomyName.
 // Used by the proposed-tags panel to surface "🎯 Looks like <library entry>"
 // suggestions. Strict enough that an exact normalized match is safe to offer
@@ -4240,37 +4372,18 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                 className="p-1 rounded bg-[#1c1c1c] border border-[#2e2e2e] text-gray-400 hover:text-amber-300 disabled:opacity-50"
                                 title="Rename / change parent before accepting"
                               ><Edit3 className="w-3 h-3" /></button>
-                              <select
-                                value={routeDraft[key] || ''}
+                              <RouteToCombobox
+                                kind={kind}
+                                libEntries={libEntries}
                                 disabled={isBusy || libEntries.length === 0}
-                                onChange={e => {
-                                  const v = e.target.value;
-                                  setRouteDraft(prev => ({ ...prev, [key]: v }));
-                                  if (!v) return;
-                                  const target = libEntries.find(le => `${le.name}::${le.parent || ''}` === v);
-                                  if (!target) {
-                                    setRouteDraft(prev => ({ ...prev, [key]: '' }));
-                                    return;
-                                  }
-                                  // Fire the remap then clear the draft so
-                                  // a fresh pick is possible if the row
-                                  // doesn't transition to a ghost (e.g. the
-                                  // user routes, then the next render
-                                  // shows the badge — clearing is harmless).
+                                isBusy={isBusy && !!routeDraft[key]}
+                                onSelect={target => {
+                                  setRouteDraft(prev => ({ ...prev, [key]: `${target.name}::${target.parent || ''}` }));
                                   Promise.resolve(remap(kind, p.name, target.name, target.parent)).finally(() => {
                                     setRouteDraft(prev => ({ ...prev, [key]: '' }));
                                   });
                                 }}
-                                className="px-1 py-1 rounded text-[10px] bg-[#1c1c1c] border border-[#2e2e2e] text-gray-400 hover:text-white max-w-[110px] disabled:opacity-50"
-                                title="Route this proposal's contacts to an existing library entry instead of adding a new one"
-                              >
-                                <option value="">{isBusy && routeDraft[key] ? 'Routing…' : 'Route to…'}</option>
-                                {libEntries.map(le => (
-                                  <option key={`${le.name}::${le.parent || ''}`} value={`${le.name}::${le.parent || ''}`}>
-                                    {kind === 'sub_identities' ? `${le.name} (under ${le.parent})` : le.name}
-                                  </option>
-                                ))}
-                              </select>
+                              />
                               {aiState === 'route' && aiTarget ? (
                                 <button
                                   onClick={() => remap(kind, p.name, aiTarget!.name, aiTarget!.parent)}
