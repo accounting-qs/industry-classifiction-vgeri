@@ -46,12 +46,18 @@ The vertical / served market belongs in SECTOR, never the identity.
  4. Private equity / PE firm / venture capital / VC fund / hedge fund /
     asset management / wealth management / family office / fund administration /
     investment bank / M&A advisory / bank / credit union / mortgage lender /
-    consumer lender / commercial lender
+    consumer lender / commercial lender /
+    broker-dealer / securities brokerage / investment brokerage
        → identity = Financial Services  (even if focused on a vertical;
           "PE-BACKED" or "venture-backed" describing a startup is NOT this rule —
           that's a financing status, not the company's identity)
        Sub-identity hint: banks / credit unions / lenders / mortgage brokers /
        consumer & commercial credit → Banking & Lending (single combined sub).
+       NOTE on "Brokerage" alone — the word is ambiguous and a poor sub name:
+         • For real estate, the sub is Real Estate Brokerage (under Real Estate).
+         • For finance (broker-dealers, securities, IB-adjacent firms), the sub
+           is Investment Banking. Never propose just "Brokerage" as a Financial
+           Services sub — route to Investment Banking.
 
  4b. ANTI-MISTAKE for the word "advisory". When "advisory" is attached to an
      investment-finance verb, the identity is Financial Services, NOT
@@ -76,6 +82,49 @@ The vertical / served market belongs in SECTOR, never the identity.
     sports management
        → identity = Agency  (NEVER Consulting & Advisory)
 
+     SUB-IDENTITY SELECTION for Agency (anti-fragmentation):
+     The Agency sub library covers the full landscape of agency-shop variants
+     through a small set of broad subs. BEFORE proposing a new Agency sub,
+     map the input to one of these:
+       • Paid-media work of ANY channel (display, search, social, OOH, DOOH,
+         mobile, programmatic, direct-mail, broadcast, performance, demand
+         generation, media buying, media planning) → Performance Marketing Agency
+       • PR / corporate communications / media relations / ghostwriting /
+         investor-facing comms-as-PR → PR Agency
+       • Branding / brand strategy / brand identity / naming / positioning →
+         Branding Agency
+       • Creative / video / photo / production / content / design-as-craft
+         (when the agency is a brand-side creative shop, not a vendor) →
+         Creative Agency
+       • Event production / experiential / exhibition / trade-show booth /
+         event-AV / event technology → Event Management Agency
+       • Talent / influencer / artist / athlete / sports management → Talent
+         Management Agency
+       • Full-stack / integrated / "agency of record" shops covering many of
+         the above → Full Service Agency
+
+     ANTI-FRAGMENTATION — do NOT coin new Agency subs for these patterns;
+     route to Performance Marketing Agency:
+       ✗ "Media Buying Agency" / "Media Planning Agency" / "Media Buying and
+         Planning Agency" / "Strategic Media Planning Agency"
+       ✗ "Social Media Agency" / "Social Media Marketing Agency"
+       ✗ "Direct Marketing Agency" / "Direct Mail Agency"
+       ✗ "Out-of-Home Advertising Agency" / "DOOH Agency" / "Mobile Advertising Agency"
+       ✗ "Student Advertising Agency" / "Cultural Marketing Agency" /
+         "Hispanic/Multicultural Marketing Agency" (audience targeting alone
+         is not a sub)
+       ✗ "Recruitment Advertising" / "Employment Advertising"
+       ✗ "Field Marketing Agency" / "Salesforce Outsourcing Agency"
+       ✗ "Performance Agency" / "Digital Marketing Agency" / "Growth Agency"
+       ✗ "Business Development Agency" (when it's really paid-marketing-led
+         BD; if it's actually sales rep / SDR-as-a-service, the work is
+         closer to Staffing & Recruiting)
+
+     Only propose a NEW Agency sub when the work is CLEARLY OUTSIDE these
+     seven existing subs (truly novel agency model). Channel / audience /
+     vertical specialty alone is NOT enough — those go into sector, not into
+     a sub.
+
  7. Non-profit / 501(c) / foundation / charity / land trust / trade association /
     chamber of commerce / advocacy / professional association /
     religious organization
@@ -87,9 +136,18 @@ The vertical / served market belongs in SECTOR, never the identity.
 
  8. Architecture / architectural design / interior design / engineering firm /
     general contractor / home builder / civil engineering / construction management /
-    MEP engineering / infrastructure development (rail, ports, roads, bridges)
+    MEP engineering / infrastructure development (rail, ports, roads, bridges) /
+    architecture and design studio / heavy civil construction
        → identity = Construction & Engineering  (NEVER Manufacturing & Industrial,
           NEVER Logistics & Transportation)
+       ANTI-MISTAKE — "architectural design and consulting" / "architecture & design
+       consulting" / "interior design consultancy" / "design studio" / "design and
+       build" → Construction & Engineering > Architecture, NOT Consulting & Advisory.
+       The "consulting" / "advisory" / "studio" suffix on a design firm describes
+       how they sell their work; the identity stays Construction & Engineering.
+       Sub-identity hint: prefer Architecture for design-led firms, Civil Engineering
+       for heavy civil / infrastructure, Infrastructure Development for project-scale
+       rail/port/road/bridge work.
 
  9. Real estate brokerage / real estate developer / property management /
     real estate investment / title & escrow / housing operator
@@ -109,8 +167,12 @@ The vertical / served market belongs in SECTOR, never the identity.
      market research / research services / consumer insights /
      industry analysis / benchmarking services / strategic research /
      decision support services / business intelligence advisory /
-     analyst & advisory services / customer insights research
-       → identity = Consulting & Advisory  (NOT Accounting & Tax, NOT Agency)
+     analyst & advisory services / customer insights research /
+     investor relations / IR consulting / investor communications /
+     capital markets advisory / public company advisory
+       → identity = Consulting & Advisory  (NOT Accounting & Tax, NOT Agency,
+          NOT Financial Services for the IR/capital-markets advisory cases —
+          those are advisory services TO companies, not investment activities)
      The word "consulting" doesn't have to appear in the input. Any firm
      whose product is RESEARCH + RECOMMENDATIONS (not software, not creative,
      not operating something) belongs here.
@@ -187,9 +249,13 @@ The vertical / served market belongs in SECTOR, never the identity.
        → identity = Education Operator
 
 16. Hotel / restaurant / hotel management / hospitality operator / tour operator /
+    travel agent / travel agency / vacation planning / cruise booking /
     business aviation / private aviation / charter flight operator
        → identity = Hospitality & Travel  (often DQ if family-owned / local /
           single-location consumer-only)
+       ANTI-MISTAKE — "travel agent" / "travel agency" contains the word
+       "agency" but it's NOT rule 6 (marketing/advertising agency). A travel
+       agency books trips and is a hospitality/travel operator.
        Note: business aviation OPERATORS (own/fly the jets) live here, NOT in
        Logistics & Transportation.
 
@@ -295,6 +361,20 @@ Paired-or-empty (mechanical check after step 2):
     VALID_SUB_IDENTITIES
   Sub-without-identity is always wrong. Identity-without-sub is fine — Phase
   1b rolls those rows up to identity-level cleanly.
+
+SUB_IDENTITY IS A TAXONOMY VALUE, NOT A COMMENT. Accept only:
+  (a) an existing library entry name (exact spelling, copy verbatim), OR
+  (b) a clean propose-new name — a real noun naming a kind of company
+      ("Title & Escrow", "Career Coaching"), OR
+  (c) JSON null (the bare value, not the string).
+NEVER emit meta-text describing the absence of a fit. Phrases the model has
+wrongly written into sub_identity and must NEVER repeat:
+  ✗ "sub not explicit"            ✗ "not in subs"
+  ✗ "no specific sub"             ✗ "sub not in library"
+  ✗ "X sub not in subs"           ✗ "<descriptor> not in library"
+  ✗ "no sub fits"                 ✗ any phrase that explains the field
+                                    rather than naming a kind of company
+If no library sub applies and you can't coin a real noun, emit JSON null.
 
 ═══════════════════════════════════════════════════════════════════════════
 CORE RULES (apply throughout the sequence)
