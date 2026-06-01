@@ -26,6 +26,7 @@ exports
 
 # Helper project
 lloyd-enrichment-project-main
+local_assets
 
 # Eval harness — last-run.json is regenerated on every eval, noisy in diffs.
 scripts/eval/last-run.json
