@@ -767,14 +767,14 @@ export default function App() {
           <h1 className="text-sm font-bold text-white">Quantum Scaling</h1>
         </div>
         <nav className="flex-1 px-2 py-4 space-y-1 overflow-hidden">
-          <SidebarIconButton active={activeTab === AppTab.IMPORT} onClick={() => navigate('/import')} icon={<Upload className="w-5 h-5" />} label="Import CSV" />
-          <SidebarIconButton active={activeTab === AppTab.MANAGER} onClick={() => navigate('/contacts')} icon={<Users className="w-5 h-5" />} label="Contacts" />
-          <SidebarIconButton active={activeTab === AppTab.ENRICHMENT} onClick={() => navigate('/pipeline')} icon={<Zap className={`w-5 h-5 ${stats.isProcessing ? 'text-[#3ecf8e] animate-pulse' : ''}`} />} label="Pipeline Monitor" />
-          <SidebarIconButton active={activeTab === AppTab.BUCKETING} onClick={() => navigate('/bucketing')} icon={<Layers className="w-5 h-5" />} label="Bucketing" />
+          <SidebarIconButton active={activeTab === AppTab.IMPORT} href="/import" onClick={() => navigate('/import')} icon={<Upload className="w-5 h-5" />} label="Import CSV" />
+          <SidebarIconButton active={activeTab === AppTab.MANAGER} href="/contacts" onClick={() => navigate('/contacts')} icon={<Users className="w-5 h-5" />} label="Contacts" />
+          <SidebarIconButton active={activeTab === AppTab.ENRICHMENT} href="/pipeline" onClick={() => navigate('/pipeline')} icon={<Zap className={`w-5 h-5 ${stats.isProcessing ? 'text-[#3ecf8e] animate-pulse' : ''}`} />} label="Pipeline Monitor" />
+          <SidebarIconButton active={activeTab === AppTab.BUCKETING} href="/bucketing" onClick={() => navigate('/bucketing')} icon={<Layers className="w-5 h-5" />} label="Bucketing" />
         </nav>
         <div className="p-2 border-t border-[#2e2e2e] space-y-1">
-          <SidebarIconButton active={activeTab === AppTab.CONNECTORS} onClick={() => navigate('/connectors')} icon={<KeyRound className="w-5 h-5" />} label="Connectors" />
-          <SidebarIconButton active={activeTab === AppTab.PROXIES} onClick={() => navigate('/proxies')} icon={<BarChart2 className={`w-5 h-5 ${activeTab === AppTab.PROXIES ? 'text-[#3ecf8e]' : ''}`} />} label="Proxy Performance" />
+          <SidebarIconButton active={activeTab === AppTab.CONNECTORS} href="/connectors" onClick={() => navigate('/connectors')} icon={<KeyRound className="w-5 h-5" />} label="Connectors" />
+          <SidebarIconButton active={activeTab === AppTab.PROXIES} href="/proxies" onClick={() => navigate('/proxies')} icon={<BarChart2 className={`w-5 h-5 ${activeTab === AppTab.PROXIES ? 'text-[#3ecf8e]' : ''}`} />} label="Proxy Performance" />
         </div>
       </aside>
 
@@ -1831,12 +1831,27 @@ function ExportButton({ job, listName, onStart, onClear }: {
   );
 }
 
-function SidebarIconButton({ active, onClick, icon, label }: any) {
+function SidebarIconButton({ active, onClick, icon, label, href }: any) {
+  // Render as <a href> so right-click / cmd+click can open the route in a new
+  // tab. Left-clicks still go through the SPA navigate handler — we only let
+  // the browser handle the link when the user is explicitly opening it in a
+  // new tab/window (modifier key or non-primary button).
+  const handleClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    if (e.defaultPrevented) return;
+    if (e.button !== 0) return;
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    e.preventDefault();
+    onClick?.();
+  };
   return (
-    <button onClick={onClick} className={`w-full flex items-center gap-4 p-2 rounded-md transition-all ${active ? 'bg-[#2e2e2e] text-[#3ecf8e]' : 'text-gray-400 hover:text-white hover:bg-[#2e2e2e]'}`}>
+    <a
+      href={href || '#'}
+      onClick={handleClick}
+      className={`w-full flex items-center gap-4 p-2 rounded-md transition-all ${active ? 'bg-[#2e2e2e] text-[#3ecf8e]' : 'text-gray-400 hover:text-white hover:bg-[#2e2e2e]'}`}
+    >
       <div className="min-w-[20px]">{icon}</div>
       <span className="text-[13px] font-semibold capitalize">{label}</span>
-    </button>
+    </a>
   );
 }
 
