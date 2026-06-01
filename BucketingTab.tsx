@@ -23,6 +23,7 @@ import type { BucketingRun, BucketProposal, LibraryBucket } from './types';
 type BucketingView = 'index' | 'setup' | 'detail' | 'library' | 'taxonomy';
 
 const RESERVED_GENERAL = 'General';
+const RESERVED_DISQUALIFIED = 'Disqualified';
 // Recognize legacy names too, in case a run was created before v2.3.
 const RESERVED_NAMES = new Set(['general', 'generic', 'disqualified', 'other']);
 
@@ -522,6 +523,7 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
 }) {
   const [name, setName] = useState('');
   const [selectedLists, setSelectedLists] = useState<Set<string>>(new Set());
+  const [hideBucketed, setHideBucketed] = useState(false);
   // Default OFF — trust the tagger's per-row is_disqualified decision instead of
   // auto-DQ'ing every contact whose identity is library-flagged [DQ].
   const [applyIdentityDqCascade, setApplyIdentityDqCascade] = useState(false);
@@ -540,6 +542,9 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
   const totalRaw = importLists.filter(l => selectedLists.has(l.name)).reduce((s, l) => s + (l.contact_count || 0), 0);
   const canStart = !!name.trim() && selectedLists.size > 0 && !loading;
 
+  const visibleLists = hideBucketed ? importLists.filter(l => !l.bucketed) : importLists;
+  const hiddenCount = importLists.length - visibleLists.length;
+
   return (
     <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-6 space-y-5">
       <div>
@@ -553,14 +558,27 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
       </div>
 
       <div>
-        <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">
-          Select lists ({selectedLists.size} selected · {totalSelected.toLocaleString()} enriched / {totalRaw.toLocaleString()} total)
-        </label>
+        <div className="flex items-center justify-between mb-2 gap-3">
+          <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+            Select lists ({selectedLists.size} selected · {totalSelected.toLocaleString()} enriched / {totalRaw.toLocaleString()} total)
+          </label>
+          <label className="flex items-center gap-1.5 cursor-pointer text-[10px] font-bold text-gray-400 uppercase tracking-widest hover:text-gray-200 transition-colors">
+            <input
+              type="checkbox"
+              checked={hideBucketed}
+              onChange={e => setHideBucketed(e.target.checked)}
+              className="w-3 h-3 accent-[#3ecf8e]"
+            />
+            Hide bucketed{hideBucketed && hiddenCount > 0 ? ` (${hiddenCount})` : ''}
+          </label>
+        </div>
         {importLists.length === 0 ? (
           <div className="text-xs text-gray-500 italic px-3 py-2 border border-[#2e2e2e] rounded">No lists available — import a CSV first.</div>
+        ) : visibleLists.length === 0 ? (
+          <div className="text-xs text-gray-500 italic px-3 py-2 border border-[#2e2e2e] rounded">All lists are bucketed — uncheck "Hide bucketed" to show them.</div>
         ) : (
           <div className="border border-[#2e2e2e] rounded max-h-64 overflow-y-auto custom-scrollbar">
-            {importLists.map(l => {
+            {visibleLists.map(l => {
               const isSel = selectedLists.has(l.name);
               // Show a "Bucketed" badge when this list has appeared in at
               // least one prior bucketing run (or been manually marked) so
@@ -1984,6 +2002,41 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
             <div className="px-4 py-2 border-b border-[#2e2e2e] text-[10px] text-gray-600 normal-case tracking-normal">
               Phase 1b counts decide the campaign bucket: combo → sub-identity → identity → General.
             </div>
+            {/* Pinned summary: surface the General + Disqualified buckets
+                ALWAYS — they sit outside the per-identity groups below so
+                they would otherwise be invisible from the sub-identity
+                hierarchy. Total row included so the user can sanity-check
+                that the panel adds up to the full run. */}
+            {(() => {
+              const totalContacts = bucketCounts.reduce((s, c) => s + (Number(c.contact_count) || 0), 0);
+              const generalCount = Number(
+                bucketCounts.find(c => c.bucket_name === RESERVED_GENERAL)?.contact_count || 0
+              );
+              const dqCount = Number(
+                bucketCounts.find(c => c.bucket_name === RESERVED_DISQUALIFIED)?.contact_count || 0
+              );
+              const pct = (n: number) => totalContacts > 0
+                ? `${((n / totalContacts) * 100).toFixed(1)}%`
+                : '—';
+              return (
+                <div className="px-4 py-2.5 border-b border-[#2e2e2e] flex items-center flex-wrap gap-x-4 gap-y-1.5 text-[11px] font-mono">
+                  <div className="flex items-center gap-1.5">
+                    <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-widest bg-gray-700/40 text-gray-300 border border-gray-600/50">General</span>
+                    <span className="text-amber-300 font-bold">{generalCount.toLocaleString()}</span>
+                    <span className="text-gray-500">contacts · {pct(generalCount)}</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-widest bg-rose-700/30 text-rose-200 border border-rose-600/40">Disqualified</span>
+                    <span className="text-amber-300 font-bold">{dqCount.toLocaleString()}</span>
+                    <span className="text-gray-500">contacts · {pct(dqCount)}</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 ml-auto">
+                    <span className="text-gray-500">Total</span>
+                    <span className="text-white font-bold">{totalContacts.toLocaleString()}</span>
+                  </div>
+                </div>
+              );
+            })()}
             <BucketChainList
               buckets={sourceBuckets}
               identities={primaryIdentities}

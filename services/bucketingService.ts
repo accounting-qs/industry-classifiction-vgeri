@@ -1237,7 +1237,14 @@ export async function runTaxonomyProposal(
 
         for (const t of tagResult.taggings) {
             const conf01 = Math.max(0, Math.min(1, (t.confidence || 0) / 10));
-            const lowConf = (t.confidence || 0) < PHASE1A_QA_FLOOR;
+            // Confidence gate — use identity_confidence ONLY, not the
+            // row-min (which is dragged down to 1 whenever the LLM correctly
+            // nulls sub_identity or sector per the new per-tag confidence
+            // rule in CORE_PRINCIPLES). The previous row-min gate was
+            // dumping rows with high identity confidence + null sub into
+            // the pre-rollup General bucket, making the taxonomy_ready
+            // panel under-report identity counts.
+            const lowConf = (t.identity_confidence || 0) < PHASE1A_QA_FLOOR;
             const identityIsDq = !!(t.identity && dqIdentities.has(t.identity));
             // DQ confidence floor — only honor a DQ verdict when the tagger is
             // ≥ 7/10 sure about the identity. Below that, route to General
@@ -1652,7 +1659,11 @@ export async function recalculateTaxonomyWithLibrary(
     // the preview counts and downstream cascade stay in sync.
     const updates: any[] = [];
     for (const t of taggings) {
-        const lowConf = (t.confidence || 0) < PHASE1A_QA_FLOOR;
+        // Identity-confidence gate (same fix as in the Phase 1a tagger hot
+        // path — see the lengthier comment there). Row-min was dragging
+        // confident-identity rows into pre-rollup General whenever sub or
+        // sector were correctly null.
+        const lowConf = (t.identity_confidence || 0) < PHASE1A_QA_FLOOR;
         const idConf = t.identity_confidence || 0;
         const dqByLLM = !!t.is_disqualified && idConf >= PHASE1A_DQ_FLOOR;
         const isDisqualified = dqByLLM;
