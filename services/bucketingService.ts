@@ -955,31 +955,23 @@ export async function runTaxonomyProposal(
         throw new Error('Empty vocabulary — selected lists have no contacts.');
     }
 
-    // Inherit Phase 1a tags from prior successful runs on byte-exact
-    // industry_string matches. Per-industry tags are a property of the
-    // industry_string itself, so if another run already paid the LLM
-    // cost we copy the row instead of re-tagging. Run this BEFORE the
-    // resume read so inherited rows show up in existingByIndustry and
-    // are skipped by the tagger. Best-effort: failure is non-fatal —
-    // the tagger will tag from scratch in that case.
-    try {
-        ctx.progress({ phase: 'phase1a', step: 'inherit_prior_tags', note: 'Checking for tags from prior runs on the same industries…' });
-        const { data: inhRes, error: inhErr } = await supabase.rpc('inherit_phase1a_tags', { p_new_run_id: runId });
-        if (inhErr) {
-            ctx.log(`[Bucketing ${runId}] inherit_phase1a_tags failed (non-fatal — re-tagging from scratch): ${inhErr.message}`, 'warn');
-        } else {
-            const { inherited_rows, distinct_industries } = (inhRes || {}) as { inherited_rows?: number; distinct_industries?: number };
-            const ih = Number(inherited_rows || 0);
-            const di = Number(distinct_industries || 0);
-            if (ih > 0) {
-                ctx.log(`[Bucketing ${runId}] inherited ${ih.toLocaleString()} of ${di.toLocaleString()} distinct industry tags from prior runs — those skip the LLM`);
-            } else {
-                ctx.log(`[Bucketing ${runId}] inherit step: 0 of ${di.toLocaleString()} distinct industries had a prior-run tag (all will be tagged fresh)`);
-            }
-        }
-    } catch (e: any) {
-        ctx.log(`[Bucketing ${runId}] inherit_phase1a_tags exception (non-fatal): ${e.message}`, 'warn');
-    }
+    // Cross-run tag inheritance DISABLED (per user directive, 2026-06-02).
+    //
+    // Earlier design called inherit_phase1a_tags here to copy byte-exact
+    // industry_string tags from prior successful runs, sparing the LLM
+    // cost on already-seen strings. The trade-off was that stale tags
+    // (from before recent prompt or library changes) leaked into new runs,
+    // and any bad pattern in an early run — meta-text sub names, mistaken
+    // identities, pre-cleanup taxonomy values — propagated forever. The
+    // explicit policy is now: each run tags from scratch against the current
+    // prompt + library; no cross-run state is reused.
+    //
+    // In-run proposal sharing (within tagIndustries) is unchanged — batches
+    // still see proposals coined by earlier batches in the same run via the
+    // PROPOSAL APPENDIX. That keeps naming consistent inside a single run
+    // without dragging stale tags across runs. The inherit_phase1a_tags
+    // RPC stays defined in the DB but is no longer called.
+    ctx.log(`[Bucketing ${runId}] cross-run tag inheritance disabled — tagging from scratch against current library + prompt`);
 
     // Resume support: don't wipe. Read existing rows (including just-inherited
     // ones from the prior step) so we know which industries are already tagged
@@ -3103,6 +3095,52 @@ Output: identity=Consulting & Advisory, sub_identity=Management Consulting, sect
 Note:   research-and-recommend work is Consulting & Advisory even without the
         word "consulting" (rule 11b expanded). Market research collapses into
         Management Consulting.
+
+─── IT Services vs Consulting & Advisory: BUILD/OPERATE/DELIVER vs ADVISE ───
+The same vocabulary (cloud, cybersecurity, SAP, Microsoft, IT) shows up in
+both identities. The deciding question: is the company DOING the work for
+the client (IT Services) or RECOMMENDING what should be done (Consulting &
+Advisory)? "Consulting", "advisory", "strategy", "assessment", "readiness",
+"roadmap" → Consulting & Advisory. "Managed", "as-a-service", "monitoring",
+"operations", "implementation", "support", "migration", "hosting",
+"administration" → IT Services.
+
+Input:  Managed cybersecurity monitoring and SOC-as-a-service for SMBs
+Output: identity=IT Services, sub_identity=Cybersecurity Services, sector=null
+Note:   "Managed monitoring" + "SOC-as-a-service" = THEY OPERATE the
+        cybersecurity for the client. IT Services > Cybersecurity Services.
+
+Input:  Cybersecurity strategy, risk assessment, and SOC 2 readiness advisory
+Output: identity=Consulting & Advisory, sub_identity=IT Consulting, sector=null
+Note:   "strategy", "risk assessment", "advisory" = ADVICE, not delivery.
+        Consulting & Advisory > IT Consulting.
+
+Input:  Cloud security and compliance consulting for healthcare providers
+Output: identity=Consulting & Advisory, sub_identity=IT Consulting, sector=Healthcare
+Note:   "consulting" is the work itself — they advise. Consulting & Advisory
+        > IT Consulting. Healthcare is the served vertical → sector.
+
+Input:  24/7 managed IT helpdesk and endpoint management for law firms
+Output: identity=IT Services, sub_identity=null, sector=Legal
+Note:   "Managed" + "helpdesk" + "endpoint management" = THEY OPERATE the
+        IT for the client. IT Services, sub=null (MSP is the default flavor),
+        Legal is the served vertical.
+
+Input:  Cloud infrastructure migration and ongoing managed cloud for enterprise
+Output: identity=IT Services, sub_identity=Data Migration Services, sector=null
+Note:   "migration" + "managed cloud" = THEY DELIVER and OPERATE. IT Services.
+        Sub = Data Migration Services since migration is the explicit work.
+
+Input:  Microsoft Dynamics 365 implementation and ongoing administration services
+Output: identity=IT Services, sub_identity=Custom Software Development, sector=null
+Note:   "implementation" + "administration" = THEY BUILD and OPERATE. Even
+        for a packaged-software product like Dynamics 365, the work is
+        custom-built integration, not advice.
+
+Input:  Microsoft Cloud and Dynamics 365 consulting and roadmap services
+Output: identity=Consulting & Advisory, sub_identity=IT Consulting, sector=null
+Note:   "consulting" + "roadmap" = ADVICE on what to build, not the build
+        itself. Consulting & Advisory > IT Consulting.
 
 ─── "Advisory" attached to investment verbs — NOT consulting ──────────
 
