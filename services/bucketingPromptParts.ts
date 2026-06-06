@@ -70,6 +70,25 @@ The vertical / served market belongs in SECTOR, never the identity.
      The word "advisory" alone (e.g. "strategy advisory", "business advisory")
      stays with Consulting & Advisory under rule 11b.
 
+ 4c. ANTI-MISTAKE for retail / personal financial advisory. When the
+     "advisory" or "advisor" attaches to PERSONAL or RETAIL wealth /
+     financial planning, the identity is Financial Services > Wealth
+     Management, NOT Consulting & Advisory > Management Consulting.
+     Trigger phrases:
+       "wealth advisory", "wealth management", "wealth planner",
+       "personal financial advisory", "personal financial planning",
+       "financial advisor", "financial advisory" (when serving individuals,
+       families, or independent advisors), "RIA" / "registered investment
+       advisor", "boutique financial advisory for individuals",
+       "financial advisor support services" (B2B services TO RIAs / wealth
+       firms — these still go to Financial Services as their identity-of-
+       work, since the client is a financial-services firm).
+       → identity = Financial Services > Wealth Management
+     Disambiguator: "financial advisor" / "wealth" + "individuals" /
+     "families" / "high net worth" / "HNW" / "retirement" → this rule.
+     "Strategic financial advisory for CFOs" / "Corporate financial
+     planning" → still Consulting & Advisory (corporate advisory work).
+
  5. Manufacturer / maker of / manufactures X / produces X / fabrication / OEM
        → identity = Manufacturing & Industrial
           EXCEPTIONS:
@@ -181,6 +200,35 @@ The vertical / served market belongs in SECTOR, never the identity.
      of the specialist subs (Engineering / Environmental / HR / IT /
      Educational Consulting / Risk & Insurance Advisory) when the specialty
      is explicit.
+
+     SUB-IDENTITY ROUTING — pick the specialist sub when the input clearly
+     names the specialty domain. Audit of one real run showed Management
+     Consulting absorbing ~12% of contacts that should have been the
+     specialist subs. The recurring patterns:
+       • "construction consulting" / "construction claims consulting" /
+         "construction cost estimating consulting" / "owner's representative
+         and project management" / "infrastructure project consulting" /
+         "civil consulting" / "MEP consulting" / "design-build consulting"
+           → sub = Engineering Consulting
+       • "environmental consulting" / "sustainability consulting" /
+         "energy efficiency consulting" / "energy market analysis and
+         consulting" / "energy management consulting" / "renewables
+         consulting" / "carbon / emissions consulting"
+           → sub = Environmental Consulting
+       • "HR consulting" / "talent consulting" / "compensation consulting" /
+         "benefits consulting" / "workforce consulting"
+           → sub = HR Consulting
+       • "IT consulting" / "cloud consulting" / "cybersecurity consulting" /
+         "data strategy consulting" / "digital transformation consulting" /
+         "ERP consulting" / "SAP consulting / advisory"
+           → sub = IT Consulting
+       • "education consulting" / "academic consulting" / "curriculum
+         consulting" / "school strategy consulting" / "college consulting"
+           → sub = Educational Consulting
+       • "risk consulting" / "insurance advisory" / "GRC consulting" /
+         "compliance advisory" / "regulatory advisory"
+           → sub = Risk & Insurance Advisory
+     If none of the above match clearly, default to Management Consulting.
 
  11c. ANTI-CATCH-ALL for Consulting & Advisory. Consulting & Advisory is for
       firms whose CORE OFFERING is pure advisory — they recommend, they
