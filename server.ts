@@ -279,47 +279,74 @@ app.get('/api/status', async (req, res) => {
 app.post('/api/enrich', async (req, res) => {
     const { contactIds, filters, searchQuery } = req.body;
 
+    if (!contactIds && !filters) {
+        return res.status(400).json({ error: 'Provide contactIds or filters' });
+    }
+
+    // Multi-list serial queueing. The processNextChunk SELECT in JobProcessor
+    // already orders by job_items.id ASC, so each list's items (inserted as a
+    // contiguous bigserial range) fully drain before the next list's items
+    // get claimed — FIFO across jobs without code changes there.
+    //
+    // Behavior:
+    //   - If no job is running: start fresh (reset stats, blank log buffer,
+    //     queue this list, start the processor).
+    //   - If a job IS running: append this list to the existing queue
+    //     (additive jobStats.total, keep log buffer, processor already up).
+    // Either way we 202 immediately and run the heavy enqueue work in the
+    // background, so a 100k-contact resolve+insert doesn't block the response.
+    //
+    // Self-heal kept: if both in-memory flags say "busy" but the DB shows zero
+    // active items, the flags got stuck (crash mid-queueing, etc.) — clear
+    // them so the request goes through cleanly.
+    let joiningExisting = false;
     if (jobStats.isProcessing || jobStats.queueingPhase) {
-        // Self-heal: in-memory flags can get pinned (e.g. crash mid-queueing,
-        // or queueingPhase=true blocks the /api/status auto-reset at L194).
-        // If the DB has no active items, clear the flags and let the request
-        // through instead of permanently locking out enrichment.
         const { count } = await supabase
             .from('job_items')
             .select('*', { count: 'exact', head: true })
             .in('status', ['pending', 'processing', 'retrying']);
 
         if (count && count > 0) {
-            return res.status(409).json({ error: 'A job is already in progress or queueing' });
+            // Real active queue — join it serially.
+            joiningExisting = true;
+        } else {
+            // Stale flags — reset and start fresh.
+            addServerLog(
+                `⚠️ Stale pipeline state cleared (isProcessing=${jobStats.isProcessing}, queueingPhase=${jobStats.queueingPhase}); no active job_items.`,
+                'Pipeline',
+                'warn'
+            );
+            jobStats.isProcessing = false;
+            jobStats.queueingPhase = false;
+            jobStats.queued = 0;
+            await persistPipelineState();
         }
-
-        addServerLog(
-            `⚠️ Stale pipeline state cleared (isProcessing=${jobStats.isProcessing}, queueingPhase=${jobStats.queueingPhase}); no active job_items.`,
-            'Pipeline',
-            'warn'
-        );
-        jobStats.isProcessing = false;
-        jobStats.queueingPhase = false;
-        jobStats.queued = 0;
-        await persistPipelineState();
     }
 
-    if (!contactIds && !filters) {
-        return res.status(400).json({ error: 'Provide contactIds or filters' });
+    if (joiningExisting) {
+        // Mark queueing phase but DON'T reset totals — backgroundEnqueue will
+        // add this list's count to whatever's already running.
+        jobStats.queueingPhase = true;
+        res.status(202).json({
+            message: 'Enrichment queued — will start after current list finishes (FIFO serial)',
+            joined_existing_queue: true
+        });
+    } else {
+        // Fresh start: reset stats + log buffer.
+        jobStats = { total: 0, completed: 0, failed: 0, isProcessing: true, queueingPhase: true, queued: 0 };
+        currentJobLogs = [];
+        res.status(202).json({ message: 'Enrichment queueing started in background' });
     }
 
-    // Set queueing state and respond 202 immediately — no timeout risk
-    jobStats = { total: 0, completed: 0, failed: 0, isProcessing: true, queueingPhase: true, queued: 0 };
-    currentJobLogs = [];
-
-    res.status(202).json({ message: 'Enrichment queueing started in background' });
-
-    // Fire-and-forget: resolve IDs + create job + insert items in background
-    backgroundEnqueue(contactIds, filters, searchQuery).catch(err => {
+    backgroundEnqueue(contactIds, filters, searchQuery, joiningExisting).catch(err => {
         console.error('Background enqueue fatal error:', err);
         addServerLog(`❌ Fatal enqueue error: ${err.message}`, 'Pipeline', 'error');
-        jobStats.isProcessing = false;
+        // Only clear flags if no other queueing/processing remains. The
+        // background processor's poll loop will clear them naturally when
+        // the queue drains, so just leave them alone here on a single-list
+        // failure inside a multi-list queue.
         jobStats.queueingPhase = false;
+        if (!joiningExisting) jobStats.isProcessing = false;
     });
 });
 
@@ -332,7 +359,8 @@ app.post('/api/enrich', async (req, res) => {
 async function backgroundEnqueue(
     rawContactIds: string[] | undefined,
     filters: any | undefined,
-    searchQuery: string | undefined
+    searchQuery: string | undefined,
+    joiningExisting: boolean = false
 ) {
     let contactIds = rawContactIds;
 
@@ -353,14 +381,23 @@ async function backgroundEnqueue(
 
     if (!contactIds || contactIds.length === 0) {
         addServerLog(`⚠️ No contacts found matching filters.`, 'Pipeline', 'warn');
-        jobStats.isProcessing = false;
         jobStats.queueingPhase = false;
+        if (!joiningExisting) jobStats.isProcessing = false;
         return;
     }
 
     const totalToEnrich = contactIds.length;
-    jobStats.total = totalToEnrich;
-    addServerLog(`📊 Total contacts to enrich: ${totalToEnrich.toLocaleString()}`, 'Pipeline', 'phase');
+    if (joiningExisting) {
+        // Additive: don't trash list 1's in-flight totals while appending
+        // list 2. The DB-backed /api/import-lists/stats endpoint shows the
+        // authoritative per-list progress; jobStats.total is just the
+        // aggregate hint for the Pipeline Monitor's combined progress bar.
+        jobStats.total = (jobStats.total || 0) + totalToEnrich;
+        addServerLog(`📥 Appending ${totalToEnrich.toLocaleString()} contacts to the active queue (will start after the current list completes).`, 'Pipeline', 'phase');
+    } else {
+        jobStats.total = totalToEnrich;
+        addServerLog(`📊 Total contacts to enrich: ${totalToEnrich.toLocaleString()}`, 'Pipeline', 'phase');
+    }
     addServerLog(`📦 Starting queue insertion for ${totalToEnrich.toLocaleString()} records...`, 'Pipeline', 'phase');
 
     try {
@@ -405,25 +442,36 @@ async function backgroundEnqueue(
             }
 
             enqueued += chunk.length;
-            jobStats.queued = enqueued;
+            // Additive too — for a joining list, jobStats.queued already
+            // reflects the previous list's queued count, so we increment
+            // by the chunk size rather than overwriting with this list's
+            // running tally.
+            jobStats.queued = (jobStats.queued || 0) + chunk.length;
             addServerLog(`📥 Queued ${enqueued.toLocaleString()} / ${totalToEnrich.toLocaleString()} (${Math.round(enqueued / totalToEnrich * 100)}%)`, 'Sync');
         }
 
         // Step 4: Queueing complete — switch to processing phase
         jobStats.queueingPhase = false;
-        jobStats.queued = totalToEnrich;
         await persistPipelineState();
 
-        addServerLog(`✅ All ${totalToEnrich.toLocaleString()} records queued. Starting enrichment...`, 'Pipeline', 'phase');
-        addServerLog(`📊 Pipeline summary: ${totalToEnrich.toLocaleString()} submitted → ${totalToEnrich.toLocaleString()} queued → 0 completed, 0 failed`, 'Pipeline', 'info');
+        if (joiningExisting) {
+            addServerLog(`✅ ${totalToEnrich.toLocaleString()} additional records queued behind the active list (FIFO). They'll start as soon as the in-flight list completes.`, 'Pipeline', 'phase');
+        } else {
+            addServerLog(`✅ All ${totalToEnrich.toLocaleString()} records queued. Starting enrichment...`, 'Pipeline', 'phase');
+            addServerLog(`📊 Pipeline summary: ${totalToEnrich.toLocaleString()} submitted → ${totalToEnrich.toLocaleString()} queued → 0 completed, 0 failed`, 'Pipeline', 'info');
+        }
 
-        // Step 5: Start the Background Processor
+        // Step 5: Start the Background Processor (idempotent — returns early
+        // if already running, so this is safe to call on every enqueue).
         JobProcessor.start();
     } catch (err: any) {
         console.error('Enqueue error:', err);
         addServerLog(`❌ Fatal enqueue error: ${err.message}`, 'Pipeline', 'error');
-        jobStats.isProcessing = false;
+        // Same logic as the wrapper's catch: don't kill the in-flight list's
+        // isProcessing flag when a later list's enqueue fails. The current
+        // list keeps draining; the failing one is just dropped.
         jobStats.queueingPhase = false;
+        if (!joiningExisting) jobStats.isProcessing = false;
     }
 }
 
