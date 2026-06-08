@@ -399,18 +399,83 @@ export class JobProcessor {
     }
 
     private static async processNextChunk(): Promise<number> {
-        // 1. Claim N pending/retrying items. Order by id ASC so items from
-        // older jobs drain before items from newer jobs — that way the
-        // oldest in-flight enrich run finishes first instead of two runs
-        // interleaving forever. (job_items.id is bigserial and monotonic
-        // within a job's insert, so ordering by id is equivalent to FIFO
-        // across jobs for practical purposes.)
+        // 1. FIFO across jobs (real serial multi-list queueing):
+        //    a. Find the OLDEST job that still has pending/retrying items.
+        //    b. Claim a chunk only from THAT job.
+        //    Tomorrow's tick repeats the lookup, so when job A drains the
+        //    processor automatically moves to job B without any state.
+        //
+        // The previous version ordered by job_items.id ASC and assumed
+        // id was bigserial-monotonic — wrong, job_items.id is uuid /
+        // gen_random_uuid(). UUID ordering is effectively random, so older
+        // and newer jobs' items were getting claimed in proportional shares
+        // (round-robin parallel), not FIFO. Verified live on 2026-06-08: two
+        // lists queued 4 hours apart were both at ~19% completion instead of
+        // one being 100% done. Filtering to a single job_id fixes it.
+        const { data: oldestJob, error: oldestErr } = await supabase
+            .from('jobs')
+            .select('id')
+            .eq('status', 'processing')
+            .order('created_at', { ascending: true })
+            .limit(1)
+            .single();
+
+        if (oldestErr && oldestErr.code !== 'PGRST116') {
+            // PGRST116 = no rows. Any other error is a real DB failure —
+            // bubble to the watchdog (same as the prior fetchError path).
+            throw oldestErr;
+        }
+
+        if (!oldestJob) {
+            // No 'processing' job. Could mean: (1) queue is genuinely empty,
+            // or (2) a previously-cancelled job still has pending rows that
+            // didn't get re-flipped to 'processing'. Fall back to any job
+            // with pending items (oldest first) so we don't strand them.
+            const { data: orphanJob, error: orphanErr } = await supabase
+                .from('jobs')
+                .select('id')
+                .in('status', ['processing', 'pending', 'cancelled'])
+                .order('created_at', { ascending: true })
+                .limit(50);
+
+            if (orphanErr) throw orphanErr;
+            if (!orphanJob || orphanJob.length === 0) return 0;
+
+            // Check which of those candidates still has unfinished items.
+            for (const cand of orphanJob) {
+                const { count } = await supabase
+                    .from('job_items')
+                    .select('*', { count: 'exact', head: true })
+                    .eq('job_id', cand.id)
+                    .in('status', ['pending', 'retrying']);
+                if (count && count > 0) {
+                    // Promote it back to processing so the lookup above
+                    // finds it next tick and we don't pay the orphan scan.
+                    await supabase.from('jobs')
+                        .update({ status: 'processing' })
+                        .eq('id', cand.id);
+                    return await this.claimChunkFromJob(cand.id);
+                }
+            }
+            return 0;
+        }
+
+        return await this.claimChunkFromJob(oldestJob.id);
+    }
+
+    /**
+     * Claim a chunk of pending/retrying items belonging to a SPECIFIC job.
+     * Extracted so the FIFO + orphan-fallback paths in processNextChunk
+     * share the same locking + dispatch code.
+     */
+    private static async claimChunkFromJob(jobId: string): Promise<number> {
         const { data: itemIdsToClaim, error: fetchError } = await supabase
             .from('job_items')
             .select('id, job_id')
+            .eq('job_id', jobId)
             .in('status', ['pending', 'retrying'])
             .or('next_retry_at.is.null,next_retry_at.lte.now()')
-            .order('id', { ascending: true })
+            .order('created_at', { ascending: true })
             .limit(QUEUE_FETCH_CHUNK_SIZE);
 
         if (fetchError) {
@@ -425,6 +490,8 @@ export class JobProcessor {
         }
 
         const ids = itemIdsToClaim.map(row => row.id);
+        // Always 1 now (FIFO claim is per-job) but kept for the log line so
+        // we'd notice immediately if someone re-broadened the claim later.
         const activeJobIds = [...new Set(itemIdsToClaim.map(row => row.job_id))];
 
         // Mark as processing
