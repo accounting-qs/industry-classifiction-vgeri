@@ -399,68 +399,69 @@ export class JobProcessor {
     }
 
     private static async processNextChunk(): Promise<number> {
-        // 1. FIFO across jobs (real serial multi-list queueing):
-        //    a. Find the OLDEST job that still has pending/retrying items.
-        //    b. Claim a chunk only from THAT job.
-        //    Tomorrow's tick repeats the lookup, so when job A drains the
-        //    processor automatically moves to job B without any state.
+        // FIFO across jobs (real serial multi-list queueing):
+        //   - Walk 'processing' jobs oldest-first.
+        //   - For each, claim a chunk filtered to that job_id only.
+        //   - If a job returns 0 items, its queue is drained — mark it
+        //     'completed' and try the next-oldest in the SAME tick so the
+        //     processor doesn't sleep on a dead job.
         //
-        // The previous version ordered by job_items.id ASC and assumed
-        // id was bigserial-monotonic — wrong, job_items.id is uuid /
-        // gen_random_uuid(). UUID ordering is effectively random, so older
-        // and newer jobs' items were getting claimed in proportional shares
-        // (round-robin parallel), not FIFO. Verified live on 2026-06-08: two
-        // lists queued 4 hours apart were both at ~19% completion instead of
-        // one being 100% done. Filtering to a single job_id fixes it.
-        const { data: oldestJob, error: oldestErr } = await supabase
+        // History: ordering job_items by id ASC was wrong (uuid, not bigserial),
+        // and a previous fix that just filtered to oldest 'processing' job
+        // got stuck once that job drained because its status never flipped to
+        // 'completed' (the global auto-complete only fires when the WHOLE queue
+        // is empty). This loop handles per-job completion inline.
+        const { data: candidates, error: candErr } = await supabase
             .from('jobs')
             .select('id')
             .eq('status', 'processing')
             .order('created_at', { ascending: true })
-            .limit(1)
-            .single();
+            .limit(20);
 
-        if (oldestErr && oldestErr.code !== 'PGRST116') {
-            // PGRST116 = no rows. Any other error is a real DB failure —
-            // bubble to the watchdog (same as the prior fetchError path).
-            throw oldestErr;
-        }
+        if (candErr) throw candErr;
 
-        if (!oldestJob) {
-            // No 'processing' job. Could mean: (1) queue is genuinely empty,
-            // or (2) a previously-cancelled job still has pending rows that
-            // didn't get re-flipped to 'processing'. Fall back to any job
-            // with pending items (oldest first) so we don't strand them.
-            const { data: orphanJob, error: orphanErr } = await supabase
-                .from('jobs')
-                .select('id')
-                .in('status', ['processing', 'pending', 'cancelled'])
-                .order('created_at', { ascending: true })
-                .limit(50);
+        if (candidates && candidates.length > 0) {
+            for (const cand of candidates) {
+                const claimed = await this.claimChunkFromJob(cand.id);
+                if (claimed > 0) return claimed;
 
-            if (orphanErr) throw orphanErr;
-            if (!orphanJob || orphanJob.length === 0) return 0;
-
-            // Check which of those candidates still has unfinished items.
-            for (const cand of orphanJob) {
-                const { count } = await supabase
-                    .from('job_items')
-                    .select('*', { count: 'exact', head: true })
-                    .eq('job_id', cand.id)
-                    .in('status', ['pending', 'retrying']);
-                if (count && count > 0) {
-                    // Promote it back to processing so the lookup above
-                    // finds it next tick and we don't pay the orphan scan.
-                    await supabase.from('jobs')
-                        .update({ status: 'processing' })
-                        .eq('id', cand.id);
-                    return await this.claimChunkFromJob(cand.id);
-                }
+                // Zero items on a 'processing' job = drained. Mark completed
+                // so the next tick (and the cascade below) skips it cleanly.
+                await supabase.from('jobs')
+                    .update({ status: 'completed', finished_at: new Date().toISOString() })
+                    .eq('id', cand.id)
+                    .eq('status', 'processing');
+                this.log(`✅ Job ${cand.id} drained — marking completed; advancing FIFO.`, 'phase');
             }
-            return 0;
         }
 
-        return await this.claimChunkFromJob(oldestJob.id);
+        // Fallback: no live 'processing' job had items. Look for jobs in
+        // 'pending'/'cancelled' that still have unfinished rows (orphans
+        // from a previously-cancelled or never-promoted job) and rescue them.
+        const { data: orphanJob, error: orphanErr } = await supabase
+            .from('jobs')
+            .select('id')
+            .in('status', ['pending', 'cancelled'])
+            .order('created_at', { ascending: true })
+            .limit(50);
+
+        if (orphanErr) throw orphanErr;
+        if (!orphanJob || orphanJob.length === 0) return 0;
+
+        for (const cand of orphanJob) {
+            const { count } = await supabase
+                .from('job_items')
+                .select('*', { count: 'exact', head: true })
+                .eq('job_id', cand.id)
+                .in('status', ['pending', 'retrying']);
+            if (count && count > 0) {
+                await supabase.from('jobs')
+                    .update({ status: 'processing' })
+                    .eq('id', cand.id);
+                return await this.claimChunkFromJob(cand.id);
+            }
+        }
+        return 0;
     }
 
     /**
