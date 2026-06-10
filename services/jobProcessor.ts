@@ -115,6 +115,47 @@ export class JobProcessor {
         }
     }
 
+    // Render → Supabase has intermittent transport blips — undici throws
+    // "TypeError: fetch failed", or supabase-js bubbles back ECONNRESET /
+    // ETIMEDOUT / EAI_AGAIN. The chunk-write upserts used to log + drop on
+    // these, leaving items in `processing` until the 5-min watchdog reset.
+    // This classifier matches the same set the import path retries on
+    // (server.ts:isTransientImportError) so behaviour is consistent.
+    private static isTransientSupabaseError(err: any): boolean {
+        if (!err) return false;
+        if (err.code === '57014' || err.code === '40001' || err.code === '40P01') return true;
+        const msg = String(err?.message || err || '').toLowerCase();
+        return /fetch failed|econnreset|etimedout|eai_again|enotfound|socket hang up|network|aborted|connection reset/.test(msg);
+    }
+
+    // Wrap a Supabase op with transport-level retry. Mirrors
+    // importSupabaseRetry in server.ts. Catches BOTH thrown TypeErrors
+    // (undici can throw directly out of await) AND tuple-shape errors
+    // (the supabase-js usual path). Capped exponential backoff so a stuck
+    // pooler doesn't park the worker indefinitely.
+    private static async retrySupabaseOp<T>(
+        label: string,
+        fn: () => PromiseLike<{ data: T; error: any }>,
+        maxRetries = 5
+    ): Promise<{ data: T | null; error: any }> {
+        let attempt = 0;
+        while (true) {
+            let result: { data: T | null; error: any };
+            try {
+                result = await fn();
+            } catch (thrown: any) {
+                result = { data: null, error: thrown };
+            }
+            if (!result.error || !this.isTransientSupabaseError(result.error) || attempt >= maxRetries) {
+                return result;
+            }
+            attempt++;
+            const backoff = Math.min(8000, 500 * Math.pow(2, attempt));
+            this.log(`↻ ${label} transient (${result.error?.message || 'unknown'}); retry ${attempt}/${maxRetries} in ${backoff}ms`, 'warn');
+            await new Promise(r => setTimeout(r, backoff));
+        }
+    }
+
     // First time we see a list in this run, query the RPC for its current
     // completed+failed baseline and total. Everything after is maintained
     // in-memory off that baseline. Failing the RPC call (e.g. migration
@@ -726,21 +767,30 @@ export class JobProcessor {
         // 1. Update Job Items (most critical — tracks item state)
         if (itemsToUpsert.length > 0) {
             const deduped = dedupeBy(itemsToUpsert as any[], 'id');
-            const { error: itemErr } = await supabase.from('job_items').upsert(deduped, { onConflict: 'id' });
+            const { error: itemErr } = await this.retrySupabaseOp(
+                'job_items upsert',
+                () => supabase.from('job_items').upsert(deduped, { onConflict: 'id' })
+            );
             if (itemErr) this.log(`⚠️ job_items upsert error: ${itemErr.message}`, 'error');
         }
 
         // 2. Update Contacts
         if (contactsToUpdate.length > 0) {
             const deduped = dedupeBy(contactsToUpdate as any[], 'id');
-            const { error: contactErr } = await supabase.from('contacts').upsert(deduped, { onConflict: 'id' });
+            const { error: contactErr } = await this.retrySupabaseOp(
+                'contacts upsert',
+                () => supabase.from('contacts').upsert(deduped, { onConflict: 'id' })
+            );
             if (contactErr) this.log(`⚠️ contacts upsert error: ${contactErr.message}`, 'error');
         }
 
         // 3. Update Enrichments
         if (enrichmentsToUpsert.length > 0) {
             const deduped = dedupeBy(enrichmentsToUpsert as any[], 'contact_id');
-            const { error: enrichErr } = await supabase.from('enrichments').upsert(deduped, { onConflict: 'contact_id' });
+            const { error: enrichErr } = await this.retrySupabaseOp(
+                'enrichments upsert',
+                () => supabase.from('enrichments').upsert(deduped, { onConflict: 'contact_id' })
+            );
             if (enrichErr) this.log(`⚠️ enrichments upsert error: ${enrichErr.message}`, 'error');
         }
 
@@ -761,7 +811,10 @@ export class JobProcessor {
                     content: sanitizeForPostgres(u.content)
                 }])).values()
             );
-            const { error: digestErr } = await supabase.from('scraped_data').upsert(dedupedByDomain, { onConflict: 'domain' });
+            const { error: digestErr } = await this.retrySupabaseOp(
+                'scraped_data batch upsert',
+                () => supabase.from('scraped_data').upsert(dedupedByDomain, { onConflict: 'domain' })
+            );
             if (digestErr) this.log(`⚠️ scraped_data batch upsert error: ${digestErr.message}`, 'error');
         }
 
