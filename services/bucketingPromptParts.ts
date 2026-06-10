@@ -24,14 +24,14 @@ The vertical / served market belongs in SECTOR, never the identity.
        fintech · regtech · insurtech · edtech · proptech · healthtech /
        medtech · legaltech · martech · adtech · agritech · climatetech
        → identity = Software & SaaS  (NEVER Financial Services / Insurance Services
-         / Healthcare Provider / Life Sciences & MedTech / Education Operator / etc.)
+         / Healthcare Provider / Life Sciences & MedTech / Education & Training / etc.)
      Trigger phrases: "fintech startup", "regtech platform", "insurtech app",
      "edtech company", "healthtech product".
      EXCEPTION — when the X-tech term modifies an INVESTOR or OPERATOR noun, the
      investor/operator identity wins:
        "fintech investor" / "fintech-focused PE firm" → Financial Services
        "healthtech VC fund" → Financial Services
-       "edtech operator running 12 schools" → Education Operator
+       "edtech operator running 12 schools" → Education & Training
      In ambiguous cases (no investor/operator noun), DEFAULT TO Software & SaaS.
 
  2. Staffing / recruiting / recruitment / talent acquisition / executive search /
@@ -93,7 +93,7 @@ The vertical / served market belongs in SECTOR, never the identity.
        → identity = Manufacturing & Industrial
           EXCEPTIONS:
             • medical device / pharmaceutical / biotech / diagnostics /
-              contract manufacturing & sterilization for medical → Life Sciences
+              contract manufacturing & sterilization for medical → Life Sciences & MedTech
             • agricultural manufacturing → still Manufacturing & Industrial
 
  6. Marketing / advertising / creative / branding / PR / media / digital /
@@ -150,7 +150,7 @@ The vertical / served market belongs in SECTOR, never the identity.
        → identity = Non-Profit & Association
        EXCEPTIONS (mission-driven but the WORK is in another vertical):
          • affordable / supportive housing operator → Real Estate (Housing Operator)
-         • workforce / job training programs → Education Operator (Workforce
+         • workforce / job training programs → Education & Training (Workforce
            Development Services)
 
  8. Architecture / architectural design / interior design / engineering firm /
@@ -289,12 +289,12 @@ The vertical / served market belongs in SECTOR, never the identity.
 14b. Pharmaceutical company / pharma / biotech / biotechnology / drug developer /
      medical device manufacturer / diagnostics maker / therapeutics company /
      contract manufacturing & sterilization (medical) / CDMO / CRO
-       → identity = Life Sciences  (DEVELOPS or PRODUCES drugs, devices,
+       → identity = Life Sciences & MedTech  (DEVELOPS or PRODUCES drugs, devices,
           diagnostics, or biologic therapies). NOT a care provider, NOT software.
 
 15. School / university / college / training provider / vocational training /
     learning company / workforce development
-       → identity = Education Operator
+       → identity = Education & Training
 
 16. Hotel / restaurant / hotel management / hospitality operator / tour operator /
     travel agent / travel agency / vacation planning / cruise booking /

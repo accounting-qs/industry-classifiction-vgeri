@@ -807,8 +807,8 @@ bucket is decided AFTERWARDS by combining counts across those axes.
 Layer 1 — PRIMARY IDENTITY (high-level business type, ~6-12 total)
    What kind of company is this AT ITS CORE?
    Examples: "Agency", "Consulting & Advisory", "Software & SaaS",
-   "IT Services", "Financial Services", "Real Estate Operator",
-   "Healthcare Operator", "Education Operator", "Staffing & Recruiting",
+   "IT Services", "Financial Services", "Real Estate",
+   "Healthcare Provider", "Education & Training", "Staffing & Recruiting",
    "Legal Services", "Accounting & Tax".
 
 Layer 2 — SUB-IDENTITY (subtype within identity)
@@ -869,15 +869,15 @@ OPERATOR vs ENABLER
 Operators directly operate in a vertical: clinics, hospitals, schools,
 universities, banks, city governments, churches, property managers,
 manufacturing plants, retailers, restaurants. Their primary_identity
-NAMES the vertical (e.g. "Healthcare Operator", "Education Operator").
+NAMES the vertical (e.g. "Healthcare Provider", "Education & Training").
 
 Enablers serve verticals from outside: agencies, consultants, software
 firms, investors, staffing firms, IT providers, advisors. Their
 primary_identity is the enabler category (Agency, Consulting & Advisory,
 Software & SaaS, …) — the vertical they serve goes in sector.
 
-Operator identities (Healthcare Operator, Education Operator, Government,
-Real Estate Operator, Religious Organization) require explicit operator
+Operator identities (Healthcare Provider, Education & Training, Government
+Contractor, Real Estate, Non-Profit & Association) require explicit operator
 evidence: "clinic", "hospital", "school district", "university", "city
 government", "church", "property management company". Generic mentions
 of the sector ("healthcare technology", "marketing for hospitals") are
@@ -6523,8 +6523,8 @@ EXPLICIT EXAMPLES — CORRECT:
       sub-identity = PropTech SaaS  (or Vertical SaaS)
       sector = Real Estate     ← yes, real estate is the OWN model
   • "Medical clinic" →
-      primary_identity = Healthcare Operator
-      sub-identity = Medical Clinic / Hospital
+      primary_identity = Healthcare Provider
+      sub-identity = null  (medical clinics use identity-only — no matching sub)
       sector = ""
 
 EXPLICIT EXAMPLES — INCORRECT:
