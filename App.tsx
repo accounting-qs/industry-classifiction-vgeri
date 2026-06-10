@@ -2873,7 +2873,6 @@ function ProxyStatsDashboard() {
 // ============================================
 
 const CONTACTS_FIELDS = [
-  { key: 'contact_id', label: 'contact_id', description: 'UUID identifier' },
   { key: 'lead_list_name', label: 'lead_list_name', description: 'Lead list source' },
   { key: 'first_name', label: 'first_name', description: 'First name' },
   { key: 'last_name', label: 'last_name', description: 'Last name' },
@@ -2949,7 +2948,6 @@ function CSVImportWizard({
       linkedin_url: ['linkedin_url', 'linkedin', 'linkedin_profile', 'li_url'],
       title: ['title', 'job_title', 'jobtitle', 'position', 'role'],
       lead_list_name: ['lead_list_name', 'lead_list', 'list_name', 'list', 'source'],
-      contact_id: ['contact_id', 'contactid', 'id', 'uuid'],
     };
 
     const result: Record<string, string> = {};

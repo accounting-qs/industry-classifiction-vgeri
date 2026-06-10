@@ -975,7 +975,7 @@ app.post('/api/import', async (req, res) => {
 
         const buildRow = (c: any) => {
             const row: any = {};
-            row.contact_id = c.contact_id || crypto.randomUUID();
+            row.contact_id = crypto.randomUUID();
             if (c.email) row.email = c.email.trim();
             if (c.first_name) row.first_name = c.first_name;
             if (c.last_name) row.last_name = c.last_name;
