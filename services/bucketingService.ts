@@ -3358,17 +3358,16 @@ const PLACEHOLDER_TAG_VALUES = new Set([
 
 // Reject obvious text-bleed values where the LLM dumped reasoning prose
 // into a tag slot (e.g. primary_identity="The homepage explicitly states
-// that Sunflower Development Center specializes in..."). Real taxonomy
-// names are short (5–40 chars), have no sentence punctuation, and don't
-// start with sentence-y words. Anything that fails these checks is
-// nullified at parse time so it can't pollute bucket_industry_map.
+// that Sunflower Development Center specializes in..."). Length + sentence
+// punctuation are sufficient — anything shorter that the LLM emits gets
+// normalised by snapTaggingsToLibrary downstream. (An earlier sentence-
+// start regex matched "It " case-insensitively and was nuking legitimate
+// "IT Services" identities — removed.)
 const TAG_MAX_LEN = 60;
-const TAG_SENTENCE_START = /^(The |A |This |It |They |Their |Based on |According to |Looking at )/i;
 const TAG_SENTENCE_PUNCT = /[.!?]\s+[A-Z]/;
 function validTag(v: string | null): string | null {
     if (!v) return null;
     if (v.length > TAG_MAX_LEN) return null;
-    if (TAG_SENTENCE_START.test(v)) return null;
     if (TAG_SENTENCE_PUNCT.test(v)) return null;
     return v;
 }
