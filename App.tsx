@@ -192,7 +192,7 @@ export default function App() {
   const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
   const [activeListFilter, setActiveListFilter] = useState<string | null>(null);
   const [contactsLoading, setContactsLoading] = useState(false);
-  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number }[]>([]);
+  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | null }[]>([]);
   const [listStatsSource, setListStatsSource] = useState<'rpc' | 'fallback'>('rpc');
   const [importListsLoading, setImportListsLoading] = useState(true);
   // Tracks the lazy /api/import-lists/stats fetch independently of the
@@ -317,18 +317,24 @@ export default function App() {
       .then(res => res.ok ? res.json() : Promise.reject(new Error(`stats ${res.status}`)))
       .then(data => {
         if (!data || !Array.isArray(data.stats)) return;
-        const byName = new Map<string, { completed: number; failed: number; total: number }>();
+        const byName = new Map<string, { completed: number; failed: number; total: number; queue_state: 'running' | 'queued' | null }>();
         for (const row of data.stats) {
-          byName.set(row.lead_list_name, { completed: row.completed, failed: row.failed, total: row.total });
+          byName.set(row.lead_list_name, {
+            completed: row.completed,
+            failed: row.failed,
+            total: row.total,
+            queue_state: row.queue_state === 'running' || row.queue_state === 'queued' ? row.queue_state : null,
+          });
         }
         setImportLists(prev => prev.map(l => {
           const s = byName.get(l.name);
-          if (!s) return { ...l, enriched_count: 0, failed_count: 0 };
+          if (!s) return { ...l, enriched_count: 0, failed_count: 0, queue_state: null };
           return {
             ...l,
             enriched_count: s.completed,
             failed_count: s.failed,
             contact_count: s.total || l.contact_count || 0,
+            queue_state: s.queue_state,
           };
         }));
         setListStatsSource(data.stats_source === 'fallback' ? 'fallback' : 'rpc');
@@ -1180,7 +1186,7 @@ function ImportedListsTable({
   onGoToImport,
   showAllListsRow = true,
 }: {
-  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number }[];
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | null }[];
   loading: boolean;
   statsLoading?: boolean;
   statsSource: 'rpc' | 'fallback';
@@ -1403,6 +1409,22 @@ function ImportedListsTable({
                       <div className="flex flex-col gap-1">
                         <span>{l.name}</span>
                         <span className="inline-flex items-center gap-1.5">
+                          {l.queue_state === 'running' && (
+                            <span
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-[#3ecf8e]/15 text-[#3ecf8e] border border-[#3ecf8e]/40"
+                              title="Enrichment running — worker is currently processing this list."
+                            >
+                              <Loader2 className="w-2.5 h-2.5 animate-spin" /> Enriching
+                            </span>
+                          )}
+                          {l.queue_state === 'queued' && (
+                            <span
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/40"
+                              title="Queued — another list is enriching ahead of this one. FIFO: it'll start when the current list drains."
+                            >
+                              <Zap className="w-2.5 h-2.5" /> Queued
+                            </span>
+                          )}
                           {l.bucketed && (
                             <span
                               className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-[#3ecf8e]/15 text-[#3ecf8e] border border-[#3ecf8e]/30"
@@ -1614,7 +1636,7 @@ function ListSelectorModal({
   onSetListBucketed,
   onGoToImport,
 }: {
-  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number }[];
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | null }[];
   loading: boolean;
   statsLoading?: boolean;
   statsSource: 'rpc' | 'fallback';

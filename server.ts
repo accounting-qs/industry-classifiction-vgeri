@@ -1197,12 +1197,37 @@ app.get('/api/import-lists/stats', async (_req, res) => {
         // between page refreshes.
         const { data: stats, error: rpcErr } = await supabase.rpc('get_list_enrichment_stats');
 
+        // Per-list enrichment-queue state. With multi-list FIFO, more
+        // than one list can have job_items pending at the same time —
+        // exactly one runs (active job, status='processing' items), the
+        // rest sit queued behind it. We surface that as 'running' vs
+        // 'queued' on each row so the Import History badge shows which
+        // list the worker is on and which are next in line.
+        const queueByList = new Map<string, 'running' | 'queued'>();
+        try {
+            const { data: queueRows, error: queueErr } = await supabase.rpc('get_list_enrichment_queue_state');
+            if (!queueErr && Array.isArray(queueRows)) {
+                for (const r of queueRows as Array<{ lead_list_name: string; queue_state: string }>) {
+                    if (r.queue_state === 'running' || r.queue_state === 'queued') {
+                        queueByList.set(r.lead_list_name, r.queue_state);
+                    }
+                }
+            } else if (queueErr) {
+                // Soft-fail: rendering without the badge is fine. Log so
+                // the missing migration shows up in Render but don't 500.
+                console.warn(`[import-lists/stats] queue-state RPC unavailable: ${queueErr.message}`);
+            }
+        } catch (err: any) {
+            console.warn(`[import-lists/stats] queue-state lookup failed: ${err.message}`);
+        }
+
         if (!rpcErr && Array.isArray(stats)) {
             const rows = (stats as any[]).map(row => ({
                 lead_list_name: row.lead_list_name as string,
                 completed: Number(row.completed_count) || 0,
                 failed: Number(row.failed_count) || 0,
                 total: Number(row.total_count) || 0,
+                queue_state: queueByList.get(row.lead_list_name as string) || null,
             }));
             return res.json({ stats: rows, stats_source: 'rpc' as const });
         }
@@ -1229,6 +1254,7 @@ app.get('/api/import-lists/stats', async (_req, res) => {
                 completed: completed.count || 0,
                 failed: failed.count || 0,
                 total: l.contact_count || 0,
+                queue_state: queueByList.get(l.name as string) || null,
             };
         }));
         res.json({ stats: rows, stats_source: 'fallback' as const });
