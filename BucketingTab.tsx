@@ -3489,6 +3489,13 @@ type ActionRecord = {
 type ProposalSuggestion = {
   route_to?: string;
   route_to_parent?: string;
+  // Cross-layer routing target. Today only used for IDENTITY proposals
+  // that should really be a sub-identity (e.g. "Holding Company" →
+  // "Venture Capital" under "Financial Services"). When set on an
+  // identity-layer suggestion, route_to + route_to_parent name a
+  // sub-identity in the library; clicking the chip rewrites BOTH
+  // primary_identity and sub_identity on every matching row.
+  route_to_layer?: 'identities' | 'sub_identities';
   accept_as_new?: boolean;
   // wrong_layer: the proposal's NAME is from a different taxonomy layer
   // (e.g. an identity name used as a sub-identity, a sector name used as
@@ -3504,6 +3511,7 @@ type ProposalSuggestion = {
   alt_routes?: Array<{
     route_to: string;
     route_to_parent?: string;
+    route_to_layer?: 'identities' | 'sub_identities';
     confidence: number;
     reason: string;
   }>;
@@ -3526,6 +3534,12 @@ type ProposalSuggestionsBlob = {
 // This combobox: substring filter (case-insensitive), keyboard nav (↑↓ Enter
 // Escape), click-outside to close, no autofocus side-effects on parent
 // re-render. Local-only state; the parent only sees onSelect(entry).
+//
+// Cross-layer note: when the proposal panel is for IDENTITIES, libEntries
+// can include sub-identities too (each tagged with targetKind='sub_identities').
+// Picking one routes the identity proposal to that sub, atomically rewriting
+// primary_identity (= the sub's parent) and sub_identity (= the sub's name).
+type RouteTarget = { name: string; parent?: string; targetKind?: 'identities' | 'sub_identities' };
 function RouteToCombobox({
   libEntries,
   kind,
@@ -3533,9 +3547,9 @@ function RouteToCombobox({
   disabled,
   isBusy
 }: {
-  libEntries: { name: string; parent?: string }[];
+  libEntries: RouteTarget[];
   kind: 'identities' | 'sub_identities' | 'sectors';
-  onSelect: (entry: { name: string; parent?: string }) => void;
+  onSelect: (entry: RouteTarget) => void;
   disabled?: boolean;
   isBusy?: boolean;
 }) {
@@ -3550,7 +3564,8 @@ function RouteToCombobox({
     const q = query.trim().toLowerCase();
     if (!q) return libEntries;
     return libEntries.filter(le => {
-      const label = kind === 'sub_identities'
+      const isSub = le.targetKind === 'sub_identities' || kind === 'sub_identities';
+      const label = isSub
         ? `${le.name} ${le.parent || ''}`
         : le.name;
       return label.toLowerCase().includes(q);
@@ -3581,7 +3596,7 @@ function RouteToCombobox({
     if (el) el.scrollIntoView({ block: 'nearest' });
   }, [open, highlight]);
 
-  const choose = (le: { name: string; parent?: string }) => {
+  const choose = (le: RouteTarget) => {
     onSelect(le);
     setOpen(false);
     setQuery('');
@@ -3628,23 +3643,32 @@ function RouteToCombobox({
           <div ref={listRef} className="max-h-[260px] overflow-y-auto">
             {filtered.length === 0 ? (
               <div className="px-2 py-2 text-[10px] text-gray-500 italic">No matches.</div>
-            ) : filtered.map((le, i) => (
+            ) : filtered.map((le, i) => {
+              const isSubTarget = le.targetKind === 'sub_identities' || kind === 'sub_identities';
+              return (
               <button
-                key={`${le.name}::${le.parent || ''}`}
+                key={`${le.targetKind || kind}:${le.name}::${le.parent || ''}`}
                 type="button"
                 onClick={() => choose(le)}
                 onMouseEnter={() => setHighlight(i)}
                 className={`block w-full text-left px-2 py-1 text-[10px] truncate ${
                   i === highlight ? 'bg-[#2e2e2e] text-white' : 'text-gray-300'
                 } hover:bg-[#2e2e2e] hover:text-white`}
-                title={kind === 'sub_identities' ? `${le.name} (under ${le.parent})` : le.name}
+                title={isSubTarget ? `${le.name} (under ${le.parent || ''})` : le.name}
               >
                 <span className="text-white font-medium">{le.name}</span>
-                {kind === 'sub_identities' && le.parent && (
+                {isSubTarget && le.parent && (
                   <span className="text-gray-500"> · {le.parent}</span>
                 )}
+                {/* When mixing layers (identity proposal panel offering sub
+                    targets), tag the cross-layer rows so the user sees that
+                    picking one will atomically rewrite both columns. */}
+                {kind === 'identities' && le.targetKind === 'sub_identities' && (
+                  <span className="ml-1 px-1 rounded bg-sky-500/10 text-sky-300 text-[8px] font-bold">SUB</span>
+                )}
               </button>
-            ))}
+            );
+            })}
           </div>
         </div>
       )}
@@ -3894,7 +3918,13 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
   // proposal disappears from /proposed-tags after refresh because its
   // is_new_* flags are gone server-side, but the row stays visible as a
   // "Routed to X" ghost.
-  const remap = async (kind: TaxKind, fromName: string, toName: string, toParent?: string) => {
+  const remap = async (
+    kind: TaxKind,
+    fromName: string,
+    toName: string,
+    toParent?: string,
+    toLayer?: TaxKind
+  ) => {
     setBusyKey(`${kind}:${fromName}`);
     onError(null);
     try {
@@ -3902,7 +3932,15 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
       const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(runId)}/proposed-tags/${kind}/remap`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from_name: fromName, to_name: toName, to_parent: toParent })
+        body: JSON.stringify({
+          from_name: fromName,
+          to_name: toName,
+          to_parent: toParent,
+          // Same-layer routes leave to_layer undefined for back-compat with
+          // older server builds. Cross-layer (identity → sub-identity)
+          // explicitly sets to_layer so the server rewrites both columns.
+          ...(toLayer && toLayer !== kind ? { to_layer: toLayer } : {})
+        })
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || `Failed (${res.status})`);
@@ -4190,11 +4228,30 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                   // Library entries available as Route-to-existing targets.
                   // For sub-identities we keep parent_identity so the remap
                   // can rewrite both columns atomically.
-                  const libEntries: { name: string; parent?: string }[] = (() => {
+                  //
+                  // Cross-layer: for IDENTITY proposals we also include
+                  // sub-identities in the dropdown — proposals like
+                  // "Holding Company" are usually best understood as a
+                  // sub-identity ("Venture Capital" under "Financial
+                  // Services") and picking one atomically rewrites both
+                  // primary_identity and sub_identity on every matching row.
+                  const libEntries: RouteTarget[] = (() => {
                     if (!library) return [];
-                    if (kind === 'identities') return (library.identities || []).filter((e: any) => !e.archived).map((e: any) => ({ name: e.name }));
-                    if (kind === 'sub_identities') return (library.sub_identities || []).filter((e: any) => !e.archived).map((e: any) => ({ name: e.name, parent: e.parent_identity }));
-                    return (library.sectors || []).filter((e: any) => !e.archived).map((e: any) => ({ name: e.name }));
+                    if (kind === 'identities') {
+                      const ids = (library.identities || [])
+                        .filter((e: any) => !e.archived)
+                        .map((e: any) => ({ name: e.name, targetKind: 'identities' as const }));
+                      const subs = (library.sub_identities || [])
+                        .filter((e: any) => !e.archived)
+                        .map((e: any) => ({
+                          name: e.name,
+                          parent: e.parent_identity,
+                          targetKind: 'sub_identities' as const
+                        }));
+                      return [...ids, ...subs];
+                    }
+                    if (kind === 'sub_identities') return (library.sub_identities || []).filter((e: any) => !e.archived).map((e: any) => ({ name: e.name, parent: e.parent_identity, targetKind: 'sub_identities' as const }));
+                    return (library.sectors || []).filter((e: any) => !e.archived).map((e: any) => ({ name: e.name, targetKind: 'sectors' as const }));
                   })();
                   // Suggested match: a library entry that's either an exact
                   // name match (LLM tagged is_new=true before the library
@@ -4229,14 +4286,20 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                   const aiSuggKey = kind === 'sub_identities' ? `${p.name}|${p.parent || ''}` : p.name;
                   const aiSugg: ProposalSuggestion | undefined = (aiSuggestions as any)?.[kind]?.[aiSuggKey];
                   let aiState: 'route' | 'new' | 'wrong_layer' | 'stale' | null = null;
-                  let aiTarget: { name: string; parent?: string } | null = null;
+                  let aiTarget: RouteTarget | null = null;
                   if (aiSugg && !isActioned && !isEditing) {
                     if (aiSugg.wrong_layer) {
                       aiState = 'wrong_layer';
                     } else if (aiSugg.route_to) {
+                      // Effective target layer: explicit route_to_layer
+                      // wins (used by identity → sub-identity cross-layer
+                      // suggestions); otherwise default to the proposal's
+                      // own layer.
+                      const effectiveLayer: TaxKind = (aiSugg.route_to_layer as TaxKind) || (kind as TaxKind);
                       const target = libEntries.find(le =>
                         le.name === aiSugg.route_to &&
-                        (kind !== 'sub_identities' || le.parent === aiSugg.route_to_parent)
+                        (le.targetKind || kind) === effectiveLayer &&
+                        (effectiveLayer !== 'sub_identities' || le.parent === aiSugg.route_to_parent)
                       );
                       if (target) { aiState = 'route'; aiTarget = target; }
                       else aiState = 'stale';
@@ -4365,18 +4428,26 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                 summary. Colors by confidence: green ≥8,
                                 amber 5-7, red ≤4. */}
                             {aiSugg && !isActioned && !isEditing && aiState === 'route' && aiTarget && (() => {
-                              const candidates: Array<{ name: string; parent?: string; confidence: number; reason: string }> = [
-                                { name: aiTarget.name, parent: aiTarget.parent, confidence: aiSugg.confidence, reason: aiSugg.reason }
+                              type Cand = { name: string; parent?: string; targetKind: TaxKind; confidence: number; reason: string };
+                              const primaryLayer: TaxKind = (aiTarget.targetKind as TaxKind) || (kind as TaxKind);
+                              const candidates: Cand[] = [
+                                { name: aiTarget.name, parent: aiTarget.parent, targetKind: primaryLayer, confidence: aiSugg.confidence, reason: aiSugg.reason }
                               ];
                               for (const alt of (aiSugg.alt_routes || [])) {
-                                // Only show alts whose target still lives in the active library.
+                                // Only show alts whose target still lives
+                                // in the active libEntries set. Honor each
+                                // alt's own route_to_layer (cross-layer
+                                // alts allowed for identity proposals).
+                                const altLayer: TaxKind = (alt.route_to_layer as TaxKind) || (kind as TaxKind);
                                 const stillExists = libEntries.some(le =>
                                   le.name === alt.route_to &&
-                                  (kind !== 'sub_identities' || le.parent === alt.route_to_parent)
+                                  (le.targetKind || kind) === altLayer &&
+                                  (altLayer !== 'sub_identities' || le.parent === alt.route_to_parent)
                                 );
                                 if (stillExists) candidates.push({
                                   name: alt.route_to,
                                   parent: alt.route_to_parent,
+                                  targetKind: altLayer,
                                   confidence: alt.confidence,
                                   reason: alt.reason
                                 });
@@ -4392,11 +4463,13 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                       : color === 'amber'
                                         ? 'bg-amber-500/15 text-amber-300 border-amber-500/30 hover:bg-amber-500/25'
                                         : 'bg-red-500/15 text-red-300 border-red-500/30 hover:bg-red-500/25';
+                                    const showParent = cand.targetKind === 'sub_identities' && cand.parent;
+                                    const isCrossLayer = cand.targetKind !== kind;
                                     return (
                                       <button
-                                        key={`${cand.name}::${cand.parent || ''}`}
+                                        key={`${cand.targetKind}:${cand.name}::${cand.parent || ''}`}
                                         type="button"
-                                        onClick={() => remap(kind, p.name, cand.name, cand.parent)}
+                                        onClick={() => remap(kind, p.name, cand.name, cand.parent, cand.targetKind)}
                                         disabled={isBusy}
                                         className={`px-1.5 py-0.5 rounded text-[9px] font-bold inline-flex items-center gap-1 border disabled:opacity-50 ${cls}`}
                                         title={`Claude Opus 4.7 · confidence ${cand.confidence}/10 — ${cand.reason}`}
@@ -4405,7 +4478,10 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                         <span>
                                           {i === 0 ? 'AI: ' : `Alt ${i}: `}
                                           <span className="underline">{cand.name}</span>
-                                          {cand.parent && kind === 'sub_identities' ? ` (under ${cand.parent})` : ''}
+                                          {showParent ? ` (under ${cand.parent})` : ''}
+                                          {isCrossLayer && cand.targetKind === 'sub_identities' && (
+                                            <span className="ml-1 px-1 rounded bg-sky-500/20 text-sky-200 text-[8px]">SUB</span>
+                                          )}
                                           {` · ${cand.confidence}/10`}
                                         </span>
                                       </button>
@@ -4488,7 +4564,10 @@ function Phase1aProposedTagsPanel({ runId, onError, recalcing, onFinalize, final
                                 isBusy={isBusy && !!routeDraft[key]}
                                 onSelect={target => {
                                   setRouteDraft(prev => ({ ...prev, [key]: `${target.name}::${target.parent || ''}` }));
-                                  Promise.resolve(remap(kind, p.name, target.name, target.parent)).finally(() => {
+                                  // targetKind === 'sub_identities' on an
+                                  // identity proposal triggers the cross-
+                                  // layer remap (rewrites both columns).
+                                  Promise.resolve(remap(kind, p.name, target.name, target.parent, target.targetKind as TaxKind | undefined)).finally(() => {
                                     setRouteDraft(prev => ({ ...prev, [key]: '' }));
                                   });
                                 }}

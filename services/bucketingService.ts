@@ -260,7 +260,14 @@ interface TaxonomySnapshot {
 // collisions with the "::" the UI uses inside routeDraft values.
 export interface ProposalSuggestion {
     route_to?: string;            // existing library entry name (verbatim) — the model's top pick
-    route_to_parent?: string;     // sub_identities only — parent identity of route_to
+    route_to_parent?: string;     // parent identity of route_to (set for sub-identity targets,
+                                  // including cross-layer identity → sub routes)
+    // Cross-layer routing target — meaningful only on identity-layer
+    // suggestions today, set to 'sub_identities' when the model judged
+    // the proposal really belongs to a sub-identity (e.g. "Holding Company"
+    // → "Venture Capital" under "Financial Services"). The UI uses this
+    // to rewrite BOTH columns atomically. Omitted for same-layer routes.
+    route_to_layer?: 'identities' | 'sub_identities';
     accept_as_new?: boolean;      // exactly one of route_to / accept_as_new / wrong_layer is set
     wrong_layer?: boolean;        // proposal's NAME is from a different layer (identity-as-sub,
                                   // sector-as-sub, sub-as-sector). Surfaced to the human; route/
@@ -275,6 +282,7 @@ export interface ProposalSuggestion {
     alt_routes?: Array<{
         route_to: string;
         route_to_parent?: string;
+        route_to_layer?: 'identities' | 'sub_identities';
         confidence: number;
         reason: string;
     }>;
@@ -4407,11 +4415,17 @@ interface RawSuggestion {
     decision: 'route' | 'new' | 'wrong_layer';
     route_to?: string;
     route_to_parent?: string;
+    // Cross-layer routing target. Only meaningful for IDENTITY proposals
+    // today — set to 'sub_identities' when the LLM judges the proposal
+    // really belongs to a sub-identity (e.g. "Holding Company" → "Venture
+    // Capital" under "Financial Services"). Omitted for same-layer routes.
+    route_to_layer?: 'identities' | 'sub_identities';
     confidence: number;
     reason: string;
     alt_routes?: Array<{
         route_to: string;
         route_to_parent?: string;
+        route_to_layer?: 'identities' | 'sub_identities';
         confidence: number;
         reason: string;
     }>;
@@ -4419,7 +4433,11 @@ interface RawSuggestion {
 
 function layerGuidance(layer: SuggestLayer): string {
     if (layer === 'identities') {
-        return `IDENTITY proposals (Layer 1 — the company's top-level business model). Identities are stable, curated, and adding a new one is cheap. Route ONLY when the proposal is an OBVIOUS paraphrase of an existing identity ("Insurance" → "Insurance Services"; "PE Firm" → "Financial Services"). DO NOT route to a "least-wrong" neighbour — return decision=new instead. NEVER route at confidence ≥ 5 unless it's a true synonym. Inputs like "Professional Services" / "B2B" / "Subscription" / "Holding Company" are not identities — return decision=new at confidence ≤ 4 and the human will reject.`;
+        return `IDENTITY proposals (Layer 1 — the company's top-level business model). Identities are stable, curated, and adding a new one is cheap. Route ONLY when the proposal is an OBVIOUS paraphrase of an existing identity ("Insurance" → "Insurance Services"; "PE Firm" → "Financial Services"). DO NOT route to a "least-wrong" neighbour — return decision=new instead. NEVER route at confidence ≥ 5 unless it's a true synonym.
+
+CROSS-LAYER (identity → sub-identity): when the proposal is really a SUB-IDENTITY rather than a top-level identity (e.g. "Holding Company" is too narrow to be its own identity but fits cleanly as "Venture Capital" under "Financial Services"), route to that SUB-IDENTITY by setting route_to to the sub-identity name, route_to_parent to its parent identity, AND route_to_layer="sub_identities". The library block lists sub-identity entries with the "(sub under <Parent>)" suffix so you can pick them. Confidence rules unchanged — only set confidence ≥ 7 when the sub is a clear semantic fit; ≤ 4 when it's the least-wrong of several. This atomically rewrites BOTH the proposal's primary_identity AND sub_identity on every matching contact row — use it instead of "new" whenever a sub-identity is the right answer.
+
+Inputs like "Professional Services" / "B2B" / "Subscription" are not identities — return decision=new at confidence ≤ 4 and the human will reject. "Holding Company" specifically: prefer the cross-layer sub-identity route above over decision=new.`;
     }
     if (layer === 'sub_identities') {
         return `SUB-IDENTITY proposals (Layer 2 — functional subtype under an identity). Each proposal lists a parent identity. Sub-identities fragment heavily; prefer route. Same-parent route is the default. Cross-parent routes (route_to_parent ≠ proposal's parent) are allowed but MUST cap confidence ≤ 4 — they silently re-parent contacts and need human review. If the proposal's NAME is itself an identity name ("Manufacturing & Industrial" used as a sub-identity) or a sector name ("Life Sciences & Biotech" used as a sub-identity), return decision=wrong_layer with the reason naming the correct layer — DO NOT route, DO NOT accept_as_new.`;
@@ -4433,6 +4451,11 @@ function buildSuggestPrompt(
     libEntries: TaxonomyEntry[],
     contactCounts: Record<string, number>,
     libraryExamples: Record<string, string[]>,
+    // Extra library entries from a DIFFERENT layer that are valid cross-
+    // layer route targets. Today: only populated for the identity layer
+    // (passed the sub-identity library). The LLM sees them with a
+    // "(sub under <Parent>)" suffix in the LIBRARY block.
+    crossLayerEntries?: TaxonomyEntry[],
 ): { system: string; user: string } {
     const layerCountKey = layer === 'identities' ? 'identity' : layer === 'sub_identities' ? 'sub_identity' : 'sector';
 
@@ -4475,12 +4498,14 @@ OUTPUT — strict JSON, single object with key "suggestions":
       "parent": "<parent identity name verbatim>",        // sub_identities only
       "decision": "route" | "new" | "wrong_layer",
       "route_to": "<library entry name verbatim>",        // when decision = route (top pick)
-      "route_to_parent": "<library parent identity>",     // sub_identities + route only
+      "route_to_parent": "<library parent identity>",     // when target is a sub-identity (same-layer sub OR cross-layer from identity)
+      "route_to_layer": "sub_identities",                 // OPTIONAL, identity proposals only, when routing to a SUB-identity in the library
       "confidence": 1-10,
       "reason": "...",
       "alt_routes": [                                     // OPTIONAL, decision=route only, max 2 entries
         { "route_to": "<library entry name verbatim>",
-          "route_to_parent": "<library parent identity>", // sub_identities only
+          "route_to_parent": "<library parent identity>", // when alt's target is a sub-identity
+          "route_to_layer": "sub_identities",             // OPTIONAL, same semantics as primary
           "confidence": 1-10,
           "reason": "..." }
       ]
@@ -4492,13 +4517,14 @@ HARD RULES:
   - One object per PROPOSAL in the user message. Do not drop any.
   - When decision=route, route_to MUST appear in the LIBRARY block. Copy character-for-character. Do NOT invent names.
   - For sub-identities + route, route_to_parent MUST match the library entry's listed parent (after the cross-parent confidence cap above).
-  - When decision=new or wrong_layer, omit route_to / route_to_parent / alt_routes.
+  - For IDENTITY proposals routed cross-layer to a sub-identity, set route_to_layer="sub_identities" and route_to_parent to the sub's parent identity. route_to must appear in the library block under the "(sub under <Parent>)" suffix.
+  - When decision=new or wrong_layer, omit route_to / route_to_parent / route_to_layer / alt_routes.
   - Output ONLY the JSON object. No prose, no markdown fences.`;
 
     // Library block — each entry gets its description AND up to 3 concrete
     // example industries from past confirmed mappings, so the router sees
     // what the entry actually contains rather than just a one-line gloss.
-    const libBlock = libEntries.map(e => {
+    const sameLayerBlock = libEntries.map(e => {
         const key = layer === 'sub_identities' ? `${e.name}|${e.parent_identity || ''}` : e.name;
         const exs = libraryExamples[key] || [];
         const exsStr = exs.length ? ` · ex: ${exs.map(s => `"${s}"`).join(', ')}` : '';
@@ -4508,6 +4534,22 @@ HARD RULES:
         }
         return `  - "${e.name}"${desc}${exsStr}`;
     }).join('\n');
+
+    // Cross-layer block. For identity proposals we expose the sub-identity
+    // library so the LLM can route a too-narrow identity proposal (e.g.
+    // "Holding Company") to a sub-identity ("Venture Capital" under
+    // "Financial Services") in one step. Description only — examples are
+    // looked up by layer-scoped `libraryExamples` and aren't passed for the
+    // cross layer (keeps the surface area small; the description carries
+    // enough signal for the route decision).
+    const crossBlock = (layer === 'identities' && crossLayerEntries && crossLayerEntries.length > 0)
+        ? '\n\n  CROSS-LAYER TARGETS (sub-identities — for the cross-layer route described in LAYER GUIDANCE; set route_to_layer="sub_identities" + route_to_parent when picking one):\n'
+            + crossLayerEntries.map(e => {
+                const desc = e.description ? `: ${e.description}` : '';
+                return `  - "${e.name}" (sub under "${e.parent_identity || ''}")${desc}`;
+            }).join('\n')
+        : '';
+    const libBlock = sameLayerBlock + crossBlock;
 
     // Proposal block — 5 samples (not 3) plus cross-layer co-occurrence so
     // the router can disambiguate identity-vs-sector confusion. E.g. a sub
@@ -4554,11 +4596,12 @@ async function callSuggestLLM(
     libraryExamples: Record<string, string[]>,
     signal: AbortSignal | undefined,
     log: (m: string, level?: 'info' | 'warn') => void,
+    crossLayerEntries?: TaxonomyEntry[],
 ): Promise<{ suggestions: RawSuggestion[]; cost: number }> {
     const anthropic = await getAnthropic(supabase);
     if (!anthropic) throw new Error('Anthropic API key not configured. Add it on the Connectors page (saved as ANTHROPIC_API_KEY).');
 
-    const { system, user } = buildSuggestPrompt(layer, proposals, libEntries, contactCounts, libraryExamples);
+    const { system, user } = buildSuggestPrompt(layer, proposals, libEntries, contactCounts, libraryExamples, crossLayerEntries);
     const resp = await anthropic.messages.create({
         model: SUGGEST_ROUTINGS_MODEL,
         max_tokens: SUGGEST_ROUTINGS_MAX_TOKENS,
@@ -4681,7 +4724,10 @@ export async function suggestProposalRoutings(
         }
         try {
             const layerExamples = libraryExamples[layer];
-            const r = await callSuggestLLM(supabase, layer, layerProposals as any, libEntries, contactCounts, layerExamples, signal, log);
+            // Identity proposals get the sub-identity library as cross-layer
+            // route targets — see CROSS-LAYER guidance in the prompt.
+            const crossLayer = layer === 'identities' ? snapshot.sub_identities : undefined;
+            const r = await callSuggestLLM(supabase, layer, layerProposals as any, libEntries, contactCounts, layerExamples, signal, log, crossLayer);
             log(`[${layer}] ${r.suggestions.length} suggestions for ${layerProposals.length} proposals · $${r.cost.toFixed(4)}`);
             return { layer, suggestions: r.suggestions, cost: r.cost };
         } catch (err: any) {
@@ -4692,9 +4738,18 @@ export async function suggestProposalRoutings(
 
     const blob: ProposalSuggestionsBlob = { identities: {}, sub_identities: {}, sectors: {} };
     let totalCost = 0;
+    // Cross-layer route targets, layer-keyed. Today only the identity
+    // layer is allowed to route cross-layer (to sub-identities). Lookup
+    // by name + parent.
+    const crossLayerLibs: Record<SuggestLayer, TaxonomyEntry[]> = {
+        identities: snapshot.sub_identities,
+        sub_identities: [],
+        sectors: [],
+    };
     for (const r of results) {
         totalCost += r.cost;
         const layerLib = snapshot[r.layer];
+        const crossLib = crossLayerLibs[r.layer];
         for (const raw of r.suggestions) {
             if (!raw || typeof raw.name !== 'string') continue;
             const out: ProposalSuggestion = {
@@ -4709,14 +4764,25 @@ export async function suggestProposalRoutings(
                 out.wrong_layer = true;
             } else {
                 const wantRoute = raw.decision === 'route' && typeof raw.route_to === 'string' && raw.route_to.trim();
+                // Cross-layer route: identity proposal pointing at a
+                // sub-identity target. Requires route_to_layer="sub_identities"
+                // AND a route_to_parent that exists alongside route_to in the
+                // sub-identity library. Same-layer routes leave route_to_layer
+                // unset.
+                const wantCrossLayer = wantRoute && r.layer === 'identities' && raw.route_to_layer === 'sub_identities';
                 if (wantRoute) {
-                    const exists = layerLib.some(e =>
-                        e.name === raw.route_to &&
-                        (r.layer !== 'sub_identities' || e.parent_identity === raw.route_to_parent)
-                    );
+                    const exists = wantCrossLayer
+                        ? crossLib.some(e => e.name === raw.route_to && e.parent_identity === raw.route_to_parent)
+                        : layerLib.some(e =>
+                            e.name === raw.route_to &&
+                            (r.layer !== 'sub_identities' || e.parent_identity === raw.route_to_parent)
+                          );
                     if (exists) {
                         out.route_to = raw.route_to;
-                        if (r.layer === 'sub_identities') {
+                        if (wantCrossLayer) {
+                            out.route_to_layer = 'sub_identities';
+                            out.route_to_parent = raw.route_to_parent;
+                        } else if (r.layer === 'sub_identities') {
                             out.route_to_parent = raw.route_to_parent;
                             // Cross-parent routes silently re-parent contacts.
                             // Cap confidence at 4 so the human reviews even if
@@ -4733,23 +4799,29 @@ export async function suggestProposalRoutings(
                         // against the primary; apply the cross-parent cap.
                         // Cap to 2 alts even if the model returns more.
                         if (Array.isArray(raw.alt_routes) && raw.alt_routes.length > 0) {
-                            const seenKeys = new Set<string>([
-                                r.layer === 'sub_identities'
-                                    ? `${out.route_to}|${out.route_to_parent || ''}`
-                                    : out.route_to!
-                            ]);
+                            // The dedupe key folds layer + name + parent so a
+                            // same-name sub-identity under a different parent
+                            // counts as a distinct alt.
+                            const primaryKey = (out.route_to_layer === 'sub_identities' || r.layer === 'sub_identities')
+                                ? `${out.route_to_layer || r.layer}:${out.route_to}|${out.route_to_parent || ''}`
+                                : `${r.layer}:${out.route_to}`;
+                            const seenKeys = new Set<string>([primaryKey]);
                             const alts: NonNullable<ProposalSuggestion['alt_routes']> = [];
                             for (const a of raw.alt_routes) {
                                 if (alts.length >= 2) break;
                                 if (!a || typeof a.route_to !== 'string' || !a.route_to.trim()) continue;
-                                const altKey = r.layer === 'sub_identities'
-                                    ? `${a.route_to}|${a.route_to_parent || ''}`
-                                    : a.route_to;
+                                const altCrossLayer = r.layer === 'identities' && a.route_to_layer === 'sub_identities';
+                                const effLayer: SuggestLayer = altCrossLayer ? 'sub_identities' : r.layer;
+                                const altKey = (effLayer === 'sub_identities')
+                                    ? `${effLayer}:${a.route_to}|${a.route_to_parent || ''}`
+                                    : `${effLayer}:${a.route_to}`;
                                 if (seenKeys.has(altKey)) continue;
-                                const altExists = layerLib.some(e =>
-                                    e.name === a.route_to &&
-                                    (r.layer !== 'sub_identities' || e.parent_identity === a.route_to_parent)
-                                );
+                                const altExists = altCrossLayer
+                                    ? crossLib.some(e => e.name === a.route_to && e.parent_identity === a.route_to_parent)
+                                    : layerLib.some(e =>
+                                        e.name === a.route_to &&
+                                        (r.layer !== 'sub_identities' || e.parent_identity === a.route_to_parent)
+                                      );
                                 if (!altExists) continue;
                                 let altConf = clampConfidence(a.confidence);
                                 let altReason = String(a.reason || '').slice(0, 240);
@@ -4764,7 +4836,8 @@ export async function suggestProposalRoutings(
                                 altConf = Math.min(altConf, out.confidence);
                                 alts.push({
                                     route_to: a.route_to,
-                                    route_to_parent: r.layer === 'sub_identities' ? a.route_to_parent : undefined,
+                                    route_to_parent: effLayer === 'sub_identities' ? a.route_to_parent : undefined,
+                                    route_to_layer: altCrossLayer ? 'sub_identities' : undefined,
                                     confidence: altConf,
                                     reason: altReason,
                                 });

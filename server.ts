@@ -3866,32 +3866,62 @@ app.delete('/api/bucketing/taxonomy/:kind/:id', async (req, res) => {
 // inflating the library with a near-duplicate.
 app.post('/api/bucketing/runs/:runId/proposed-tags/:layer/remap', async (req, res) => {
     try {
-        const layer = TAXONOMY_LAYER_COLS[req.params.layer];
-        const table = pickTaxonomyTable(req.params.layer);
-        if (!layer || !table) return res.status(400).json({ error: 'unknown layer' });
+        const fromLayerKey = req.params.layer;
+        const fromLayer = TAXONOMY_LAYER_COLS[fromLayerKey];
+        if (!fromLayer) return res.status(400).json({ error: 'unknown layer' });
         const body = req.body || {};
         const fromName = String(body.from_name || '').trim();
         const toName = String(body.to_name || '').trim();
         if (!fromName || !toName) return res.status(400).json({ error: 'from_name and to_name are required' });
 
-        const { data: libRowData, error: libErr } = await supabase
-            .from(table)
-            .select('name,archived' + (req.params.layer === 'sub_identities' ? ',parent_identity' : ''))
-            .eq('name', toName)
-            .maybeSingle();
+        // Cross-layer routing: the proposal lives on one layer but the user
+        // (or AI suggester) wants to route to an entry on a different layer.
+        // Currently supported direction: identity proposal → sub-identity
+        // target. The remap then atomically rewrites BOTH primary_identity
+        // (= target's parent) AND sub_identity (= target name) on every
+        // matching row, and clears both is_new_* flags. Same-layer routes
+        // (the existing behaviour) leave `to_layer` undefined.
+        const toLayerKey = String(body.to_layer || fromLayerKey);
+        const crossLayer = toLayerKey !== fromLayerKey;
+        if (crossLayer && !(fromLayerKey === 'identities' && toLayerKey === 'sub_identities')) {
+            return res.status(400).json({ error: `cross-layer remap ${fromLayerKey} → ${toLayerKey} not supported` });
+        }
+        const targetTable = pickTaxonomyTable(toLayerKey);
+        const targetLayer = TAXONOMY_LAYER_COLS[toLayerKey];
+        if (!targetTable || !targetLayer) return res.status(400).json({ error: 'unknown to_layer' });
+
+        // Sub-identity names aren't globally unique (the same name can live
+        // under multiple parents). When the target is a sub-identity, the
+        // caller MUST send to_parent so we can disambiguate the lookup.
+        let libQuery = supabase
+            .from(targetTable)
+            .select('name,archived' + (toLayerKey === 'sub_identities' ? ',parent_identity' : ''))
+            .eq('name', toName);
+        const requestedParent = String(body.to_parent || '').trim();
+        if (toLayerKey === 'sub_identities' && requestedParent) {
+            libQuery = libQuery.eq('parent_identity', requestedParent);
+        }
+        const { data: libRowData, error: libErr } = await libQuery.maybeSingle();
         if (libErr) return res.status(400).json({ error: libErr.message });
         const libRow = libRowData as { name?: string; archived?: boolean; parent_identity?: string } | null;
         if (!libRow || libRow.archived) {
-            return res.status(404).json({ error: `target "${toName}" is not in the ${req.params.layer} library` });
+            return res.status(404).json({ error: `target "${toName}" is not in the ${toLayerKey} library` });
         }
 
-        const update: Record<string, any> = { [layer.col]: toName, [layer.flag]: false };
-        if (req.params.layer === 'sub_identities') {
-            // Sub-identities must stay consistent with their parent on the
-            // row — use the library entry's canonical parent unless the
-            // caller overrode it (rare; reserved for edge cases where the
-            // user wants a specific parent override).
-            const targetParent = String(body.to_parent || libRow.parent_identity || '').trim();
+        // Build the column update. Same-layer route writes one column +
+        // clears one flag. Sub-identity target (same-layer or cross-layer)
+        // also rewrites primary_identity so the parent stays consistent
+        // with the chosen sub. Cross-layer also clears the source layer's
+        // is_new_* flag so the proposal stops surfacing for re-action.
+        const update: Record<string, any> = {
+            [targetLayer.col]: toName,
+            [targetLayer.flag]: false
+        };
+        if (crossLayer) {
+            update[fromLayer.flag] = false;
+        }
+        if (toLayerKey === 'sub_identities') {
+            const targetParent = requestedParent || String(libRow.parent_identity || '').trim();
             if (!targetParent) return res.status(400).json({ error: 'to_parent missing and library entry has no parent_identity' });
             update.primary_identity = targetParent;
         }
@@ -3900,11 +3930,11 @@ app.post('/api/bucketing/runs/:runId/proposed-tags/:layer/remap', async (req, re
             .from('bucket_industry_map')
             .update(update)
             .eq('bucketing_run_id', req.params.runId)
-            .eq(layer.col, fromName)
-            .eq(layer.flag, true)
+            .eq(fromLayer.col, fromName)
+            .eq(fromLayer.flag, true)
             .select('industry_string');
         if (error) return res.status(400).json({ error: error.message });
-        res.json({ ok: true, rewritten: (data || []).length, to_name: toName });
+        res.json({ ok: true, rewritten: (data || []).length, to_name: toName, to_layer: toLayerKey });
     } catch (err: any) {
         res.status(400).json({ error: err.message });
     }
