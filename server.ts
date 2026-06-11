@@ -400,25 +400,36 @@ async function backgroundEnqueue(
     }
     addServerLog(`📦 Starting queue insertion for ${totalToEnrich.toLocaleString()} records...`, 'Pipeline', 'phase');
 
+    let jobId: string | null = null;
     try {
-        // Step 2: Create a new job
-        const { data: jobRaw, error: errJob } = await supabase.from('jobs').insert({
-            status: 'processing',
-            total_items: totalToEnrich,
-            started_at: new Date().toISOString()
-        }).select('id').single();
+        // Step 2: Create a new job. importSupabaseRetry catches both
+        // Postgres transient codes AND undici "TypeError: fetch failed"
+        // (which previously threw out of the bare insert and crashed the
+        // whole enqueue without a log line).
+        const { data: jobRaw, error: errJob } = await importSupabaseRetry(
+            'Enqueue.jobInsert',
+            () => supabase.from('jobs').insert({
+                status: 'processing',
+                total_items: totalToEnrich,
+                started_at: new Date().toISOString()
+            }).select('id').single()
+        );
 
         if (errJob) throw errJob;
-        const jobId = jobRaw.id;
+        jobId = jobRaw.id;
         addServerLog(`🆔 Job created: ${jobId} (${totalToEnrich.toLocaleString()} items)`, 'Pipeline', 'info');
 
         // Step 3: Insert job_items in chunks (with progress updates).
-        // Chunks are small (2000) so a single INSERT stays well under Supabase's
-        // 8s statement_timeout even when another job's worker is already running
-        // against job_items. 57014 (statement_timeout) and 40001 (serialization)
-        // are retried with exponential backoff since they're transient under load.
+        // Chunks are small (2000) so a single INSERT stays well under
+        // Supabase's 8s statement_timeout. importSupabaseRetry handles
+        // both Postgres transients (57014/40001/40P01) AND undici fetch
+        // failures, ECONNRESET, EAI_AGAIN, etc. — previously a single
+        // undici blip mid-enqueue would silently kill the loop after N
+        // chunks, leaving a job row with total_items set to the full
+        // count but only the first N×2000 job_items actually queued.
+        // The FIFO would then drain those N×2000, mark the job complete,
+        // and move on with the rest of the list orphaned.
         const ENQUEUE_CHUNK_SIZE = 2000;
-        const MAX_RETRIES = 4;
         let enqueued = 0;
         for (let i = 0; i < contactIds.length; i += ENQUEUE_CHUNK_SIZE) {
             const chunk = contactIds.slice(i, i + ENQUEUE_CHUNK_SIZE);
@@ -429,17 +440,11 @@ async function backgroundEnqueue(
                 attempt_count: 0
             }));
 
-            let attempt = 0;
-            while (true) {
-                const { error: errItems } = await supabase.from('job_items').insert(items);
-                if (!errItems) break;
-                const transient = errItems.code === '57014' || errItems.code === '40001' || errItems.code === '40P01';
-                if (!transient || attempt >= MAX_RETRIES) throw errItems;
-                attempt++;
-                const delay = 500 * Math.pow(2, attempt - 1);
-                addServerLog(`⚠️ Enqueue chunk transient error (${errItems.code}); retry ${attempt}/${MAX_RETRIES} in ${delay}ms`, 'Pipeline', 'warn');
-                await new Promise(r => setTimeout(r, delay));
-            }
+            const { error: errItems } = await importSupabaseRetry(
+                'Enqueue.itemsInsert',
+                () => supabase.from('job_items').insert(items) as any
+            );
+            if (errItems) throw errItems;
 
             enqueued += chunk.length;
             // Additive too — for a joining list, jobStats.queued already
@@ -467,6 +472,24 @@ async function backgroundEnqueue(
     } catch (err: any) {
         console.error('Enqueue error:', err);
         addServerLog(`❌ Fatal enqueue error: ${err.message}`, 'Pipeline', 'error');
+
+        // Roll back the job row and any partially-inserted job_items so
+        // the FIFO doesn't see a corrupted job (total_items set to the
+        // full count, but only the first N chunks actually queued). Left
+        // alone, the worker would drain the partial set, mark the job
+        // complete, and move on — silently orphaning every contact whose
+        // chunk hadn't been inserted yet. The user clicks Enrich again to
+        // re-queue cleanly; resume-mode skips the contacts already done.
+        if (jobId) {
+            try {
+                await supabase.from('job_items').delete().eq('job_id', jobId);
+                await supabase.from('jobs').delete().eq('id', jobId);
+                addServerLog(`🧹 Rolled back partial job ${jobId} — re-click Enrich to queue the list again.`, 'Pipeline', 'warn');
+            } catch (rbErr: any) {
+                addServerLog(`⚠️ Rollback of partial job ${jobId} failed: ${rbErr.message}. Manual cleanup may be required.`, 'Pipeline', 'error');
+            }
+        }
+
         // Same logic as the wrapper's catch: don't kill the in-flight list's
         // isProcessing flag when a later list's enqueue fails. The current
         // list keeps draining; the failing one is just dropped.
