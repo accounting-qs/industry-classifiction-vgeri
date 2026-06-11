@@ -220,15 +220,25 @@ app.get('/api/status', async (req, res) => {
     // FETCH LIVE JOB STATS FROM DB (Issue #8: job_items is the single source of truth)
     let liveStats = { ...jobStats };
 
-    // Always fetch real counts from job_items — this is the ground truth
+    // Active = parent jobs.status IN (pending, processing). Without this
+    // scoping, the Pipeline Monitor's combined progress bar would sum
+    // every job_item ever inserted in this workspace's history — the
+    // counter would grow monotonically across the DB's lifetime and the
+    // banner would still claim "X in queue" months after the queue
+    // drained. Joining via jobs!inner ties every count to the live FIFO
+    // window.
+    const ACTIVE_PARENT = ['pending', 'processing'];
     const [
         { count: completedCount },
         { count: failedCount },
         { count: pendingCount },
     ] = await Promise.all([
-        supabase.from('job_items').select('*', { count: 'exact', head: true }).eq('status', 'completed'),
-        supabase.from('job_items').select('*', { count: 'exact', head: true }).eq('status', 'failed'),
-        supabase.from('job_items').select('*', { count: 'exact', head: true }).in('status', ['pending', 'retrying']),
+        supabase.from('job_items').select('jobs!inner(status)', { count: 'exact', head: true })
+            .eq('status', 'completed').in('jobs.status', ACTIVE_PARENT),
+        supabase.from('job_items').select('jobs!inner(status)', { count: 'exact', head: true })
+            .eq('status', 'failed').in('jobs.status', ACTIVE_PARENT),
+        supabase.from('job_items').select('jobs!inner(status)', { count: 'exact', head: true })
+            .in('status', ['pending', 'retrying']).in('jobs.status', ACTIVE_PARENT),
     ]);
 
     const dbCompleted = completedCount || 0;
@@ -246,12 +256,15 @@ app.get('/api/status', async (req, res) => {
         jobStats.failed = liveStats.failed;
         jobStats.total = liveStats.total;
 
-        // Auto-detect if processing actually finished
+        // Auto-detect if processing actually finished. Same scoping as
+        // above so a lingering 'processing' job_item on a 'completed'
+        // parent (legacy orphan) can't keep isProcessing stuck on.
         if (inQueue === 0 && !jobStats.queueingPhase) {
             const { count: processingCount } = await supabase
                 .from('job_items')
-                .select('*', { count: 'exact', head: true })
-                .eq('status', 'processing');
+                .select('jobs!inner(status)', { count: 'exact', head: true })
+                .eq('status', 'processing')
+                .in('jobs.status', ACTIVE_PARENT);
 
             if (!processingCount || processingCount === 0) {
                 jobStats.isProcessing = false;

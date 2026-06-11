@@ -354,10 +354,20 @@ export class JobProcessor {
                     // as empty, which could auto-stop the processor the
                     // moment a sanity check timed out and leave thousands
                     // of pending items orphaned.
+                    //
+                    // We also scope the count to job_items whose PARENT job
+                    // is still live (pending/processing). Without this join
+                    // an orphan row (job_items.status='retrying' under a
+                    // jobs.status='completed' parent) would keep the worker
+                    // spinning forever even though no live job can ever
+                    // pick it up. The orphan reaper in commit 2 prevents
+                    // those rows from existing in the first place; this
+                    // join is defence-in-depth.
                     const { count, error: countErr } = await supabase
                         .from('job_items')
-                        .select('*', { count: 'exact', head: true })
-                        .in('status', ['pending', 'retrying', 'processing']);
+                        .select('jobs!inner(status)', { count: 'exact', head: true })
+                        .in('status', ['pending', 'retrying', 'processing'])
+                        .in('jobs.status', ['pending', 'processing']);
 
                     if (countErr) {
                         this.log(`⚠️ Queue drain check failed (${countErr.message}); keep polling instead of auto-stopping.`, 'warn');
@@ -506,30 +516,33 @@ export class JobProcessor {
         }
 
         // Fallback: no live 'processing' job had items. Look for jobs in
-        // 'pending'/'cancelled' that still have unfinished rows (orphans
-        // from a previously-cancelled or never-promoted job) and rescue them.
+        // any non-processing terminal-or-pre-live state that STILL have
+        // unfinished rows — orphans from a previously-cancelled job, a
+        // job that was created with status='pending' and never promoted,
+        // or (defensively) a 'completed' job whose worker missed reaping
+        // some retrying items. The list_jobs_with_open_items RPC uses
+        // EXISTS so we don't scan millions of historical jobs.
         const { data: orphanJob, error: orphanErr } = await supabase
-            .from('jobs')
-            .select('id')
-            .in('status', ['pending', 'cancelled'])
-            .order('created_at', { ascending: true })
-            .limit(50);
+            .rpc('list_jobs_with_open_items', { p_limit: 50 });
 
         if (orphanErr) throw orphanErr;
         if (!orphanJob || orphanJob.length === 0) return 0;
 
-        for (const cand of orphanJob) {
-            const { count } = await supabase
-                .from('job_items')
-                .select('*', { count: 'exact', head: true })
-                .eq('job_id', cand.id)
-                .in('status', ['pending', 'retrying']);
-            if (count && count > 0) {
+        for (const cand of orphanJob as Array<{ id: string; status: string }>) {
+            // Promote pending/cancelled jobs to processing so the FIFO
+            // walker picks them up next tick. 'completed' jobs with open
+            // items are a different beast — those items are orphans the
+            // reaper should retire (commit 2). We do NOT resurrect a
+            // 'completed' job here; just claim its items so they progress
+            // through retry → terminal-fail and stop blocking the queue
+            // count. The reaper will close them out atomically.
+            if (cand.status === 'pending' || cand.status === 'cancelled') {
                 await supabase.from('jobs')
                     .update({ status: 'processing' })
                     .eq('id', cand.id);
-                return await this.claimChunkFromJob(cand.id);
             }
+            const claimed = await this.claimChunkFromJob(cand.id);
+            if (claimed > 0) return claimed;
         }
         return 0;
     }
