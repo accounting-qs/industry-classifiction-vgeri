@@ -495,11 +495,27 @@ async function backgroundEnqueue(
         // re-queue cleanly; resume-mode skips the contacts already done.
         if (jobId) {
             try {
-                await supabase.from('job_items').delete().eq('job_id', jobId);
-                await supabase.from('jobs').delete().eq('id', jobId);
+                // Delete order: items first, then the jobs row. A failure
+                // between the two leaves an empty 'processing' jobs row
+                // that the orphan reaper (commit 2) or the worker's drain
+                // path will close out cleanly. Reversing the order would
+                // leave the items pointing at a vanished parent — a state
+                // no read site currently tolerates. importSupabaseRetry
+                // gives transport blips a chance instead of silently
+                // leaving the partial state for the reaper.
+                const { error: itemDelErr } = await importSupabaseRetry(
+                    'Enqueue.rollbackItems',
+                    () => supabase.from('job_items').delete().eq('job_id', jobId) as any
+                );
+                if (itemDelErr) throw itemDelErr;
+                const { error: jobDelErr } = await importSupabaseRetry(
+                    'Enqueue.rollbackJob',
+                    () => supabase.from('jobs').delete().eq('id', jobId) as any
+                );
+                if (jobDelErr) throw jobDelErr;
                 addServerLog(`🧹 Rolled back partial job ${jobId} — re-click Enrich to queue the list again.`, 'Pipeline', 'warn');
             } catch (rbErr: any) {
-                addServerLog(`⚠️ Rollback of partial job ${jobId} failed: ${rbErr.message}. Manual cleanup may be required.`, 'Pipeline', 'error');
+                addServerLog(`⚠️ Rollback of partial job ${jobId} failed: ${rbErr.message}. Manual cleanup: DELETE FROM job_items WHERE job_id='${jobId}'; DELETE FROM jobs WHERE id='${jobId}';`, 'Pipeline', 'error');
             }
         }
 
