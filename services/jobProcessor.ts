@@ -466,8 +466,37 @@ export class JobProcessor {
                 const claimed = await this.claimChunkFromJob(cand.id);
                 if (claimed > 0) return claimed;
 
-                // Zero items on a 'processing' job = drained. Mark completed
-                // so the next tick (and the cascade below) skips it cleanly.
+                // Zero items CLAIMABLE doesn't mean the job is drained — it
+                // can also mean every remaining item is in 'retrying' with
+                // next_retry_at still in the future. Earlier code marked
+                // those jobs completed, which silently orphaned the retrying
+                // items (FIFO only scans 'processing' jobs, so once a job
+                // flips to 'completed' its retrying items are never picked
+                // up again — even after next_retry_at passes). Re-checking
+                // the job's open queue WITHOUT the next_retry_at filter
+                // distinguishes the two cases: truly empty → mark drained
+                // and advance; still has retrying items → keep job in
+                // 'processing' and return 0 so the outer pollLoop sleeps
+                // POLL_INTERVAL_MS and re-checks when the backoff expires.
+                const { count: openCount, error: openErr } = await supabase
+                    .from('job_items')
+                    .select('id', { count: 'exact', head: true })
+                    .eq('job_id', cand.id)
+                    .in('status', ['pending', 'retrying', 'processing']);
+                if (openErr) {
+                    // Soft-fail to "drained" rather than throwing — a count
+                    // error here would block FIFO for everyone. Erring
+                    // toward "drained" matches the old behaviour for the
+                    // happy path; the only regression risk is the bug this
+                    // patch fixes, and that requires repeated count errors.
+                    this.log(`⚠️ Drain check failed for job ${cand.id} (${openErr.message}); falling back to old drained-marking behaviour.`, 'warn');
+                } else if ((openCount || 0) > 0) {
+                    this.log(`⏸ Job ${cand.id} has ${openCount} item(s) backing off (retrying / pending) — keeping in 'processing', will recheck after next_retry_at.`);
+                    return 0;
+                }
+
+                // Genuinely zero items remaining — mark completed so the
+                // next tick (and the cascade below) skips it cleanly.
                 await supabase.from('jobs')
                     .update({ status: 'completed', finished_at: new Date().toISOString() })
                     .eq('id', cand.id)
