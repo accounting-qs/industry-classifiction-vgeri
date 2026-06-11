@@ -80,6 +80,14 @@ export class JobProcessor {
     // backoff (5/10/20/40/80s) kicks in instead.
     private static consecutiveStmtTimeouts = 0;
 
+    // Last time we ran reap_orphan_job_items inside the poll loop. The
+    // reaper is also called once on startup (recoverStaleJobs); this
+    // periodic call is the defence-in-depth backstop against any path
+    // that completes a job without going through reconcile_and_complete_job.
+    // 60s grace inside the RPC means a fresh completion isn't racy.
+    private static lastReaperAt = 0;
+    private static readonly REAPER_INTERVAL_MS = 60_000;
+
     // Per-list progress tracker: keyed by lead_list_name. `baseline` is the
     // completed+failed count at the moment we first saw this list in the
     // current run (from the RPC), so the log's "1000/100000" reflects the
@@ -290,14 +298,34 @@ export class JobProcessor {
      */
     public static async recoverStaleJobs() {
         try {
-            const { data, error } = await supabase
+            // Recovery step 1: any items left in 'processing' belonging to
+            // a STILL-LIVE parent (pending/processing) are the result of a
+            // crash mid-claim — flip them back to 'pending' so the worker
+            // re-claims after start(). Items whose parent is already
+            // terminal are NOT resurrected here (they'd just zombie); the
+            // orphan reaper below handles those.
+            const { data: recovered, error: recoverErr } = await supabase
                 .from('job_items')
                 .update({ status: 'pending', locked_at: null })
                 .eq('status', 'processing')
+                .in('job_id',
+                    (await supabase.from('jobs').select('id').in('status', ['pending', 'processing'])).data?.map(j => j.id) || []
+                )
                 .select('id');
 
-            if (!error && data && data.length > 0) {
-                this.log(`♻️ Recovered ${data.length} stale job items from previous crash.`, 'info');
+            if (!recoverErr && recovered && recovered.length > 0) {
+                this.log(`♻️ Recovered ${recovered.length} stale job items from previous crash.`, 'info');
+            }
+
+            // Recovery step 2: retire any leftover open items whose parent
+            // job is already terminal (the FL Oct 14 shape — pre-fix
+            // residue). Grace 0 because nothing legitimate should be in
+            // this state at boot; the periodic reaper inside pollLoop uses
+            // 60s to avoid racing fresh job completions.
+            const { data: reapedCount, error: reapErr } = await supabase
+                .rpc('reap_orphan_job_items', { p_grace_seconds: 0 });
+            if (!reapErr && (reapedCount || 0) > 0) {
+                this.log(`🧹 Reaped ${reapedCount} orphan items (parent job already terminal).`, 'warn');
             }
 
             // Auto-start if there are any jobs still incomplete
@@ -337,6 +365,27 @@ export class JobProcessor {
                 // Issue #7: Auto-reset items stuck in 'processing' for too long
                 await this.resetStaleProcessingItems();
 
+                // Periodic orphan reaper. Cheap when there's nothing to do
+                // (the RPC is one indexed UPDATE that matches zero rows).
+                // Catches anything that bypasses reconcile_and_complete_job
+                // — e.g. a direct DB UPDATE, a future code path that flips
+                // jobs.status without the RPC, or a race we didn't foresee.
+                const now = Date.now();
+                if (now - this.lastReaperAt >= this.REAPER_INTERVAL_MS) {
+                    this.lastReaperAt = now;
+                    try {
+                        const { data: reaped, error: reapErr } = await supabase
+                            .rpc('reap_orphan_job_items', { p_grace_seconds: 60 });
+                        if (reapErr) {
+                            this.log(`⚠️ Periodic reaper failed: ${reapErr.message}`, 'warn');
+                        } else if ((reaped || 0) > 0) {
+                            this.log(`🧹 Periodic reaper retired ${reaped} orphan items.`, 'warn');
+                        }
+                    } catch (e: any) {
+                        this.log(`⚠️ Periodic reaper threw: ${e?.message || e}`, 'warn');
+                    }
+                }
+
                 const processedCount = await this.withTimeout(
                     'processNextChunk',
                     this.processNextChunk(),
@@ -373,10 +422,20 @@ export class JobProcessor {
                         this.log(`⚠️ Queue drain check failed (${countErr.message}); keep polling instead of auto-stopping.`, 'warn');
                         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
                     } else if (count === 0) {
-                        // Confirmed zero pending/retrying/processing — safe to auto-stop.
-                        await supabase.from('jobs')
-                            .update({ status: 'completed', finished_at: new Date().toISOString() })
-                            .eq('status', 'processing');
+                        // Confirmed zero pending/retrying/processing under
+                        // any live parent — safe to auto-stop. Close each
+                        // still-'processing' job atomically via the RPC so
+                        // any straggler open item gets retired in the same
+                        // transaction (defence-in-depth: openCount==0 above
+                        // should mean none exist, but a race against a
+                        // crashed claimChunkFromJob could leave one).
+                        const { data: activeJobs } = await supabase
+                            .from('jobs').select('id').eq('status', 'processing');
+                        for (const j of (activeJobs || []) as Array<{ id: string }>) {
+                            const { error: rpcErr } = await supabase.rpc(
+                                'reconcile_and_complete_job', { p_job_id: j.id });
+                            if (rpcErr) this.log(`⚠️ Auto-stop: reconcile RPC failed for ${j.id}: ${rpcErr.message}`, 'error');
+                        }
 
                         await supabase.from('pipeline_state').update({
                             is_processing: false,
@@ -505,13 +564,23 @@ export class JobProcessor {
                     return 0;
                 }
 
-                // Genuinely zero items remaining — mark completed so the
-                // next tick (and the cascade below) skips it cleanly.
-                await supabase.from('jobs')
-                    .update({ status: 'completed', finished_at: new Date().toISOString() })
-                    .eq('id', cand.id)
-                    .eq('status', 'processing');
-                this.log(`✅ Job ${cand.id} drained — marking completed; advancing FIFO.`, 'phase');
+                // Genuinely zero items remaining — flip the job atomically.
+                // The RPC retires any straggler open items in the same
+                // transaction (should be zero given the openCount probe
+                // above, but the race window is non-zero and the RPC is
+                // load-bearing for the no-orphans invariant).
+                const { data: rpcResult, error: rpcErr } = await supabase
+                    .rpc('reconcile_and_complete_job', { p_job_id: cand.id });
+                if (rpcErr) {
+                    this.log(`⚠️ reconcile_and_complete_job failed for ${cand.id}: ${rpcErr.message}`, 'error');
+                } else {
+                    const reaped = (rpcResult as Array<{ reaped: number }> | null)?.[0]?.reaped || 0;
+                    if (reaped > 0) {
+                        this.log(`⚠️ Job ${cand.id} drained with ${reaped} open items reaped — marking completed; advancing FIFO.`, 'warn');
+                    } else {
+                        this.log(`✅ Job ${cand.id} drained — marking completed; advancing FIFO.`, 'phase');
+                    }
+                }
             }
         }
 
