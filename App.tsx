@@ -354,6 +354,16 @@ export default function App() {
 
   useEffect(() => { refreshLists(); }, [refreshLists]);
 
+  // Auto-poll the import lists + stats while the Import tab is visible so
+  // the queue_state badge transitions (queued → running → none) without
+  // requiring a manual refresh. Pure DB reads, so cheap. 5s cadence is a
+  // good balance: post-FIFO-advance the badge clears within a tab cycle.
+  useEffect(() => {
+    if (activeTab !== AppTab.IMPORT) return;
+    const tick = setInterval(() => { refreshLists(); }, 5_000);
+    return () => clearInterval(tick);
+  }, [activeTab, refreshLists]);
+
   // Poll server for status — only when on the Pipeline tab or actively processing
   useEffect(() => {
     // Skip polling entirely when on the Contacts tab and nothing is processing
@@ -671,17 +681,32 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filters, searchQuery: '' })
       });
+      const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        addLog(`❌ Enrich error: ${err.error || res.status}`);
+        addLog(`❌ Enrich error: ${body.error || res.status}`);
         return;
       }
-      addLog(`✅ 202 Accepted: Backend cluster scaling up for list "${name}". Watch the queue log for the actual ${mode === 'reenrich' ? 're-enrich' : 'resume'} count.`);
-      setActiveTab(AppTab.ENRICHMENT);
-      // total starts unknown — the server logs the resolved count once the
-      // background enqueue lands. Setting to 0 here so the progress bar
-      // doesn't show the inflated csv-row-count as the denominator.
-      setStats({ total: 0, completed: 0, failed: 0, isProcessing: true });
+      // joined_existing_queue=true means another list is already running
+      // and this one was appended behind it (FIFO serial). Keep the user
+      // on Import so they can see the new Queued badge land instead of
+      // switching them to the Pipeline tab where nothing about THIS list
+      // would be visible until the FIFO advances. For a fresh start
+      // (joined_existing_queue absent/false), the Pipeline tab is the
+      // right place because that's where progress streams.
+      const joined = body?.joined_existing_queue === true;
+      if (joined) {
+        addLog(`✅ "${name}" queued behind the active list (FIFO serial). It'll start when the current list finishes.`);
+        // Force a fresh stats fetch so the new Queued badge appears
+        // without waiting for the next 5s auto-poll cycle.
+        refreshLists();
+      } else {
+        addLog(`✅ 202 Accepted: Backend cluster scaling up for list "${name}". Watch the queue log for the actual ${mode === 'reenrich' ? 're-enrich' : 'resume'} count.`);
+        setActiveTab(AppTab.ENRICHMENT);
+        // total starts unknown — the server logs the resolved count once the
+        // background enqueue lands. Setting to 0 here so the progress bar
+        // doesn't show the inflated csv-row-count as the denominator.
+        setStats({ total: 0, completed: 0, failed: 0, isProcessing: true });
+      }
     } catch (e: any) {
       addLog(`❌ Enrich error: ${e.message}`);
     }
@@ -1565,24 +1590,52 @@ function ImportedListsTable({
                             // changes is the label. Re-enrich drops the
                             // status filter so already-completed contacts
                             // get re-classified too.
+                            //
+                            // Gating: if the queue-state RPC reports this
+                            // list as 'running' or 'queued', the button is
+                            // disabled — a second click would either be a
+                            // no-op (resolve filter deduplicates against
+                            // open job_items) or hit the partial UNIQUE
+                            // index. Visible feedback beats either failure
+                            // mode.
                             const total = l.contact_count || 0;
                             const done = (l.enriched_count || 0) + (l.failed_count || 0);
                             const allDone = total > 0 && done >= total;
                             const fresh = done === 0;
                             const mode: 'resume' | 'reenrich' = allDone ? 'reenrich' : 'resume';
-                            const label = allDone ? 'Re-enrich' : fresh ? 'Enrich' : 'Resume';
-                            const title = allDone
-                              ? 'Re-enrich every contact in this list (re-runs classification on already-done rows)'
-                              : fresh
-                                ? 'Enrich all contacts in this list'
-                                : 'Resume — only contacts without an enrichment row will be queued';
+                            const inQueue = l.queue_state === 'running' || l.queue_state === 'queued';
+                            const baseLabel = allDone ? 'Re-enrich' : fresh ? 'Enrich' : 'Resume';
+                            const label = inQueue
+                              ? (l.queue_state === 'running' ? 'Enriching…' : 'Queued')
+                              : baseLabel;
+                            const title = inQueue
+                              ? (l.queue_state === 'running'
+                                  ? 'This list is currently being enriched — wait for it to finish before clicking again.'
+                                  : 'This list is queued behind another active list. It will start when the current list completes.')
+                              : allDone
+                                ? 'Re-enrich every contact in this list (re-runs classification on already-done rows)'
+                                : fresh
+                                  ? 'Enrich all contacts in this list'
+                                  : 'Resume — only contacts without an enrichment row will be queued';
                             return (
                               <button
-                                onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count, mode); }}
-                                className="px-2 py-1 rounded-md text-[10px] font-bold bg-[#3ecf8e] text-black hover:bg-[#2fb37a] transition-colors flex items-center gap-1 whitespace-nowrap"
+                                onClick={e => {
+                                  e.stopPropagation();
+                                  if (inQueue) return;
+                                  onEnrichList(l.name, l.contact_count, mode);
+                                }}
+                                disabled={inQueue}
+                                className={`px-2 py-1 rounded-md text-[10px] font-bold flex items-center gap-1 whitespace-nowrap transition-colors ${
+                                  inQueue
+                                    ? 'bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 cursor-not-allowed'
+                                    : 'bg-[#3ecf8e] text-black hover:bg-[#2fb37a]'
+                                }`}
                                 title={title}
                               >
-                                <Zap className="w-3 h-3 shrink-0" /> {label}
+                                {inQueue && l.queue_state === 'running'
+                                  ? <Loader2 className="w-3 h-3 shrink-0 animate-spin" />
+                                  : <Zap className="w-3 h-3 shrink-0" />}
+                                {label}
                               </button>
                             );
                           })()}
