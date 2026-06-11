@@ -415,14 +415,19 @@ async function backgroundEnqueue(
 
     let jobId: string | null = null;
     try {
-        // Step 2: Create a new job. importSupabaseRetry catches both
-        // Postgres transient codes AND undici "TypeError: fetch failed"
-        // (which previously threw out of the bare insert and crashed the
-        // whole enqueue without a log line).
+        // Step 2: Create a new job in status='pending'. The worker's
+        // FIFO walker only claims jobs in 'processing', so a brand-new
+        // empty job can't be raced into a premature 'completed' state
+        // while its first chunks are mid-insert. After the LAST chunk
+        // lands (below) we explicitly promote it to 'processing'. The
+        // orphan-rescue path is the safety net if that promotion update
+        // fails — list_jobs_with_open_items still surfaces this job once
+        // any item is inserted, and the rescue loop in jobProcessor will
+        // promote it on the next tick.
         const { data: jobRaw, error: errJob } = await importSupabaseRetry(
             'Enqueue.jobInsert',
             () => supabase.from('jobs').insert({
-                status: 'processing',
+                status: 'pending',
                 total_items: totalToEnrich,
                 started_at: new Date().toISOString()
             }).select('id').single()
@@ -430,7 +435,7 @@ async function backgroundEnqueue(
 
         if (errJob) throw errJob;
         jobId = jobRaw.id;
-        addServerLog(`🆔 Job created: ${jobId} (${totalToEnrich.toLocaleString()} items)`, 'Pipeline', 'info');
+        addServerLog(`🆔 Job created (pending): ${jobId} (${totalToEnrich.toLocaleString()} items)`, 'Pipeline', 'info');
 
         // Step 3: Insert job_items in chunks (with progress updates).
         // Chunks are small (2000) so a single INSERT stays well under
@@ -466,6 +471,25 @@ async function backgroundEnqueue(
             // running tally.
             jobStats.queued = (jobStats.queued || 0) + chunk.length;
             addServerLog(`📥 Queued ${enqueued.toLocaleString()} / ${totalToEnrich.toLocaleString()} (${Math.round(enqueued / totalToEnrich * 100)}%)`, 'Sync');
+        }
+
+        // Step 3.5: All chunks landed. Promote the job from 'pending' to
+        // 'processing' so the FIFO walker picks it up. We don't need to
+        // bail on failure here — the orphan-rescue fallback in the
+        // worker promotes any 'pending' job with open items on its next
+        // tick (at most one POLL_INTERVAL_MS later). Use retry so a
+        // transport blip doesn't cost us that whole interval.
+        if (jobId) {
+            const { error: promErr } = await importSupabaseRetry(
+                'Enqueue.promote',
+                () => supabase.from('jobs')
+                    .update({ status: 'processing', started_at: new Date().toISOString() })
+                    .eq('id', jobId)
+                    .eq('status', 'pending') as any
+            );
+            if (promErr) {
+                addServerLog(`⚠️ Job ${jobId} promotion to 'processing' failed (${promErr.message}); orphan-rescue will pick it up.`, 'Pipeline', 'warn');
+            }
         }
 
         // Step 4: Queueing complete — switch to processing phase
