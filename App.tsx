@@ -274,15 +274,31 @@ export default function App() {
   // The list shell is fetched first (cheap query, renders immediately);
   // the enrichment progress aggregate is fetched separately so a slow
   // or missing stats RPC can't block the table from painting.
+  //
+  // Out-of-order protection: with the 5s auto-poll, a slow tick-N
+  // response can land AFTER tick-N+1's — overwriting fresh numbers
+  // with older ones made the stats visibly jump back and forth between
+  // two values on consecutive loads. Each invocation aborts the
+  // previous tick's in-flight requests and stamps itself with a seq;
+  // handlers ignore everything but the newest seq.
+  const refreshSeqRef = useRef(0);
+  const refreshAbortRef = useRef<AbortController | null>(null);
   const refreshLists = useCallback(() => {
-    fetch('/api/distinct/lead_list_name')
+    refreshAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    refreshAbortRef.current = ctrl;
+    const seq = ++refreshSeqRef.current;
+    const isCurrent = () => seq === refreshSeqRef.current;
+
+    fetch('/api/distinct/lead_list_name', { signal: ctrl.signal })
       .then(res => res.json())
-      .then(data => { if (Array.isArray(data)) setLeadListOptions(data); })
+      .then(data => { if (isCurrent() && Array.isArray(data)) setLeadListOptions(data); })
       .catch(() => { });
     setImportListsLoading(true);
-    fetch('/api/import-lists')
+    fetch('/api/import-lists', { signal: ctrl.signal })
       .then(res => res.json())
       .then(data => {
+        if (!isCurrent()) return;
         // Accept both legacy (bare array) and new ({ lists, stats_source? }) shapes
         // so a rolling deploy doesn't leave the client stranded. `stats_source`
         // is no longer set here — it comes from the /stats endpoint below.
@@ -292,7 +308,7 @@ export default function App() {
           // progress bars flickering to 0% between the list fetch
           // landing and the stats fetch landing.
           setImportLists(prev => {
-            const prevByName: Record<string, { enriched_count?: number; failed_count?: number }> = {};
+            const prevByName: Record<string, { enriched_count?: number; failed_count?: number; queue_state?: 'running' | 'queued' | null }> = {};
             for (const p of prev) prevByName[p.name] = p;
             return lists.map((l: any) => {
               const old = prevByName[l.name];
@@ -300,23 +316,26 @@ export default function App() {
                 ...l,
                 enriched_count: old?.enriched_count,
                 failed_count: old?.failed_count,
+                queue_state: old?.queue_state ?? null,
               };
             });
           });
         }
       })
       .catch(() => { })
-      .finally(() => setImportListsLoading(false));
+      .finally(() => { if (isCurrent()) setImportListsLoading(false); });
 
     // Fire-and-forget stats fetch. The row-level `statsLoading` flag
     // stays on until this resolves (or rejects), so the progress
     // column can render a spinner instead of misleading 0% bars while
-    // the aggregate is in flight.
+    // the aggregate is in flight. The endpoint serves a cached
+    // snapshot (instant + internally consistent); the server decides
+    // out of band when to recompute it.
     setImportListsStatsLoading(true);
-    fetch('/api/import-lists/stats')
+    fetch('/api/import-lists/stats', { signal: ctrl.signal })
       .then(res => res.ok ? res.json() : Promise.reject(new Error(`stats ${res.status}`)))
       .then(data => {
-        if (!data || !Array.isArray(data.stats)) return;
+        if (!isCurrent() || !data || !Array.isArray(data.stats)) return;
         const byName = new Map<string, { completed: number; failed: number; total: number; queue_state: 'running' | 'queued' | null }>();
         for (const row of data.stats) {
           byName.set(row.lead_list_name, {
@@ -340,6 +359,7 @@ export default function App() {
         setListStatsSource(data.stats_source === 'fallback' ? 'fallback' : 'rpc');
       })
       .catch(() => {
+        if (!isCurrent()) return; // aborted by a newer tick — not a failure
         // Stats endpoint itself failed — surface the banner so the user
         // knows the progress numbers can't be trusted. Mark every row's
         // counts as 0 so the spinner gives up (better to show empty
@@ -349,7 +369,7 @@ export default function App() {
           l.enriched_count === undefined ? { ...l, enriched_count: 0, failed_count: 0 } : l
         ));
       })
-      .finally(() => setImportListsStatsLoading(false));
+      .finally(() => { if (isCurrent()) setImportListsStatsLoading(false); });
   }, []);
 
   useEffect(() => { refreshLists(); }, [refreshLists]);
@@ -1319,7 +1339,7 @@ function ImportedListsTable({
         <div className="px-6 py-2.5 bg-amber-500/10 border-b border-amber-500/30 text-amber-400 text-[11px] flex items-start gap-2">
           <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
           <span>
-            <span className="font-bold">Approximate stats.</span> The <code className="bg-black/30 px-1 rounded">get_list_enrichment_stats</code> RPC isn't installed yet — counts can swing or show 0 randomly, and the "failed" slice is invisible. Run <code className="bg-black/30 px-1 rounded">supabase/migrations/20260423_list_enrichment_stats_rpc.sql</code> in the SQL editor for accurate progress.
+            <span className="font-bold">Progress stats unavailable.</span> The stats endpoint failed — rows show their last loaded counts (or 0). Auto-retrying every few seconds; if this persists, check the server logs and that <code className="bg-black/30 px-1 rounded">supabase/migrations/20260612_list_stats_cache.sql</code> is applied.
           </span>
         </div>
       )}

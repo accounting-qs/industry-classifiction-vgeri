@@ -1259,81 +1259,154 @@ app.get('/api/import-lists', async (_req, res) => {
     }
 });
 
+// ---------------------------------------------------------------
+// List-stats cache orchestration (20260612_list_stats_cache.sql).
+//
+// Page loads NEVER aggregate the base tables anymore. They read
+// list_enrichment_stats_cache (via the get_list_enrichment_stats
+// reader RPC, ~5ms) and this server decides — out of band — when the
+// cache needs recomputing via refresh_list_enrichment_stats:
+//   * targeted (p_lists=[...], ~0.3-1s/list): lists actively being
+//     enriched whose snapshot is older than STATS_ACTIVE_TTL_MS, lists
+//     that just left the queue (so DONE lands promptly), lists with no
+//     snapshot yet, and lists touched by import/rename/delete.
+//   * full (p_lists=null, ~9s at 2.6M enrichments): safety net every
+//     STATS_FULL_TTL_MS, or when too many lists need recompute at once.
+//
+// Single-flight: at most ONE refresh runs at a time, no matter how
+// many tabs poll. The previous design ran the full 9s aggregate on
+// every 5s poll tick — queries overlapped, stacked load, periodically
+// hit statement_timeout, and the endpoint then served PostgREST
+// count=estimated approximations whose totals came from
+// import_lists.contact_count (pre-dedup CSV row count) instead of the
+// live contacts count. The UI flipped between those two realities on
+// every refresh — including the Resume/Re-enrich/DONE button states.
+// ---------------------------------------------------------------
+
+const STATS_ACTIVE_TTL_MS = 10_000;
+const STATS_FULL_TTL_MS = 10 * 60_000;
+// Above this many stale lists a single full pass beats N index scans.
+const STATS_TARGETED_MAX_LISTS = 10;
+const STATS_REFRESH_FAILURE_BACKOFF_MS = 60_000;
+
+let statsRefreshInFlight = false;
+let statsRefreshLastFailureAt = 0;
+// Lists seen with a queue badge on the previous poll — the diff against
+// the current poll tells us which lists just drained so their final
+// (DONE) counts get computed immediately instead of at the full TTL.
+let statsPrevQueueLists = new Set<string>();
+
+function kickStatsRefresh(lists: string[] | null, reason: string) {
+    if (statsRefreshInFlight) return;
+    if (Date.now() - statsRefreshLastFailureAt < STATS_REFRESH_FAILURE_BACKOFF_MS) return;
+    statsRefreshInFlight = true;
+    const label = lists ? `${lists.length} list(s)` : 'all lists';
+    Promise.resolve(supabase.rpc('refresh_list_enrichment_stats', { p_lists: lists }))
+        .then(({ error }: { error: any }) => {
+            if (error) {
+                statsRefreshLastFailureAt = Date.now();
+                console.warn(`[list-stats] refresh of ${label} (${reason}) failed: ${error.message}`);
+            }
+        })
+        .catch((err: any) => {
+            statsRefreshLastFailureAt = Date.now();
+            console.warn(`[list-stats] refresh of ${label} (${reason}) threw: ${err?.message || 'unknown'}`);
+        })
+        .finally(() => { statsRefreshInFlight = false; });
+}
+
+// Rename/delete leave a cache row keyed by a name that no longer
+// exists. The full-TTL refresh would prune it eventually; doing it
+// inline keeps the history table from showing a ghost row for up to
+// ten minutes. Soft-fail by design — the pruning pass is the backstop.
+async function renameStatsCacheRow(oldName: string | null, newName: string | null) {
+    try {
+        if (oldName) {
+            await supabase.from('list_enrichment_stats_cache')
+                .delete().eq('lead_list_name', oldName);
+        }
+    } catch (err: any) {
+        console.warn(`[list-stats] cache row cleanup for "${oldName}" failed: ${err?.message || 'unknown'}`);
+    }
+    if (newName) kickStatsRefresh([newName], 'list renamed');
+}
+
 // Aggregate enrichment progress per list. Split off /api/import-lists
-// so a slow or missing RPC doesn't block the list table from
-// rendering. The client fires this after the list shell paints and
-// merges the counts in when they arrive.
+// so the list table can render before the counts land. Serves the
+// cached snapshot — consistent and instant — and schedules any
+// recompute in the background. No approximate fallback: stale-but-real
+// numbers beat estimated ones that disagree with the next load.
 app.get('/api/import-lists/stats', async (_req, res) => {
     try {
-        // Preferred path: `get_list_enrichment_stats` RPC returns
-        // completed/failed/total for every list in one aggregate pass.
-        // PostgREST's per-list count=estimated returned 0 unpredictably
-        // (the planner short-circuits filtered joins), which broke the
-        // "done" indicator and made the same list's count change 30%+
-        // between page refreshes.
-        const { data: stats, error: rpcErr } = await supabase.rpc('get_list_enrichment_stats');
+        const [statsRes, queueRes] = await Promise.all([
+            supabase.rpc('get_list_enrichment_stats'),
+            supabase.rpc('get_list_enrichment_queue_state'),
+        ]);
+
+        if (statsRes.error || !Array.isArray(statsRes.data)) {
+            console.error(`[import-lists/stats] cache reader RPC failed (code=${(statsRes.error as any)?.code || 'n/a'}): ${statsRes.error?.message || 'no rows'}`);
+            return res.status(503).json({ error: 'list stats unavailable — is 20260612_list_stats_cache.sql applied?' });
+        }
 
         // Per-list enrichment-queue state. With multi-list FIFO, more
         // than one list can have job_items pending at the same time —
-        // exactly one runs (active job, status='processing' items), the
-        // rest sit queued behind it. We surface that as 'running' vs
-        // 'queued' on each row so the Import History badge shows which
-        // list the worker is on and which are next in line.
+        // exactly one runs, the rest sit queued behind it.
         const queueByList = new Map<string, 'running' | 'queued'>();
-        try {
-            const { data: queueRows, error: queueErr } = await supabase.rpc('get_list_enrichment_queue_state');
-            if (!queueErr && Array.isArray(queueRows)) {
-                for (const r of queueRows as Array<{ lead_list_name: string; queue_state: string }>) {
-                    if (r.queue_state === 'running' || r.queue_state === 'queued') {
-                        queueByList.set(r.lead_list_name, r.queue_state);
-                    }
+        if (!queueRes.error && Array.isArray(queueRes.data)) {
+            for (const r of queueRes.data as Array<{ lead_list_name: string; queue_state: string }>) {
+                if (r.queue_state === 'running' || r.queue_state === 'queued') {
+                    queueByList.set(r.lead_list_name, r.queue_state);
                 }
-            } else if (queueErr) {
-                // Soft-fail: rendering without the badge is fine. Log so
-                // the missing migration shows up in Render but don't 500.
-                console.warn(`[import-lists/stats] queue-state RPC unavailable: ${queueErr.message}`);
             }
-        } catch (err: any) {
-            console.warn(`[import-lists/stats] queue-state lookup failed: ${err.message}`);
+        } else if (queueRes.error) {
+            // Soft-fail: rendering without the badge is fine.
+            console.warn(`[import-lists/stats] queue-state RPC unavailable: ${queueRes.error.message}`);
         }
 
-        if (!rpcErr && Array.isArray(stats)) {
-            const rows = (stats as any[]).map(row => ({
-                lead_list_name: row.lead_list_name as string,
-                completed: Number(row.completed_count) || 0,
-                failed: Number(row.failed_count) || 0,
-                total: Number(row.total_count) || 0,
-                queue_state: queueByList.get(row.lead_list_name as string) || null,
-            }));
-            return res.json({ stats: rows, stats_source: 'rpc' as const });
-        }
-
-        // RPC unavailable (function missing, schema cache stale,
-        // permission denied, timeout). Fall back to per-list estimated
-        // counts and tell the client the numbers may drift. The
-        // import_lists row list is small (~tens of rows) so the
-        // parallel head=true queries are cheap even though each one is
-        // approximate.
-        console.warn(`[import-lists/stats] RPC get_list_enrichment_stats unavailable (code=${(rpcErr as any)?.code || 'n/a'}): ${rpcErr?.message || 'unknown'} — falling back to per-list estimated counts`);
-        const { data: lists } = await supabase.from('import_lists').select('name, contact_count');
-        const rows = await Promise.all((lists || []).map(async (l: any) => {
-            const [completed, failed] = await Promise.all([
-                supabase.from('contacts')
-                    .select('contact_id, enrichments!inner(status)', { count: 'estimated', head: true })
-                    .eq('lead_list_name', l.name).eq('enrichments.status', 'completed'),
-                supabase.from('contacts')
-                    .select('contact_id, enrichments!inner(status)', { count: 'estimated', head: true })
-                    .eq('lead_list_name', l.name).eq('enrichments.status', 'failed'),
-            ]);
-            return {
-                lead_list_name: l.name as string,
-                completed: completed.count || 0,
-                failed: failed.count || 0,
-                total: l.contact_count || 0,
-                queue_state: queueByList.get(l.name as string) || null,
-            };
+        const now = Date.now();
+        const rows = (statsRes.data as any[]).map(row => ({
+            lead_list_name: row.lead_list_name as string,
+            completed: Number(row.completed_count) || 0,
+            failed: Number(row.failed_count) || 0,
+            total: Number(row.total_count) || 0,
+            queue_state: queueByList.get(row.lead_list_name as string) || null,
+            refreshed_at: (row.refreshed_at as string | null) || null,
         }));
-        res.json({ stats: rows, stats_source: 'fallback' as const });
+
+        // ---- background refresh scheduling (never blocks the response) ----
+        // Only the RUNNING list's counts move (the FIFO worker writes one
+        // job at a time; queued lists sit untouched), so only running
+        // lists age out on the short TTL. The queue diff still tracks
+        // running∪queued so a drained/cancelled list gets one final
+        // recompute the moment it leaves the queue (DONE lands promptly).
+        const inQueueSet = new Set(queueByList.keys());
+        const justFinished = [...statsPrevQueueLists].filter(n => !inQueueSet.has(n));
+        statsPrevQueueLists = inQueueSet;
+
+        const staleTargets = new Set<string>(justFinished);
+        let oldestAge = 0;
+        for (const r of rows) {
+            if (!r.refreshed_at) {
+                // No snapshot yet (list imported moments ago) — targeted
+                // recompute; deliberately kept out of oldestAge so one
+                // missing row doesn't escalate to a full 9s pass.
+                staleTargets.add(r.lead_list_name);
+                continue;
+            }
+            const age = now - Date.parse(r.refreshed_at);
+            oldestAge = Math.max(oldestAge, age);
+            if (age > STATS_ACTIVE_TTL_MS && queueByList.get(r.lead_list_name) === 'running') {
+                staleTargets.add(r.lead_list_name);
+            }
+        }
+
+        if (oldestAge > STATS_FULL_TTL_MS || staleTargets.size > STATS_TARGETED_MAX_LISTS) {
+            kickStatsRefresh(null, oldestAge > STATS_FULL_TTL_MS ? 'full TTL elapsed' : 'many stale lists');
+        } else if (staleTargets.size > 0) {
+            kickStatsRefresh([...staleTargets], 'active/finished lists stale');
+        }
+
+        res.json({ stats: rows, stats_source: 'cache' as const });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }
@@ -1425,6 +1498,9 @@ app.post('/api/import-lists', async (req, res) => {
                 .single();
             if (updErr) return res.status(500).json({ error: updErr.message });
             await upsertDedupStats(existing.id);
+            // Contacts are fully uploaded by the time the client POSTs
+            // here, so the recompute lands the true post-dedup total.
+            kickStatsRefresh([name], 'import merged into existing list');
             return res.json({ ...updated, merged: true, prior_count: existing.contact_count || 0 });
         }
 
@@ -1436,6 +1512,7 @@ app.post('/api/import-lists', async (req, res) => {
 
         if (error) return res.status(500).json({ error: error.message });
         if (data?.id) await upsertDedupStats(data.id);
+        kickStatsRefresh([name], 'new list imported');
         res.json(data);
     } catch (err: any) {
         res.status(500).json({ error: err.message });
@@ -1485,6 +1562,7 @@ app.patch('/api/import-lists/:id', async (req, res) => {
 
         if (!rpcErr) {
             const row = Array.isArray(rpcData) ? rpcData[0] : rpcData;
+            await renameStatsCacheRow(row?.old_name ?? null, newName);
             return res.json({
                 id,
                 name: row?.new_name ?? newName,
@@ -1562,6 +1640,7 @@ app.patch('/api/import-lists/:id', async (req, res) => {
             console.warn(`[import-lists] enrichments rename cascade failed: ${updEnrichErr.message}`);
         }
 
+        await renameStatsCacheRow(oldName, newName);
         res.json({ id, name: newName, oldName, contact_count: existing.contact_count, created_at: existing.created_at });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
@@ -2056,6 +2135,10 @@ async function runDeleteJob(job: DeleteJob) {
         job.status = 'done';
         job.completedAt = new Date().toISOString();
         scheduleDeletePersist();
+        // Drop the stats snapshot for the vanished list right away —
+        // otherwise the import_lists row is gone but a refresh-by-TTL
+        // is what would eventually prune the cache entry.
+        await renameStatsCacheRow(job.listName, null);
         addServerLog(`🗑️ Deleted list "${job.listName}": ${job.contactsDeleted.toLocaleString()} contacts, ${job.enrichmentsDeleted.toLocaleString()} enrichments.`, 'Sync', 'info');
     } catch (err: any) {
         job.status = 'failed';

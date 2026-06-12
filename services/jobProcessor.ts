@@ -164,18 +164,21 @@ export class JobProcessor {
         }
     }
 
-    // First time we see a list in this run, query the RPC for its current
-    // completed+failed baseline and total. Everything after is maintained
-    // in-memory off that baseline. Failing the RPC call (e.g. migration
-    // not yet applied) falls through to a zero baseline + contact_count
-    // from import_lists — the log is still informative, just less
-    // precise.
+    // First time we see a list in this run, force a targeted recompute of
+    // its stats-cache row and use the returned counts as the baseline.
+    // get_list_enrichment_stats now reads the cache (which can be up to
+    // ACTIVE_TTL stale); the refresh RPC aggregates the base tables for
+    // just this list (~0.3-1s via the per-list indexes), so the baseline
+    // is exact AND the cache is warm right as the list starts running.
+    // Failing the RPC call (e.g. migration not yet applied) falls through
+    // to a zero baseline + contact_count from import_lists — the log is
+    // still informative, just less precise.
     private static async ensureListBaseline(listName: string): Promise<void> {
         if (this.listProgress.has(listName)) return;
         let total = 0;
         let baseline = 0;
         try {
-            const { data } = await supabase.rpc('get_list_enrichment_stats');
+            const { data } = await supabase.rpc('refresh_list_enrichment_stats', { p_lists: [listName] });
             if (Array.isArray(data)) {
                 const row = (data as any[]).find(r => r.lead_list_name === listName);
                 if (row) {
@@ -579,6 +582,19 @@ export class JobProcessor {
                         this.log(`⚠️ Job ${cand.id} drained with ${reaped} open items reaped — marking completed; advancing FIFO.`, 'warn');
                     } else {
                         this.log(`✅ Job ${cand.id} drained — marking completed; advancing FIFO.`, 'phase');
+                    }
+                    // Snap the stats cache to final counts for every list
+                    // this run touched, so the import-history row flips to
+                    // DONE immediately — even if no browser tab is open to
+                    // trigger the server's stale-detection path. Fire and
+                    // forget; the poll-driven refresh is the backstop.
+                    const runLists = [...this.listProgress.keys()];
+                    if (runLists.length > 0) {
+                        Promise.resolve(supabase.rpc('refresh_list_enrichment_stats', { p_lists: runLists }))
+                            .then(({ error }: { error: any }) => {
+                                if (error) this.log(`⚠️ Post-drain stats refresh failed: ${error.message}`, 'warn');
+                            })
+                            .catch(() => { /* poll-driven refresh covers it */ });
                     }
                 }
             }
