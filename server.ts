@@ -1301,7 +1301,14 @@ function kickStatsRefresh(lists: string[] | null, reason: string) {
     if (Date.now() - statsRefreshLastFailureAt < STATS_REFRESH_FAILURE_BACKOFF_MS) return;
     statsRefreshInFlight = true;
     const label = lists ? `${lists.length} list(s)` : 'all lists';
-    Promise.resolve(supabase.rpc('refresh_list_enrichment_stats', { p_lists: lists }))
+    // request_list_stats_refresh (not the raw refresh RPC): the Render
+    // env can lack SUPABASE_SERVICE_ROLE_KEY, in which case this server
+    // runs on the anon key (server.ts:55 fallback) and the raw,
+    // service_role-only refresh 401s. The wrapper is anon-callable but
+    // self-gating — advisory-lock single-flight + skips rows refreshed
+    // within the last 5s (targeted) / 30s (full) — so correctness no
+    // longer depends on which key the deploy ended up with.
+    Promise.resolve(supabase.rpc('request_list_stats_refresh', { p_lists: lists }))
         .then(({ error }: { error: any }) => {
             if (error) {
                 statsRefreshLastFailureAt = Date.now();

@@ -307,13 +307,23 @@ export default function App() {
           // Merge with any stats we already have in state — avoids the
           // progress bars flickering to 0% between the list fetch
           // landing and the stats fetch landing.
+          //
+          // contact_count is preserved from state too: this endpoint
+          // carries import_lists.contact_count (the CSV row count,
+          // pre-dedup) while the stats fetch supplies the live
+          // post-dedup total. Both land each poll tick in either order
+          // — letting this one overwrite the total made rows flip
+          // between two values (e.g. 59,797 ↔ 59,511) on a per-tick
+          // coin flip, DONE/Resume buttons included. The raw value is
+          // only used before the first stats response (old === undefined).
           setImportLists(prev => {
-            const prevByName: Record<string, { enriched_count?: number; failed_count?: number; queue_state?: 'running' | 'queued' | null }> = {};
+            const prevByName: Record<string, { contact_count?: number; enriched_count?: number; failed_count?: number; queue_state?: 'running' | 'queued' | null }> = {};
             for (const p of prev) prevByName[p.name] = p;
             return lists.map((l: any) => {
               const old = prevByName[l.name];
               return {
                 ...l,
+                contact_count: old?.contact_count ?? l.contact_count,
                 enriched_count: old?.enriched_count,
                 failed_count: old?.failed_count,
                 queue_state: old?.queue_state ?? null,
