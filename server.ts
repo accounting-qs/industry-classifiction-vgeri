@@ -1419,6 +1419,38 @@ app.get('/api/import-lists/stats', async (_req, res) => {
     }
 });
 
+// App-wide phase-funnel stats for the Enrichment Dashboard (/dashboard).
+// Thin wrapper over get_dashboard_stats() — Phase 0 (enrichment) sums the
+// cached list stats, Phase 1a/1b count distinct contacts in the bucket
+// tables. Fetched on load + manual Refresh only, so no background refresh
+// scheduling like /api/import-lists/stats needs.
+app.get('/api/dashboard/stats', async (_req, res) => {
+    try {
+        const { data, error } = await supabase.rpc('get_dashboard_stats');
+        const row = Array.isArray(data) ? data[0] : data;
+        if (error || !row) {
+            console.error(`[dashboard/stats] RPC failed (code=${(error as any)?.code || 'n/a'}): ${error?.message || 'no rows'}`);
+            return res.status(503).json({ error: 'dashboard stats unavailable — is 20260623_dashboard_stats_rpc.sql applied?' });
+        }
+        res.json({
+            phase0: {
+                total_imported: Number(row.total_imported) || 0,
+                enriched: Number(row.enriched) || 0,
+                failed: Number(row.failed) || 0,
+                pending: Number(row.pending) || 0,
+            },
+            bucketing: {
+                taxonomy_finalized: Number(row.taxonomy_finalized) || 0,
+                bucket_assigned: Number(row.bucket_assigned) || 0,
+                run_count: Number(row.run_count) || 0,
+                completed_run_count: Number(row.completed_run_count) || 0,
+            },
+        });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.post('/api/import-lists', async (req, res) => {
     const { name, contact_count, dedup_stats } = req.body;
     if (!name) return res.status(400).json({ error: 'Name is required' });

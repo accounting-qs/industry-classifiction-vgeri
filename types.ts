@@ -41,6 +41,7 @@ export type MergedContact = Contact & Partial<Enrichment> & {
 };
 
 export enum AppTab {
+  DASHBOARD = 'dashboard',
   MANAGER = 'contacts',
   ENRICHMENT = 'enrichment',
   IMPORT = 'import',

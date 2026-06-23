@@ -6,6 +6,7 @@ import { BucketingTab } from './BucketingTab';
 import { ConnectorsTab } from './ConnectorsTab';
 
 const TAB_TO_PATH: Record<AppTab, string> = {
+  [AppTab.DASHBOARD]: '/dashboard',
   [AppTab.IMPORT]: '/import',
   [AppTab.MANAGER]: '/contacts',
   [AppTab.ENRICHMENT]: '/pipeline',
@@ -15,6 +16,7 @@ const TAB_TO_PATH: Record<AppTab, string> = {
 };
 
 function tabFromPath(pathname: string): AppTab {
+  if (pathname.startsWith('/dashboard')) return AppTab.DASHBOARD;
   if (pathname.startsWith('/import')) return AppTab.IMPORT;
   if (pathname.startsWith('/pipeline')) return AppTab.ENRICHMENT;
   if (pathname.startsWith('/bucketing')) return AppTab.BUCKETING;
@@ -72,6 +74,7 @@ import {
   Moon,
   Monitor,
   PieChart,
+  LayoutDashboard,
 } from 'lucide-react';
 
 /**
@@ -828,6 +831,7 @@ export default function App() {
           <h1 className="text-sm font-bold text-white">Quantum Scaling</h1>
         </div>
         <nav className="flex-1 px-2 py-4 space-y-1 overflow-hidden">
+          <SidebarIconButton active={activeTab === AppTab.DASHBOARD} href="/dashboard" onClick={() => navigate('/dashboard')} icon={<LayoutDashboard className={`w-5 h-5 ${activeTab === AppTab.DASHBOARD ? 'text-[#3ecf8e]' : ''}`} />} label="Dashboard" />
           <SidebarIconButton active={activeTab === AppTab.IMPORT} href="/import" onClick={() => navigate('/import')} icon={<Upload className="w-5 h-5" />} label="Import CSV" />
           <SidebarIconButton active={activeTab === AppTab.MANAGER} href="/contacts" onClick={() => navigate('/contacts')} icon={<Users className="w-5 h-5" />} label="Contacts" />
           <SidebarIconButton active={activeTab === AppTab.ENRICHMENT} href="/pipeline" onClick={() => navigate('/pipeline')} icon={<Zap className={`w-5 h-5 ${stats.isProcessing ? 'text-[#3ecf8e] animate-pulse' : ''}`} />} label="Pipeline Monitor" />
@@ -955,7 +959,8 @@ export default function App() {
             );
             return (
               <Routes>
-                <Route path="/" element={<Navigate to="/import" replace />} />
+                <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                <Route path="/dashboard" element={<EnrichmentDashboard />} />
                 <Route path="/import" element={importElement} />
                 <Route path="/contacts" element={contactsElement} />
                 <Route path="/pipeline" element={pipelineElement} />
@@ -1968,6 +1973,139 @@ function StatCard({ label, value, color }: any) {
     <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-6 shadow-sm">
       <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">{label}</p>
       <p className={`text-3xl font-bold ${color}`}>{value}</p>
+    </div>
+  );
+}
+
+interface DashboardStats {
+  phase0: { total_imported: number; enriched: number; failed: number; pending: number };
+  bucketing: { taxonomy_finalized: number; bucket_assigned: number; run_count: number; completed_run_count: number };
+}
+
+// Two-segment horizontal progress bar (done = green, secondary = amber)
+// over a total — same visual language as EnrichmentProgress, scaled up
+// for the dashboard's headline funnels.
+function FunnelBar({ total, primary, secondary }: { total: number; primary: number; secondary?: number }) {
+  if (total <= 0) return <div className="h-2 bg-[#1c1c1c] rounded-full" />;
+  const primaryPct = Math.min(100, (primary / total) * 100);
+  const secondaryPct = Math.min(100 - primaryPct, ((secondary || 0) / total) * 100);
+  return (
+    <div className="h-2 bg-[#1c1c1c] rounded-full overflow-hidden flex">
+      <div className="h-full bg-[#3ecf8e] transition-all" style={{ width: `${primaryPct}%` }} />
+      <div className="h-full bg-amber-500/70 transition-all" style={{ width: `${secondaryPct}%` }} />
+    </div>
+  );
+}
+
+// App-wide enrichment overview: Phase 0 (enrichment) + Phase 1a/1b
+// (bucketing) funnels. Reads /api/dashboard/stats on load with a manual
+// Refresh button (no polling) — see get_dashboard_stats() RPC.
+function EnrichmentDashboard() {
+  const [stats, setStats] = useState<DashboardStats | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
+
+  const fetchStats = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    fetch('/api/dashboard/stats')
+      .then(res => res.ok ? res.json() : res.json().then(b => Promise.reject(new Error(b.error || `HTTP ${res.status}`))))
+      .then((data: DashboardStats) => {
+        setStats(data);
+        setLastRefreshed(new Date());
+      })
+      .catch(err => setError(err.message || 'Failed to load dashboard stats'))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { fetchStats(); }, [fetchStats]);
+
+  const fmt = (n: number) => n.toLocaleString();
+  const p0 = stats?.phase0;
+  const bk = stats?.bucketing;
+  const enrichedPct = p0 && p0.total_imported > 0 ? Math.round(((p0.enriched + p0.failed) / p0.total_imported) * 100) : 0;
+  const assignedPct = bk && bk.taxonomy_finalized > 0 ? Math.round((bk.bucket_assigned / bk.taxonomy_finalized) * 100) : 0;
+
+  return (
+    <div className="flex-1 p-8 overflow-y-auto custom-scrollbar bg-[#1c1c1c]">
+      <div className="max-w-4xl mx-auto">
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h2 className="text-2xl font-bold flex items-center gap-3 text-white">
+              <LayoutDashboard className="w-6 h-6 text-[#3ecf8e]" />
+              Enrichment Dashboard
+            </h2>
+            <p className="text-sm text-gray-500 mt-2">
+              How many leads are in each phase, across the whole app.
+              {lastRefreshed && (
+                <span className="text-gray-600"> · updated {lastRefreshed.toLocaleTimeString()}</span>
+              )}
+            </p>
+          </div>
+          <button
+            onClick={fetchStats}
+            disabled={loading}
+            className="flex items-center gap-2 px-4 py-2 bg-[#2e2e2e] hover:bg-[#3e3e3e] border border-[#3e3e3e] text-white rounded-lg font-bold text-xs transition-colors disabled:opacity-60"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-[#3ecf8e]' : ''}`} />
+            Refresh
+          </button>
+        </div>
+
+        {error && (
+          <div className="mb-6 p-4 bg-rose-500/10 border border-rose-500/30 rounded-xl text-sm text-rose-300 flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0" /> {error}
+          </div>
+        )}
+
+        {loading && !stats ? (
+          <div className="space-y-8">
+            {[0, 1].map(i => (
+              <div key={i} className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                {[0, 1, 2, 3].map(j => (
+                  <div key={j} className="h-[104px] bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl animate-pulse" />
+                ))}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="space-y-10">
+            {/* Phase 0 — Enrichment */}
+            <section>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-xs font-bold text-gray-400 uppercase tracking-widest">Phase 0 · Enrichment</h3>
+                <span className="text-[11px] font-mono text-gray-500">{enrichedPct}% processed</span>
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-3">
+                <StatCard label="Imported" value={fmt(p0?.total_imported || 0)} color="text-white" />
+                <StatCard label="Enriched" value={fmt(p0?.enriched || 0)} color="text-[#3ecf8e]" />
+                <StatCard label="Failed" value={fmt(p0?.failed || 0)} color="text-amber-400" />
+                <StatCard label="Pending" value={fmt(p0?.pending || 0)} color="text-gray-400" />
+              </div>
+              <FunnelBar total={p0?.total_imported || 0} primary={p0?.enriched || 0} secondary={p0?.failed || 0} />
+            </section>
+
+            {/* Phase 1a/1b — Bucketing */}
+            <section>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-xs font-bold text-gray-400 uppercase tracking-widest">Phase 1a / 1b · Bucketing</h3>
+                <span className="text-[11px] font-mono text-gray-500">
+                  {fmt(bk?.completed_run_count || 0)}/{fmt(bk?.run_count || 0)} runs completed
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-4 mb-3">
+                <StatCard label="Taxonomy finalized (1a)" value={fmt(bk?.taxonomy_finalized || 0)} color="text-sky-400" />
+                <StatCard label="Buckets assigned (1b)" value={fmt(bk?.bucket_assigned || 0)} color="text-[#3ecf8e]" />
+              </div>
+              <FunnelBar total={bk?.taxonomy_finalized || 0} primary={bk?.bucket_assigned || 0} />
+              <p className="text-[11px] text-gray-600 mt-2">
+                {assignedPct}% of taxonomy-finalized contacts have a final bucket assignment. Counts are distinct contacts across all runs.
+              </p>
+            </section>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
