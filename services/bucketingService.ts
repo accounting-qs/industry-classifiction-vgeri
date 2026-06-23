@@ -5212,16 +5212,24 @@ async function fetchPhase1aTaxonomyMap(
     // would silently return only 1000 rows, so runs with >1k distinct
     // industry strings would have most contacts miss the JOIN-first lookup
     // and waste LLM cycles in Phase 1b.
+    // Keyset scan by industry_string (the PK's 2nd column). OFFSET pagination
+    // (.range) re-scans the whole run partition per page — it times out on
+    // large runs, and this loader SWALLOWS the error (returns a partial map),
+    // which silently sends matched contacts down the LLM path or to General.
+    // The old `offset > 200_000` cap also silently dropped every industry
+    // string past 200k. Keyset gives constant per-page cost and loads the
+    // full run regardless of size.
     const PAGE = 1000;
-    let offset = 0;
+    let lastKey: string | null = null;
     while (true) {
-        const { data, error } = await supabase
+        let q = supabase
             .from('bucket_industry_map')
             .select('industry_string,primary_identity,sub_identity,sector,confidence,identity_confidence,sub_identity_confidence,sector_confidence,is_generic,is_disqualified,llm_reason,source,assigned_bucket_name,assigned_bucket_primary_identity')
-            .eq('bucketing_run_id', runId)
-            .range(offset, offset + PAGE - 1);
+            .eq('bucketing_run_id', runId);
+        if (lastKey !== null) q = q.gt('industry_string', lastKey);
+        const { data, error } = await q.order('industry_string', { ascending: true }).limit(PAGE);
         if (error) {
-            ctx.log(`[Bucketing ${runId}] failed to load Phase 1a taxonomy map (offset=${offset}): ${error.message}`, 'error');
+            ctx.log(`[Bucketing ${runId}] failed to load Phase 1a taxonomy map (after ${map.size} rows): ${error.message}`, 'error');
             return map;
         }
         const rows = (data || []) as any[];
@@ -5229,8 +5237,7 @@ async function fetchPhase1aTaxonomyMap(
             if (row.industry_string) map.set(row.industry_string, row);
         }
         if (rows.length < PAGE) break;
-        offset += PAGE;
-        if (offset > 200_000) break; // hard ceiling — bucket_industry_map should never have this many rows for one run
+        lastKey = rows[rows.length - 1].industry_string;
     }
     return map;
 }
