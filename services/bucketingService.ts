@@ -1836,25 +1836,61 @@ export async function finalizeTaxonomyAgainstLibrary(
     const libSectors = new Set(snapshot.sectors.map(s => s.name));
     const dqIdentities = new Set(snapshot.identities.filter(i => i.is_disqualified).map(i => i.name));
 
-    // Pull every Phase 1a row that still has at least one is_new_* flag —
-    // those are the orphans we need to either keep (now accepted) or null.
-    const allRows: any[] = [];
+    // Single keyset scan of the run's Phase 1a map. OFFSET pagination
+    // (.range) degrades to O(n²) — each page re-scans the whole 300k-row
+    // partition with random heap I/O — and on a large run it blew past the
+    // REST statement_timeout ("canceling statement due to statement timeout"
+    // at offset 10000). Keyset by industry_string (the PK's second column)
+    // walks the partition once via the PK index, so every page is 1000
+    // sequential rows regardless of run size.
+    //
+    // We read ALL rows once and partition in JS instead of filtering on the
+    // unindexed is_new_* booleans:
+    //   • candidates = source='llm_phase1a' rows with any is_new_* flag —
+    //                  these get the keep/null pass below.
+    //   • everything else keeps its taxonomy through finalize, so we fold it
+    //     straight into the used-taxonomy accumulators that re-synthesize
+    //     taxonomy_proposal — replacing the old second full-table re-fetch.
+    const usedIdentitySet = new Set<string>();
+    const usedCharByKey = new Map<string, { spec: string; identity: string; description: string }>();
+    const usedSectors = new Set<string>();
+    const addUsed = (identity: string | null, sub: string | null, sector: string | null) => {
+        if (identity) usedIdentitySet.add(identity);
+        if (sub && identity) {
+            const key = `${identity}::${sub}`;
+            if (!usedCharByKey.has(key)) {
+                const charDesc = snapshot.sub_identities.find(c => c.name === sub)?.description || '';
+                usedCharByKey.set(key, { spec: sub, identity, description: charDesc });
+            }
+        }
+        if (sector) usedSectors.add(sector);
+    };
+
+    const candidates: any[] = [];
     {
         const PAGE = 1000;
-        for (let off = 0; off < 200_000; off += PAGE) {
-            const { data, error } = await supabase
+        let lastKey: string | null = null;
+        for (;;) {
+            let q = supabase
                 .from('bucket_industry_map')
-                .select('*')
-                .eq('bucketing_run_id', runId)
-                .or('is_new_identity.eq.true,is_new_sub_identity.eq.true,is_new_sector.eq.true')
-                .range(off, off + PAGE - 1);
-            if (error) throw new Error(`bucket_industry_map fetch failed at offset ${off}: ${error.message}`);
+                .select('industry_string,primary_identity,sub_identity,sector,is_new_identity,is_new_sub_identity,is_new_sector,is_disqualified,source,raw_industry')
+                .eq('bucketing_run_id', runId);
+            if (lastKey !== null) q = q.gt('industry_string', lastKey);
+            const { data, error } = await q.order('industry_string', { ascending: true }).limit(PAGE);
+            if (error) throw new Error(`bucket_industry_map scan failed after ${candidates.length} candidates: ${error.message}`);
             const rows = (data || []) as any[];
-            allRows.push(...rows);
+            for (const r of rows) {
+                if (r.source === 'llm_phase1a' && (r.is_new_identity || r.is_new_sub_identity || r.is_new_sector)) {
+                    candidates.push(r);
+                } else {
+                    // Untouched by finalize → its current taxonomy is final.
+                    addUsed(r.primary_identity, r.sub_identity, r.sector);
+                }
+            }
             if (rows.length < PAGE) break;
+            lastKey = rows[rows.length - 1].industry_string;
         }
     }
-    const candidates = allRows.filter(r => r.source === 'llm_phase1a');
     ctx.log(`[Finalize ${runId}] ${candidates.length} orphan row(s) — keeping accepted proposals, routing rejected ones to General (library: ${snapshot.identities.length} identities / ${snapshot.sub_identities.length} sub-identities / ${snapshot.sectors.length} sectors)`);
 
     if (candidates.length === 0) {
@@ -1896,6 +1932,10 @@ export async function finalizeTaxonomyAgainstLibrary(
             : (newSub && newSector ? `${newSub} (${newSector})`
                 : (newSub || newIdentity || 'Generic'));
 
+        // Post-finalize values feed the taxonomy_proposal re-synthesis below
+        // (this replaces re-reading the whole table after the update).
+        addUsed(newIdentity, newSub, newSector);
+
         if (!newIdentity && !newSub && !newSector) nullified++;
         else rerouted++;
 
@@ -1928,36 +1968,10 @@ export async function finalizeTaxonomyAgainstLibrary(
     }
 
     // Re-synthesize taxonomy_proposal so the Review screen reflects the new
-    // shape (orphan rows now point at library entries or null).
-    const refreshedRows: any[] = [];
-    {
-        const PAGE = 1000;
-        for (let off = 0; off < 200_000; off += PAGE) {
-            const { data, error } = await supabase
-                .from('bucket_industry_map')
-                .select('industry_string,primary_identity,sub_identity,sector')
-                .eq('bucketing_run_id', runId)
-                .range(off, off + PAGE - 1);
-            if (error) throw new Error(`bucket_industry_map re-fetch failed at offset ${off}: ${error.message}`);
-            const rows = (data || []) as any[];
-            refreshedRows.push(...rows);
-            if (rows.length < PAGE) break;
-        }
-    }
-    const usedIdentitySet = new Set<string>();
-    const usedCharByKey = new Map<string, { spec: string; identity: string; description: string }>();
-    const usedSectors = new Set<string>();
-    for (const r of refreshedRows) {
-        if (r.primary_identity) usedIdentitySet.add(r.primary_identity);
-        if (r.sub_identity && r.primary_identity) {
-            const key = `${r.primary_identity}::${r.sub_identity}`;
-            if (!usedCharByKey.has(key)) {
-                const charDesc = snapshot.sub_identities.find(c => c.name === r.sub_identity)?.description || '';
-                usedCharByKey.set(key, { spec: r.sub_identity, identity: r.primary_identity, description: charDesc });
-            }
-        }
-        if (r.sector) usedSectors.add(r.sector);
-    }
+    // shape (orphan rows now point at library entries or null). The used-tag
+    // accumulators were filled during the single scan above (non-candidate
+    // rows) and the keep/null pass (candidates' post-finalize values), so no
+    // second full-table read is needed.
     const primaryIdentities = Array.from(usedIdentitySet).map(name => {
         const ent = snapshot.identities.find(i => i.name === name);
         return { name, description: ent?.description || '', identity_type: 'other', operator_required: false };
