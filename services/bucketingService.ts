@@ -1374,17 +1374,23 @@ export async function runTaxonomyProposal(
     // historical set in the proposal.
     const proposalRows: any[] = [];
     {
+        // Keyset scan by industry_string (the PK's 2nd column). OFFSET
+        // pagination (.range) re-scans the whole run partition per page and
+        // times out on large runs; keyset walks it once via the PK index.
         const PAGE = 1000;
-        for (let off = 0; off < 500_000; off += PAGE) {
-            const { data, error } = await supabase
+        let lastKey: string | null = null;
+        for (;;) {
+            let q = supabase
                 .from('bucket_industry_map')
                 .select('industry_string,primary_identity,sub_identity,sector')
-                .eq('bucketing_run_id', runId)
-                .range(off, off + PAGE - 1);
-            if (error) throw new Error(`taxonomy_proposal rebuild fetch failed at offset ${off}: ${error.message}`);
-            const rows = (data || []);
+                .eq('bucketing_run_id', runId);
+            if (lastKey !== null) q = q.gt('industry_string', lastKey);
+            const { data, error } = await q.order('industry_string', { ascending: true }).limit(PAGE);
+            if (error) throw new Error(`taxonomy_proposal rebuild scan failed after ${proposalRows.length} rows: ${error.message}`);
+            const rows = (data || []) as any[];
             proposalRows.push(...rows);
             if (rows.length < PAGE) break;
+            lastKey = rows[rows.length - 1].industry_string;
         }
     }
     const usedIdentitySet = new Set<string>();
@@ -1533,17 +1539,25 @@ export async function recalculateTaxonomyWithLibrary(
     // PostgREST's 1000-row hard cap (same trick the streaming CSV uses).
     const allRows: any[] = [];
     {
+        // Keyset scan by industry_string (the PK's 2nd column). OFFSET
+        // pagination (.range) re-scanned the whole run partition per page
+        // (times out on large runs), AND the old `off < 200_000` cap silently
+        // dropped every row past 200k on bigger runs — a 307k run would
+        // recalc only the first 200k. Keyset removes both the timeout and cap.
         const PAGE = 1000;
-        for (let off = 0; off < 200_000; off += PAGE) {
-            const { data, error } = await supabase
+        let lastKey: string | null = null;
+        for (;;) {
+            let q = supabase
                 .from('bucket_industry_map')
                 .select('*')
-                .eq('bucketing_run_id', runId)
-                .range(off, off + PAGE - 1);
-            if (error) throw new Error(`bucket_industry_map fetch failed at offset ${off}: ${error.message}`);
+                .eq('bucketing_run_id', runId);
+            if (lastKey !== null) q = q.gt('industry_string', lastKey);
+            const { data, error } = await q.order('industry_string', { ascending: true }).limit(PAGE);
+            if (error) throw new Error(`bucket_industry_map scan failed after ${allRows.length} rows: ${error.message}`);
             const rows = (data || []) as any[];
             allRows.push(...rows);
             if (rows.length < PAGE) break;
+            lastKey = rows[rows.length - 1].industry_string;
         }
     }
     ctx.log(`[Recalc ${runId}] loaded ${allRows.length} bucket_industry_map rows`);
