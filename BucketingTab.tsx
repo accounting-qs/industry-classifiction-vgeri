@@ -15,7 +15,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import {
   Layers, Loader2, AlertCircle, ArrowLeft, Plus, X, Trash2, Download,
   Play, BookMarked, CheckCircle2, Edit3, Archive, Upload, Square, RotateCcw,
-  ChevronDown, ChevronRight, ArrowRight, Sparkles
+  ChevronDown, ChevronRight, ArrowRight, Sparkles, Copy, Check
 } from 'lucide-react';
 import Papa from 'papaparse';
 import type { BucketingRun, BucketProposal, LibraryBucket } from './types';
@@ -2535,6 +2535,78 @@ function PipelineRerunPanel({ run, onRefresh, onError }: {
 
 // ───── RESULTS VIEW ───────────────────────────────────────────────
 
+// Reference panel: the import lists that fed this run (bucketing_runs.list_names).
+// Each name is click-to-copy; "Copy all" yields newline-separated names for
+// pasting elsewhere. Renders nothing when a run has no recorded lists.
+function UsedListsPanel({ listNames }: { listNames: string[] }) {
+  const [copiedAll, setCopiedAll] = useState(false);
+  const [copiedOne, setCopiedOne] = useState<string | null>(null);
+
+  if (!Array.isArray(listNames) || listNames.length === 0) return null;
+
+  const copy = async (text: string, onDone: () => void) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      onDone();
+    } catch {
+      // Fallback for non-secure contexts where the async Clipboard API is blocked.
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); onDone(); } catch { /* noop */ }
+      document.body.removeChild(ta);
+    }
+  };
+
+  const copyAll = () => copy(listNames.join('\n'), () => {
+    setCopiedAll(true);
+    window.setTimeout(() => setCopiedAll(false), 1500);
+  });
+
+  const copyOne = (name: string) => copy(name, () => {
+    setCopiedOne(name);
+    window.setTimeout(() => setCopiedOne(c => (c === name ? null : c)), 1500);
+  });
+
+  return (
+    <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
+      <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
+        <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">
+          Used lists ({listNames.length})
+        </span>
+        <button
+          onClick={copyAll}
+          className="px-2.5 py-1 rounded text-[10px] font-bold bg-[#1c1c1c] text-gray-300 border border-[#2e2e2e] hover:border-gray-500 flex items-center gap-1.5"
+        >
+          {copiedAll ? <Check className="w-3 h-3 text-[#3ecf8e]" /> : <Copy className="w-3 h-3" />}
+          {copiedAll ? 'Copied' : 'Copy all'}
+        </button>
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {listNames.map(name => {
+          const isCopied = copiedOne === name;
+          return (
+            <button
+              key={name}
+              onClick={() => copyOne(name)}
+              title="Click to copy"
+              className="group max-w-full px-2 py-1 rounded text-[11px] font-mono border bg-[#1c1c1c] text-gray-300 border-[#2e2e2e] hover:border-gray-500 flex items-center gap-1.5"
+            >
+              <span className="truncate">{name}</span>
+              {isCopied
+                ? <Check className="w-3 h-3 text-[#3ecf8e] shrink-0" />
+                : <Copy className="w-3 h-3 text-gray-600 group-hover:text-gray-400 shrink-0" />}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onRefresh, onError, onLibrarySaved }: {
   run: BucketingRun;
   bucketCounts: any[];
@@ -2742,6 +2814,8 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onRe
         <StatCard label="Contacts assigned" value={total.toLocaleString()} color="text-[#3ecf8e]" />
         <StatCard label="Total cost" value={`$${(Number(run.cost_usd) || 0).toFixed(3)}`} color="text-white" />
       </div>
+
+      <UsedListsPanel listNames={run.list_names} />
 
       <RunCoveragePanel runId={run.id} />
 
