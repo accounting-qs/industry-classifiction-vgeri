@@ -460,14 +460,15 @@ async function withHeartbeat<T>(
 // Build the vocabulary by streaming contacts + enrichments instead. This is
 // more round-trips than one aggregate RPC, but it is exact and cannot be
 // silently truncated by PostgREST's 1000-row function response cap.
-// Ceiling bumped 250k→400k (2026-06-23, per user directive). A 473,672-contact /
-// 8-list run produced 307,380 distinct (classification, status) rows — ~42% past
-// the largest run that had ever completed (216k distinct, 290k contacts). This is
-// a tripwire against silently marking a *partial* taxonomy complete, not a
-// capacity wall: the RPC already transferred 250k full vocab objects in ~2s
-// before throwing, and tagging cost/time scale linearly. Override per-run via the
-// env var; 400k leaves ~30% headroom over the current largest known vocabulary.
-const VOCAB_HARD_LIMIT = Number(process.env.BUCKETING_VOCAB_HARD_LIMIT || 400_000);
+// Ceiling raised 250k→500k (2026-06-23, per user directive). A 473,672-contact /
+// 8-list run produced 307,380 distinct (classification, status) rows, tripping the
+// original 250k limit — ~42% past the largest run that had ever completed (216k
+// distinct, 290k contacts). This is a tripwire against silently marking a *partial*
+// taxonomy complete, not a capacity wall: the RPC already transferred 250k full
+// vocab objects in ~2s before throwing, and tagging cost/time scale linearly.
+// Override per-run via the env var; 500k leaves ~60% headroom over the current
+// largest known vocabulary.
+const VOCAB_HARD_LIMIT = Number(process.env.BUCKETING_VOCAB_HARD_LIMIT || 500_000);
 
 function vocabularyStatus(contact: ContactRouteInput): { industry: string; status: string } {
     const classification = (contact.classification || '').trim();
