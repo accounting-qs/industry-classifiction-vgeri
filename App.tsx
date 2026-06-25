@@ -571,10 +571,10 @@ export default function App() {
 
   const exportToCSV = () => {
     if (!contacts.length) return;
-    const headers = ['Contact ID', 'Email', 'First Name', 'Last Name', 'Website', 'Industry', 'Confidence', 'Cost', 'Status', 'Processed At'];
+    const headers = ['Contact ID', 'Email', 'First Name', 'Last Name', 'Website', 'Industry', 'Enrichment Classification', 'Confidence', 'Cost', 'Status', 'Processed At'];
     const rows = contacts.map(c => [
       c.contact_id, c.email, c.first_name, c.last_name, c.company_website,
-      c.classification || c.industry || '', c.confidence || '', c.cost || '0',
+      c.industry || '', c.classification || '', c.confidence || '', c.cost || '0',
       c.status || 'pending', c.processed_at || ''
     ]);
     const csvContent = [headers.join(','), ...rows.map(row => row.map(v => `"${String(v).replace(/"/g, '""')}"`).join(','))].join('\n');
@@ -911,7 +911,8 @@ export default function App() {
                   { key: 'first_name', label: 'first_name', type: 'text', defaultWidth: 100 },
                   { key: 'last_name', label: 'last_name', type: 'text', defaultWidth: 100 },
                   { key: 'company_website', label: 'website', type: 'text', defaultWidth: 180 },
-                  { key: 'classification', label: 'industry', type: 'text', defaultWidth: 180 },
+                  { key: 'industry', label: 'industry', type: 'text', defaultWidth: 160 },
+                  { key: 'classification', label: 'enrichment classification', type: 'text', defaultWidth: 200 },
                   { key: 'confidence', label: 'confidence', type: 'confidence', defaultWidth: 110 },
                   { key: 'cost', label: 'cost', type: 'currency', defaultWidth: 90 },
                   { key: 'status', label: 'status', type: 'status', defaultWidth: 140 },
@@ -2110,6 +2111,40 @@ function EnrichmentDashboard() {
   );
 }
 
+const FILTER_OP_LABELS: Record<string, string> = {
+  equals: 'is', contains: 'contains', starts_with: 'starts with',
+  greater_than: '>', less_than: '<', in: 'is', not_in: 'is not',
+};
+
+// Operators that make sense for a given filter column, gated by the
+// column's data type. Stops the UI from offering e.g. "contains" on a
+// numeric/date column (ilike on a non-text column errors or returns
+// nothing) or lexicographic ">" on a uuid.
+function operatorsForColumn(column: string, type: string): FilterOperator[] {
+  if (column === 'status') return ['in'];
+  if (column === 'lead_list_name') return ['in', 'not_in'];
+  switch (type) {
+    case 'confidence':
+    case 'currency':
+    case 'date':
+      return ['equals', 'greater_than', 'less_than'];
+    case 'uuid':
+      return ['equals'];
+    default: // text
+      return ['equals', 'contains', 'starts_with'];
+  }
+}
+
+// A fresh value suited to the column's value widget, applied when the
+// column changes so a stale value from the previous widget can't leak
+// into an incompatible operator (e.g. text "abc" landing on numeric ">",
+// which Postgres rejects as invalid numeric input).
+function defaultValueForColumn(column: string, type: string): any {
+  if (column === 'status' || column === 'lead_list_name') return [];
+  if (type === 'confidence') return '1';
+  return '';
+}
+
 function DataTable({
   data,
   columns,
@@ -2169,23 +2204,19 @@ function DataTable({
 
   const updateFilter = (id: string, updates: Partial<FilterCondition>) => {
     onFiltersChange(activeFilters.map((f: FilterCondition) => {
-      if (f.id === id) {
-        const next = { ...f, ...updates };
-        if (next.column === 'status' && !Array.isArray(next.value)) {
-          next.value = [];
-          next.operator = 'in';
-        }
-        if (next.column === 'lead_list_name' && !Array.isArray(next.value)) {
-          next.value = [];
-          if (next.operator !== 'in' && next.operator !== 'not_in') next.operator = 'in';
-        }
-        if (next.column === 'confidence' && (next.value === '' || Array.isArray(next.value))) {
-          next.value = "1";
-          next.operator = 'equals';
-        }
-        return next;
+      if (f.id !== id) return f;
+      const next = { ...f, ...updates };
+      // When the column changes, reset to a valid operator/value for the
+      // new column type so a stale value or an operator the new column
+      // doesn't support can never carry over (e.g. text "abc" + ">"
+      // landing on confidence, which Postgres rejects).
+      if (updates.column !== undefined && updates.column !== f.column) {
+        const type = columns.find((c: any) => c.key === next.column)?.type || 'text';
+        const allowed = operatorsForColumn(next.column, type);
+        if (!allowed.includes(next.operator)) next.operator = allowed[0];
+        next.value = defaultValueForColumn(next.column, type);
       }
-      return f;
+      return next;
     }));
   };
 
@@ -2261,7 +2292,10 @@ function DataTable({
                       <p className="text-[11px] text-gray-400">No active filters. Add a condition to start filtering.</p>
                     </div>
                   ) : (
-                    activeFilters.map((filter: FilterCondition) => (
+                    activeFilters.map((filter: FilterCondition) => {
+                      const colType = columns.find((c: any) => c.key === filter.column)?.type || 'text';
+                      const allowedOps = operatorsForColumn(filter.column, colType);
+                      return (
                       <div key={filter.id} className="flex flex-col gap-3 p-3 bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl relative group hover:border-[#3ecf8e44] transition-all">
                         <button onClick={() => removeFilter(filter.id)} className="absolute top-2 right-2 p-1.5 text-gray-500 hover:text-rose-400 transition-colors">
                           <X className="w-3.5 h-3.5" />
@@ -2287,24 +2321,11 @@ function DataTable({
                               value={filter.operator}
                               onChange={(e) => updateFilter(filter.id, { operator: e.target.value as FilterOperator })}
                               className="w-full bg-[#1c1c1c] border border-[#2e2e2e] text-[11px] rounded-lg px-2.5 py-1.5 text-gray-200 outline-none focus:border-[#3ecf8e] disabled:opacity-50 transition-all"
-                              disabled={filter.column === 'status'}
+                              disabled={allowedOps.length <= 1}
                             >
-                              {filter.column === 'status' ? (
-                                <option value="in">is</option>
-                              ) : filter.column === 'lead_list_name' ? (
-                                <>
-                                  <option value="in">is</option>
-                                  <option value="not_in">is not</option>
-                                </>
-                              ) : (
-                                <>
-                                  <option value="equals">is</option>
-                                  <option value="contains">contains</option>
-                                  <option value="starts_with">starts with</option>
-                                  <option value="greater_than">&gt;</option>
-                                  <option value="less_than">&lt;</option>
-                                </>
-                              )}
+                              {allowedOps.map(op => (
+                                <option key={op} value={op}>{FILTER_OP_LABELS[op]}</option>
+                              ))}
                             </select>
                           </div>
                         </div>
@@ -2361,6 +2382,22 @@ function DataTable({
                                 <option key={opt} value={opt}>{opt}</option>
                               ))}
                             </select>
+                          ) : colType === 'date' ? (
+                            <input
+                              type="date"
+                              value={filter.value}
+                              onChange={(e) => updateFilter(filter.id, { value: e.target.value })}
+                              className="w-full bg-[#1c1c1c] border border-[#2e2e2e] text-[11px] rounded-lg px-2.5 py-1.5 text-gray-200 focus:border-[#3ecf8e] outline-none transition-all"
+                            />
+                          ) : colType === 'currency' ? (
+                            <input
+                              type="number"
+                              step="any"
+                              placeholder="0.00"
+                              value={filter.value}
+                              onChange={(e) => updateFilter(filter.id, { value: e.target.value })}
+                              className="w-full bg-[#1c1c1c] border border-[#2e2e2e] text-[11px] rounded-lg px-2.5 py-1.5 text-gray-200 focus:border-[#3ecf8e] outline-none transition-all placeholder:text-gray-600"
+                            />
                           ) : (
                             <input
                               type="text"
@@ -2372,7 +2409,8 @@ function DataTable({
                           )}
                         </div>
                       </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
 

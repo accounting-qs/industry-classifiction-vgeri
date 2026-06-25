@@ -551,6 +551,17 @@ async function backgroundEnqueue(
     }
 }
 
+// Escape a free-text term for use inside a PostgREST or= ilike value.
+// Two layers: LIKE metacharacters (\ % _) so the term matches literally,
+// then PostgREST's double-quoted-value metacharacters (" and the
+// backslashes introduced by the first pass) so a stray quote/backslash
+// can't break out of the or= grammar. Wrapped by the caller as "%term%".
+function escapeSearchTerm(raw: string): string {
+    return raw
+        .replace(/([\\%_])/g, '\\$1')
+        .replace(/(["\\])/g, '\\$1');
+}
+
 /**
  * Resolves contact IDs from filters.
  * Strategy 1: Try the `resolve_enrichment_targets` RPC (runs in DB with 120s timeout, no row limits)
@@ -606,12 +617,17 @@ async function resolveFilteredContactIds(filters: any, searchQuery?: string): Pr
             .order('created_at', { ascending: true })
             .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
 
-        if (searchQuery) {
-            const q = `"%${searchQuery}%"`;
+        const trimmedSearch = searchQuery?.trim();
+        if (trimmedSearch) {
+            const q = `"%${escapeSearchTerm(trimmedSearch)}%"`;
             query = query.or(`first_name.ilike.${q},last_name.ilike.${q},email.ilike.${q},company_website.ilike.${q},company_name.ilike.${q},industry.ilike.${q},lead_list_name.ilike.${q}`);
         }
 
         for (const f of (filters || [])) {
+            // Skip incomplete scalar filters so we never send an empty string
+            // to eq/ilike/gt/lt (Postgres rejects '' on numeric/timestamp cols).
+            if (f.value === '' || f.value === null || f.value === undefined) continue;
+
             const isEnrichmentCol = enrichmentCols.includes(f.column);
             const colPath = isEnrichmentCol ? `enrichments.${f.column}` : f.column;
 

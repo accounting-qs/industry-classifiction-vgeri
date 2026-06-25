@@ -20,6 +20,40 @@ console.log('🔍 Supabase Config Check:', {
   key: DEFAULT_ANON_KEY ? 'PRESENT' : 'MISSING'
 });
 
+// Columns the global "Search contacts..." box matches. All are columns
+// on the contacts table so the search stays a single-table OR.
+// `industry` holds the AI classification for enriched contacts (the
+// enrichment pipeline writes it back to contacts.industry — see
+// jobProcessor.createResult) and the raw imported industry for
+// un-enriched contacts, so searching it covers the grid's "Industry"
+// column in both states.
+const CONTACT_SEARCH_COLUMNS = [
+  'first_name', 'last_name', 'email', 'company_website',
+  'company_name', 'industry', 'lead_list_name',
+];
+
+// Escape a free-text term for use inside a PostgREST or= ilike value.
+// Two layers: (1) LIKE metacharacters (\ % _) so the term matches
+// literally rather than as wildcards, then (2) PostgREST's
+// double-quoted-value metacharacters (" and the backslashes introduced
+// by step 1) so a stray quote/backslash can't break out of the or=
+// grammar. The result is wrapped by the caller as "%<term>%".
+function escapeSearchTerm(raw: string): string {
+  return raw
+    .replace(/([\\%_])/g, '\\$1')  // \ % _  ->  \\ \% \_   (literal in ILIKE)
+    .replace(/(["\\])/g, '\\$1');  // " \    ->  \" \\       (safe in or= value)
+}
+
+// Builds the PostgREST .or() filter string for a search term, or null
+// when the (trimmed) term is empty — so a blank/whitespace-only query is
+// a no-op instead of an everything-matches "%   %" scan.
+function buildContactSearchOr(searchQuery?: string): string | null {
+  const trimmed = searchQuery?.trim();
+  if (!trimmed) return null;
+  const q = `"%${escapeSearchTerm(trimmed)}%"`;
+  return CONTACT_SEARCH_COLUMNS.map(col => `${col}.ilike.${q}`).join(',');
+}
+
 class SupabaseService {
   private client: SupabaseClient | null = null;
   public isConnected: boolean = false;
@@ -51,14 +85,21 @@ class SupabaseService {
   }
 
   private applyFilters(query: any, filters: FilterCondition[], enrichmentCols: string[], searchQuery?: string) {
-    if (searchQuery) {
-      const q = `"%${searchQuery}%"`;
-      // Search across contacts table columns only
-      // Quoting the value (q) is necessary for PostgREST to parse values with dots or special characters
-      query = query.or(`first_name.ilike.${q},last_name.ilike.${q},email.ilike.${q},company_website.ilike.${q},company_name.ilike.${q},industry.ilike.${q},lead_list_name.ilike.${q}`);
+    // Free-text search across contacts-table columns only (single-table
+    // OR). See CONTACT_SEARCH_COLUMNS / buildContactSearchOr above for the
+    // field list, the blank-query guard, and the escaping rationale.
+    const searchOr = buildContactSearchOr(searchQuery);
+    if (searchOr) {
+      query = query.or(searchOr);
     }
 
     filters.forEach(f => {
+      // Skip incomplete scalar filters (e.g. a freshly-added cost/date/text
+      // filter whose value hasn't been typed yet) so we never send an empty
+      // string to eq/ilike/gt/lt — Postgres rejects '' on numeric/timestamp
+      // columns. Array-valued filters (status, lead_list_name) are unaffected.
+      if (f.value === '' || f.value === null || f.value === undefined) return;
+
       const isEnrichmentCol = enrichmentCols.includes(f.column);
       const colPath = isEnrichmentCol ? `enrichments.${f.column}` : f.column;
 
