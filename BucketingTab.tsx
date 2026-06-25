@@ -2748,7 +2748,9 @@ function BucketingResults({ run, bucketCounts, sectorMix, generalBreakdown, onRe
         company_name: r.contacts?.company_name,
         company_website: r.contacts?.company_website,
         lead_list_name: r.contacts?.lead_list_name,
-        classification_text: r.contacts?.industry,
+        // AI classification (enrichments.classification, raw-industry fallback)
+        // hydrated server-side — contacts.industry is now the raw imported value.
+        classification_text: r.contacts?.classification ?? r.contacts?.industry,
         // 3-layer truth schema (v5)
         primary_identity: r.primary_identity || r.bucket_ancestor || '',
         sub_identity: r.sub_identity || r.bucket_leaf || '',

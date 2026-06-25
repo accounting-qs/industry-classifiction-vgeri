@@ -21,12 +21,10 @@ console.log('🔍 Supabase Config Check:', {
 });
 
 // Columns the global "Search contacts..." box matches. All are columns
-// on the contacts table so the search stays a single-table OR.
-// `industry` holds the AI classification for enriched contacts (the
-// enrichment pipeline writes it back to contacts.industry — see
-// jobProcessor.createResult) and the raw imported industry for
-// un-enriched contacts, so searching it covers the grid's "Industry"
-// column in both states.
+// on the contacts table so the search stays a single-table OR. `industry`
+// is the RAW imported value — the enrichment pipeline no longer overwrites
+// it (the AI classification lives on enrichments.classification, reachable
+// via the dedicated "classification" filter column, not this free-text box).
 const CONTACT_SEARCH_COLUMNS = [
   'first_name', 'last_name', 'email', 'company_website',
   'company_name', 'industry', 'lead_list_name',

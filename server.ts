@@ -3044,6 +3044,7 @@ app.get('/api/bucketing/runs/:id/contacts', async (req, res) => {
 
         const ids = (assigns || []).map((r: any) => r.contact_id);
         let contactMap = new Map<string, any>();
+        const classificationMap = new Map<string, string>();
         if (ids.length > 0) {
             const { data: cs, error: cErr } = await supabase
                 .from('contacts')
@@ -3051,12 +3052,35 @@ app.get('/api/bucketing/runs/:id/contacts', async (req, res) => {
                 .in('contact_id', ids);
             if (cErr) return res.status(500).json({ error: cErr.message });
             for (const c of (cs || []) as any[]) contactMap.set(c.contact_id, c);
+
+            // Hydrate the AI classification separately. contacts.industry is now
+            // the RAW imported value (no longer overwritten by enrichment), so
+            // the per-bucket export's classification_text must come from
+            // enrichments.classification, falling back to raw industry only when
+            // a contact is unenriched. Chunk the IN-list at 200 to stay under
+            // PostgREST URL length caps (mirrors the taxonomy-contacts endpoint).
+            for (let i = 0; i < ids.length; i += 200) {
+                const slice = ids.slice(i, i + 200);
+                const { data: edata, error: eErr } = await supabase
+                    .from('enrichments')
+                    .select('contact_id,classification')
+                    .in('contact_id', slice);
+                if (eErr) return res.status(500).json({ error: eErr.message });
+                for (const e of (edata || []) as any[]) {
+                    if (e.classification) classificationMap.set(e.contact_id, e.classification);
+                }
+            }
         }
 
-        const data = (assigns || []).map((r: any) => ({
-            ...r,
-            contacts: contactMap.get(r.contact_id) || null,
-        }));
+        const data = (assigns || []).map((r: any) => {
+            const contact = contactMap.get(r.contact_id) || null;
+            return {
+                ...r,
+                contacts: contact
+                    ? { ...contact, classification: classificationMap.get(r.contact_id) ?? contact.industry ?? null }
+                    : null,
+            };
+        });
         res.json({ data, count: count || 0, page, pageSize });
     } catch (err: any) {
         res.status(500).json({ error: err.message });

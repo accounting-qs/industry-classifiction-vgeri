@@ -134,7 +134,6 @@ export async function enrichSingle(item: BatchItem): Promise<any> {
     return {
       contact_id: item.contact_id,
       classification: parsed.classification || "Unknown",
-      industry: parsed.classification || "Unknown",
       confidence: normalizeConfidence(parsed.confidence),
       reasoning: parsed.reasoning || "No reasoning provided.",
       input_tokens,
@@ -156,7 +155,6 @@ export async function enrichSingle(item: BatchItem): Promise<any> {
     return {
       contact_id: item.contact_id,
       classification: "ERROR",
-      industry: "ERROR",
       confidence: 1,
       reasoning: isAbort ? `OpenAI request timed out after ${OPENAI_TIMEOUT_MS}ms` : err.message,
       input_tokens: 0,

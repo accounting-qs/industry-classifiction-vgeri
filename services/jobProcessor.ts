@@ -853,7 +853,6 @@ export class JobProcessor {
         let jobsToUpdate: Record<string, { completed: number, failed: number }> = {};
         let itemsToUpsert: any[] = [];
         let enrichmentsToUpsert: any[] = [];
-        let contactsToUpdate: any[] = [];
 
         // Per-list delta for this chunk — drives the progress log.
         const perListDelta: Record<string, number> = {};
@@ -874,9 +873,6 @@ export class JobProcessor {
 
             if (res.enrichmentUpdate) {
                 enrichmentsToUpsert.push(res.enrichmentUpdate);
-            }
-            if (res.contactUpdate) {
-                contactsToUpdate.push(res.contactUpdate);
             }
         });
 
@@ -906,17 +902,7 @@ export class JobProcessor {
             if (itemErr) this.log(`⚠️ job_items upsert error: ${itemErr.message}`, 'error');
         }
 
-        // 2. Update Contacts
-        if (contactsToUpdate.length > 0) {
-            const deduped = dedupeBy(contactsToUpdate as any[], 'id');
-            const { error: contactErr } = await this.retrySupabaseOp(
-                'contacts upsert',
-                () => supabase.from('contacts').upsert(deduped, { onConflict: 'id' })
-            );
-            if (contactErr) this.log(`⚠️ contacts upsert error: ${contactErr.message}`, 'error');
-        }
-
-        // 3. Update Enrichments
+        // 2. Update Enrichments
         if (enrichmentsToUpsert.length > 0) {
             const deduped = dedupeBy(enrichmentsToUpsert as any[], 'contact_id');
             const { error: enrichErr } = await this.retrySupabaseOp(
@@ -999,7 +985,6 @@ export class JobProcessor {
         results.length = 0;
         itemsToUpsert.length = 0;
         enrichmentsToUpsert.length = 0;
-        contactsToUpdate.length = 0;
         pendingDigestUpserts.length = 0;
         // Null out object references so V8 can collect the backing stores
         domainCache = null as any;
@@ -1007,7 +992,6 @@ export class JobProcessor {
         jobsToUpdate = null as any;
         itemsToUpsert = null as any;
         enrichmentsToUpsert = null as any;
-        contactsToUpdate = null as any;
 
         return returnedLength;
     }
@@ -1037,13 +1021,13 @@ export class JobProcessor {
             lead_list_name: contact.lead_list_name || null,
         };
 
-        const cnt = {
-            id: contact.id, // The int8 for contacts table primary key
-            email: contact.email,
-            industry: enr.classification,
-            lead_list_name: contact.lead_list_name
-        };
-
+        // The enrichment flow no longer writes back to contacts: the AI
+        // classification lives only on enrichments.classification (read via
+        // COALESCE(enrichments.classification, contacts.industry) everywhere it
+        // is needed). contacts.industry stays the RAW imported value. The old
+        // `cnt` object's only enrichment-derived field was `industry =
+        // enr.classification`; the rest (email, lead_list_name) were unchanged,
+        // so there is nothing to upsert here anymore.
         return {
             jobId: jobItem.job_id,
             newStatus: status,
@@ -1058,7 +1042,7 @@ export class JobProcessor {
                 finished_at: new Date().toISOString(),
             },
             enrichmentUpdate: enr,
-            contactUpdate: cnt
+            contactUpdate: null
         };
     }
 
