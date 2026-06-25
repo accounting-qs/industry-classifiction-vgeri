@@ -2027,6 +2027,11 @@ function EnrichmentDashboard() {
   const bk = stats?.bucketing;
   const enrichedPct = p0 && p0.total_imported > 0 ? Math.round(((p0.enriched + p0.failed) / p0.total_imported) * 100) : 0;
   const assignedPct = bk && bk.taxonomy_finalized > 0 ? Math.round((bk.bucket_assigned / bk.taxonomy_finalized) * 100) : 0;
+  const processed = (p0?.enriched || 0) + (p0?.failed || 0);                       // finished Phase 0 (enriched + failed)
+  const awaitingEnrichment = p0?.pending || 0;                                     // imported but enrichment not yet done
+  const awaitingBucketing = Math.max(processed - (bk?.bucket_assigned || 0), 0);   // processed leads without a final bucket
+  const totalBucketed = Math.max(bk?.taxonomy_finalized || 0, bk?.bucket_assigned || 0);
+  const awaitingPct = p0 && p0.total_imported > 0 ? Math.round((awaitingEnrichment / p0.total_imported) * 100) : 0;
 
   return (
     <div className="flex-1 p-8 overflow-y-auto custom-scrollbar bg-[#1c1c1c]">
@@ -2072,6 +2077,21 @@ function EnrichmentDashboard() {
           </div>
         ) : (
           <div className="space-y-10">
+            {/* Import — pre-enrichment backlog (before Phase 0) */}
+            <section>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-xs font-bold text-gray-400 uppercase tracking-widest">Import · Pre-enrichment</h3>
+                <span className="text-[11px] font-mono text-gray-500">{awaitingPct}% awaiting</span>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <StatCard label="Total imported" value={fmt(p0?.total_imported || 0)} color="text-white" />
+                <StatCard label="Awaiting enrichment" value={fmt(awaitingEnrichment)} color="text-amber-400" />
+              </div>
+              <p className="text-[11px] text-gray-600 mt-2">
+                Imported leads still waiting for enrichment to run. Cleared leads move on to Phase 0.
+              </p>
+            </section>
+
             {/* Phase 0 — Enrichment */}
             <section>
               <div className="flex items-center justify-between mb-3">
@@ -2079,10 +2099,10 @@ function EnrichmentDashboard() {
                 <span className="text-[11px] font-mono text-gray-500">{enrichedPct}% processed</span>
               </div>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-3">
-                <StatCard label="Imported" value={fmt(p0?.total_imported || 0)} color="text-white" />
+                <StatCard label="Processed" value={fmt(processed)} color="text-white" />
                 <StatCard label="Enriched" value={fmt(p0?.enriched || 0)} color="text-[#3ecf8e]" />
                 <StatCard label="Failed" value={fmt(p0?.failed || 0)} color="text-amber-400" />
-                <StatCard label="Pending" value={fmt(p0?.pending || 0)} color="text-gray-400" />
+                <StatCard label="Awaiting bucketing" value={fmt(awaitingBucketing)} color="text-sky-400" />
               </div>
               <FunnelBar total={p0?.total_imported || 0} primary={p0?.enriched || 0} secondary={p0?.failed || 0} />
             </section>
@@ -2095,9 +2115,10 @@ function EnrichmentDashboard() {
                   {fmt(bk?.completed_run_count || 0)}/{fmt(bk?.run_count || 0)} runs completed
                 </span>
               </div>
-              <div className="grid grid-cols-2 gap-4 mb-3">
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mb-3">
                 <StatCard label="Taxonomy finalized (1a)" value={fmt(bk?.taxonomy_finalized || 0)} color="text-sky-400" />
                 <StatCard label="Buckets assigned (1b)" value={fmt(bk?.bucket_assigned || 0)} color="text-[#3ecf8e]" />
+                <StatCard label="Total bucketed" value={fmt(totalBucketed)} color="text-white" />
               </div>
               <FunnelBar total={bk?.taxonomy_finalized || 0} primary={bk?.bucket_assigned || 0} />
               <p className="text-[11px] text-gray-600 mt-2">
