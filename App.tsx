@@ -3306,7 +3306,11 @@ function CSVImportWizard({
   };
 
   const mappedFields = Object.values(mapping).filter(v => v !== '__skip__');
-  const hasRequiredField = mappedFields.includes('email') || mappedFields.includes('company_website');
+  // Email is mandatory. The server skips any contact without an email
+  // (an emailless row never enters the DB), so an import with no email
+  // column mapped would insert nothing — better to require it upfront
+  // than to let the user discover an all-skipped result after the fact.
+  const hasRequiredField = mappedFields.includes('email');
 
   const startImport = () => {
     if (!file) return;
@@ -3339,6 +3343,12 @@ function CSVImportWizard({
     const failedChunks: any[][] = [];
     const CHUNK_SIZE = 2000;
     const RETRY_CHUNK_SIZE = 500;
+    // The server caps its per-chunk failedContacts sample, but we accumulate
+    // across every chunk — so cap the running list too. The "Failed" tile and
+    // the modal subtitle read the true count from totalFailed; this only
+    // bounds the per-row detail table so a huge blank-email file can't freeze
+    // the tab rendering hundreds of thousands of rows.
+    const FAILED_SAMPLE_CAP = 1000;
 
     const sendChunk = async (chunk: any[], isRetry = false): Promise<void> => {
       try {
@@ -3385,7 +3395,9 @@ function CSVImportWizard({
             }
           }
           if (data.errors?.length) errors.push(...data.errors);
-          if (data.failedContacts?.length) allFailedContacts.push(...data.failedContacts);
+          if (data.failedContacts?.length && allFailedContacts.length < FAILED_SAMPLE_CAP) {
+            allFailedContacts.push(...data.failedContacts.slice(0, FAILED_SAMPLE_CAP - allFailedContacts.length));
+          }
         }
       } catch (err: any) {
         // Browser-level throw (network down, server crashed mid-response).
@@ -3476,10 +3488,18 @@ function CSVImportWizard({
           setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
           setImportStatus(totalFailed > 0 || errors.length > 0 ? 'error' : 'done');
 
-          // Record import list if a name was provided and contacts were imported/updated
+          // Record import list if a name was provided and the import had
+          // anything worth persisting — either contacts landed (inserted/
+          // updated) or rows were skipped as invalid. The `|| totalInvalid`
+          // arm matters for the all-emailless case: every row is rejected so
+          // totalAffected is 0, but we still want the "No email address"
+          // breakdown durably visible in the import-history dedup modal, not
+          // just in the ephemeral wizard result. (A no-op all-duplicates
+          // re-import — totalAffected 0, totalInvalid 0 — still records
+          // nothing, as before.)
           const listName = listNameOverride.trim();
           const totalAffected = totalInserted + totalUpdated;
-          if (listName && totalAffected > 0) {
+          if (listName && (totalAffected > 0 || totalInvalid > 0)) {
             try {
               await fetch('/api/import-lists', {
                 method: 'POST',
@@ -3738,7 +3758,7 @@ function CSVImportWizard({
             {!hasRequiredField && (
               <div className="flex items-center gap-3 px-4 py-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-400 text-xs font-medium">
                 <AlertCircle className="w-4 h-4 shrink-0" />
-                You must map at least <strong>email</strong> or <strong>company_website</strong> to proceed.
+                You must map the <strong>email</strong> column to proceed — contacts without an email are skipped and never imported.
               </div>
             )}
 
@@ -3971,7 +3991,10 @@ function CSVImportWizard({
             <div className="flex items-center justify-between px-6 py-4 border-b border-[#2e2e2e]">
               <div>
                 <h3 className="text-sm font-bold text-white">Failed Contacts</h3>
-                <p className="text-[10px] text-gray-500 mt-0.5">{importResult.failedContacts.length} contacts failed validation</p>
+                <p className="text-[10px] text-gray-500 mt-0.5">
+                  {importResult.failed.toLocaleString()} contacts skipped
+                  {importResult.failed > importResult.failedContacts.length && ` — showing first ${importResult.failedContacts.length.toLocaleString()}`}
+                </p>
               </div>
               <button
                 onClick={() => setShowFailedModal(false)}

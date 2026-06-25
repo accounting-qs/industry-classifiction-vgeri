@@ -966,7 +966,7 @@ app.post('/api/import', async (req, res) => {
     // Email validation: reject emails with disallowed characters
     const DISALLOWED_CHARS = /[()<>\[\]:;,\\"!#$%^&*=+{}|?~`\s]/;
     const validateEmail = (email: string): string | null => {
-        if (!email || email.trim() === '') return 'Email is empty';
+        if (!email || email.trim() === '') return 'No email address';
         const trimmed = email.trim();
         if (DISALLOWED_CHARS.test(trimmed)) {
             const bad = trimmed.match(DISALLOWED_CHARS);
@@ -980,20 +980,36 @@ app.post('/api/import', async (req, res) => {
     };
 
     try {
-        // 1. Validate emails and separate valid from invalid
+        // 1. Validate emails and separate valid from invalid.
+        // failedContacts is only a *sample* for the wizard's detail modal —
+        // capped so a file full of blank-email rows can't balloon the JSON
+        // response or freeze the browser rendering hundreds of thousands of
+        // table rows. The authoritative totals are invalidCount /
+        // invalidByReason, which count every skip regardless of the cap.
+        const FAILED_SAMPLE_CAP = 1000;
         const failedContacts: { email: string; row: number; reason: string }[] = [];
         const validContacts: any[] = [];
         const invalidByReason: Record<string, number> = {};
+        let invalidCount = 0;
 
         contacts.forEach((c: any, idx: number) => {
             const email = c.email?.trim();
-            if (email) {
-                const validationError = validateEmail(email);
-                if (validationError) {
-                    failedContacts.push({ email, row: idx + 1, reason: validationError });
-                    invalidByReason[validationError] = (invalidByReason[validationError] || 0) + 1;
-                    return; // Skip invalid
+            // Always validate — a missing/blank email is itself a skip
+            // reason, not a free pass. The old `if (email)` guard let
+            // emailless rows fall straight through into validContacts, so
+            // contacts with no email were inserted with a NULL email. NULLs
+            // don't collide on the unique-email index, so every such row
+            // became a fresh, un-dedupable contact. We now reject them like
+            // any other invalid email and report "No email address" back to
+            // the wizard's failed-contacts modal + the dedup-stats modal.
+            const validationError = validateEmail(email);
+            if (validationError) {
+                invalidCount++;
+                if (failedContacts.length < FAILED_SAMPLE_CAP) {
+                    failedContacts.push({ email: email || '(no email)', row: idx + 1, reason: validationError });
                 }
+                invalidByReason[validationError] = (invalidByReason[validationError] || 0) + 1;
+                return; // Skip — never insert an emailless contact
             }
             validContacts.push(c);
         });
@@ -1192,20 +1208,20 @@ app.post('/api/import', async (req, res) => {
         inserted = await writeAll(newContacts, 'insert');
         updated = await writeAll(updateContacts, 'upsert');
 
-        const totalFailed = failedContacts.length + dbFailed;
-        addServerLog(`📥 Import complete: ${inserted} new, ${updated} updated, ${duplicates} duplicates, ${totalFailed} failed (${failedContacts.length} invalid emails).`, 'Sync', 'info');
+        const totalFailed = invalidCount + dbFailed;
+        addServerLog(`📥 Import complete: ${inserted} new, ${updated} updated, ${duplicates} duplicates, ${totalFailed} failed (${invalidCount} invalid emails).`, 'Sync', 'info');
         res.json({
             inserted,
             updated,
             duplicates,
             failed: totalFailed,
             errors,
-            failedContacts,
+            failedContacts, // capped sample (see FAILED_SAMPLE_CAP); `invalid` carries the true total
             // Dedup-stats extras (consumed by the import-history dedup modal):
             withinFileDupes,
             crossListDupes,
             crossListBreakdown,
-            invalid: failedContacts.length,
+            invalid: invalidCount,
             invalidByReason,
         });
     } catch (err: any) {
