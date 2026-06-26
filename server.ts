@@ -1464,6 +1464,36 @@ app.get('/api/dashboard/stats', async (_req, res) => {
             console.error(`[dashboard/stats] RPC failed (code=${(error as any)?.code || 'n/a'}): ${error?.message || 'no rows'}`);
             return res.status(503).json({ error: 'dashboard stats unavailable — is 20260623_dashboard_stats_rpc.sql applied?' });
         }
+
+        // Awaiting bucketing = processed (completed+failed) contacts that live
+        // in lists which are NOT yet bucketed. A list counts as bucketed if it
+        // is used in any bucketing run OR manually flagged — the exact same
+        // rule as /api/import-lists, so this agrees with the import-history
+        // "Bucketed / Mark bucketed" badges. All three reads hit small
+        // cached/metadata tables (one row per list/run), never raw contacts.
+        let awaiting_bucketing = 0;
+        try {
+            const [statsRes, listsRes, runsRes] = await Promise.all([
+                supabase.from('list_enrichment_stats_cache').select('lead_list_name, completed_count, failed_count'),
+                supabase.from('import_lists').select('name, manually_bucketed'),
+                supabase.from('bucketing_runs').select('list_names'),
+            ]);
+            const bucketedNames = new Set<string>();
+            for (const r of (runsRes.data || []) as { list_names: string[] | null }[]) {
+                for (const n of (r.list_names || [])) bucketedNames.add(n);
+            }
+            for (const l of (listsRes.data || []) as { name: string; manually_bucketed: boolean | null }[]) {
+                if (l.manually_bucketed) bucketedNames.add(l.name);
+            }
+            for (const s of (statsRes.data || []) as { lead_list_name: string; completed_count: number; failed_count: number }[]) {
+                if (!bucketedNames.has(s.lead_list_name)) {
+                    awaiting_bucketing += (Number(s.completed_count) || 0) + (Number(s.failed_count) || 0);
+                }
+            }
+        } catch (err: any) {
+            console.warn(`[dashboard/stats] awaiting-bucketing calc failed: ${err.message}`);
+        }
+
         res.json({
             phase0: {
                 total_imported: Number(row.total_imported) || 0,
@@ -1474,6 +1504,7 @@ app.get('/api/dashboard/stats', async (_req, res) => {
             bucketing: {
                 taxonomy_finalized: Number(row.taxonomy_finalized) || 0,
                 bucket_assigned: Number(row.bucket_assigned) || 0,
+                awaiting_bucketing,
                 run_count: Number(row.run_count) || 0,
                 completed_run_count: Number(row.completed_run_count) || 0,
             },

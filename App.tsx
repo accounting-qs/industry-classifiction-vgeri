@@ -1969,18 +1969,18 @@ function SidebarIconButton({ active, onClick, icon, label, href }: any) {
 // BUCKETING TAB lives in BucketingTab.tsx — see that file for the full v2 UI
 // (3-level chain, library, generic/DQ first-class, save-to-library).
 
-function StatCard({ label, value, color }: any) {
+function StatCard({ label, value, color, size = 'lg' }: any) {
   return (
     <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-6 shadow-sm">
       <p className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-1">{label}</p>
-      <p className={`text-3xl font-bold ${color}`}>{value}</p>
+      <p className={`${size === 'sm' ? 'text-xl' : 'text-3xl'} font-bold ${color}`}>{value}</p>
     </div>
   );
 }
 
 interface DashboardStats {
   phase0: { total_imported: number; enriched: number; failed: number; pending: number };
-  bucketing: { taxonomy_finalized: number; bucket_assigned: number; run_count: number; completed_run_count: number };
+  bucketing: { taxonomy_finalized: number; bucket_assigned: number; awaiting_bucketing: number; run_count: number; completed_run_count: number };
 }
 
 // Two-segment horizontal progress bar (done = green, secondary = amber)
@@ -2029,7 +2029,7 @@ function EnrichmentDashboard() {
   const assignedPct = bk && bk.taxonomy_finalized > 0 ? Math.round((bk.bucket_assigned / bk.taxonomy_finalized) * 100) : 0;
   const processed = (p0?.enriched || 0) + (p0?.failed || 0);                       // finished Phase 0 (enriched + failed)
   const awaitingEnrichment = p0?.pending || 0;                                     // imported but enrichment not yet done
-  const awaitingBucketing = Math.max(processed - (bk?.bucket_assigned || 0), 0);   // processed leads without a final bucket
+  const awaitingBucketing = bk?.awaiting_bucketing || 0;                           // processed leads in lists not yet bucketed
   const totalBucketed = Math.max(bk?.taxonomy_finalized || 0, bk?.bucket_assigned || 0);
   const awaitingPct = p0 && p0.total_imported > 0 ? Math.round((awaitingEnrichment / p0.total_imported) * 100) : 0;
 
@@ -2084,7 +2084,7 @@ function EnrichmentDashboard() {
                 <span className="text-[11px] font-mono text-gray-500">{awaitingPct}% awaiting</span>
               </div>
               <div className="grid grid-cols-2 gap-4">
-                <StatCard label="Total imported" value={fmt(p0?.total_imported || 0)} color="text-white" />
+                <StatCard label="Total imported" value={fmt(p0?.total_imported || 0)} color="text-white" size="sm" />
                 <StatCard label="Awaiting enrichment" value={fmt(awaitingEnrichment)} color="text-amber-400" />
               </div>
               <p className="text-[11px] text-gray-600 mt-2">
@@ -2099,9 +2099,9 @@ function EnrichmentDashboard() {
                 <span className="text-[11px] font-mono text-gray-500">{enrichedPct}% processed</span>
               </div>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-3">
-                <StatCard label="Processed" value={fmt(processed)} color="text-white" />
-                <StatCard label="Enriched" value={fmt(p0?.enriched || 0)} color="text-[#3ecf8e]" />
-                <StatCard label="Failed" value={fmt(p0?.failed || 0)} color="text-amber-400" />
+                <StatCard label="Processed" value={fmt(processed)} color="text-white" size="sm" />
+                <StatCard label="Enriched" value={fmt(p0?.enriched || 0)} color="text-[#3ecf8e]" size="sm" />
+                <StatCard label="Failed" value={fmt(p0?.failed || 0)} color="text-amber-400" size="sm" />
                 <StatCard label="Awaiting bucketing" value={fmt(awaitingBucketing)} color="text-sky-400" />
               </div>
               <FunnelBar total={p0?.total_imported || 0} primary={p0?.enriched || 0} secondary={p0?.failed || 0} />
@@ -2116,9 +2116,9 @@ function EnrichmentDashboard() {
                 </span>
               </div>
               <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mb-3">
-                <StatCard label="Taxonomy finalized (1a)" value={fmt(bk?.taxonomy_finalized || 0)} color="text-sky-400" />
-                <StatCard label="Buckets assigned (1b)" value={fmt(bk?.bucket_assigned || 0)} color="text-[#3ecf8e]" />
                 <StatCard label="Total bucketed" value={fmt(totalBucketed)} color="text-white" />
+                <StatCard label="Taxonomy finalized (1a)" value={fmt(bk?.taxonomy_finalized || 0)} color="text-sky-400" size="sm" />
+                <StatCard label="Buckets assigned (1b)" value={fmt(bk?.bucket_assigned || 0)} color="text-[#3ecf8e]" size="sm" />
               </div>
               <FunnelBar total={bk?.taxonomy_finalized || 0} primary={bk?.bucket_assigned || 0} />
               <p className="text-[11px] text-gray-600 mt-2">
