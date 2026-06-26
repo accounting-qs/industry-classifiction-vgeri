@@ -2084,8 +2084,8 @@ function EnrichmentDashboard() {
                 <span className="text-[11px] font-mono text-gray-500">{awaitingPct}% awaiting</span>
               </div>
               <div className="grid grid-cols-2 gap-4">
-                <StatCard label="Total imported" value={fmt(p0?.total_imported || 0)} color="text-white" size="sm" />
                 <StatCard label="Awaiting enrichment" value={fmt(awaitingEnrichment)} color="text-amber-400" />
+                <StatCard label="Total imported" value={fmt(p0?.total_imported || 0)} color="text-white" size="sm" />
               </div>
               <p className="text-[11px] text-gray-600 mt-2">
                 Imported leads still waiting for enrichment to run. Cleared leads move on to Phase 0.
@@ -2099,10 +2099,10 @@ function EnrichmentDashboard() {
                 <span className="text-[11px] font-mono text-gray-500">{enrichedPct}% processed</span>
               </div>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-3">
+                <StatCard label="Awaiting bucketing" value={fmt(awaitingBucketing)} color="text-sky-400" />
                 <StatCard label="Processed" value={fmt(processed)} color="text-white" size="sm" />
                 <StatCard label="Enriched" value={fmt(p0?.enriched || 0)} color="text-[#3ecf8e]" size="sm" />
                 <StatCard label="Failed" value={fmt(p0?.failed || 0)} color="text-amber-400" size="sm" />
-                <StatCard label="Awaiting bucketing" value={fmt(awaitingBucketing)} color="text-sky-400" />
               </div>
               <FunnelBar total={p0?.total_imported || 0} primary={p0?.enriched || 0} secondary={p0?.failed || 0} />
             </section>
