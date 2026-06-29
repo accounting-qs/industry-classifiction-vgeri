@@ -1462,7 +1462,10 @@ app.get('/api/dashboard/stats', async (_req, res) => {
         const row = Array.isArray(data) ? data[0] : data;
         if (error || !row) {
             console.error(`[dashboard/stats] RPC failed (code=${(error as any)?.code || 'n/a'}): ${error?.message || 'no rows'}`);
-            return res.status(503).json({ error: 'dashboard stats unavailable — is 20260623_dashboard_stats_rpc.sql applied?' });
+            const msg = (error as any)?.code === '57014'
+                ? 'dashboard stats timed out — the bucket distinct-count is too slow (check the contact_id indexes from 20260626_bucket_contact_id_indexes.sql)'
+                : 'dashboard stats unavailable — is 20260623_dashboard_stats_rpc.sql applied?';
+            return res.status(503).json({ error: msg });
         }
 
         // Awaiting bucketing = processed (completed+failed) contacts that live
