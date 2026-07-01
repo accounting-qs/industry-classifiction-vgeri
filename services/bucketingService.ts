@@ -1850,21 +1850,24 @@ export async function finalizeTaxonomyAgainstLibrary(
     const libSectors = new Set(snapshot.sectors.map(s => s.name));
     const dqIdentities = new Set(snapshot.identities.filter(i => i.is_disqualified).map(i => i.name));
 
-    // Single keyset scan of the run's Phase 1a map. OFFSET pagination
-    // (.range) degrades to O(n²) — each page re-scans the whole 300k-row
-    // partition with random heap I/O — and on a large run it blew past the
-    // REST statement_timeout ("canceling statement due to statement timeout"
-    // at offset 10000). Keyset by industry_string (the PK's second column)
-    // walks the partition once via the PK index, so every page is 1000
-    // sequential rows regardless of run size.
+    // Single set-based read of the run's Phase 1a map via the
+    // finalize_taxonomy_candidates RPC. The prior approach keyset-paginated
+    // the partition over PostgREST (~1 request per 1000 rows); every REST
+    // request runs under the calling role's ~8s statement_timeout, so on a
+    // large run (200k+ industry strings → 200+ page requests) the odds that
+    // ANY page trips that cap under load approach 1 — observed as
+    // "bucket_industry_map scan failed after N candidates: canceling statement
+    // due to statement timeout" mid-scan. The RPC does the whole read in one
+    // server-side statement with statement_timeout raised to 600s (same
+    // pattern as finalize_per_contact_taxonomy), so run size no longer matters.
     //
-    // We read ALL rows once and partition in JS instead of filtering on the
-    // unindexed is_new_* booleans:
+    // It returns the same two things the old JS scan produced:
     //   • candidates = source='llm_phase1a' rows with any is_new_* flag —
     //                  these get the keep/null pass below.
-    //   • everything else keeps its taxonomy through finalize, so we fold it
-    //     straight into the used-taxonomy accumulators that re-synthesize
-    //     taxonomy_proposal — replacing the old second full-table re-fetch.
+    //   • the distinct taxonomy that non-candidate rows keep through finalize,
+    //     pre-aggregated so we can seed the used-taxonomy accumulators that
+    //     re-synthesize taxonomy_proposal. Candidate rows fold in their
+    //     POST-finalize values in the keep/null loop, exactly as before.
     const usedIdentitySet = new Set<string>();
     const usedCharByKey = new Map<string, { spec: string; identity: string; description: string }>();
     const usedSectors = new Set<string>();
@@ -1882,28 +1885,25 @@ export async function finalizeTaxonomyAgainstLibrary(
 
     const candidates: any[] = [];
     {
-        const PAGE = 1000;
-        let lastKey: string | null = null;
-        for (;;) {
-            let q = supabase
-                .from('bucket_industry_map')
-                .select('industry_string,primary_identity,sub_identity,sector,is_new_identity,is_new_sub_identity,is_new_sector,is_disqualified,source,raw_industry')
-                .eq('bucketing_run_id', runId);
-            if (lastKey !== null) q = q.gt('industry_string', lastKey);
-            const { data, error } = await q.order('industry_string', { ascending: true }).limit(PAGE);
-            if (error) throw new Error(`bucket_industry_map scan failed after ${candidates.length} candidates: ${error.message}`);
-            const rows = (data || []) as any[];
-            for (const r of rows) {
-                if (r.source === 'llm_phase1a' && (r.is_new_identity || r.is_new_sub_identity || r.is_new_sector)) {
-                    candidates.push(r);
-                } else {
-                    // Untouched by finalize → its current taxonomy is final.
-                    addUsed(r.primary_identity, r.sub_identity, r.sector);
-                }
-            }
-            if (rows.length < PAGE) break;
-            lastKey = rows[rows.length - 1].industry_string;
-        }
+        const { data, error } = await supabase.rpc('finalize_taxonomy_candidates', { p_run_id: runId });
+        if (error) throw new Error(`finalize_taxonomy_candidates scan failed: ${error.message}`);
+        const payload = (data || {}) as {
+            candidates?: any[];
+            used_identities?: string[];
+            used_sub_pairs?: { identity: string; sub: string }[];
+            used_sectors?: string[];
+        };
+        // Seed the used-taxonomy accumulators from the non-candidate rows the
+        // RPC already aggregated (these keep their taxonomy through finalize).
+        // Splitting into per-axis addUsed() calls reproduces exactly what the
+        // old per-row addUsed(identity, sub, sector) scan built.
+        for (const id of payload.used_identities || []) addUsed(id, null, null);
+        for (const p of payload.used_sub_pairs || []) addUsed(p.identity, p.sub, null);
+        for (const s of payload.used_sectors || []) addUsed(null, null, s);
+        // Orphan rows still carrying a not-yet-accepted proposed tag — the
+        // keep/null pass below folds their post-finalize taxonomy into the
+        // accumulators, matching the old scan's candidate handling.
+        for (const r of payload.candidates || []) candidates.push(r);
     }
     ctx.log(`[Finalize ${runId}] ${candidates.length} orphan row(s) — keeping accepted proposals, routing rejected ones to General (library: ${snapshot.identities.length} identities / ${snapshot.sub_identities.length} sub-identities / ${snapshot.sectors.length} sectors)`);
 
