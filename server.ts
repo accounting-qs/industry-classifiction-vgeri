@@ -413,6 +413,17 @@ async function backgroundEnqueue(
     }
     addServerLog(`📦 Starting queue insertion for ${totalToEnrich.toLocaleString()} records...`, 'Pipeline', 'phase');
 
+    // Denormalize the list name onto the job row so the per-list run
+    // controls (pause/continue/cancel) can target this job directly.
+    // Every enqueue is single-list (the list-modal button sends exactly one
+    // lead_list_name via the `in` filter); a multi-list or raw-contactIds
+    // enqueue leaves this null and simply opts out of per-list controls.
+    const leadListFilter = (filters || []).find((f: any) => f.column === 'lead_list_name' && f.operator === 'in');
+    const jobLeadListName: string | null =
+        leadListFilter && Array.isArray(leadListFilter.value) && leadListFilter.value.length === 1
+            ? leadListFilter.value[0]
+            : null;
+
     let jobId: string | null = null;
     try {
         // Step 2: Create a new job in status='pending'. The worker's
@@ -429,7 +440,8 @@ async function backgroundEnqueue(
             () => supabase.from('jobs').insert({
                 status: 'pending',
                 total_items: totalToEnrich,
-                started_at: new Date().toISOString()
+                started_at: new Date().toISOString(),
+                lead_list_name: jobLeadListName
             }).select('id').single()
         );
 
@@ -796,6 +808,97 @@ app.post('/api/resume', async (req, res) => {
         console.error('Resume error:', err);
         addServerLog(`❌ Resume failed: ${err.message}`, 'Pipeline', 'error');
         res.status(500).json({ error: err.message });
+    }
+});
+
+// Per-list run controls: pause / continue / cancel a single list's
+// enrichment run. The global /api/stop|reset|resume act on the whole
+// pipeline; these are scoped to one lead_list_name via jobs.lead_list_name
+// (set at enqueue time). See 20260713_list_run_controls.sql for the model.
+app.post('/api/enrich/control', async (req, res) => {
+    const { listName, action } = req.body || {};
+    if (!listName || typeof listName !== 'string') {
+        return res.status(400).json({ error: 'listName is required' });
+    }
+    if (!['pause', 'continue', 'cancel'].includes(action)) {
+        return res.status(400).json({ error: "action must be 'pause', 'continue', or 'cancel'" });
+    }
+
+    // Fire-and-forget targeted stats recompute so the row's badge/counts
+    // flip promptly without waiting for the next poll cycle.
+    const refreshStats = () => {
+        Promise.resolve(supabase.rpc('request_list_stats_refresh', { p_lists: [listName] }))
+            .then(({ error }: { error: any }) => {
+                if (error) console.warn(`[enrich/control] stats refresh failed: ${error.message}`);
+            })
+            .catch(() => { /* poll-driven refresh is the backstop */ });
+    };
+
+    try {
+        if (action === 'pause') {
+            // Park the list's active job. The FIFO walker only claims
+            // 'processing' jobs and list_jobs_with_open_items() only returns
+            // pending/cancelled/completed jobs — so a 'paused' job is skipped
+            // by both claim paths with no worker change. Its job_items stay
+            // 'pending', ready for continue. Other queued lists keep running.
+            const { data, error } = await supabase.from('jobs')
+                .update({ status: 'paused' })
+                .eq('lead_list_name', listName)
+                .eq('status', 'processing')
+                .select('id');
+            if (error) throw error;
+            addServerLog(`⏸ Paused enrichment for list "${listName}" (${data?.length || 0} job(s)).`, 'Pipeline', 'warn');
+            refreshStats();
+            return res.json({ message: `Paused "${listName}"`, paused_jobs: data?.length || 0 });
+        }
+
+        if (action === 'continue') {
+            const { data, error } = await supabase.from('jobs')
+                .update({ status: 'processing' })
+                .eq('lead_list_name', listName)
+                .eq('status', 'paused')
+                .select('id');
+            if (error) throw error;
+            // Ensure the worker is up to drain the resumed (still-pending)
+            // items — the un-enriched contacts that were queued at pause time.
+            jobStats.isProcessing = true;
+            await persistPipelineState();
+            JobProcessor.start();
+            addServerLog(`▶️ Continuing enrichment for list "${listName}" (${data?.length || 0} job(s)).`, 'Pipeline', 'phase');
+            refreshStats();
+            return res.json({ message: `Continuing "${listName}"`, resumed_jobs: data?.length || 0 });
+        }
+
+        // action === 'cancel'
+        // Delete the list's OPEN job_items first (mirrors /api/reset) so the
+        // orphan-rescue path can't resurrect the job, then mark the job(s)
+        // cancelled — that cancelled row is the persistent signal the UI uses
+        // to offer "Re-Run enrichment". Completed/failed items + their
+        // enrichments are left untouched.
+        const { count: openBefore } = await supabase.from('job_items')
+            .select('*', { count: 'exact', head: true })
+            .eq('lead_list_name', listName)
+            .in('status', ['pending', 'retrying', 'processing']);
+
+        const { error: delErr } = await supabase.from('job_items')
+            .delete()
+            .eq('lead_list_name', listName)
+            .in('status', ['pending', 'retrying', 'processing']);
+        if (delErr) throw delErr;
+
+        const { error: cancelErr } = await supabase.from('jobs')
+            .update({ status: 'cancelled' })
+            .eq('lead_list_name', listName)
+            .in('status', ['processing', 'paused', 'pending']);
+        if (cancelErr) throw cancelErr;
+
+        addServerLog(`🚫 Cancelled enrichment for list "${listName}" — ${(openBefore || 0).toLocaleString()} queued item(s) cleared. Completed rows kept.`, 'Pipeline', 'phase');
+        refreshStats();
+        return res.json({ message: `Cancelled "${listName}"`, cleared: openBefore || 0 });
+    } catch (err: any) {
+        console.error(`[enrich/control:${action}] error:`, err);
+        addServerLog(`❌ ${action} failed for "${listName}": ${err.message}`, 'Pipeline', 'error');
+        return res.status(500).json({ error: err.message });
     }
 });
 
@@ -1390,10 +1493,11 @@ app.get('/api/import-lists/stats', async (_req, res) => {
         // Per-list enrichment-queue state. With multi-list FIFO, more
         // than one list can have job_items pending at the same time —
         // exactly one runs, the rest sit queued behind it.
-        const queueByList = new Map<string, 'running' | 'queued'>();
+        const queueByList = new Map<string, 'running' | 'queued' | 'paused' | 'cancelled'>();
         if (!queueRes.error && Array.isArray(queueRes.data)) {
             for (const r of queueRes.data as Array<{ lead_list_name: string; queue_state: string }>) {
-                if (r.queue_state === 'running' || r.queue_state === 'queued') {
+                if (r.queue_state === 'running' || r.queue_state === 'queued' ||
+                    r.queue_state === 'paused' || r.queue_state === 'cancelled') {
                     queueByList.set(r.lead_list_name, r.queue_state);
                 }
             }

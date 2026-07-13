@@ -64,6 +64,10 @@ const HEARTBEAT_MS = parseInt(process.env.HEARTBEAT_MS || '60000', 10);
 export class JobProcessor {
     private static isRunning = false;
     private static shouldStop = false;
+    // Set once when a contact fails with OpenAI `insufficient_quota` so we
+    // auto-pause instead of thrashing retries through every remaining item.
+    // Cleared on start() (the operator restored billing and hit Resume).
+    private static quotaHalted = false;
     // Fix #1: Batched log buffer — avoids fire-and-forget promises per log call
     private static pendingLogs: { timestamp: string; instance_id: string; module: string; message: string; level: string }[] = [];
     private static heartbeatTimer: NodeJS.Timeout | null = null;
@@ -227,6 +231,7 @@ export class JobProcessor {
         if (this.isRunning) return;
         this.isRunning = true;
         this.shouldStop = false;
+        this.quotaHalted = false;
         // Fresh run → fresh per-list tallies. Baseline is queried lazily
         // the first time we see items from each list.
         this.listProgress.clear();
@@ -296,6 +301,19 @@ export class JobProcessor {
     public static stop() {
         this.log('🛑 Stop signal received. JobProcessor will halt after current chunk.', 'warn');
         this.shouldStop = true;
+    }
+
+    /**
+     * Called when a contact fails with OpenAI `insufficient_quota`. Halts the
+     * loop once (guarded) so a dead billing account doesn't burn retries
+     * through the whole queue. Remaining items stay 'pending', so once the
+     * operator restores credits a Resume/Continue picks up where it left off.
+     */
+    public static haltForQuota() {
+        if (this.quotaHalted) return;
+        this.quotaHalted = true;
+        this.log('🚫 OpenAI quota exhausted (insufficient_quota) — auto-pausing the pipeline to stop burning retries. Add credits / raise the limit at platform.openai.com, then Resume.', 'error');
+        this.stop();
     }
 
     /**
@@ -829,6 +847,12 @@ export class JobProcessor {
                     // proxyUsed is 'Cache' when digest came from digestCache; otherwise it's the winning proxy name.
                     const source = proxyUsed === 'Cache' ? 'digest_cache' : proxyUsed;
                     return this.createResult(jobItem, true, 'completed', aiOutput.reasoning, aiOutput, digest, aiOutput.cost, source);
+                } else if (aiOutput.error_category === 'openai_quota') {
+                    // Dead OpenAI account — not retryable. Fail this item and
+                    // halt the loop so the queue stops churning. The operator
+                    // fixes billing, then Continue/Resume drains the rest.
+                    this.haltForQuota();
+                    return this.createResult(jobItem, false, 'failed', 'OpenAI quota exhausted (insufficient_quota) — enrichment auto-paused; fix billing then Resume.', undefined, undefined, 0, 'error:quota');
                 } else {
                     // Treat OpenAI 5xx / timeout as transient — don't burn a retry slot as fast.
                     const isTransient = aiOutput.error_category === 'openai_5xx' || aiOutput.error_category === 'openai_timeout';

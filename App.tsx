@@ -75,6 +75,8 @@ import {
   Monitor,
   PieChart,
   LayoutDashboard,
+  Pause,
+  Ban,
 } from 'lucide-react';
 
 /**
@@ -195,7 +197,7 @@ export default function App() {
   const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
   const [activeListFilter, setActiveListFilter] = useState<string | null>(null);
   const [contactsLoading, setContactsLoading] = useState(false);
-  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | null }[]>([]);
+  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null }[]>([]);
   const [listStatsSource, setListStatsSource] = useState<'rpc' | 'fallback'>('rpc');
   const [importListsLoading, setImportListsLoading] = useState(true);
   // Tracks the lazy /api/import-lists/stats fetch independently of the
@@ -320,7 +322,7 @@ export default function App() {
           // coin flip, DONE/Resume buttons included. The raw value is
           // only used before the first stats response (old === undefined).
           setImportLists(prev => {
-            const prevByName: Record<string, { contact_count?: number; enriched_count?: number; failed_count?: number; queue_state?: 'running' | 'queued' | null }> = {};
+            const prevByName: Record<string, { contact_count?: number; enriched_count?: number; failed_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null }> = {};
             for (const p of prev) prevByName[p.name] = p;
             return lists.map((l: any) => {
               const old = prevByName[l.name];
@@ -349,13 +351,13 @@ export default function App() {
       .then(res => res.ok ? res.json() : Promise.reject(new Error(`stats ${res.status}`)))
       .then(data => {
         if (!isCurrent() || !data || !Array.isArray(data.stats)) return;
-        const byName = new Map<string, { completed: number; failed: number; total: number; queue_state: 'running' | 'queued' | null }>();
+        const byName = new Map<string, { completed: number; failed: number; total: number; queue_state: 'running' | 'queued' | 'paused' | 'cancelled' | null }>();
         for (const row of data.stats) {
           byName.set(row.lead_list_name, {
             completed: row.completed,
             failed: row.failed,
             total: row.total,
-            queue_state: row.queue_state === 'running' || row.queue_state === 'queued' ? row.queue_state : null,
+            queue_state: (['running', 'queued', 'paused', 'cancelled'] as const).includes(row.queue_state as any) ? (row.queue_state as 'running' | 'queued' | 'paused' | 'cancelled') : null,
           });
         }
         setImportLists(prev => prev.map(l => {
@@ -745,6 +747,35 @@ export default function App() {
     }
   };
 
+  // Per-list run controls — pause / continue / cancel a single list's run.
+  //   pause    → parks the list's job; Continue resumes only the un-enriched
+  //              contacts that were still queued.
+  //   continue → un-parks and drains the remaining queued items.
+  //   cancel   → clears the list's queued items (keeps completed/failed);
+  //              the row then offers a full "Re-Run enrichment".
+  const controlList = async (name: string, action: 'pause' | 'continue' | 'cancel') => {
+    const verb = action === 'pause' ? 'Pausing' : action === 'continue' ? 'Continuing' : 'Cancelling';
+    addLog(`⏯️ ${verb} enrichment for list "${name}"...`);
+    try {
+      const res = await fetch('/api/enrich/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ listName: name, action }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        addLog(`❌ ${action} error: ${body.error || res.status}`);
+        return;
+      }
+      addLog(`✅ ${body.message || `${action} ok`}`);
+      // Refresh immediately so the row's badge/buttons reflect the new state
+      // without waiting for the next 5s auto-poll cycle.
+      refreshLists();
+    } catch (e: any) {
+      addLog(`❌ ${action} error: ${e.message}`);
+    }
+  };
+
   const refreshExportJobs = useCallback(async () => {
     try {
       const res = await fetch('/api/export-jobs');
@@ -868,6 +899,7 @@ export default function App() {
                 activeListFilter={activeListFilter}
                 onOpenList={(name) => { setActiveListFilter(name); navigate('/contacts'); }}
                 onEnrichList={enrichList}
+                onControlList={controlList}
                 onStartExport={startExportList}
                 onClearExport={clearExportJob}
                 onRefreshLists={refreshLists}
@@ -990,6 +1022,7 @@ export default function App() {
           onClose={() => setShowListModal(false)}
           onOpenList={openList}
           onEnrichList={enrichList}
+          onControlList={controlList}
           onStartExport={startExportList}
           onClearExport={clearExportJob}
           onRenameList={renameImportList}
@@ -1238,6 +1271,7 @@ function ImportedListsTable({
   deleteJobs,
   onOpenList,
   onEnrichList,
+  onControlList,
   onStartExport,
   onClearExport,
   onRenameList,
@@ -1247,7 +1281,7 @@ function ImportedListsTable({
   onGoToImport,
   showAllListsRow = true,
 }: {
-  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | null }[];
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null }[];
   loading: boolean;
   statsLoading?: boolean;
   statsSource: 'rpc' | 'fallback';
@@ -1256,6 +1290,7 @@ function ImportedListsTable({
   deleteJobs?: DeleteJob[];
   onOpenList: (name: string | null) => void;
   onEnrichList: (name: string, contactCount: number, mode?: 'resume' | 'reenrich') => void;
+  onControlList: (name: string, action: 'pause' | 'continue' | 'cancel') => void;
   onStartExport: (name: string) => void;
   onClearExport: (jobId: string) => void;
   onRenameList?: (oldName: string, newName: string) => void;
@@ -1486,6 +1521,22 @@ function ImportedListsTable({
                               <Zap className="w-2.5 h-2.5" /> Queued
                             </span>
                           )}
+                          {l.queue_state === 'paused' && (
+                            <span
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/40"
+                              title="Paused — this run is parked. Continue resumes the remaining un-enriched contacts."
+                            >
+                              <Pause className="w-2.5 h-2.5" /> Paused
+                            </span>
+                          )}
+                          {l.queue_state === 'cancelled' && (
+                            <span
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-red-500/15 text-red-400 border border-red-500/40"
+                              title="Cancelled — the queued items were cleared (completed rows kept). Re-Run to enrich the whole list again."
+                            >
+                              <Ban className="w-2.5 h-2.5" /> Cancelled
+                            </span>
+                          )}
                           {l.bucketed && (
                             <span
                               className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-[#3ecf8e]/15 text-[#3ecf8e] border border-[#3ecf8e]/30"
@@ -1617,61 +1668,95 @@ function ImportedListsTable({
                             </button>
                           )}
                           {(() => {
-                            // Three-state button computed per row:
-                            //  - never run (0 done):       "Enrich"    → resume-mode (status='new')
-                            //  - partial (0 < done < total): "Resume"  → resume-mode
-                            //  - fully done (done==total):  "Re-enrich" → full re-run
-                            // Enrich and Resume call the same code path
-                            // (status='new' filter); the only thing that
-                            // changes is the label. Re-enrich drops the
-                            // status filter so already-completed contacts
-                            // get re-classified too.
+                            // Per-list run-state machine over queue_state
+                            // (from get_list_enrichment_queue_state):
+                            //   running / queued → Pause + Cancel
+                            //   paused           → Continue + Cancel
+                            //   cancelled        → Re-Run enrichment (all)
+                            //   null (idle)      → Enrich / Resume / Re-enrich
                             //
-                            // Gating: if the queue-state RPC reports this
-                            // list as 'running' or 'queued', the button is
-                            // disabled — a second click would either be a
-                            // no-op (resolve filter deduplicates against
-                            // open job_items) or hit the partial UNIQUE
-                            // index. Visible feedback beats either failure
-                            // mode.
+                            // Semantics: Pause parks the run; Continue resumes
+                            // only the remaining un-enriched contacts. Cancel
+                            // clears the queued items (keeps completed/failed);
+                            // Re-Run re-queues every contact in the list.
+                            const qs = l.queue_state;
                             const total = l.contact_count || 0;
                             const done = (l.enriched_count || 0) + (l.failed_count || 0);
+
+                            const ctrlBtn = 'px-2 py-1 rounded-md text-[10px] font-bold flex items-center gap-1 whitespace-nowrap transition-colors border';
+                            const pauseCls = `${ctrlBtn} bg-[#1c1c1c] border-[#2e2e2e] text-amber-300 hover:border-amber-400/50 hover:text-amber-200`;
+                            const cancelCls = `${ctrlBtn} bg-[#1c1c1c] border-[#2e2e2e] text-red-400 hover:border-red-500/50 hover:text-red-300`;
+                            const goCls = `${ctrlBtn} border-transparent bg-[#3ecf8e] text-black hover:bg-[#2fb37a]`;
+
+                            const cancelBtn = (
+                              <button
+                                onClick={e => { e.stopPropagation(); onControlList(l.name, 'cancel'); }}
+                                className={cancelCls}
+                                title="Cancel this run — clears the queued items (keeps completed rows). You can then Re-Run the whole list."
+                              >
+                                <Ban className="w-3 h-3 shrink-0" /> Cancel
+                              </button>
+                            );
+
+                            if (qs === 'running' || qs === 'queued') {
+                              return (
+                                <>
+                                  <button
+                                    onClick={e => { e.stopPropagation(); onControlList(l.name, 'pause'); }}
+                                    className={pauseCls}
+                                    title="Pause this run — stops after in-flight items; Continue resumes the remaining un-enriched contacts."
+                                  >
+                                    <Pause className="w-3 h-3 shrink-0" /> Pause
+                                  </button>
+                                  {cancelBtn}
+                                </>
+                              );
+                            }
+
+                            if (qs === 'paused') {
+                              return (
+                                <>
+                                  <button
+                                    onClick={e => { e.stopPropagation(); onControlList(l.name, 'continue'); }}
+                                    className={goCls}
+                                    title="Continue — resume enrichment for the remaining un-enriched contacts."
+                                  >
+                                    <Play className="w-3 h-3 shrink-0" /> Continue
+                                  </button>
+                                  {cancelBtn}
+                                </>
+                              );
+                            }
+
+                            if (qs === 'cancelled') {
+                              return (
+                                <button
+                                  onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count, 'reenrich'); }}
+                                  className={goCls}
+                                  title="Re-Run enrichment for every contact in this list (all contacts — enriched, failed, and un-enriched)."
+                                >
+                                  <RefreshCw className="w-3 h-3 shrink-0" /> Re-Run enrichment
+                                </button>
+                              );
+                            }
+
+                            // Idle — the original three-state button.
                             const allDone = total > 0 && done >= total;
                             const fresh = done === 0;
                             const mode: 'resume' | 'reenrich' = allDone ? 'reenrich' : 'resume';
-                            const inQueue = l.queue_state === 'running' || l.queue_state === 'queued';
-                            const baseLabel = allDone ? 'Re-enrich' : fresh ? 'Enrich' : 'Resume';
-                            const label = inQueue
-                              ? (l.queue_state === 'running' ? 'Enriching…' : 'Queued')
-                              : baseLabel;
-                            const title = inQueue
-                              ? (l.queue_state === 'running'
-                                  ? 'This list is currently being enriched — wait for it to finish before clicking again.'
-                                  : 'This list is queued behind another active list. It will start when the current list completes.')
-                              : allDone
-                                ? 'Re-enrich every contact in this list (re-runs classification on already-done rows)'
-                                : fresh
-                                  ? 'Enrich all contacts in this list'
-                                  : 'Resume — only contacts without an enrichment row will be queued';
+                            const label = allDone ? 'Re-enrich' : fresh ? 'Enrich' : 'Resume';
+                            const title = allDone
+                              ? 'Re-enrich every contact in this list (re-runs classification on already-done rows)'
+                              : fresh
+                                ? 'Enrich all contacts in this list'
+                                : 'Resume — only contacts without an enrichment row will be queued';
                             return (
                               <button
-                                onClick={e => {
-                                  e.stopPropagation();
-                                  if (inQueue) return;
-                                  onEnrichList(l.name, l.contact_count, mode);
-                                }}
-                                disabled={inQueue}
-                                className={`px-2 py-1 rounded-md text-[10px] font-bold flex items-center gap-1 whitespace-nowrap transition-colors ${
-                                  inQueue
-                                    ? 'bg-[#1c1c1c] border border-[#2e2e2e] text-gray-500 cursor-not-allowed'
-                                    : 'bg-[#3ecf8e] text-black hover:bg-[#2fb37a]'
-                                }`}
+                                onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count, mode); }}
+                                className={goCls}
                                 title={title}
                               >
-                                {inQueue && l.queue_state === 'running'
-                                  ? <Loader2 className="w-3 h-3 shrink-0 animate-spin" />
-                                  : <Zap className="w-3 h-3 shrink-0" />}
-                                {label}
+                                <Zap className="w-3 h-3 shrink-0" /> {label}
                               </button>
                             );
                           })()}
@@ -1717,6 +1802,7 @@ function ListSelectorModal({
   onClose,
   onOpenList,
   onEnrichList,
+  onControlList,
   onStartExport,
   onClearExport,
   onRenameList,
@@ -1725,7 +1811,7 @@ function ListSelectorModal({
   onSetListBucketed,
   onGoToImport,
 }: {
-  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | null }[];
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null }[];
   loading: boolean;
   statsLoading?: boolean;
   statsSource: 'rpc' | 'fallback';
@@ -1735,6 +1821,7 @@ function ListSelectorModal({
   onClose: () => void;
   onOpenList: (name: string | null) => void;
   onEnrichList: (name: string, contactCount: number, mode?: 'resume' | 'reenrich') => void;
+  onControlList: (name: string, action: 'pause' | 'continue' | 'cancel') => void;
   onStartExport: (name: string) => void;
   onClearExport: (jobId: string) => void;
   onRenameList?: (oldName: string, newName: string) => void;
@@ -1770,6 +1857,7 @@ function ListSelectorModal({
             deleteJobs={deleteJobs}
             onOpenList={onOpenList}
             onEnrichList={onEnrichList}
+            onControlList={onControlList}
             onStartExport={onStartExport}
             onClearExport={onClearExport}
             onRenameList={onRenameList}
@@ -3196,6 +3284,7 @@ function CSVImportWizard({
   activeListFilter,
   onOpenList,
   onEnrichList,
+  onControlList,
   onStartExport,
   onClearExport,
   onRefreshLists,
@@ -3214,6 +3303,7 @@ function CSVImportWizard({
   activeListFilter: string | null;
   onOpenList: (name: string | null) => void;
   onEnrichList: (name: string, contactCount: number, mode?: 'resume' | 'reenrich') => void;
+  onControlList: (name: string, action: 'pause' | 'continue' | 'cancel') => void;
   onStartExport: (name: string) => void;
   onClearExport: (jobId: string) => void;
   onRefreshLists: () => void;
@@ -3993,6 +4083,7 @@ function CSVImportWizard({
             deleteJobs={deleteJobs}
             onOpenList={onOpenList}
             onEnrichList={onEnrichList}
+            onControlList={onControlList}
             onStartExport={onStartExport}
             onClearExport={onClearExport}
             onRenameList={onRenameList}

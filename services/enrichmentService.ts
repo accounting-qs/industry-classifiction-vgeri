@@ -145,8 +145,16 @@ export async function enrichSingle(item: BatchItem): Promise<any> {
     console.error(`Enrichment failed for ${item.contact_id}:`, err);
     const isAbort = err?.name === 'AbortError' || /aborted/i.test(err?.message || '');
     const httpStatus: number | undefined = err?.http_status;
-    let errorCategory: 'openai_5xx' | 'openai_4xx' | 'openai_timeout' | 'parse_error' | 'unknown';
+    // A 429 with `insufficient_quota` is a hard billing state, NOT a transient
+    // rate-limit — the account is out of credits. Categorize it separately so
+    // the job processor can fail fast and auto-pause instead of thrashing 3
+    // retries through every remaining contact (which is what happens when a
+    // whole run hits a dead OpenAI account).
+    const isQuota = httpStatus === 429 &&
+        /insufficient_quota|exceeded your current quota|check your plan and billing/i.test(err?.message || '');
+    let errorCategory: 'openai_quota' | 'openai_5xx' | 'openai_4xx' | 'openai_timeout' | 'parse_error' | 'unknown';
     if (isAbort) errorCategory = 'openai_timeout';
+    else if (isQuota) errorCategory = 'openai_quota';
     else if (httpStatus && httpStatus >= 500) errorCategory = 'openai_5xx';
     else if (httpStatus && httpStatus >= 400) errorCategory = 'openai_4xx';
     else if (/JSON|parse|No model output/i.test(err?.message || '')) errorCategory = 'parse_error';
