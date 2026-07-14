@@ -3272,6 +3272,13 @@ const CONTACTS_FIELDS = [
   { key: 'industry', label: 'industry', description: 'Industry vertical' },
   { key: 'linkedin_url', label: 'linkedin_url', description: 'LinkedIn profile URL' },
   { key: 'title', label: 'title', description: 'Job title' },
+  { key: 'seniority', label: 'seniority', description: 'Seniority' },
+  { key: 'contact_country', label: 'contact_country', description: 'Contact country' },
+  { key: 'employees_count', label: 'employees_count', description: 'Company employees count' },
+  { key: 'company_founded_year', label: 'company_founded_year', description: 'Company founded year (funded year)' },
+  { key: 'company_total_funding', label: 'company_total_funding', description: 'Company total funding (raw)' },
+  { key: 'company_annual_revenue', label: 'company_annual_revenue', description: 'Company annual revenue (raw)' },
+  { key: 'company_country', label: 'company_country', description: 'Company country' },
 ];
 
 function CSVImportWizard({
@@ -3324,6 +3331,7 @@ function CSVImportWizard({
   const [importResult, setImportResult] = useState<{ inserted: number; updated: number; duplicates: number; failed: number; errors: string[]; failedContacts: { email: string; row: number; reason: string }[] }>({ inserted: 0, updated: 0, duplicates: 0, failed: 0, errors: [], failedContacts: [] });
   const [dragOver, setDragOver] = useState(false);
   const [showFailedModal, setShowFailedModal] = useState(false);
+  const [showMappingWarning, setShowMappingWarning] = useState(false);
   const [listNameOverride, setListNameOverride] = useState('');
   const [overwriteDuplicates, setOverwriteDuplicates] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -3340,6 +3348,13 @@ function CSVImportWizard({
       linkedin_url: ['linkedin_url', 'linkedin', 'linkedin_profile', 'li_url'],
       title: ['title', 'job_title', 'jobtitle', 'position', 'role'],
       lead_list_name: ['lead_list_name', 'lead_list', 'list_name', 'list', 'source'],
+      seniority: ['seniority', 'seniority_level'],
+      contact_country: ['contact_country', 'country'],
+      employees_count: ['employees_count', 'employee_count', 'num_employees', 'headcount', 'company_size'],
+      company_founded_year: ['company_founded_year', 'founded_year', 'funded_year', 'founded', 'year_founded'],
+      company_total_funding: ['company_total_funding', 'total_funding'],
+      company_annual_revenue: ['company_annual_revenue', 'annual_revenue', 'revenue'],
+      company_country: ['company_country'],
     };
 
     const result: Record<string, string> = {};
@@ -3422,6 +3437,27 @@ function CSVImportWizard({
   // column mapped would insert nothing — better to require it upfront
   // than to let the user discover an all-skipped result after the fact.
   const hasRequiredField = mappedFields.includes('email');
+
+  // Optional-but-recommended fields the user hasn't mapped. email is
+  // excluded (it's the hard requirement, gated separately). lead_list_name
+  // counts as provided when the user typed a list-name override, so we
+  // don't nag about a column they're supplying by hand. Purely a
+  // confirmation prompt — the user can proceed regardless.
+  const unmappedFields = CONTACTS_FIELDS.filter(f =>
+    f.key !== 'email' &&
+    !mappedFields.includes(f.key) &&
+    !(f.key === 'lead_list_name' && listNameOverride.trim())
+  );
+
+  // Intercept "Start Import": if any recommended field is unmapped, show
+  // the confirmation modal first; otherwise go straight to importing.
+  const handleStartClick = () => {
+    if (unmappedFields.length > 0) {
+      setShowMappingWarning(true);
+    } else {
+      startImport();
+    }
+  };
 
   const startImport = () => {
     if (!file) return;
@@ -3911,7 +3947,7 @@ function CSVImportWizard({
                 <ArrowLeft className="w-3.5 h-3.5" /> Back
               </button>
               <button
-                onClick={startImport}
+                onClick={handleStartClick}
                 disabled={!hasRequiredField}
                 className={`flex items-center gap-2 px-6 py-2.5 rounded-lg text-xs font-bold transition-all ${hasRequiredField
                   ? 'bg-[#3ecf8e] text-black hover:bg-[#2fb37a] shadow-lg shadow-[#3ecf8e]/20'
@@ -4096,6 +4132,54 @@ function CSVImportWizard({
       </div>
 
       {/* Failed Contacts Modal */}
+      {showMappingWarning && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowMappingWarning(false)}>
+          <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-md flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>
+            {/* Modal Header */}
+            <div className="flex items-start gap-3 px-6 py-4 border-b border-[#2e2e2e]">
+              <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+              <div>
+                <h3 className="text-sm font-bold text-white">Some fields aren't mapped</h3>
+                <p className="text-[11px] text-gray-500 mt-0.5">
+                  You didn't map these columns. Import will still run — the fields just stay empty. Want to go back and map them?
+                </p>
+              </div>
+            </div>
+
+            {/* Modal Body — the unmapped field list */}
+            <div className="px-6 py-4 max-h-[40vh] overflow-y-auto custom-scrollbar">
+              <div className="flex flex-wrap gap-2">
+                {unmappedFields.map(f => (
+                  <span
+                    key={f.key}
+                    title={f.description}
+                    className="px-2.5 py-1 bg-[#1c1c1c] border border-[#2e2e2e] rounded-lg text-[11px] font-mono text-amber-300"
+                  >
+                    {f.label}
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-6 py-3 border-t border-[#2e2e2e] flex justify-end gap-2">
+              <button
+                onClick={() => setShowMappingWarning(false)}
+                className="px-4 py-2 bg-[#2e2e2e] text-gray-300 rounded-lg text-xs font-bold hover:bg-[#3e3e3e] transition-colors"
+              >
+                Go back &amp; map
+              </button>
+              <button
+                onClick={() => { setShowMappingWarning(false); startImport(); }}
+                className="px-4 py-2 bg-[#3ecf8e] text-black rounded-lg text-xs font-bold hover:bg-[#2fb37a] transition-colors"
+              >
+                Import anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showFailedModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowFailedModal(false)}>
           <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-2xl max-h-[80vh] flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>

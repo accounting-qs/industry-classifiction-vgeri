@@ -1196,6 +1196,15 @@ app.post('/api/import', async (req, res) => {
             if (c.linkedin_url) row.linkedin_url = c.linkedin_url;
             if (c.title) row.title = c.title;
             if (c.lead_list_name) row.lead_list_name = c.lead_list_name;
+            // Apollo firmographic passthrough fields (all TEXT). Empty
+            // cells are dropped so they stay NULL rather than "".
+            if (c.contact_country) row.contact_country = c.contact_country;
+            if (c.employees_count) row.employees_count = c.employees_count;
+            if (c.seniority) row.seniority = c.seniority;
+            if (c.company_founded_year) row.company_founded_year = c.company_founded_year;
+            if (c.company_total_funding) row.company_total_funding = c.company_total_funding;
+            if (c.company_annual_revenue) row.company_annual_revenue = c.company_annual_revenue;
+            if (c.company_country) row.company_country = c.company_country;
             return row;
         };
 
