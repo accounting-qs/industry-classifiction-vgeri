@@ -4222,25 +4222,30 @@ app.post('/api/bucketing/taxonomy/:kind', async (req, res) => {
         if (runId) {
             const layer = TAXONOMY_LAYER_COLS[kind];
             const fromName = String(body.original_name || name).trim();
-            const update: Record<string, any> = { [layer.col]: name, [layer.flag]: false };
-            // Sub-identity rename/re-parent: rewrite primary_identity too so
-            // the (identity, sub_identity) pair stays consistent. For pure
-            // identity / sector accepts the parent column on the row is
-            // unrelated and we leave it alone.
-            if (kind === 'sub_identities' && parentIdentity) {
-                update.primary_identity = parentIdentity;
-            }
-            const { data: rewrittenRows, error: rewriteErr } = await supabase
-                .from('bucket_industry_map')
-                .update(update)
-                .eq('bucketing_run_id', runId)
-                .eq(layer.col, fromName)
-                .eq(layer.flag, true)
-                .select('industry_string');
+            // Server-side, timeout-hardened rewrite. Done in the RPC (not a
+            // PostgREST `UPDATE ... .select()`) because at volume the row set
+            // is the whole run partition and the caller-role statement_timeout
+            // cancels the update mid-flight — the library row would commit but
+            // the run rewrite fail ("library row saved but run rewrite
+            // failed: canceling statement due to statement timeout"). Sub-
+            // identity accept also rewrites primary_identity so the
+            // (identity, sub_identity) pair stays consistent; identity/sector
+            // accepts leave the parent column alone (p_set_parent = null).
+            const { data: rewrittenCount, error: rewriteErr } = await supabase.rpc('rewrite_proposed_tag', {
+                p_run_id: runId,
+                p_match_col: layer.col,
+                p_match_name: fromName,
+                p_match_flag: layer.flag,
+                p_set_col: layer.col,
+                p_set_name: name,
+                p_set_flag: layer.flag,
+                p_also_clear_flag: null,
+                p_set_parent: kind === 'sub_identities' && parentIdentity ? parentIdentity : null,
+            });
             if (rewriteErr) {
                 return res.status(400).json({ error: `library row saved but run rewrite failed: ${rewriteErr.message}` });
             }
-            rewritten = (rewrittenRows || []).length;
+            rewritten = Number(rewrittenCount) || 0;
         }
         res.json({ ...data, rewritten });
     } catch (err: any) {
@@ -4340,28 +4345,32 @@ app.post('/api/bucketing/runs/:runId/proposed-tags/:layer/remap', async (req, re
         // also rewrites primary_identity so the parent stays consistent
         // with the chosen sub. Cross-layer also clears the source layer's
         // is_new_* flag so the proposal stops surfacing for re-action.
-        const update: Record<string, any> = {
-            [targetLayer.col]: toName,
-            [targetLayer.flag]: false
-        };
-        if (crossLayer) {
-            update[fromLayer.flag] = false;
-        }
+        const alsoClearFlag = crossLayer ? fromLayer.flag : null;
+        let setParent: string | null = null;
         if (toLayerKey === 'sub_identities') {
             const targetParent = requestedParent || String(libRow.parent_identity || '').trim();
             if (!targetParent) return res.status(400).json({ error: 'to_parent missing and library entry has no parent_identity' });
-            update.primary_identity = targetParent;
+            setParent = targetParent;
         }
 
-        const { data, error } = await supabase
-            .from('bucket_industry_map')
-            .update(update)
-            .eq('bucketing_run_id', req.params.runId)
-            .eq(fromLayer.col, fromName)
-            .eq(fromLayer.flag, true)
-            .select('industry_string');
+        // Server-side, timeout-hardened rewrite — see rewrite_proposed_tag /
+        // migration 20260715. Matches on the from-layer (col + flag), writes
+        // the to-layer, and for cross-layer routes clears the from-layer flag
+        // too. Was a PostgREST `UPDATE ... .select()` that cancelled on the
+        // caller-role statement_timeout at volume.
+        const { data: rewrittenCount, error } = await supabase.rpc('rewrite_proposed_tag', {
+            p_run_id: req.params.runId,
+            p_match_col: fromLayer.col,
+            p_match_name: fromName,
+            p_match_flag: fromLayer.flag,
+            p_set_col: targetLayer.col,
+            p_set_name: toName,
+            p_set_flag: targetLayer.flag,
+            p_also_clear_flag: alsoClearFlag,
+            p_set_parent: setParent,
+        });
         if (error) return res.status(400).json({ error: error.message });
-        res.json({ ok: true, rewritten: (data || []).length, to_name: toName, to_layer: toLayerKey });
+        res.json({ ok: true, rewritten: Number(rewrittenCount) || 0, to_name: toName, to_layer: toLayerKey });
     } catch (err: any) {
         res.status(400).json({ error: err.message });
     }
