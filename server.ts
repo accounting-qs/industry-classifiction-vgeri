@@ -9,13 +9,14 @@ import fs from 'fs';
 import fsp from 'fs/promises';
 import crypto from 'crypto';
 import zlib from 'zlib';
-import { Transform } from 'node:stream';
+import { Transform, Readable } from 'node:stream';
 import { pipeline as streamPipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'url';
+import Papa from 'papaparse';
 import { createClient } from '@supabase/supabase-js';
 import { Pool, type PoolClient } from 'pg';
 import pgCopyStreams from 'pg-copy-streams';
-const { to: copyTo } = pgCopyStreams;
+const { to: copyTo, from: copyFrom } = pgCopyStreams;
 import { db } from './services/supabaseClient';
 import { JobProcessor } from './services/jobProcessor';
 import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, recalculateTaxonomyWithLibrary, finalizeTaxonomyAgainstLibrary, runBucketAssignment, BucketingCancelledError, debugTagSingleIndustry, suggestProposalRoutings, loadRunProposals } from './services/bucketingService';
@@ -3552,12 +3553,21 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts.csv', async (req, res) => {
 // local-disk pattern needs neither).
 const CSV_FILES_DIR = path.join(EXPORTS_DIR, 'bucketing-csv');
 
-// Only one CSV export runs at a time. The streaming COPY query pins one
-// Postgres backend for the duration (~30 s on a 150k-row run) and the
-// instance is a 2-CPU / 2-GB Small; two concurrent exports would compete
-// with each other and with any live Phase 1b. POST handler returns 429
-// when busy; the worker's finally clears the flag.
-const exportLock = { busy: false };
+// Only one streaming COPY runs at a time, process-wide. A COPY pins one
+// Postgres backend for its whole duration and getPgPool() is capped at
+// max:2, so concurrent COPYs would starve each other and compete with
+// any live Phase 1b.
+//
+// Shared by BOTH directions: bucketing CSV *exports* (COPY TO STDOUT,
+// runCsvExportJob) and contact *imports* (COPY FROM STDIN,
+// runContactImportJob). They must share one slot rather than hold two
+// independent locks — an export and an import running together would
+// consume the entire pool and deadlock anything else needing pg.
+//
+// `holder` is purely for the 429 message, so a caller told "busy" knows
+// which side is busy. Handlers return 429 when taken; each worker's
+// finally releases it.
+const copySlot = { busy: false, holder: null as string | null };
 
 async function ensureCsvFilesDir() {
     await fsp.mkdir(CSV_FILES_DIR, { recursive: true });
@@ -3685,7 +3695,8 @@ async function runCsvExportJob(jobId: string, runId: string): Promise<void> {
         if (client && !clientReleased) {
             try { client.release(new Error('csv export aborted')); } catch { /* already released */ }
         }
-        exportLock.busy = false;
+        copySlot.busy = false;
+        copySlot.holder = null;
     }
 }
 
@@ -3871,8 +3882,12 @@ watchdogStuckRuns().catch(() => {});
 app.post('/api/bucketing/runs/:id/csv-jobs', async (req, res) => {
     const id = req.params.id;
     try {
-        if (exportLock.busy) {
-            return res.status(429).json({ error: 'Another export is in progress, retry in a minute' });
+        if (copySlot.busy) {
+            return res.status(429).json({
+                error: copySlot.holder === 'import'
+                    ? 'A contact import is streaming right now — retry when it finishes'
+                    : 'Another export is in progress, retry in a minute'
+            });
         }
         const { data: run, error: rErr } = await supabase
             .from('bucketing_runs').select('id,status').eq('id', id).single();
@@ -3892,7 +3907,8 @@ app.post('/api/bucketing/runs/:id/csv-jobs', async (req, res) => {
             .select('*').single();
         if (jErr || !job) return res.status(500).json({ error: jErr?.message || 'Failed to create job' });
 
-        exportLock.busy = true;
+        copySlot.busy = true;
+        copySlot.holder = 'export';
         runCsvExportJob(job.id, id).catch(err => {
             console.error(`[CSV-job ${job.id}] uncaught:`, err);
         });
@@ -3971,6 +3987,807 @@ app.get('/api/bucketing/runs/:id/csv-jobs', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+// ════════════════════════════════════════════════════════════════════
+// STORAGE-BACKED CONTACT IMPORT
+//
+// Replaces the browser-driven import (Papa.parse in the tab → 2000-row
+// JSON chunks → POST /api/import). That path had no parser backpressure
+// (every un-sent chunk stayed alive in the tab), issued 170–4,900
+// sequential POSTs for a large file, and died with the tab — a refresh
+// lost everything.
+//
+// Flow:
+//   1. POST /api/import-jobs            → job row + signed upload URL
+//   2. browser PUTs the file directly  → 'contact-imports' bucket
+//      (bytes never touch this server — a 1 GB upload costs the Render
+//      instance nothing, and no credential is exposed to the client)
+//   3. POST /api/import-jobs/:id/uploaded → range-read 256 KB for header
+//                                           + preview; job parks here
+//   4. POST /api/import-jobs/:id/start  → mapping captured, worker runs
+//   5. GET  /api/import-jobs/:id        → poll progress
+//
+// After step 2 the file is durable, so mapping and ingest survive a tab
+// crash. Ingest never parses CSV in Node — the bytes go straight into a
+// TEMP table via COPY FROM STDIN (Postgres does the parsing at C speed)
+// and a single SQL merge moves them into contacts. Constant memory,
+// independent of file size.
+// ════════════════════════════════════════════════════════════════════
+
+const IMPORT_BUCKET = 'contact-imports';
+// Enough to capture the header row + a handful of data rows on any
+// realistic CSV (a 47-column Apollo row is ~3 KB). We never read more
+// than this for preview — the whole point is not to pull a gigabyte.
+const IMPORT_PREVIEW_BYTES = 256 * 1024;
+// Rows per merge statement. Each batch is its own transaction, so a
+// 10M-row import doesn't hold one transaction open for hours. Safe to
+// re-run: the merge is ON CONFLICT-idempotent.
+const IMPORT_MERGE_BATCH = 100_000;
+
+// Columns on public.contacts that an import may write. Doubles as the
+// injection allowlist — a mapping value not in this set is rejected
+// before any SQL is built.
+const IMPORT_TARGET_COLUMNS = [
+    'email', 'first_name', 'last_name', 'company_website', 'company_name',
+    'industry', 'linkedin_url', 'title', 'lead_list_name', 'contact_country',
+    'employees_count', 'seniority', 'company_founded_year',
+    'company_total_funding', 'company_annual_revenue', 'company_country',
+] as const;
+type ImportTargetColumn = typeof IMPORT_TARGET_COLUMNS[number];
+
+// Mirrors validateEmail() in POST /api/import exactly — same five
+// reasons, same order, so the dedup-stats modal keeps rendering the
+// identical breakdown regardless of which path did the import.
+// Verified against the JS implementation on real inputs.
+// %E% is substituted with the email column expression. An explicit
+// placeholder rather than a word-boundary regex — the character class
+// below contains letters, and a stray substitution inside it would
+// silently corrupt the validation rather than fail loudly.
+const IMPORT_EMAIL_REASON_SQL = `
+    CASE
+        WHEN %E% IS NULL OR btrim(%E%) = '' THEN 'No email address'
+        WHEN btrim(%E%) ~ '[()<>\\[\\]:;,\\\\"!#$%^&*=+{}|?~\`[:space:]]' THEN 'Contains invalid character'
+        WHEN position('@' in btrim(%E%)) = 0 THEN 'Missing @ symbol'
+        WHEN split_part(btrim(%E%), '@', 1) = '' THEN 'Missing local part before @'
+        WHEN position('.' in split_part(btrim(%E%), '@', 2)) = 0 THEN 'Invalid domain (missing dot)'
+        ELSE NULL
+    END`;
+
+async function updateImportJob(jobId: string, patch: Record<string, any>) {
+    const { error } = await supabase.from('contact_import_jobs').update(patch).eq('id', jobId);
+    if (error) console.warn(`[import-job ${jobId}] status update failed: ${error.message}`);
+}
+
+// Every object in the import bucket, paginated. Storage's list() caps at
+// 1000 per call and silently truncates — a single capped page would make
+// the orphan sweep quietly stop cleaning once a backlog built up, which
+// is exactly the failure mode the sweep exists to prevent.
+async function listAllImportObjects(): Promise<{ name: string; created_at?: string; metadata?: any }[]> {
+    const out: any[] = [];
+    const PAGE = 1000;
+    for (let offset = 0; ; offset += PAGE) {
+        const { data, error } = await supabase.storage
+            .from(IMPORT_BUCKET).list('', { limit: PAGE, offset });
+        if (error) throw new Error(error.message);
+        const page = data || [];
+        out.push(...page);
+        if (page.length < PAGE) break;
+    }
+    return out;
+}
+
+// Range-read the head of an uploaded object and pull out the header row
+// + up to 5 preview rows. Returns the object's true total size from the
+// Content-Range header so we never trust a client-supplied size.
+async function readImportHead(objectPath: string): Promise<{
+    headers: string[]; previewRows: Record<string, string>[]; totalBytes: number;
+}> {
+    const { data: signed, error } = await supabase.storage
+        .from(IMPORT_BUCKET).createSignedUrl(objectPath, 300);
+    if (error || !signed?.signedUrl) {
+        throw new Error(`Uploaded file not found in storage: ${error?.message || 'no signed URL'}`);
+    }
+    const resp = await fetch(signed.signedUrl, {
+        headers: { Range: `bytes=0-${IMPORT_PREVIEW_BYTES - 1}` }
+    });
+    if (!resp.ok && resp.status !== 206) {
+        throw new Error(`Could not read uploaded file (HTTP ${resp.status})`);
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+
+    // bytes 0-262143/987654 → 987654. A 200 (file smaller than the
+    // range) means what we hold IS the whole file.
+    let totalBytes = buf.length;
+    const cr = resp.headers.get('content-range');
+    const m = cr && /\/(\d+)\s*$/.exec(cr);
+    if (m) totalBytes = Number(m[1]);
+
+    let text = buf.toString('utf8');
+    // Drop the trailing partial row — unless we grabbed the entire file,
+    // in which case the last line is genuinely complete.
+    if (totalBytes > buf.length) {
+        const cut = text.lastIndexOf('\n');
+        if (cut > 0) text = text.slice(0, cut);
+    }
+
+    const parsed = Papa.parse<Record<string, string>>(text, {
+        header: true, skipEmptyLines: true, preview: 5
+    });
+    const headers = (parsed.meta.fields || []).filter(h => h !== undefined && h !== null);
+    if (headers.length === 0) throw new Error('No column headers found — is this a CSV?');
+
+    return { headers, previewRows: parsed.data.slice(0, 5), totalBytes };
+}
+
+// ── Routes ──────────────────────────────────────────────────────────
+
+// 1. Create a job + mint a signed upload token. The browser uploads
+//    straight to Storage with this — the bytes never touch this server,
+//    so a 1 GB file costs the Render instance nothing.
+app.post('/api/import-jobs', async (req, res) => {
+    try {
+        const { filename } = req.body || {};
+        const { data: job, error } = await supabase
+            .from('contact_import_jobs')
+            .insert({ status: 'awaiting_upload', filename: filename || 'upload.csv' })
+            .select('*').single();
+        if (error || !job) return res.status(500).json({ error: error?.message || 'Could not create job' });
+
+        // Object key is derived solely from the job id — never from the
+        // user-supplied filename, so there is no path-traversal surface.
+        const objectPath = `${job.id}.csv`;
+        const { data: signed, error: sErr } = await supabase.storage
+            .from(IMPORT_BUCKET).createSignedUploadUrl(objectPath, { upsert: true });
+        if (sErr || !signed) {
+            await supabase.from('contact_import_jobs').delete().eq('id', job.id);
+            return res.status(500).json({
+                error: `Could not create upload URL: ${sErr?.message || 'unknown'}. Is the 'contact-imports' bucket present and is SUPABASE_SERVICE_ROLE_KEY set?`
+            });
+        }
+        await updateImportJob(job.id, { storage_path: objectPath });
+
+        res.status(201).json({
+            job: { ...job, storage_path: objectPath },
+            upload: {
+                bucket: IMPORT_BUCKET,
+                objectName: objectPath,
+                // A signed upload URL authorises by itself — verified that a
+                // bare PUT with NO apikey and NO Authorization header
+                // succeeds, and that Storage does not consult RLS on this
+                // path. That is what lets the bucket keep service_role-only
+                // policies while the browser still uploads directly: no
+                // credential of any kind is handed to the client.
+                //
+                // (Resumable/TUS was tried first and rejected — this
+                // project's storage version answers "Invalid Compact JWS" to
+                // a signed upload token on /upload/resumable, and the only
+                // way to make TUS work was to grant anon INSERT on the
+                // bucket, which is exactly the posture we moved away from.
+                // Standard uploads are documented to 5 GB, well past the
+                // 1 GB target. Trade-off: an interrupted upload restarts
+                // rather than resumes — see uploadToStorage() in App.tsx,
+                // which retries the whole PUT twice.)
+                url: signed.signedUrl,
+                token: signed.token,
+                // Token TTL is 2 h — plenty for a 1 GB transfer, but the UI
+                // should surface a clear "link expired, re-select the file"
+                // rather than hanging if someone leaves the tab overnight.
+                expiresInSeconds: 7200,
+            }
+        });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 2. Upload finished — confirm the object landed, snapshot headers +
+//    preview. The job parks in 'uploaded' until the user finishes
+//    mapping; a tab crash between here and /start loses nothing.
+app.post('/api/import-jobs/:id/uploaded', async (req, res) => {
+    const jobId = req.params.id;
+    try {
+        const { data: job, error } = await supabase
+            .from('contact_import_jobs').select('*').eq('id', jobId).single();
+        if (error || !job) return res.status(404).json({ error: error?.message || 'Job not found' });
+
+        const { headers, previewRows, totalBytes } = await readImportHead(job.storage_path);
+        await updateImportJob(jobId, {
+            status: 'uploaded',
+            csv_headers: headers,
+            preview_rows: previewRows,
+            file_size_bytes: totalBytes,
+        });
+        res.json({ job: { ...job, status: 'uploaded', file_size_bytes: totalBytes }, headers, previewRows });
+    } catch (err: any) {
+        await updateImportJob(jobId, { status: 'failed', error_message: String(err.message || err).slice(0, 1000) });
+        res.status(400).json({ error: err.message });
+    }
+});
+
+// 3. Mapping captured → queue the ingest. Returns immediately; the
+//    worker runs detached and the UI polls GET /api/import-jobs/:id.
+app.post('/api/import-jobs/:id/start', async (req, res) => {
+    const jobId = req.params.id;
+    try {
+        const { mapping, listName, overwriteDuplicates } = req.body || {};
+        if (!mapping || typeof mapping !== 'object') {
+            return res.status(400).json({ error: 'mapping is required' });
+        }
+        const { data: job, error } = await supabase
+            .from('contact_import_jobs').select('*').eq('id', jobId).single();
+        if (error || !job) return res.status(404).json({ error: error?.message || 'Job not found' });
+        if (job.status !== 'uploaded' && job.status !== 'failed') {
+            return res.status(409).json({ error: `Job is ${job.status}, cannot start` });
+        }
+
+        // Validate every target against the allowlist before it can reach
+        // SQL generation, and require email — the merge keys on it, so a
+        // mapping without it would insert nothing.
+        const targets = new Set<string>();
+        for (const [header, target] of Object.entries(mapping as Record<string, string>)) {
+            if (!target || target === '__skip__') continue;
+            if (!(IMPORT_TARGET_COLUMNS as readonly string[]).includes(target)) {
+                return res.status(400).json({ error: `Unknown target column: ${target}` });
+            }
+            if (!(job.csv_headers || []).includes(header)) {
+                return res.status(400).json({ error: `Mapped header not present in file: ${header}` });
+            }
+            if (targets.has(target)) {
+                return res.status(400).json({ error: `Two columns are mapped to ${target}` });
+            }
+            targets.add(target);
+        }
+        if (!targets.has('email')) {
+            return res.status(400).json({ error: 'An email column must be mapped' });
+        }
+        if (!targets.has('lead_list_name') && !String(listName || '').trim()) {
+            return res.status(400).json({ error: 'Provide a list name, or map a lead_list_name column' });
+        }
+
+        await updateImportJob(jobId, {
+            status: 'queued',
+            mapping,
+            list_name: String(listName || '').trim() || null,
+            overwrite_duplicates: !!overwriteDuplicates,
+            error_message: null,
+            progress_bytes: 0, progress_rows: 0,
+            inserted_count: 0, updated_count: 0, duplicate_count: 0,
+            within_file_dupes: 0, cross_list_dupes: 0, invalid_count: 0,
+        });
+        drainImportQueue();
+        res.status(202).json({ queued: true });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 4. Poll.
+app.get('/api/import-jobs/:id', async (req, res) => {
+    try {
+        const { data: job, error } = await supabase
+            .from('contact_import_jobs').select('*').eq('id', req.params.id).single();
+        if (error || !job) return res.status(404).json({ error: error?.message || 'Job not found' });
+        res.json({ job });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 5. Recent jobs — lets the wizard offer "you have a file uploaded and
+//    waiting for mapping" after a refresh, which is the whole point of
+//    staging in Storage.
+app.get('/api/import-jobs', async (_req, res) => {
+    try {
+        const { data: jobs, error } = await supabase
+            .from('contact_import_jobs').select('*')
+            .order('created_at', { ascending: false }).limit(20);
+        if (error) return res.status(500).json({ error: error.message });
+        res.json({ jobs: jobs || [] });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 6. Discard — drops the staged object and the row. Refused while the
+//    merge is live so we never delete bytes out from under a COPY.
+app.delete('/api/import-jobs/:id', async (req, res) => {
+    try {
+        const { data: job } = await supabase
+            .from('contact_import_jobs').select('id,status,storage_path').eq('id', req.params.id).single();
+        if (!job) return res.status(404).json({ error: 'Job not found' });
+        if (job.status === 'running') return res.status(409).json({ error: 'Import is running — wait for it to finish' });
+        if (job.storage_path) {
+            await supabase.storage.from(IMPORT_BUCKET).remove([job.storage_path]).catch(() => {});
+        }
+        await supabase.from('contact_import_jobs').delete().eq('id', job.id);
+        res.json({ deleted: true });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 7. What is actually sitting in the bucket right now. Deliberately
+//    reads Storage rather than the job table — the job table is what we
+//    *think* is staged, and the whole point is to surface any drift.
+//    Path is not under /api/import-jobs/... because that would collide
+//    with the :id route above.
+app.get('/api/import-storage/usage', async (_req, res) => {
+    try {
+        const objects = await listAllImportObjects();
+        const bytes = objects.reduce((n, o) => n + Number(o?.metadata?.size || 0), 0);
+        const { data: rows } = await supabase
+            .from('contact_import_jobs').select('status');
+        const byStatus: Record<string, number> = {};
+        for (const r of (rows || []) as any[]) byStatus[r.status] = (byStatus[r.status] || 0) + 1;
+        res.json({
+            objects: objects.length,
+            bytes,
+            mb: +(bytes / 1024 / 1024).toFixed(1),
+            jobsByStatus: byStatus,
+        });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 8. Manual purge — drops every staged object and its job row except a
+//    live import. Same escape hatch the CSV-export side has: lets space
+//    be reclaimed immediately instead of waiting for the 24 h TTL.
+//    Sweeps by *bucket contents*, so it also catches orphans.
+app.post('/api/import-storage/purge', async (_req, res) => {
+    try {
+        const { data: running } = await supabase
+            .from('contact_import_jobs').select('storage_path')
+            .in('status', ['running', 'queued']).not('storage_path', 'is', null);
+        const keep = new Set((running || []).map((r: any) => r.storage_path));
+
+        const objects = await listAllImportObjects();
+        const doomed = objects.map(o => o.name).filter(n => !keep.has(n));
+        for (let i = 0; i < doomed.length; i += 100) {
+            await supabase.storage.from(IMPORT_BUCKET).remove(doomed.slice(i, i + 100));
+        }
+        const { count } = await supabase
+            .from('contact_import_jobs').delete({ count: 'exact' })
+            .not('status', 'in', '("running","queued")');
+
+        console.log(`[import-purge] removed ${doomed.length} object(s), ${count || 0} job row(s)`);
+        res.json({ objectsDeleted: doomed.length, jobsDeleted: count || 0, kept: keep.size });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Queue drain ─────────────────────────────────────────────────────
+// Only one import runs at a time (it shares copySlot with exports), so
+// queued jobs wait their turn. Called after /start, after each job
+// finishes, and on the cleanup tick so a queued job can never be
+// stranded by a server restart.
+let importDraining = false;
+function drainImportQueue() {
+    if (importDraining || copySlot.busy) return;
+    importDraining = true;
+    (async () => {
+        try {
+            const { data: next } = await supabase
+                .from('contact_import_jobs').select('id')
+                .eq('status', 'queued')
+                .order('created_at', { ascending: true }).limit(1);
+            const job = (next || [])[0];
+            if (!job) return;
+            if (copySlot.busy) return;
+            copySlot.busy = true;
+            copySlot.holder = 'import';
+            runContactImportJob(job.id)
+                .catch(err => console.error(`[import-job ${job.id}] uncaught:`, err))
+                .finally(() => { drainImportQueue(); });
+        } finally {
+            importDraining = false;
+        }
+    })();
+}
+
+// ── Worker ──────────────────────────────────────────────────────────
+async function runContactImportJob(jobId: string): Promise<void> {
+    let client: PoolClient | null = null;
+    let clientReleased = false;
+    let objectPath: string | null = null;
+    let succeeded = false;
+
+    try {
+        const { data: job, error } = await supabase
+            .from('contact_import_jobs').select('*').eq('id', jobId).single();
+        if (error || !job) throw new Error(error?.message || 'Job not found');
+        objectPath = job.storage_path;
+
+        const headers: string[] = job.csv_headers || [];
+        const mapping: Record<string, string> = job.mapping || {};
+        if (headers.length === 0) throw new Error('Job has no header snapshot — re-upload the file');
+
+        // header name → target column, resolved to positional indexes.
+        // Positions (not names) become the TEMP table's columns, so odd
+        // header text — spaces, quotes, duplicates, unicode — can never
+        // reach an SQL identifier.
+        const colFor = new Map<ImportTargetColumn, number>();
+        for (const [header, target] of Object.entries(mapping)) {
+            if (!target || target === '__skip__') continue;
+            if (!(IMPORT_TARGET_COLUMNS as readonly string[]).includes(target)) continue;
+            const idx = headers.indexOf(header);
+            if (idx >= 0) colFor.set(target as ImportTargetColumn, idx);
+        }
+        if (!colFor.has('email')) throw new Error('No email column mapped');
+
+        await updateImportJob(jobId, {
+            status: 'running', stage: 'copy',
+            started_at: new Date().toISOString(), error_message: null,
+        });
+
+        client = await getPgPool().connect();
+        // This session runs multi-minute COPY and merge statements. The
+        // 8 s PostgREST statement_timeout that the rest of the app codes
+        // against does not apply here, but role defaults might — clear
+        // them explicitly.
+        await client.query('SET statement_timeout = 0');
+        await client.query('SET idle_in_transaction_session_timeout = 0');
+        // TEMP tables are session-scoped, and pool.release() returns the
+        // *session* to the pool — it does not end it. Two imports landing
+        // on the same pooled connection inside getPgPool()'s 30 s
+        // idleTimeoutMillis would therefore find the previous job's
+        // _imp_stage still present and fail with "relation already
+        // exists". (Intermittent by nature: spaced-out imports get a
+        // fresh connection and look fine.) DISCARD TEMP drops every temp
+        // table in the session, so we always start clean.
+        await client.query('DISCARD TEMP');
+
+        // ── Stage 1: stream Storage → TEMP table via COPY ────────────
+        const stageCols = headers.map((_, i) => `c${i} text`).join(', ');
+        await client.query(`CREATE TEMP TABLE _imp_stage (${stageCols})`);
+
+        const { data: signed, error: sErr } = await supabase.storage
+            .from(IMPORT_BUCKET).createSignedUrl(objectPath!, 24 * 60 * 60);
+        if (sErr || !signed?.signedUrl) throw new Error(`Could not read staged file: ${sErr?.message || 'unknown'}`);
+
+        const resp = await fetch(signed.signedUrl);
+        if (!resp.ok || !resp.body) throw new Error(`Could not download staged file (HTTP ${resp.status})`);
+
+        const totalBytes = Number(job.file_size_bytes || 0);
+        let bytesRead = 0;
+        let lastTick = Date.now();
+        const byteCounter = new Transform({
+            transform(chunk: Buffer, _enc, cb) {
+                bytesRead += chunk.length;
+                // Debounced, fire-and-forget — a slow status write must
+                // never stall the COPY pipe.
+                if (Date.now() - lastTick > 2000) {
+                    lastTick = Date.now();
+                    updateImportJob(jobId, { progress_bytes: bytesRead }).catch(() => {});
+                }
+                cb(null, chunk);
+            }
+        });
+
+        const copyStream = client.query(copyFrom(
+            `COPY _imp_stage FROM STDIN WITH (FORMAT csv, HEADER true)`
+        ));
+        try {
+            await streamPipeline(Readable.fromWeb(resp.body as any), byteCounter, copyStream);
+        } catch (copyErr: any) {
+            // Postgres' CSV reader is strict and its messages give no
+            // hint about what a user should actually do. Translate the
+            // common structural failures — they all mean "the file is
+            // malformed", but the fix differs per case.
+            const raw = String(copyErr?.message || copyErr);
+            const at = ` (after ~${(bytesRead / 1024 / 1024).toFixed(1)} MB of ${(totalBytes / 1024 / 1024).toFixed(1)} MB)`;
+            let friendly = raw;
+            if (/unquoted newline/i.test(raw)) {
+                friendly = `The file has a line break inside a field that isn't wrapped in quotes${at}. Re-export it from the source tool — most exporters quote such fields automatically.`;
+            } else if (/extra data after last expected column/i.test(raw)) {
+                friendly = `A row has more columns than the header${at}. Usually an unescaped comma in a field. Re-export with quoting enabled.`;
+            } else if (/missing data for column/i.test(raw)) {
+                friendly = `A row has fewer columns than the header${at}. The file is likely truncated or rows were hand-edited.`;
+            } else if (/unterminated CSV quoted field/i.test(raw)) {
+                friendly = `A quoted field is never closed${at}. There is probably a stray double-quote in the data.`;
+            } else if (/invalid byte sequence|encoding/i.test(raw)) {
+                friendly = `The file isn't valid UTF-8${at}. Re-save it as UTF-8 (Excel: "CSV UTF-8").`;
+            }
+            throw new Error(`${friendly}${friendly === raw ? '' : ` [postgres: ${raw}]`}`);
+        }
+
+        await updateImportJob(jobId, { progress_bytes: bytesRead || totalBytes });
+
+        const { rows: [{ n: stagedRows }] } = await client.query<{ n: string }>(
+            'SELECT count(*)::bigint AS n FROM _imp_stage'
+        );
+        const totalRows = Number(stagedRows);
+        await updateImportJob(jobId, { stage: 'merge', total_rows: totalRows });
+
+        // ── Stage 2: normalise + classify, entirely in SQL ───────────
+        // Blank cells become NULL (not ''), matching buildRow()'s
+        // "empty cells are dropped" behaviour in POST /api/import.
+        const sel = (t: ImportTargetColumn) =>
+            colFor.has(t) ? `NULLIF(btrim(c${colFor.get(t)}), '')` : `NULL::text`;
+
+        // An explicit list name always wins over a mapped column — same
+        // precedence the wizard had (listNameOverride overwrote
+        // mapped.lead_list_name on every row).
+        const listNameExpr = job.list_name
+            ? `$1::text`
+            : (colFor.has('lead_list_name') ? `NULLIF(btrim(c${colFor.get('lead_list_name')}), '')` : `NULL::text`);
+        const listParams = job.list_name ? [job.list_name] : [];
+
+        const dataCols = IMPORT_TARGET_COLUMNS.filter(c => c !== 'lead_list_name');
+        await client.query(`
+            CREATE TEMP TABLE _imp_norm AS
+            SELECT
+                row_number() OVER () AS rn,
+                ${dataCols.map(c => `${sel(c)} AS ${c}`).join(',\n                ')},
+                ${listNameExpr} AS lead_list_name,
+                ${IMPORT_EMAIL_REASON_SQL.split('%E%').join(sel('email'))} AS invalid_reason
+            FROM _imp_stage
+        `, listParams);
+
+        const { rows: invalidRows } = await client.query<{ invalid_reason: string; n: string }>(
+            `SELECT invalid_reason, count(*)::bigint AS n FROM _imp_norm
+             WHERE invalid_reason IS NOT NULL GROUP BY 1`
+        );
+        const invalidByReason: Record<string, number> = {};
+        let invalidCount = 0;
+        for (const r of invalidRows) {
+            invalidByReason[r.invalid_reason] = Number(r.n);
+            invalidCount += Number(r.n);
+        }
+
+        // Within-file dedup. Keeps the FIRST occurrence (ORDER BY rn),
+        // matching the old seenInChunk behaviour — except this now sees
+        // the whole file at once, so duplicates spanning what used to be
+        // a chunk boundary are caught properly instead of leaking
+        // through to the DB pre-check.
+        await client.query(`
+            CREATE TEMP TABLE _imp_valid AS
+            SELECT row_number() OVER (ORDER BY d.rn) AS vid, d.*
+            FROM (
+                SELECT DISTINCT ON (lower(email)) *
+                FROM _imp_norm WHERE invalid_reason IS NULL
+                ORDER BY lower(email), rn
+            ) d
+        `);
+        await client.query('CREATE INDEX ON _imp_valid (vid)');
+
+        const { rows: [{ n: dedupedStr }] } = await client.query<{ n: string }>(
+            'SELECT count(*)::bigint AS n FROM _imp_valid'
+        );
+        const dedupedRows = Number(dedupedStr);
+        const withinFileDupes = Math.max(0, (totalRows - invalidCount) - dedupedRows);
+
+        // Which existing lists the pre-existing emails came from. Uses
+        // the contacts_email_unique index, so this is an index join even
+        // at millions of rows.
+        const { rows: breakdownRows } = await client.query<{ src: string | null; n: string }>(`
+            SELECT c.lead_list_name AS src, count(*)::bigint AS n
+            FROM _imp_valid v JOIN contacts c ON c.email = v.email
+            GROUP BY 1
+        `);
+        const crossListBreakdown: Record<string, number> = {};
+        let crossListDupes = 0;
+        for (const r of breakdownRows) {
+            // Same-list matches are a re-import of the same list, not a
+            // cross-list collision — counted as duplicates but kept out
+            // of the "which other list had this" breakdown.
+            if (job.list_name && r.src === job.list_name) continue;
+            crossListBreakdown[r.src || '(unknown list)'] = Number(r.n);
+            crossListDupes += Number(r.n);
+        }
+
+        // ── Stage 3: batched merge ───────────────────────────────────
+        const insertCols = ['contact_id', ...IMPORT_TARGET_COLUMNS];
+        const selectExprs = ['gen_random_uuid()', ...IMPORT_TARGET_COLUMNS.map(c => `b.${c}`)];
+        // COALESCE so a blank cell in the CSV never wipes data that is
+        // already on the contact — only a non-empty value overwrites.
+        const updateSet = IMPORT_TARGET_COLUMNS
+            .filter(c => c !== 'email')
+            .map(c => `${c} = COALESCE(EXCLUDED.${c}, contacts.${c})`).join(', ');
+        const conflictClause = job.overwrite_duplicates
+            ? `DO UPDATE SET ${updateSet}`
+            : `DO NOTHING`;
+
+        let inserted = 0;
+        let updated = 0;
+        for (let offset = 0; offset < dedupedRows; offset += IMPORT_MERGE_BATCH) {
+            const { rows } = await client.query<{ was_insert: boolean }>(`
+                WITH b AS (
+                    SELECT * FROM _imp_valid WHERE vid > $1 AND vid <= $2
+                )
+                INSERT INTO contacts (${insertCols.join(', ')})
+                SELECT ${selectExprs.join(', ')} FROM b
+                ON CONFLICT (email) ${conflictClause}
+                RETURNING (xmax = 0) AS was_insert
+            `, [offset, offset + IMPORT_MERGE_BATCH]);
+            for (const r of rows) { if (r.was_insert) inserted++; else updated++; }
+            await updateImportJob(jobId, {
+                progress_rows: Math.min(offset + IMPORT_MERGE_BATCH, dedupedRows),
+                inserted_count: inserted, updated_count: updated,
+            });
+        }
+
+        // Rows that already existed and were left alone (DO NOTHING) are
+        // duplicates; with overwrite on they show up as updates instead.
+        const duplicates = job.overwrite_duplicates ? 0 : (dedupedRows - inserted);
+
+        // Free the staging tables before handing the session back — for a
+        // 1 GB import they hold ~1.1 GB of temp space, and leaving that
+        // pinned until the connection happens to idle out is wasteful.
+        await client.query('DISCARD TEMP').catch(() => { /* best effort */ });
+        client.release();
+        clientReleased = true;
+        client = null;
+
+        await updateImportJob(jobId, {
+            status: 'completed', stage: null,
+            progress_rows: dedupedRows, total_rows: totalRows,
+            inserted_count: inserted, updated_count: updated,
+            duplicate_count: duplicates + withinFileDupes,
+            within_file_dupes: withinFileDupes,
+            cross_list_dupes: crossListDupes,
+            invalid_count: invalidCount,
+            invalid_by_reason: invalidByReason,
+            cross_list_breakdown: crossListBreakdown,
+            completed_at: new Date().toISOString(),
+        });
+        succeeded = true;
+
+        // Register in import history. Reuses POST /api/import-lists over
+        // loopback so the name-merge, dedup-stats and stats-refresh
+        // behaviour stays byte-identical to the old client-side call
+        // rather than being reimplemented here.
+        const listName = job.list_name;
+        if (listName && (inserted + updated > 0 || invalidCount > 0)) {
+            try {
+                await fetch(`http://127.0.0.1:${PORT}/api/import-lists`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: listName,
+                        contact_count: inserted + updated,
+                        dedup_stats: {
+                            total_rows: totalRows, inserted, updated,
+                            within_file_dupes: withinFileDupes,
+                            cross_list_dupes: crossListDupes,
+                            invalid: invalidCount,
+                            source_breakdown: crossListBreakdown,
+                            invalid_breakdown: invalidByReason,
+                        },
+                    }),
+                });
+            } catch (e: any) {
+                console.warn(`[import-job ${jobId}] import-lists registration failed: ${e?.message}`);
+            }
+        }
+
+        addServerLog(
+            `📥 Import "${listName || '(no list)'}" complete: ${inserted} new, ${updated} updated, ${duplicates + withinFileDupes} duplicates, ${invalidCount} invalid.`,
+            'Sync', 'info'
+        );
+        console.log(`[import-job ${jobId}] done: ${totalRows} rows staged → ${inserted} inserted, ${updated} updated`);
+    } catch (err: any) {
+        console.error(`[import-job ${jobId}] failed:`, err);
+        await updateImportJob(jobId, {
+            status: 'failed', stage: null,
+            error_message: String(err?.message || err).slice(0, 1000),
+            completed_at: new Date().toISOString(),
+        });
+    } finally {
+        // Drop rather than return a client that may be mid-COPY — a
+        // half-finished COPY leaves the backend in an indeterminate
+        // protocol state.
+        if (client && !clientReleased) {
+            try { client.release(new Error('contact import aborted')); } catch { /* already gone */ }
+        }
+        // Delete the staged object ONLY after a verified success. A
+        // failed import keeps its bytes so the user can retry the merge
+        // without re-uploading a gigabyte — that durability is the whole
+        // reason the file went to Storage first. The TTL sweep collects
+        // it if they never come back.
+        if (succeeded && objectPath) {
+            const { error: rmErr } = await supabase.storage.from(IMPORT_BUCKET).remove([objectPath]);
+            if (rmErr) console.warn(`[import-job ${jobId}] could not remove staged object: ${rmErr.message}`);
+        }
+        copySlot.busy = false;
+        copySlot.holder = null;
+    }
+}
+
+// ── Cleanup ─────────────────────────────────────────────────────────
+// Expired jobs lose their staged object and their row. Also revives the
+// queue and fails jobs orphaned mid-run by a restart — without this a
+// killed worker would leave a job stuck on 'running' forever.
+async function cleanupExpiredImportJobs() {
+    try {
+        const { data: expired } = await supabase
+            .from('contact_import_jobs').select('id,storage_path')
+            .lt('expires_at', new Date().toISOString());
+        for (const r of (expired || []) as { id: string; storage_path: string | null }[]) {
+            if (r.storage_path) {
+                await supabase.storage.from(IMPORT_BUCKET).remove([r.storage_path]).catch(() => {});
+            }
+            await supabase.from('contact_import_jobs').delete().eq('id', r.id);
+        }
+        if ((expired || []).length > 0) {
+            console.log(`[import-cleanup] removed ${(expired || []).length} expired import job(s)`);
+        }
+
+        // Belt-and-braces on the happy path. The worker deletes an
+        // object as soon as its merge is verified, but that delete is
+        // best-effort — a transient Storage blip there would otherwise
+        // strand a full-size CSV until the 24 h TTL. Catch those on the
+        // next tick instead, and null the path so we stop retrying once
+        // it's gone.
+        const { data: doneWithFiles } = await supabase
+            .from('contact_import_jobs').select('id,storage_path')
+            .eq('status', 'completed').not('storage_path', 'is', null);
+        for (const r of (doneWithFiles || []) as { id: string; storage_path: string }[]) {
+            const { error: rmErr } = await supabase.storage.from(IMPORT_BUCKET).remove([r.storage_path]);
+            if (!rmErr) await updateImportJob(r.id, { storage_path: null });
+        }
+        if ((doneWithFiles || []).length > 0) {
+            console.log(`[import-cleanup] swept ${(doneWithFiles || []).length} object(s) left by completed jobs`);
+        }
+
+        // Orphan sweep: objects in the bucket with no job row at all.
+        // The TTL pass above can only find objects it has a row for, so
+        // anything whose row vanished another way (manual DB cleanup, a
+        // failed insert after the upload landed) would otherwise sit in
+        // the bucket forever. Same reasoning as the export path's
+        // orphan-file sweep over CSV_FILES_DIR.
+        //
+        // The 1 h grace matters: a job row is created *before* its
+        // upload, but only writes storage_path afterwards, so a
+        // just-created object can briefly look unreferenced.
+        try {
+            const objects = await listAllImportObjects();
+            if (objects.length > 0) {
+                const { data: rows } = await supabase
+                    .from('contact_import_jobs').select('storage_path');
+                const known = new Set((rows || []).map((r: any) => r.storage_path).filter(Boolean));
+                const graceCutoff = Date.now() - 60 * 60 * 1000;
+                const orphans = objects
+                    .filter(o => !known.has(o.name))
+                    .filter(o => !o.created_at || new Date(o.created_at).getTime() < graceCutoff)
+                    .map(o => o.name);
+                // remove() takes a batch; chunk so a big backlog can't
+                // blow the request size.
+                for (let i = 0; i < orphans.length; i += 100) {
+                    await supabase.storage.from(IMPORT_BUCKET).remove(orphans.slice(i, i + 100));
+                }
+                if (orphans.length > 0) {
+                    console.log(`[import-cleanup] removed ${orphans.length} orphaned staged object(s)`);
+                }
+            }
+        } catch (e: any) {
+            console.warn(`[import-cleanup] orphan sweep failed: ${e?.message || e}`);
+        }
+
+        // A 'running' job with no progress for 30 min means the worker
+        // died (redeploy, OOM). Fail it so the slot and the UI unstick;
+        // the staged object survives for a retry.
+        const staleCutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+        const { data: stale } = await supabase
+            .from('contact_import_jobs').select('id')
+            .eq('status', 'running').lt('started_at', staleCutoff);
+        for (const r of (stale || []) as { id: string }[]) {
+            await updateImportJob(r.id, {
+                status: 'failed',
+                error_message: 'Worker stalled (server restart?) — the uploaded file is still staged, press Import to retry.',
+                completed_at: new Date().toISOString(),
+            });
+            console.log(`[import-cleanup] marked stale running import ${r.id} as failed`);
+        }
+
+        drainImportQueue();
+    } catch (err: any) {
+        console.error('[import-cleanup] error:', err.message || err);
+    }
+}
+
+setInterval(cleanupExpiredImportJobs, 5 * 60 * 1000);
+cleanupExpiredImportJobs().catch(() => {});
 
 // Delete a bucketing run. All run-scoped child tables
 // (bucket_industry_map, bucket_assignments, bucket_contact_map,

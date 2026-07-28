@@ -27,7 +27,6 @@ function tabFromPath(pathname: string): AppTab {
 }
 import { db } from './services/supabaseClient';
 import { enrichBatch } from './services/enrichmentService';
-import Papa from 'papaparse';
 import {
   Users,
   Zap,
@@ -3330,6 +3329,16 @@ function CSVImportWizard({
   const [importStatus, setImportStatus] = useState<'idle' | 'importing' | 'done' | 'error'>('idle');
   const [importResult, setImportResult] = useState<{ inserted: number; updated: number; duplicates: number; failed: number; errors: string[]; failedContacts: { email: string; row: number; reason: string }[] }>({ inserted: 0, updated: 0, duplicates: 0, failed: 0, errors: [], failedContacts: [] });
   const [dragOver, setDragOver] = useState(false);
+  // ── Storage-backed import state ───────────────────────────────────
+  // The file is uploaded to Supabase Storage first and the ingest runs
+  // server-side, so the browser only ever holds the File handle and a
+  // job id. Nothing here scales with file size.
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [uploadPct, setUploadPct] = useState(0);
+  const [uploadPhase, setUploadPhase] = useState<'idle' | 'uploading' | 'reading' | 'ready' | 'error'>('idle');
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  // Latest server-side job row (status/stage/progress/result counters).
+  const [job, setJob] = useState<any>(null);
   const [showFailedModal, setShowFailedModal] = useState(false);
   const [showMappingWarning, setShowMappingWarning] = useState(false);
   const [listNameOverride, setListNameOverride] = useState('');
@@ -3376,36 +3385,88 @@ function CSVImportWizard({
     return result;
   };
 
-  const handleFileSelect = (selectedFile: File) => {
+  // PUT the file straight to Supabase Storage using the server-minted
+  // signed URL. XHR rather than fetch() purely because fetch exposes no
+  // upload-progress event, and a 1 GB transfer with no progress bar is
+  // unusable. The URL authorises by itself — we deliberately send no
+  // apikey or Authorization header (see POST /api/import-jobs).
+  //
+  // Standard uploads are not resumable, so an interrupted transfer is
+  // retried whole; two retries covers a transient blip without making
+  // the user re-pick the file.
+  const uploadToStorage = (url: string, f: File, onPct: (p: number) => void) =>
+    new Promise<void>((resolve, reject) => {
+      let attempt = 0;
+      const go = () => {
+        attempt++;
+        const xhr = new XMLHttpRequest();
+        xhr.open('PUT', url, true);
+        xhr.setRequestHeader('Content-Type', 'text/csv');
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) onPct(Math.round((e.loaded / e.total) * 100));
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) return resolve();
+          // 413 means the object exceeded the project's Global file size
+          // limit — a Storage setting, not something a retry can fix.
+          if (xhr.status === 413 || /exceeded the maximum allowed size/i.test(xhr.responseText || '')) {
+            return reject(new Error(
+              `This file is larger than the project's Storage "Global file size limit". ` +
+              `Raise it in Supabase → Storage → Settings (Free plan caps at 50 MB; Pro allows up to 500 GB).`
+            ));
+          }
+          if (attempt < 3) return go();
+          reject(new Error(`Upload failed (HTTP ${xhr.status}). ${String(xhr.responseText || '').slice(0, 200)}`));
+        };
+        xhr.onerror = () => { if (attempt < 3) go(); else reject(new Error('Upload failed — network error.')); };
+        xhr.send(f);
+      };
+      go();
+    });
+
+  const handleFileSelect = async (selectedFile: File) => {
     if (!selectedFile || !selectedFile.name.endsWith('.csv')) return;
     setFile(selectedFile);
     setStep(1);
     setImportStatus('idle');
-    setImportResult({ inserted: 0, errors: [] });
+    setImportResult({ inserted: 0, updated: 0, duplicates: 0, failed: 0, errors: [], failedContacts: [] });
     setImportProgress(0);
+    setTotalRows(0);
+    setJob(null);
+    setUploadError(null);
+    setUploadPct(0);
+    setUploadPhase('uploading');
 
-    // Count total rows first (streaming, just counting)
-    let rowCount = 0;
-    Papa.parse(selectedFile, {
-      header: true,
-      skipEmptyLines: true,
-      step: () => { rowCount++; },
-      complete: () => { setTotalRows(rowCount); }
-    });
+    // Note what is NOT here any more: the old wizard ran two full
+    // Papa.parse passes over the file on the main thread (one purely to
+    // count rows) before the user had mapped a single column. On a large
+    // file that froze the tab. Headers and preview now come from the
+    // server range-reading the first 256 KB of the uploaded object.
+    try {
+      const createRes = await fetch('/api/import-jobs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: selectedFile.name }),
+      });
+      const created = await createRes.json();
+      if (!createRes.ok) throw new Error(created.error || 'Could not start upload');
 
-    // Parse preview (first 5 rows)
-    Papa.parse(selectedFile, {
-      header: true,
-      preview: 5,
-      skipEmptyLines: true,
-      complete: (results: Papa.ParseResult<Record<string, string>>) => {
-        const headers = results.meta.fields || [];
-        setCsvHeaders(headers);
-        setPreviewRows(results.data);
-        setMapping(autoMap(headers));
-        setStep(2);
-      }
-    });
+      setJobId(created.job.id);
+      await uploadToStorage(created.upload.url, selectedFile, setUploadPct);
+
+      setUploadPhase('reading');
+      const upRes = await fetch(`/api/import-jobs/${created.job.id}/uploaded`, { method: 'POST' });
+      const up = await upRes.json();
+      if (!upRes.ok) throw new Error(up.error || 'Could not read the uploaded file');
+
+      setCsvHeaders(up.headers);
+      setPreviewRows(up.previewRows || []);
+      setMapping(autoMap(up.headers));
+      setUploadPhase('ready');
+      setStep(2);
+    } catch (err: any) {
+      setUploadPhase('error');
+      setUploadError(err.message || String(err));
+    }
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -3459,225 +3520,103 @@ function CSVImportWizard({
     }
   };
 
-  const startImport = () => {
-    if (!file) return;
+  // Backing out must discard the staged object too, otherwise a user who
+  // changes their mind leaves a full-size CSV in the bucket until the TTL
+  // sweep finds it. Completed jobs are left alone — their object is
+  // already gone and the row is useful history.
+  const resetWizard = () => {
+    if (jobId && job?.status !== 'completed') {
+      fetch(`/api/import-jobs/${jobId}`, { method: 'DELETE' }).catch(() => {});
+    }
+    setJobId(null); setJob(null);
+    setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]);
+    setListNameOverride(''); setOverwriteDuplicates(false);
+    setImportStatus('idle'); setUploadPhase('idle'); setUploadPct(0);
+    setUploadError(null); setTotalRows(0); setImportProgress(0);
+  };
+
+  // Hand the mapping to the server and poll. The browser is now just a
+  // remote control: it holds no rows, sends no chunks, and can be closed
+  // mid-import without stopping it. Everything the old implementation
+  // needed here — the 2000-row buffer, the sendPromise chain, the
+  // failedChunks retry sweep, the per-chunk result accumulators — is
+  // gone, because none of that work happens in the tab any more.
+  const startImport = async () => {
+    if (!jobId) return;
     setStep(3);
     setImportStatus('importing');
     setImportProgress(0);
     setImportResult({ inserted: 0, updated: 0, duplicates: 0, failed: 0, errors: [], failedContacts: [] });
 
-    const activeMappings: [string, string][] = (Object.entries(mapping) as [string, string][]).filter(([_, v]) => v !== '__skip__');
-    let buffer: any[] = [];
-    let totalInserted = 0;
-    let totalUpdated = 0;
-    let totalDuplicates = 0;
-    let totalFailed = 0;
-    let totalRowsSent = 0; // Total rows shipped to /api/import (incl. invalid)
-    let totalWithinFileDupes = 0;
-    let totalCrossListDupes = 0;
-    let totalInvalid = 0;
-    const crossListBreakdownAccum: Record<string, number> = {};
-    const invalidByReasonAccum: Record<string, number> = {};
-    let sentToServer = 0; // Tracks rows actually sent (after API response), not just parsed
-    const errors: string[] = [];
-    const allFailedContacts: { email: string; row: number; reason: string }[] = [];
-    // Chunks the server couldn't ingest in the first pass (500s, browser
-    // fetch throws). Drained after Papa finishes parsing — see the
-    // sendPromise.then(...) block at the bottom of this function. Without
-    // this buffer, a single Render→Supabase blip dropped 2000 contacts on
-    // the floor with the only signal being a one-line "TypeError: fetch
-    // failed" in the import history.
-    const failedChunks: any[][] = [];
-    const CHUNK_SIZE = 2000;
-    const RETRY_CHUNK_SIZE = 500;
-    // The server caps its per-chunk failedContacts sample, but we accumulate
-    // across every chunk — so cap the running list too. The "Failed" tile and
-    // the modal subtitle read the true count from totalFailed; this only
-    // bounds the per-row detail table so a huge blank-email file can't freeze
-    // the tab rendering hundreds of thousands of rows.
-    const FAILED_SAMPLE_CAP = 1000;
-
-    const sendChunk = async (chunk: any[], isRetry = false): Promise<void> => {
-      try {
-        const res = await fetch('/api/import', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contacts: chunk, overwriteDuplicates })
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          // First-pass server failure → re-queue for the retry sweep.
-          // Retry-pass server failure → treat as terminal: record the
-          // contacts as lost so the user sees an honest "failed" count
-          // instead of a phantom success.
-          if (!isRetry) {
-            failedChunks.push(chunk);
-          } else {
-            const reason = data.error || `HTTP ${res.status}`;
-            errors.push(`${reason} (${chunk.length} contacts)`);
-            totalFailed += chunk.length;
-            allFailedContacts.push({
-              email: `(network failure — ${chunk.length} contacts)`,
-              row: 0,
-              reason: `${reason}. Re-running import will recover these via duplicate detection.`,
-            });
-          }
-        } else {
-          totalInserted += data.inserted || 0;
-          totalUpdated += data.updated || 0;
-          totalDuplicates += data.duplicates || 0;
-          totalFailed += data.failed || 0;
-          if (!isRetry) totalRowsSent += chunk.length;
-          totalWithinFileDupes += data.withinFileDupes || 0;
-          totalCrossListDupes += data.crossListDupes || 0;
-          totalInvalid += data.invalid || 0;
-          if (data.crossListBreakdown && typeof data.crossListBreakdown === 'object') {
-            for (const [k, v] of Object.entries(data.crossListBreakdown as Record<string, number>)) {
-              crossListBreakdownAccum[k] = (crossListBreakdownAccum[k] || 0) + (Number(v) || 0);
-            }
-          }
-          if (data.invalidByReason && typeof data.invalidByReason === 'object') {
-            for (const [k, v] of Object.entries(data.invalidByReason as Record<string, number>)) {
-              invalidByReasonAccum[k] = (invalidByReasonAccum[k] || 0) + (Number(v) || 0);
-            }
-          }
-          if (data.errors?.length) errors.push(...data.errors);
-          if (data.failedContacts?.length && allFailedContacts.length < FAILED_SAMPLE_CAP) {
-            allFailedContacts.push(...data.failedContacts.slice(0, FAILED_SAMPLE_CAP - allFailedContacts.length));
-          }
-        }
-      } catch (err: any) {
-        // Browser-level throw (network down, server crashed mid-response).
-        // Same first-pass-vs-retry logic as above.
-        if (!isRetry) {
-          failedChunks.push(chunk);
-        } else {
-          errors.push(`${err.message} (${chunk.length} contacts)`);
-          totalFailed += chunk.length;
-          allFailedContacts.push({
-            email: `(network failure — ${chunk.length} contacts)`,
-            row: 0,
-            reason: `${err.message}. Re-running import will recover these via duplicate detection.`,
-          });
-        }
-      }
-      // Progress only advances on the first pass — the retry pass re-sends
-      // the same rows, so bumping again would push the bar past 100%.
-      if (!isRetry) {
-        sentToServer += chunk.length;
-        setImportProgress(sentToServer);
-      }
-      setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
-    };
-
-    // Use a queue approach to handle async sending while streaming
-    let sendPromise = Promise.resolve();
-
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      step: (row: Papa.ParseStepResult<Record<string, string>>) => {
-        const mapped: any = {};
-        activeMappings.forEach(([csvCol, targetCol]) => {
-          const val = row.data[csvCol];
-          if (val !== undefined && val !== null && val !== '') {
-            mapped[targetCol] = val;
-          }
-        });
-
-        // Override lead_list_name if user specified a list name
-        if (listNameOverride.trim()) {
-          mapped.lead_list_name = listNameOverride.trim();
-        }
-
-        // Only include rows that have at least one mapped value
-        if (Object.keys(mapped).length > 0) {
-          buffer.push(mapped);
-        }
-
-        if (buffer.length >= CHUNK_SIZE) {
-          const chunk = [...buffer];
-          buffer = [];
-          sendPromise = sendPromise.then(() => sendChunk(chunk));
-        }
-      },
-      complete: () => {
-        // Send remaining buffer
-        if (buffer.length > 0) {
-          const chunk = [...buffer];
-          buffer = [];
-          sendPromise = sendPromise.then(() => sendChunk(chunk));
-        }
-
-        sendPromise.then(async () => {
-          setImportProgress(sentToServer);
-          setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
-
-          // Retry sweep: drain any chunks that 500'd or fetch-threw on
-          // the first pass. We split each failed chunk into smaller pieces
-          // (RETRY_CHUNK_SIZE) so a stuck pooler that timed out on 2000
-          // rows has a much better shot at 500. Sequential, with a small
-          // pause between original-chunk groups, so we don't immediately
-          // hammer the server that just told us it was unhappy.
-          if (failedChunks.length > 0) {
-            const chunksToRetry = [...failedChunks];
-            failedChunks.length = 0;
-            errors.push(`Retrying ${chunksToRetry.length} failed chunk(s) in smaller pieces…`);
-            setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
-            for (const failed of chunksToRetry) {
-              for (let i = 0; i < failed.length; i += RETRY_CHUNK_SIZE) {
-                await sendChunk(failed.slice(i, i + RETRY_CHUNK_SIZE), true);
-              }
-              await new Promise(r => setTimeout(r, 250));
-            }
-          }
-
-          setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
-          setImportStatus(totalFailed > 0 || errors.length > 0 ? 'error' : 'done');
-
-          // Record import list if a name was provided and the import had
-          // anything worth persisting — either contacts landed (inserted/
-          // updated) or rows were skipped as invalid. The `|| totalInvalid`
-          // arm matters for the all-emailless case: every row is rejected so
-          // totalAffected is 0, but we still want the "No email address"
-          // breakdown durably visible in the import-history dedup modal, not
-          // just in the ephemeral wizard result. (A no-op all-duplicates
-          // re-import — totalAffected 0, totalInvalid 0 — still records
-          // nothing, as before.)
-          const listName = listNameOverride.trim();
-          const totalAffected = totalInserted + totalUpdated;
-          if (listName && (totalAffected > 0 || totalInvalid > 0)) {
-            try {
-              await fetch('/api/import-lists', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  name: listName,
-                  contact_count: totalAffected,
-                  dedup_stats: {
-                    total_rows: totalRowsSent,
-                    inserted: totalInserted,
-                    updated: totalUpdated,
-                    within_file_dupes: totalWithinFileDupes,
-                    cross_list_dupes: totalCrossListDupes,
-                    invalid: totalInvalid,
-                    source_breakdown: crossListBreakdownAccum,
-                    invalid_breakdown: invalidByReasonAccum,
-                  },
-                })
-              });
-              onRefreshLists();
-            } catch {}
-          }
-        });
-      },
-      error: (err: Error) => {
-        errors.push(`Parse error: ${err.message}`);
-        setImportResult({ inserted: totalInserted, updated: totalUpdated, duplicates: totalDuplicates, failed: totalFailed, errors: [...errors], failedContacts: [...allFailedContacts] });
-        setImportStatus('error');
-      }
-    });
+    try {
+      const res = await fetch(`/api/import-jobs/${jobId}/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mapping, listName: listNameOverride.trim(), overwriteDuplicates }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || 'Could not start the import');
+    } catch (err: any) {
+      setImportStatus('error');
+      setImportResult(r => ({ ...r, errors: [err.message || String(err)] }));
+      return;
+    }
+    pollJob(jobId);
   };
+
+  // Poll a server-side job to a terminal state. Transient fetch failures
+  // are ignored rather than fatal — the job keeps running on the server
+  // regardless of whether this tab can currently reach it.
+  const pollJob = (id: string) => {
+    let stopped = false;
+    const tick = async () => {
+      if (stopped) return;
+      try {
+        const res = await fetch(`/api/import-jobs/${id}`);
+        const { job: cur } = await res.json();
+        if (cur) {
+          setJob(cur);
+          setTotalRows(Number(cur.total_rows || 0));
+          setImportProgress(Number(cur.progress_rows || 0));
+          setImportResult({
+            inserted: Number(cur.inserted_count || 0),
+            updated: Number(cur.updated_count || 0),
+            duplicates: Number(cur.duplicate_count || 0),
+            failed: Number(cur.invalid_count || 0),
+            errors: cur.error_message ? [cur.error_message] : [],
+            failedContacts: [],
+          });
+          if (cur.status === 'completed') { stopped = true; setImportStatus('done'); onRefreshLists(); return; }
+          if (cur.status === 'failed') { stopped = true; setImportStatus('error'); return; }
+        }
+      } catch { /* transient — keep polling */ }
+      setTimeout(tick, 1500);
+    };
+    tick();
+  };
+
+  // Re-attach to an in-flight import after a refresh. This is the payoff
+  // of staging in Storage: reloading the tab (or opening the app on
+  // another machine) picks the job back up instead of losing it.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/import-jobs');
+        if (!res.ok) return;
+        const { jobs } = await res.json();
+        const live = (jobs || []).find((x: any) => x.status === 'queued' || x.status === 'running');
+        if (!live || cancelled) return;
+        setJobId(live.id);
+        setJob(live);
+        setCsvHeaders(live.csv_headers || []);
+        setStep(3);
+        setImportStatus('importing');
+        pollJob(live.id);
+      } catch { /* nothing in flight, or server unreachable */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   return (
     <div className="flex-1 p-6 overflow-y-auto custom-scrollbar bg-[#1c1c1c]">
@@ -3688,7 +3627,14 @@ function CSVImportWizard({
             <FileSpreadsheet className="w-6 h-6 text-[#3ecf8e]" />
             Import Contacts
           </h2>
-          <p className="text-sm text-gray-500 mt-2">Upload a CSV file to add contacts for enrichment. Supports files up to 50MB.</p>
+          {/* No hardcoded size here any more. The real ceiling is the
+              Supabase project's Storage "Global file size limit", and a
+              stale number in the copy is worse than none — the old
+              "Supports files up to 50MB" was never enforced anywhere. */}
+          <p className="text-sm text-gray-500 mt-2">
+            Upload a CSV to add contacts for enrichment. Large files are handled server-side —
+            the import keeps running even if you close this tab.
+          </p>
         </div>
 
         {/* Step Indicator */}
@@ -3710,7 +3656,48 @@ function CSVImportWizard({
         </div>
 
         {/* Step 1: Upload */}
-        {step === 1 && (
+        {step === 1 && (uploadPhase === 'uploading' || uploadPhase === 'reading') && (
+          <div className="border-2 border-[#2e2e2e] rounded-2xl p-16 text-center bg-[#0e0e0e]">
+            <Upload className="w-12 h-12 mx-auto mb-4 text-[#3ecf8e] animate-pulse" />
+            <p className="text-lg font-bold text-gray-300 mb-1">
+              {uploadPhase === 'uploading' ? 'Uploading to secure storage…' : 'Reading columns…'}
+            </p>
+            <p className="text-xs text-gray-500 mb-5">
+              {file?.name} • {(file?.size ? (file.size / 1024 / 1024).toFixed(1) : '0')} MB
+            </p>
+            <div className="w-full max-w-md mx-auto h-2 bg-[#1c1c1c] rounded-full overflow-hidden">
+              <div
+                className="h-full bg-[#3ecf8e] transition-all duration-200"
+                style={{ width: `${uploadPhase === 'reading' ? 100 : uploadPct}%` }}
+              />
+            </div>
+            <p className="text-xs text-gray-500 mt-2">
+              {uploadPhase === 'reading' ? 'Almost there…' : `${uploadPct}%`}
+            </p>
+            {/* Says the quiet part out loud: this is the step that makes
+                the rest of the import independent of the browser. */}
+            <p className="text-[10px] text-gray-600 mt-4 max-w-sm mx-auto">
+              Once the upload finishes, the file is stored safely on the server. The import
+              itself runs there too, so you can close this tab without losing it.
+            </p>
+          </div>
+        )}
+
+        {step === 1 && uploadPhase === 'error' && (
+          <div className="border-2 border-red-500/30 rounded-2xl p-10 text-center bg-red-500/5">
+            <AlertCircle className="w-10 h-10 mx-auto mb-3 text-red-400" />
+            <p className="text-sm font-bold text-red-300 mb-2">Upload failed</p>
+            <p className="text-xs text-gray-400 max-w-lg mx-auto mb-5">{uploadError}</p>
+            <button
+              onClick={() => { setUploadPhase('idle'); setUploadError(null); setFile(null); setUploadPct(0); }}
+              className="text-xs font-bold px-4 py-2 rounded-lg bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 transition-colors"
+            >
+              Try another file
+            </button>
+          </div>
+        )}
+
+        {step === 1 && (uploadPhase === 'idle' || uploadPhase === 'ready') && (
           <div
             className={`border-2 border-dashed rounded-2xl p-16 text-center transition-all cursor-pointer ${dragOver
               ? 'border-[#3ecf8e] bg-[#3ecf8e]/5'
@@ -3730,7 +3717,7 @@ function CSVImportWizard({
             />
             <Upload className={`w-12 h-12 mx-auto mb-4 ${dragOver ? 'text-[#3ecf8e]' : 'text-gray-600'}`} />
             <p className="text-lg font-bold text-gray-300 mb-2">Drop your CSV file here</p>
-            <p className="text-sm text-gray-600">or click to browse • Max 50MB</p>
+            <p className="text-sm text-gray-600">or click to browse</p>
           </div>
         )}
 
@@ -3742,12 +3729,17 @@ function CSVImportWizard({
               <FileSpreadsheet className="w-8 h-8 text-[#3ecf8e]" />
               <div className="flex-1">
                 <p className="text-sm font-bold text-white">{file?.name}</p>
+                {/* Row count is deliberately absent: the old wizard got it
+                    by streaming the entire file through Papa.parse on the
+                    main thread before mapping, which froze the tab on big
+                    files. Postgres reports the exact count during ingest
+                    instead. */}
                 <p className="text-[10px] text-gray-500 uppercase tracking-wider mt-0.5">
-                  {(file?.size ? (file.size / 1024 / 1024).toFixed(2) : '0')} MB • {totalRows.toLocaleString()} rows • {csvHeaders.length} columns
+                  {(file?.size ? (file.size / 1024 / 1024).toFixed(2) : '0')} MB • {csvHeaders.length} columns • uploaded
                 </p>
               </div>
               <button
-                onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); setListNameOverride(''); setOverwriteDuplicates(false); }}
+                onClick={() => resetWizard()}
                 className="text-xs text-gray-500 hover:text-white px-3 py-1.5 border border-[#2e2e2e] rounded-lg hover:bg-[#2e2e2e] transition-colors"
               >
                 Change File
@@ -3941,7 +3933,7 @@ function CSVImportWizard({
             {/* Actions */}
             <div className="flex items-center justify-between pt-2">
               <button
-                onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); setListNameOverride(''); setOverwriteDuplicates(false); }}
+                onClick={() => resetWizard()}
                 className="flex items-center gap-2 px-4 py-2.5 text-gray-400 hover:text-white border border-[#2e2e2e] rounded-lg text-xs font-bold hover:bg-[#2e2e2e] transition-colors"
               >
                 <ArrowLeft className="w-3.5 h-3.5" /> Back
@@ -3964,24 +3956,51 @@ function CSVImportWizard({
         {step === 3 && (
           <div className="space-y-6">
             <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl p-8">
-              {importStatus === 'importing' && (
-                <div className="text-center">
-                  <Loader2 className="w-12 h-12 text-[#3ecf8e] animate-spin mx-auto mb-4" />
-                  <p className="text-lg font-bold text-white mb-2">Importing contacts...</p>
-                  <p className="text-sm text-gray-500 mb-6">
-                    {importProgress.toLocaleString()} of {totalRows.toLocaleString()} rows uploaded
-                  </p>
-                  <div className="w-full bg-[#2e2e2e] rounded-full h-3 overflow-hidden mb-2">
-                    <div
-                      className="h-full bg-gradient-to-r from-[#3ecf8e] to-[#2fb37a] rounded-full transition-all duration-300 shadow-[0_0_12px_rgba(62,207,142,0.4)]"
-                      style={{ width: `${totalRows > 0 ? Math.min((importProgress / totalRows) * 100, 100) : 0}%` }}
-                    />
+              {importStatus === 'importing' && (() => {
+                // The server runs two distinct phases and only one of them
+                // has a knowable row total, so the bar is driven by
+                // different numbers in each:
+                //   'copy'  — streaming bytes into Postgres. The row count
+                //             isn't known until COPY finishes, so progress
+                //             is byte-based.
+                //   'merge' — deduping and writing rows. Row-based.
+                const stage = job?.stage as string | undefined;
+                const queued = job?.status === 'queued';
+                const bytesDone = Number(job?.progress_bytes || 0);
+                const bytesTotal = Number(job?.file_size_bytes || 0);
+                const pct = queued ? 0
+                  : stage === 'copy'
+                    ? (bytesTotal > 0 ? Math.min((bytesDone / bytesTotal) * 100, 100) : 0)
+                    : (totalRows > 0 ? Math.min((importProgress / totalRows) * 100, 100) : 0);
+                const label = queued
+                  ? 'Queued — waiting for the current job to finish…'
+                  : stage === 'copy' ? 'Reading the file into the database…'
+                    : stage === 'merge' ? 'Matching duplicates and writing contacts…'
+                      : 'Starting…';
+                const detail = queued ? 'Your place is saved; this starts automatically.'
+                  : stage === 'copy'
+                    ? `${(bytesDone / 1024 / 1024).toFixed(1)} MB of ${(bytesTotal / 1024 / 1024).toFixed(1)} MB`
+                    : totalRows > 0
+                      ? `${importProgress.toLocaleString()} of ${totalRows.toLocaleString()} rows`
+                      : '';
+                return (
+                  <div className="text-center">
+                    <Loader2 className="w-12 h-12 text-[#3ecf8e] animate-spin mx-auto mb-4" />
+                    <p className="text-lg font-bold text-white mb-2">{label}</p>
+                    <p className="text-sm text-gray-500 mb-6">{detail}</p>
+                    <div className="w-full bg-[#2e2e2e] rounded-full h-3 overflow-hidden mb-2">
+                      <div
+                        className="h-full bg-gradient-to-r from-[#3ecf8e] to-[#2fb37a] rounded-full transition-all duration-300 shadow-[0_0_12px_rgba(62,207,142,0.4)]"
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <p className="text-[10px] text-gray-600 font-mono">{Math.round(pct)}% complete</p>
+                    <p className="text-[10px] text-gray-600 mt-4">
+                      Running on the server — safe to close this tab or refresh.
+                    </p>
                   </div>
-                  <p className="text-[10px] text-gray-600 font-mono">
-                    {totalRows > 0 ? Math.round((importProgress / totalRows) * 100) : 0}% complete
-                  </p>
-                </div>
-              )}
+                );
+              })()}
 
               {importStatus === 'done' && (
                 <div className="text-center">
@@ -4020,7 +4039,7 @@ function CSVImportWizard({
 
                   <div className="flex items-center justify-center gap-4">
                     <button
-                      onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); setImportStatus('idle'); }}
+                      onClick={() => resetWizard()}
                       className="flex items-center gap-2 px-4 py-2.5 text-gray-400 hover:text-white border border-[#2e2e2e] rounded-lg text-xs font-bold hover:bg-[#2e2e2e] transition-colors"
                     >
                       <Upload className="w-3.5 h-3.5" /> Import Another
@@ -4077,7 +4096,7 @@ function CSVImportWizard({
                   </div>
                   <div className="flex items-center justify-center gap-4">
                     <button
-                      onClick={() => { setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); setImportStatus('idle'); }}
+                      onClick={() => resetWizard()}
                       className="flex items-center gap-2 px-4 py-2.5 text-gray-400 hover:text-white border border-[#2e2e2e] rounded-lg text-xs font-bold hover:bg-[#2e2e2e] transition-colors"
                     >
                       <Upload className="w-3.5 h-3.5" /> Try Again
