@@ -32,6 +32,19 @@ const PERSONAL_EMAIL_DOMAINS = new Set([
     'earthlink.net', 'charter.net', 'optonline.net'
 ]);
 
+// The scrape target for a contact: its website, else the domain of its email.
+//
+// This MUST be the single source of truth. The per-chunk cache prefetch and the
+// per-item lookup used to compute it separately — the prefetch keyed only on
+// company_website while the lookup used the email fallback — so a website-less
+// contact's key could never match a prefetched one. It missed the cache 100% of
+// the time: zero digest_cache and zero domain_intelligence rows across 122,703
+// enriched contacts with no website, every one paying for a fresh live scrape of
+// a domain that was often already in scraped_data.
+function resolveContactDomain(contact: any): string | null {
+    return contact?.company_website || (contact?.email ? contact.email.split('@')[1] : null) || null;
+}
+
 // Concurrency Limiters
 const scrapeLimit = pLimit(CONCURRENCY_SCRAPE);
 const aiLimit = pLimit(CONCURRENCY_AI);
@@ -737,7 +750,11 @@ export class JobProcessor {
 
         // --- CHUNK LOCAL CACHE ---
         // Issue #5: Use contact.company_website, not jobItem.company_website (which doesn't exist on job_items table)
-        const uniqueDomains = [...new Set(enrichedItems.map((item: any) => item.contacts?.company_website).filter(Boolean))];
+        // Resolved via the same helper the execution path uses below, so the
+        // prefetch key set and the lookup key can never diverge again.
+        const uniqueDomains = [...new Set(
+            enrichedItems.map((item: any) => resolveContactDomain(item.contacts)).filter(Boolean)
+        )];
         let domainCache: Record<string, any> = {};
         let digestCache: Record<string, string> = {};
         // Fix #5: Batch scraped_data upserts instead of fire-and-forget per scrape
@@ -785,7 +802,7 @@ export class JobProcessor {
         const results = await Promise.all(enrichedItems.map(async (jobItem: any) => {
             const contact = jobItem.contacts;
             // Issue #5: Use contact.company_website, not jobItem.company_website
-            const domain = contact.company_website || (contact.email ? contact.email.split('@')[1] : null);
+            const domain = resolveContactDomain(contact);
 
             if (!domain) {
                 return this.createResult(jobItem, false, 'failed', 'No domain or email to extract domain from.', undefined, undefined, 0, 'error:no_domain');
