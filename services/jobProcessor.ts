@@ -763,18 +763,26 @@ export class JobProcessor {
         // Issue #1: Wrap cache-prefetch in try/catch — a failed cache query should NOT kill the chunk
         if (uniqueDomains.length > 0) {
             try {
-                // Fetch prior high-confidence classifications to reuse
-                const { data: cachedEnrichments } = await supabase
-                    .from('enrichments')
-                    .select(`classification, confidence, reasoning, contacts!inner(company_website)`)
-                    .eq('status', 'completed')
-                    .gte('confidence', 7)
-                    .in('contacts.company_website', uniqueDomains);
+                // Fetch prior high-confidence classifications to reuse, keyed
+                // by the RESOLVED domain (website, else email domain) so a
+                // website-less contact reuses them exactly like any other.
+                //
+                // This has to be an RPC. The previous PostgREST query joined
+                // contacts!inner(company_website) and filtered on that column,
+                // which an email-derived domain can only match by coincidence —
+                // it produced 0 domain_intelligence hits across 122,703
+                // enriched website-less contacts. PostgREST cannot express
+                // "split the email and compare", so the resolution happens
+                // server-side in get_domain_intelligence(), backed by a
+                // matching expression index (without it the same lookup is a
+                // 9 s seq scan over every contact).
+                const { data: cachedEnrichments, error: diErr } = await supabase
+                    .rpc('get_domain_intelligence', { p_domains: uniqueDomains });
+                if (diErr) throw new Error(diErr.message);
 
                 if (cachedEnrichments) {
-                    cachedEnrichments.forEach((row: any) => {
-                        const w = row.contacts?.company_website;
-                        if (w) domainCache[w] = row;
+                    (cachedEnrichments as any[]).forEach((row: any) => {
+                        if (row?.domain) domainCache[row.domain] = row;
                     });
                 }
             } catch (cacheErr: any) {
