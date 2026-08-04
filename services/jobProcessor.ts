@@ -32,7 +32,38 @@ const PERSONAL_EMAIL_DOMAINS = new Set([
     'earthlink.net', 'charter.net', 'optonline.net'
 ]);
 
-// The scrape target for a contact: its website, else the domain of its email.
+// Canonical form of a domain or URL. Every variant of the same site
+//   acme.com · https://www.acme.com/ · http://acme.com/ · https://www.acme.com
+// collapses to `acme.com`, so one company is one cache key regardless of how the
+// URL was written. 97% of company_website values are stored as http://www.x.com
+// while an email-derived domain is always bare, so without this they could never
+// share a cached scrape.
+//
+// MUST stay byte-identical to normalize_domain() in
+// supabase/migrations/20260728_normalize_domain_keys.sql — that SQL function
+// backs the index and the domain-intelligence RPC. A divergence does not throw,
+// it just silently misses the cache, which is how the two earlier cache bugs
+// hid. Parity is asserted against real data, not assumed.
+//
+// The whitespace class matches Postgres btrim(x, E' \t\r\n\f\v') deliberately;
+// JS .trim() would also strip Unicode spaces and disagree.
+//
+// Subdomains are preserved: careers.acme.com is genuinely a different site, and
+// collapsing arbitrary subdomains would need a public-suffix list.
+function normalizeDomain(raw: any): string | null {
+    if (raw === null || raw === undefined) return null;
+    const s = String(raw)
+        .replace(/^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/g, '')
+        .toLowerCase()
+        .replace(/^[a-z][a-z0-9+.-]*:\/\//, '')  // scheme
+        .replace(/^www\./, '')                   // leading www.
+        .replace(/[/?#:].*$/, '')                // path / query / fragment / port
+        .replace(/\.+$/, '');                    // trailing dots
+    return s || null;
+}
+
+// The scrape target for a contact: its website, else the domain of its email —
+// always in canonical form.
 //
 // This MUST be the single source of truth. The per-chunk cache prefetch and the
 // per-item lookup used to compute it separately — the prefetch keyed only on
@@ -42,7 +73,7 @@ const PERSONAL_EMAIL_DOMAINS = new Set([
 // enriched contacts with no website, every one paying for a fresh live scrape of
 // a domain that was often already in scraped_data.
 function resolveContactDomain(contact: any): string | null {
-    return contact?.company_website || (contact?.email ? contact.email.split('@')[1] : null) || null;
+    return normalizeDomain(contact?.company_website) || normalizeDomain(contact?.email ? String(contact.email).split('@')[1] : null);
 }
 
 // Concurrency Limiters
