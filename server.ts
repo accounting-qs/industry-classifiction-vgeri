@@ -62,10 +62,48 @@ if (!SUPABASE_SERVICE_KEY) {
     console.error("❌ CRITICAL: SUPABASE_SERVICE_ROLE_KEY / ANON_KEY is missing!");
 }
 
+// Which Postgres role will this key actually authenticate as?
+//
+// SUPABASE_SERVICE_KEY above falls back to the *anon* key when
+// SUPABASE_SERVICE_ROLE_KEY is unset, and the old "key: PRESENT" log
+// could not tell the two apart. So a box missing the service-role key
+// looked perfectly healthy while quietly running as `anon`: everything
+// touching tables kept working (anon has grants there), and only
+// operations that genuinely need service_role failed — most visibly
+// Storage, whose policies we scope to service_role, which surfaced as
+// "new row violates row-level security policy" on the import upload.
+// Decode the role so that misconfiguration is impossible to miss.
+function supabaseKeyRole(key: string | undefined): string {
+    if (!key) return 'missing';
+    // Newer Supabase key format isn't a JWT.
+    if (key.startsWith('sb_secret_')) return 'service_role';
+    if (key.startsWith('sb_publishable_')) return 'anon';
+    try {
+        const claims = JSON.parse(Buffer.from(key.split('.')[1], 'base64').toString());
+        return String(claims.role || 'unknown');
+    } catch { return 'unrecognised'; }
+}
+const SUPABASE_KEY_ROLE = supabaseKeyRole(SUPABASE_SERVICE_KEY);
+const SUPABASE_KEY_SOURCE = process.env.SUPABASE_SERVICE_ROLE_KEY ? 'SUPABASE_SERVICE_ROLE_KEY'
+    : process.env.VITE_SUPABASE_ANON_KEY ? 'VITE_SUPABASE_ANON_KEY (fallback)'
+        : process.env.SUPABASE_ANON_KEY ? 'SUPABASE_ANON_KEY (fallback)' : 'none';
+
 console.log('🔍 Server Supabase Config Check:', {
     url: SUPABASE_URL ? 'PRESENT' : 'MISSING',
-    key: SUPABASE_SERVICE_KEY ? 'PRESENT' : 'MISSING'
+    key: SUPABASE_SERVICE_KEY ? 'PRESENT' : 'MISSING',
+    role: SUPABASE_KEY_ROLE,
+    from: SUPABASE_KEY_SOURCE,
 });
+
+if (SUPABASE_KEY_ROLE !== 'service_role') {
+    console.error(
+        `❌ CRITICAL: the server is authenticating as "${SUPABASE_KEY_ROLE}", not service_role ` +
+        `(key came from ${SUPABASE_KEY_SOURCE}). Set SUPABASE_SERVICE_ROLE_KEY in this ` +
+        `environment. Until you do, Storage-backed CSV import will fail with ` +
+        `"new row violates row-level security policy", and any other service_role-only ` +
+        `operation will fail too.`
+    );
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY || '');
 
@@ -4140,8 +4178,17 @@ app.post('/api/import-jobs', async (req, res) => {
             .from(IMPORT_BUCKET).createSignedUploadUrl(objectPath, { upsert: true });
         if (sErr || !signed) {
             await supabase.from('contact_import_jobs').delete().eq('id', job.id);
+            // An RLS rejection here has exactly one cause: this process is
+            // not running as service_role. Say so outright rather than
+            // asking the operator to go and check — the role is already
+            // known at boot.
+            const isRls = /row-level security/i.test(sErr?.message || '');
             return res.status(500).json({
-                error: `Could not create upload URL: ${sErr?.message || 'unknown'}. Is the 'contact-imports' bucket present and is SUPABASE_SERVICE_ROLE_KEY set?`
+                error: isRls && SUPABASE_KEY_ROLE !== 'service_role'
+                    ? `The server is running as "${SUPABASE_KEY_ROLE}" instead of service_role, so it cannot create the upload. ` +
+                      `Set SUPABASE_SERVICE_ROLE_KEY in this environment's variables and redeploy ` +
+                      `(the key currently in use came from ${SUPABASE_KEY_SOURCE}).`
+                    : `Could not create upload URL: ${sErr?.message || 'unknown'}`
             });
         }
         await updateImportJob(job.id, { storage_path: objectPath });
