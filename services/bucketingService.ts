@@ -29,6 +29,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { callHeavyRpc, callHeavyRpcRows } from './pgClient';
 import pLimit from 'p-limit';
 import Anthropic from '@anthropic-ai/sdk';
 import { getSetting } from './appSettings';
@@ -1885,8 +1886,15 @@ export async function finalizeTaxonomyAgainstLibrary(
 
     const candidates: any[] = [];
     {
-        const { data, error } = await supabase.rpc('finalize_taxonomy_candidates', { p_run_id: runId });
-        if (error) throw new Error(`finalize_taxonomy_candidates scan failed: ${error.message}`);
+        // Direct Postgres: this scans the run's whole bucket_industry_map, so
+        // it grows with run size and would meet the same ~60 s gateway limit
+        // that killed the explosion.
+        let data: any;
+        try {
+            data = await callHeavyRpc('finalize_taxonomy_candidates', [runId], { statementTimeoutMs: 15 * 60 * 1000 });
+        } catch (error: any) {
+            throw new Error(`finalize_taxonomy_candidates scan failed: ${error.message}`);
+        }
         const payload = (data || {}) as {
             candidates?: any[];
             used_identities?: string[];
@@ -2043,8 +2051,26 @@ export async function finalizeTaxonomyAgainstLibrary(
         with_sector?: number;
     } = {};
     try {
-        const { data: pcRes, error: pcErr } = await supabase.rpc('finalize_per_contact_taxonomy', { p_run_id: runId });
-        if (pcErr) throw new Error(pcErr.message);
+        // Direct Postgres, NOT supabase.rpc(). Measured at 76 s for 109k
+        // contacts and scaling roughly linearly — ~8 min at the 700k target —
+        // so it is far past the ~60 s Supabase gateway limit.
+        //
+        // The old PostgREST call did not merely fail there: the gateway
+        // returned "upstream request timeout" while the statement kept running
+        // and holding its locks, the catch below logged it as non-fatal, and
+        // the rollup three minutes later collided with those locks and was
+        // cancelled. A timeout is not a result you can ignore — it means the
+        // work is still in flight.
+        const pcRes = await callHeavyRpc<typeof perContactStats>(
+            'finalize_per_contact_taxonomy',
+            [runId],
+            {
+                statementTimeoutMs: 30 * 60 * 1000,
+                onRetry: (attempt, err) => ctx.log(
+                    `[Finalize ${runId}] per-contact explosion retry ${attempt} after lock contention: ${err?.message}`, 'warn'
+                ),
+            }
+        );
         perContactStats = (pcRes || {}) as typeof perContactStats;
         const wrote = Number(perContactStats.total_contacts || 0);
         ctx.progress({
@@ -2056,9 +2082,23 @@ export async function finalizeTaxonomyAgainstLibrary(
         });
         ctx.log(`[Finalize ${runId}] per-contact explosion: ${wrote.toLocaleString()} contacts written — ${(perContactStats.with_primary_identity || 0).toLocaleString()} with identity, ${(perContactStats.with_sub_identity || 0).toLocaleString()} with sub-identity, ${(perContactStats.with_sector || 0).toLocaleString()} with sector`, 'phase');
     } catch (e: any) {
-        // Non-fatal: the per-contact explosion is a preview convenience.
-        // Phase 1b's rollup will populate per-contact rows regardless.
-        ctx.log(`[Finalize ${runId}] per-contact explosion failed (non-fatal — Phase 1b will populate): ${e.message}`, 'warn');
+        // Still non-fatal — the explosion is a preview convenience and Phase 1b
+        // repopulates these rows anyway. But it is only safe to continue
+        // because the call above now runs to completion or raises; it can no
+        // longer return early while its statement carries on writing.
+        //
+        // The previous version continued after a *gateway* timeout, i.e. while
+        // the explosion was still running and holding locks, which guaranteed
+        // the rollup would fail. If we ever see a timeout here again it means
+        // the statement genuinely exceeded 30 min, so say so plainly rather
+        // than implying the run is fine.
+        const timedOut = e?.code === '57014' || /timeout/i.test(String(e?.message || ''));
+        ctx.log(
+            timedOut
+                ? `[Finalize ${runId}] per-contact explosion TIMED OUT after 30 min — the run is too large for a single statement, or the database is contended. Phase 1b will repopulate, but investigate before retrying: ${e.message}`
+                : `[Finalize ${runId}] per-contact explosion failed (non-fatal — Phase 1b will populate): ${e.message}`,
+            'warn'
+        );
     }
 
     return {
@@ -2244,16 +2284,29 @@ export async function runBucketAssignment(
 
     ctx.log(`[BucketAssign ${runId}] v2 deterministic rollup, sub_min=${subMin}, identity_min=${idMin}`, 'phase');
     const t0 = Date.now();
-    const { data: result, error: rpcErr } = await supabase.rpc('apply_rollup_bucket_assignments', {
-        p_run_id: runId,
-        p_sub_min_volume: subMin,
-        p_identity_min_volume: idMin
-    });
-    const ms = Date.now() - t0;
-    if (rpcErr) {
-        ctx.log(`[BucketAssign ${runId}] rollup RPC failed after ${ms}ms: ${rpcErr.message}`, 'error');
-        throw new Error(`rollup failed: ${rpcErr.message}`);
+    // Direct Postgres, NOT supabase.rpc(). The rollup is one set-based
+    // DELETE+INSERT over every contact in the run — 39 s at 109k contacts,
+    // so ~4 min at the 700k target. That is past both the ~60 s Supabase
+    // gateway limit and the 120 s statement_timeout service_role inherits,
+    // and unlike the explosion it cannot be chunked: the volume thresholds
+    // are computed across the whole run in a single pass.
+    //
+    // Retries on lock contention rather than failing the run outright, which
+    // is what a straggling writer used to cost.
+    let result: any;
+    try {
+        result = await callHeavyRpc('apply_rollup_bucket_assignments', [runId, subMin, idMin], {
+            statementTimeoutMs: 30 * 60 * 1000,
+            onRetry: (attempt, err) => ctx.log(
+                `[BucketAssign ${runId}] rollup retry ${attempt} after lock contention: ${err?.message}`, 'warn'
+            ),
+        });
+    } catch (e: any) {
+        const ms = Date.now() - t0;
+        ctx.log(`[BucketAssign ${runId}] rollup RPC failed after ${ms}ms: ${e.message}`, 'error');
+        throw new Error(`rollup failed: ${e.message}`);
     }
+    const ms = Date.now() - t0;
 
     const r = (result || {}) as {
         total_contacts?: number;
@@ -4402,8 +4455,15 @@ async function loadProposedContactCounts(
     supabase: SupabaseClient,
     runId: string
 ): Promise<Record<string, number>> {
-    const { data, error } = await supabase.rpc('get_proposed_tag_contact_counts', { p_run_id: runId });
-    if (error) return {};
+    // Set-returning, so callHeavyRpcRows. Routed off PostgREST for the same
+    // reason as the others: this aggregates over every contact in the run.
+    // It still soft-fails to {} — the counts are advisory UI decoration — but
+    // at 700k it would previously have silently returned nothing on timeout,
+    // showing every proposed tag as 0 contacts.
+    let data: any[] = [];
+    try {
+        data = await callHeavyRpcRows('get_proposed_tag_contact_counts', [runId], { statementTimeoutMs: 5 * 60 * 1000 });
+    } catch { return {}; }
     const map: Record<string, number> = {};
     for (const r of (data || []) as any[]) {
         if (r?.layer && r?.name) map[`${r.layer}:${r.name}`] = Number(r.contact_count || 0);
@@ -5120,16 +5180,29 @@ export async function runAssignment(
 
     ctx.log(`[Bucketing ${runId}] Phase 1b v2 — deterministic rollup, sub_min=${subMin}, identity_min=${idMin}`, 'phase');
     const t0 = Date.now();
-    const { data: result, error: rpcErr } = await supabase.rpc('apply_rollup_bucket_assignments', {
-        p_run_id: runId,
-        p_sub_min_volume: subMin,
-        p_identity_min_volume: idMin
-    });
-    const ms = Date.now() - t0;
-    if (rpcErr) {
-        ctx.log(`[Bucketing ${runId}] rollup RPC failed after ${ms}ms: ${rpcErr.message}`, 'error');
-        throw new Error(`rollup failed: ${rpcErr.message}`);
+    // Direct Postgres, NOT supabase.rpc(). The rollup is one set-based
+    // DELETE+INSERT over every contact in the run — 39 s at 109k contacts,
+    // so ~4 min at the 700k target. That is past both the ~60 s Supabase
+    // gateway limit and the 120 s statement_timeout service_role inherits,
+    // and unlike the explosion it cannot be chunked: the volume thresholds
+    // are computed across the whole run in a single pass.
+    //
+    // Retries on lock contention rather than failing the run outright, which
+    // is what a straggling writer used to cost.
+    let result: any;
+    try {
+        result = await callHeavyRpc('apply_rollup_bucket_assignments', [runId, subMin, idMin], {
+            statementTimeoutMs: 30 * 60 * 1000,
+            onRetry: (attempt, err) => ctx.log(
+                `[Bucketing ${runId}] rollup retry ${attempt} after lock contention: ${err?.message}`, 'warn'
+            ),
+        });
+    } catch (e: any) {
+        const ms = Date.now() - t0;
+        ctx.log(`[Bucketing ${runId}] rollup RPC failed after ${ms}ms: ${e.message}`, 'error');
+        throw new Error(`rollup failed: ${e.message}`);
     }
+    const ms = Date.now() - t0;
 
     const r = (result || {}) as {
         total_contacts?: number;

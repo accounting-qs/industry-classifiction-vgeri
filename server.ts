@@ -14,8 +14,9 @@ import { pipeline as streamPipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'url';
 import Papa from 'papaparse';
 import { createClient } from '@supabase/supabase-js';
-import { Pool, type PoolClient } from 'pg';
+import { type PoolClient } from 'pg';
 import pgCopyStreams from 'pg-copy-streams';
+import { getPgPool } from './services/pgClient';
 const { to: copyTo, from: copyFrom } = pgCopyStreams;
 import { db } from './services/supabaseClient';
 import { JobProcessor } from './services/jobProcessor';
@@ -116,34 +117,11 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY || '');
 // MUST be the session-mode pooler (port 5432). The transaction-mode
 // pooler (port 6543) closes connections mid-COPY because each query
 // gets its own backend; pg-copy-streams needs a sticky session.
-let pgPoolSingleton: Pool | null = null;
-function getPgPool(): Pool {
-    if (pgPoolSingleton) return pgPoolSingleton;
-    const url = process.env.DATABASE_URL;
-    if (!url) throw new Error('DATABASE_URL is not set — required for CSV streaming export');
-    // DATABASE_URL must NOT include `?sslmode=require` — pg's
-    // connection-string parser turns that into ssl:true, which
-    // overrides this ssl option and triggers a self-signed-cert error
-    // against the Supabase pooler CA (not in Node's default trust).
-    // Leave sslmode off; the option below enables encryption without
-    // CA verification, matching Supabase's docs for direct pg.
-    pgPoolSingleton = new Pool({
-        connectionString: url,
-        max: 2,
-        idleTimeoutMillis: 30_000,
-        connectionTimeoutMillis: 10_000,
-        ssl: { rejectUnauthorized: false }
-    });
-    // Loud startup log so a 6543-misconfig is obvious in Render logs.
-    try {
-        const parsed = new URL(url);
-        console.log(`🔌 pg pool ready: host=${parsed.hostname} port=${parsed.port || '(default)'}`);
-        if (parsed.port === '6543') {
-            console.warn('⚠️  DATABASE_URL is using port 6543 (transaction-mode pooler). COPY streaming requires port 5432 (session-mode). Exports will fail mid-stream.');
-        }
-    } catch { /* not a URL — let the connection error surface */ }
-    return pgPoolSingleton;
-}
+// The direct-Postgres pool now lives in services/pgClient.ts so the
+// bucketing service can share it — its rollup and per-contact explosion
+// are far too slow to survive PostgREST's ~60 s gateway limit at volume
+// (39 s and 76 s respectively at 109k contacts). One pool, one place to
+// reason about connection count.
 
 // --- Real-time Status Tracking ---
 let currentJobLogs: LogEntry[] = []; // Cache for current session
@@ -3592,9 +3570,10 @@ app.get('/api/bucketing/runs/:id/taxonomy-contacts.csv', async (req, res) => {
 const CSV_FILES_DIR = path.join(EXPORTS_DIR, 'bucketing-csv');
 
 // Only one streaming COPY runs at a time, process-wide. A COPY pins one
-// Postgres backend for its whole duration and getPgPool() is capped at
-// max:2, so concurrent COPYs would starve each other and compete with
-// any live Phase 1b.
+// Postgres backend for its whole duration, and the shared pool
+// (services/pgClient.ts) is capped at max:6 and now also serves the
+// bucketing rollup/explosion — so concurrent COPYs would starve each other
+// and compete with any live Phase 1b.
 //
 // Shared by BOTH directions: bucketing CSV *exports* (COPY TO STDOUT,
 // runCsvExportJob) and contact *imports* (COPY FROM STDIN,
