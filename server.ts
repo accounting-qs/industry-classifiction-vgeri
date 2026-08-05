@@ -17,6 +17,7 @@ import { createClient } from '@supabase/supabase-js';
 import { type PoolClient } from 'pg';
 import pgCopyStreams from 'pg-copy-streams';
 import { getPgPool } from './services/pgClient';
+import { startMemoryMonitor, memorySnapshot, memoryHistory, writeHeapSnapshotTo, setMemoryContextProvider } from './services/memoryMonitor';
 const { to: copyTo, from: copyFrom } = pgCopyStreams;
 import { db } from './services/supabaseClient';
 import { JobProcessor } from './services/jobProcessor';
@@ -4813,6 +4814,52 @@ async function cleanupExpiredImportJobs() {
 }
 
 setInterval(cleanupExpiredImportJobs, 5 * 60 * 1000);
+
+// ── Memory telemetry ────────────────────────────────────────────────
+// The instance has been OOM-killed repeatedly (Jul 30 x2, Aug 3, Aug 4,
+// Aug 5) on a straight-line climb of ~233 MB/h, and the process emitted
+// no memory signal at all — the only evidence was Render's graph after
+// the fact. Every number below is cheap; the point is that the NEXT
+// occurrence is diagnosable from the logs instead of inferred from a
+// chart.
+//
+// The context provider ties each sample to what the process was doing, so
+// a climb can be attributed to a subsystem rather than guessed at.
+setMemoryContextProvider(() => ({
+    bucketing_runs_tracked: runAbortControllers.size,
+    export_jobs: exportJobs.size,
+    delete_jobs: deleteJobs.size,
+    copy_slot: copySlot.busy ? (copySlot.holder || 'busy') : 'idle',
+    pipeline_processing: jobStats.isProcessing,
+    pipeline_queued: jobStats.queued,
+}));
+startMemoryMonitor({ log: addServerLog });
+
+// Current memory picture. Read-only and allocation-free enough to be
+// polled while chasing a leak.
+app.get('/api/diagnostics/memory', (_req, res) => {
+    try {
+        res.json({ now: memorySnapshot(), history: memoryHistory() });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Heap snapshot on demand. NEVER automatic: v8.writeHeapSnapshot() blocks
+// the event loop for seconds and writes a file around the size of the live
+// heap, which on this box (~2 GB disk, 4 GB RAM) would turn one incident
+// into two. Call it deliberately, while watching, then download and open
+// the file in Chrome DevTools -> Memory.
+app.post('/api/diagnostics/heap-snapshot', (_req, res) => {
+    try {
+        const before = memorySnapshot();
+        const out = writeHeapSnapshotTo(path.join(EXPORTS_DIR, 'heap-snapshots'));
+        addServerLog(`🧠 heap snapshot written: ${out.file} (${Math.round(out.bytes / 1024 / 1024)} MB)`, 'Memory', 'warn');
+        res.json({ ...out, mb: Math.round(out.bytes / 1024 / 1024), rss_mb_at_capture: before.rss_mb });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
 cleanupExpiredImportJobs().catch(() => {});
 
 // Delete a bucketing run. All run-scoped child tables
