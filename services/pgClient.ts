@@ -16,11 +16,19 @@ import { Pool, type PoolClient } from 'pg';
  * `DELETE FROM bucket_contact_map` collided with the still-held locks and
  * was cancelled by `lock_timeout`.
  *
- * Measured at 109k contacts: explosion 76 s, rollup 39 s. Both scale roughly
- * linearly, so at the 700k target they are ~8 min and ~4 min — far past both
- * the 60 s gateway limit and the 120 s `statement_timeout` that service_role
- * inherits. No amount of chunking fixes the rollup, which is a single
- * set-based statement by design.
+ * Measured at 109k contacts: explosion 76 s, rollup 39 s (95.9 s under load).
+ * Both scale roughly linearly, so at the 700k target they are ~8 min and
+ * ~10 min — far past the 60 s gateway limit. No amount of chunking fixes the
+ * rollup, which is a single set-based statement by design.
+ *
+ * And the ceiling was lower than it looked: measured through the real REST
+ * path, service_role sees `statement_timeout = 8s`, inherited from the
+ * `authenticator` login role because service_role had no rolconfig of its own.
+ * The heavy RPCs only survived past that because they SET it inside the
+ * function body; plain table writes could not, which is what killed the
+ * finalize upsert on a 421k run. The accompanying migration gives service_role
+ * its own 120 s, but 120 s is still under what these operations need — hence
+ * this module.
  *
  * A direct connection has neither ceiling: no HTTP gateway, and the session's
  * timeouts are ours to set. This is the same channel the CSV export/import
@@ -127,26 +135,102 @@ export async function callHeavyRpcRows<T = any>(
     return await runHeavy(fn, args, opts, true) as T[];
 }
 
+const IDENT = /^[a-z_][a-z0-9_]*$/i;
+
+/**
+ * Bulk INSERT ... ON CONFLICT DO UPDATE over the direct connection.
+ *
+ * The PostgREST equivalent (`supabase.from(t).upsert(rows)`) is capped by
+ * whatever statement_timeout the request role carries — 8 s for service_role
+ * before the accompanying migration, and still bounded by the ~60 s gateway
+ * afterwards. This has neither limit, so a write that legitimately takes
+ * minutes at volume completes instead of dying part-way through a chunk and
+ * leaving the caller unsure how much landed.
+ *
+ * Chunk size is derived from Postgres' 65535 bind-parameter ceiling rather
+ * than hardcoded: with 13 columns that is ~4600 rows per statement, versus
+ * the 1000 the REST path used, so there are also far fewer round trips.
+ *
+ * Identifiers are validated, never interpolated blindly; values are always
+ * bound parameters.
+ */
+export async function bulkUpsert(
+    table: string,
+    rows: Record<string, any>[],
+    conflictColumns: string[],
+    opts: HeavyRpcOptions & { updateColumns?: string[] } = {}
+): Promise<number> {
+    if (rows.length === 0) return 0;
+    if (!IDENT.test(table)) throw new Error(`Unsafe table name: ${table}`);
+
+    // Union of keys across all rows: a caller may omit a column on some rows,
+    // and those must bind as NULL rather than shifting every later parameter.
+    const columns = Array.from(rows.reduce<Set<string>>((set, r) => {
+        Object.keys(r).forEach(k => set.add(k));
+        return set;
+    }, new Set<string>()));
+    for (const c of [...columns, ...conflictColumns]) {
+        if (!IDENT.test(c)) throw new Error(`Unsafe column name: ${c}`);
+    }
+
+    const updateCols = (opts.updateColumns ?? columns).filter(c => !conflictColumns.includes(c));
+    const setClause = updateCols.length > 0
+        ? `DO UPDATE SET ${updateCols.map(c => `${c} = EXCLUDED.${c}`).join(', ')}`
+        : 'DO NOTHING';
+
+    // Stay under the 65535 bind-parameter limit with headroom.
+    const perChunk = Math.max(1, Math.floor(60000 / columns.length));
+    let written = 0;
+
+    for (let i = 0; i < rows.length; i += perChunk) {
+        const chunk = rows.slice(i, i + perChunk);
+        const values: any[] = [];
+        const tuples = chunk.map(row => {
+            const ph = columns.map(c => {
+                values.push(row[c] ?? null);
+                return `$${values.length}`;
+            });
+            return `(${ph.join(', ')})`;
+        });
+        const sql =
+            `INSERT INTO ${table} (${columns.join(', ')}) VALUES ${tuples.join(', ')} ` +
+            `ON CONFLICT (${conflictColumns.join(', ')}) ${setClause}`;
+        const res = await runHeavySql(sql, values, opts);
+        written += res.rowCount ?? chunk.length;
+    }
+    return written;
+}
+
 async function runHeavy(
     fn: string,
     args: any[],
     opts: HeavyRpcOptions,
     setReturning: boolean
 ): Promise<any[]> {
+    // Function name is code-supplied, never user input, but it is concatenated
+    // into SQL so assert the shape rather than trust the caller.
+    if (!IDENT.test(fn)) throw new Error(`Unsafe function name: ${fn}`);
+    const placeholders = args.map((_, i) => `$${i + 1}`).join(', ');
+    const sql = setReturning
+        ? `SELECT * FROM ${fn}(${placeholders})`
+        : `SELECT ${fn}(${placeholders}) AS result`;
+    const res = await runHeavySql(sql, args, opts);
+    return res.rows;
+}
+
+/**
+ * Execute one statement on the direct connection with our own timeouts and a
+ * lock-contention retry. Shared by callHeavyRpc and bulkUpsert so both get
+ * identical connection hygiene — there is exactly one place that decides how a
+ * possibly-poisoned connection is returned to the pool.
+ */
+async function runHeavySql(sql: string, values: any[], opts: HeavyRpcOptions) {
     const {
         statementTimeoutMs = 15 * 60 * 1000,
         lockTimeoutMs = 30_000,
         retries = 3,
         onRetry,
     } = opts;
-
-    // Function name is code-supplied, never user input, but it is concatenated
-    // into SQL so assert the shape rather than trust the caller.
-    if (!/^[a-z_][a-z0-9_]*$/i.test(fn)) throw new Error(`Unsafe function name: ${fn}`);
-    const placeholders = args.map((_, i) => `$${i + 1}`).join(', ');
-    const sql = setReturning
-        ? `SELECT * FROM ${fn}(${placeholders})`
-        : `SELECT ${fn}(${placeholders}) AS result`;
 
     const pool = getPgPool();
     let lastErr: any;
@@ -165,8 +249,7 @@ async function runHeavy(
             // and wedge everything behind it — the failure mode that killed the
             // 109k run, where the server-wide setting is 0 (infinite).
             await client.query('SET idle_in_transaction_session_timeout = 60000');
-            const res = await client.query(sql, args);
-            return res.rows;
+            return await client.query(sql, values);
         } catch (err: any) {
             attemptErr = err;
             lastErr = err;

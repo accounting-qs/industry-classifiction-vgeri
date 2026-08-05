@@ -29,7 +29,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { callHeavyRpc, callHeavyRpcRows } from './pgClient';
+import { callHeavyRpc, callHeavyRpcRows, bulkUpsert } from './pgClient';
 import pLimit from 'p-limit';
 import Anthropic from '@anthropic-ai/sdk';
 import { getSetting } from './appSettings';
@@ -1982,11 +1982,25 @@ export async function finalizeTaxonomyAgainstLibrary(
         });
     }
 
-    for (let i = 0; i < updates.length; i += 1000) {
-        const chunk = updates.slice(i, i + 1000);
-        const { error } = await supabase.from('bucket_industry_map')
-            .upsert(chunk, { onConflict: 'bucketing_run_id,industry_string' });
-        if (error) throw new Error(`finalize upsert failed: ${error.message}`);
+    // Direct Postgres, NOT supabase.from().upsert(). Through PostgREST this
+    // write inherits service_role's statement_timeout, which was 8 s (from the
+    // `authenticator` login role) — a single 1000-row chunk measures 751 ms in
+    // isolation, so it fit until real contention pushed one chunk over the
+    // line, which is how a 421k run died here with
+    // "finalize upsert failed: canceling statement due to statement timeout".
+    //
+    // 19,183 orphan rows at 421k contacts and growing with run size, so this
+    // also stops being 20 sequential HTTP round trips: bulkUpsert sizes chunks
+    // against Postgres' bind-parameter limit instead (~4.6k rows here).
+    try {
+        await bulkUpsert('bucket_industry_map', updates, ['bucketing_run_id', 'industry_string'], {
+            statementTimeoutMs: 15 * 60 * 1000,
+            onRetry: (attempt, err) => ctx.log(
+                `[Finalize ${runId}] upsert retry ${attempt} after lock contention: ${err?.message}`, 'warn'
+            ),
+        });
+    } catch (e: any) {
+        throw new Error(`finalize upsert failed: ${e.message}`);
     }
 
     // Re-synthesize taxonomy_proposal so the Review screen reflects the new
