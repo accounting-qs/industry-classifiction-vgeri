@@ -4605,6 +4605,10 @@ async function runContactImportJob(jobId: string): Promise<void> {
         }
 
         // ── Stage 3: batched merge ───────────────────────────────────
+        // listName -> counts actually written, taken from the merge's
+        // RETURNING so every list that received rows can be registered in
+        // import history — including one named by a mapped CSV column.
+        const perList = new Map<string, { inserted: number; updated: number }>();
         const insertCols = ['contact_id', ...IMPORT_TARGET_COLUMNS];
         const selectExprs = ['gen_random_uuid()', ...IMPORT_TARGET_COLUMNS.map(c => `b.${c}`)];
         // COALESCE so a blank cell in the CSV never wipes data that is
@@ -4619,16 +4623,27 @@ async function runContactImportJob(jobId: string): Promise<void> {
         let inserted = 0;
         let updated = 0;
         for (let offset = 0; offset < dedupedRows; offset += IMPORT_MERGE_BATCH) {
-            const { rows } = await client.query<{ was_insert: boolean }>(`
+            const { rows } = await client.query<{ was_insert: boolean; lead_list_name: string | null }>(`
                 WITH b AS (
                     SELECT * FROM _imp_valid WHERE vid > $1 AND vid <= $2
                 )
                 INSERT INTO contacts (${insertCols.join(', ')})
                 SELECT ${selectExprs.join(', ')} FROM b
                 ON CONFLICT (email) ${conflictClause}
-                RETURNING (xmax = 0) AS was_insert
+                RETURNING (xmax = 0) AS was_insert, lead_list_name
             `, [offset, offset + IMPORT_MERGE_BATCH]);
-            for (const r of rows) { if (r.was_insert) inserted++; else updated++; }
+            for (const r of rows) {
+                if (r.was_insert) inserted++; else updated++;
+                // Attribute per list. When the list name comes from a mapped
+                // CSV column rather than the wizard's override, a single file
+                // can legitimately write several lists — and every one of them
+                // has to end up in import history, or the contacts are
+                // invisible in the UI even though they imported fine.
+                const key = r.lead_list_name || '';
+                const acc = perList.get(key) || { inserted: 0, updated: 0 };
+                if (r.was_insert) acc.inserted++; else acc.updated++;
+                perList.set(key, acc);
+            }
             await updateImportJob(jobId, {
                 progress_rows: Math.min(offset + IMPORT_MERGE_BATCH, dedupedRows),
                 inserted_count: inserted, updated_count: updated,
@@ -4665,21 +4680,60 @@ async function runContactImportJob(jobId: string): Promise<void> {
         // loopback so the name-merge, dedup-stats and stats-refresh
         // behaviour stays byte-identical to the old client-side call
         // rather than being reimplemented here.
-        const listName = job.list_name;
-        if (listName && (inserted + updated > 0 || invalidCount > 0)) {
+        // Register EVERY list that actually received rows, not just the name
+        // typed in the wizard.
+        //
+        // Previously this keyed solely off job.list_name, so when the list name
+        // came from a mapped CSV column instead — the `Lead List Name` header
+        // auto-maps, and a 59,539-row Apollo file carried "Apollo Good
+        // industries 100k" on every row — the 42,114 contacts imported
+        // correctly but no import_lists row was ever created. They were
+        // invisible in Import History, the list the user had named showed 0,
+        // and re-importing reported everything as duplicates because the
+        // contacts were already there under a name nothing displayed.
+        //
+        // perList comes from the merge's RETURNING, so these counts are what
+        // was really written rather than what was attempted.
+        const registrations: { name: string; inserted: number; updated: number }[] =
+            job.list_name
+                ? [{ name: job.list_name, inserted, updated }]
+                : Array.from(perList.entries())
+                    .filter(([name]) => name)
+                    .map(([name, c]) => ({ name, inserted: c.inserted, updated: c.updated }));
+
+        if (registrations.length === 0 && invalidCount > 0 && job.list_name) {
+            registrations.push({ name: job.list_name, inserted: 0, updated: 0 });
+        }
+        if (!job.list_name && registrations.length > 0) {
+            addServerLog(
+                `📥 Import ${jobId}: list name came from a mapped CSV column, not the wizard — registered ${registrations.map(r => `"${r.name}" (${r.inserted + r.updated})`).join(', ')}.`,
+                'Sync', 'warn'
+            );
+        }
+
+        for (const reg of registrations) {
+            if (reg.inserted + reg.updated === 0 && invalidCount === 0) continue;
             try {
                 await fetch(`http://127.0.0.1:${PORT}/api/import-lists`, {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        name: listName,
-                        contact_count: inserted + updated,
-                        dedup_stats: {
-                            total_rows: totalRows, inserted, updated,
+                        name: reg.name,
+                        contact_count: reg.inserted + reg.updated,
+                        // The dedup breakdown is computed for the file as a
+                        // whole and cannot be split across lists, so only
+                        // attach it when the file produced exactly one.
+                        dedup_stats: registrations.length === 1 ? {
+                            total_rows: totalRows, inserted: reg.inserted, updated: reg.updated,
                             within_file_dupes: withinFileDupes,
                             cross_list_dupes: crossListDupes,
                             invalid: invalidCount,
                             source_breakdown: crossListBreakdown,
                             invalid_breakdown: invalidByReason,
+                        } : {
+                            total_rows: reg.inserted + reg.updated,
+                            inserted: reg.inserted, updated: reg.updated,
+                            within_file_dupes: 0, cross_list_dupes: 0, invalid: 0,
+                            source_breakdown: {}, invalid_breakdown: {},
                         },
                     }),
                 });
@@ -4688,8 +4742,13 @@ async function runContactImportJob(jobId: string): Promise<void> {
             }
         }
 
+        const listLabel = registrations.length === 1
+            ? registrations[0].name
+            : registrations.length > 1
+                ? `${registrations.length} lists`
+                : '(no list)';
         addServerLog(
-            `📥 Import "${listName || '(no list)'}" complete: ${inserted} new, ${updated} updated, ${duplicates + withinFileDupes} duplicates, ${invalidCount} invalid.`,
+            `📥 Import "${listLabel}" complete: ${inserted} new, ${updated} updated, ${duplicates + withinFileDupes} duplicates, ${invalidCount} invalid.`,
             'Sync', 'info'
         );
         console.log(`[import-job ${jobId}] done: ${totalRows} rows staged → ${inserted} inserted, ${updated} updated`);

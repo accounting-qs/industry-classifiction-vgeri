@@ -3341,6 +3341,9 @@ function CSVImportWizard({
   const [job, setJob] = useState<any>(null);
   const [showFailedModal, setShowFailedModal] = useState(false);
   const [showMappingWarning, setShowMappingWarning] = useState(false);
+  // Blocks Start Import when the list name would silently come from a CSV
+  // column instead of the user. See csvListName below.
+  const [showListNameWarning, setShowListNameWarning] = useState(false);
   const [listNameOverride, setListNameOverride] = useState('');
   const [overwriteDuplicates, setOverwriteDuplicates] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -3512,8 +3515,24 @@ function CSVImportWizard({
 
   // Intercept "Start Import": if any recommended field is unmapped, show
   // the confirmation modal first; otherwise go straight to importing.
+  // The list name a mapped CSV column would supply, if the user leaves the
+  // name box blank. This is how 42,114 Apollo contacts landed under
+  // "Apollo Good industries 100k" instead of the list the user meant: the
+  // file carried a `Lead List Name` column, that header auto-maps, and the
+  // blank box let it decide silently.
+  const csvListNameHeader = Object.entries(mapping)
+    .find(([, target]) => target === 'lead_list_name')?.[0];
+  const csvListNameValue = csvListNameHeader
+    ? (previewRows.map(r => (r?.[csvListNameHeader] ?? '').trim()).find(Boolean) || '')
+    : '';
+  // Only a problem when the user supplied no name of their own — a typed
+  // name always wins server-side.
+  const listNameComesFromCsv = !listNameOverride.trim() && !!csvListNameValue;
+
   const handleStartClick = () => {
-    if (unmappedFields.length > 0) {
+    if (listNameComesFromCsv) {
+      setShowListNameWarning(true);
+    } else if (unmappedFields.length > 0) {
       setShowMappingWarning(true);
     } else {
       startImport();
@@ -3779,7 +3798,41 @@ function CSVImportWizard({
                 {(() => {
                   const trimmed = listNameOverride.trim();
                   if (!trimmed) {
-                    return <p className="text-[10px] text-gray-600 mt-1">Applied to all contacts. Leave blank to use mapped CSV column value.</p>;
+                    // A CSV column mapped to lead_list_name silently decides
+                    // the list name, and the old copy ("leave blank to use
+                    // mapped CSV column value") never said WHICH value. A
+                    // 59,539-row Apollo file carried "Apollo Good industries
+                    // 100k" in a `Lead List Name` column that auto-maps: the
+                    // 42,114 contacts imported correctly but under that name,
+                    // so the list the user had named showed 0 and re-importing
+                    // reported everything as duplicates. Show the actual value.
+                    const mappedHeader = csvListNameHeader;
+                    const sampleValue = csvListNameValue;
+                    if (mappedHeader && sampleValue) {
+                      return (
+                        <p className="text-[10px] text-amber-400 mt-1 flex items-start gap-1.5">
+                          <AlertCircle className="w-3 h-3 mt-0.5 shrink-0" />
+                          <span>
+                            These contacts will be filed under{' '}
+                            <span className="font-bold">"{sampleValue}"</span>, taken from your{' '}
+                            <span className="font-bold">"{mappedHeader}"</span> column — not a name you typed.
+                            Type a name above to override it.
+                          </span>
+                        </p>
+                      );
+                    }
+                    if (mappedHeader) {
+                      return (
+                        <p className="text-[10px] text-amber-400 mt-1 flex items-start gap-1.5">
+                          <AlertCircle className="w-3 h-3 mt-0.5 shrink-0" />
+                          <span>
+                            Your <span className="font-bold">"{mappedHeader}"</span> column is mapped to the list name but looks
+                            empty. Type a name above, or these contacts land with no list.
+                          </span>
+                        </p>
+                      );
+                    }
+                    return <p className="text-[10px] text-gray-600 mt-1">Applied to all contacts. Required unless a CSV column is mapped to the list name.</p>;
                   }
                   const match = importLists.find(l => l.name.toLowerCase() === trimmed.toLowerCase());
                   if (match) {
@@ -4151,6 +4204,54 @@ function CSVImportWizard({
       </div>
 
       {/* Failed Contacts Modal */}
+      {showListNameWarning && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowListNameWarning(false)}>
+          <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-md flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="flex items-start gap-3 px-6 py-4 border-b border-[#2e2e2e]">
+              <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+              <div>
+                <h3 className="text-sm font-bold text-white">Where should these contacts be filed?</h3>
+                <p className="text-[11px] text-gray-500 mt-0.5">
+                  You left the list name blank, so the name will come from your CSV — not from you.
+                </p>
+              </div>
+            </div>
+
+            <div className="px-6 py-4 space-y-3">
+              <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl px-4 py-3">
+                <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold">Will be filed under</p>
+                <p className="text-sm font-bold text-amber-300 mt-1 break-all">{csvListNameValue}</p>
+                <p className="text-[10px] text-gray-600 mt-1">
+                  from the <span className="font-mono text-gray-400">{csvListNameHeader}</span> column
+                </p>
+              </div>
+              <p className="text-[11px] text-gray-500">
+                If that isn't what you expected, go back and type a name — it overrides the column for every row.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-[#2e2e2e]">
+              <button
+                onClick={() => setShowListNameWarning(false)}
+                className="px-4 py-2 rounded-lg text-xs font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 transition-colors"
+              >
+                Go back &amp; name it
+              </button>
+              <button
+                onClick={() => {
+                  setShowListNameWarning(false);
+                  if (unmappedFields.length > 0) setShowMappingWarning(true);
+                  else startImport();
+                }}
+                className="px-4 py-2 rounded-lg text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#35b87d] transition-colors"
+              >
+                Use "{csvListNameValue.length > 24 ? csvListNameValue.slice(0, 24) + '…' : csvListNameValue}"
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showMappingWarning && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowMappingWarning(false)}>
           <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-md flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>
