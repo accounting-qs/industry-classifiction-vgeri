@@ -3344,6 +3344,10 @@ function CSVImportWizard({
   // Blocks Start Import when the list name would silently come from a CSV
   // column instead of the user. See csvListName below.
   const [showListNameWarning, setShowListNameWarning] = useState(false);
+  // Surfaced when an import lands zero new contacts. Without it the run looks
+  // identical to a failure: nothing is added, and an all-duplicate import
+  // registers no list either, so Import History stays empty too.
+  const [showAllDuplicatesModal, setShowAllDuplicatesModal] = useState(false);
   const [listNameOverride, setListNameOverride] = useState('');
   const [overwriteDuplicates, setOverwriteDuplicates] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -3613,6 +3617,17 @@ function CSVImportWizard({
     };
     tick();
   };
+
+  // An import that adds nothing is a real, common outcome — re-importing a
+  // file whose leads are already in the database. It needs to be stated
+  // outright: "0 new, 130,170 duplicates" is a success, but silence reads as
+  // a failure, which is exactly how a 49k-row re-import got reported as
+  // "imported but did not show up".
+  useEffect(() => {
+    if (importStatus !== 'done') return;
+    const added = importResult.inserted + importResult.updated;
+    if (added === 0 && importResult.duplicates > 0) setShowAllDuplicatesModal(true);
+  }, [importStatus, importResult.inserted, importResult.updated, importResult.duplicates]);
 
   // Re-attach to an in-flight import after a refresh. This is the payoff
   // of staging in Storage: reloading the tab (or opening the app on
@@ -4204,6 +4219,87 @@ function CSVImportWizard({
       </div>
 
       {/* Failed Contacts Modal */}
+      {showAllDuplicatesModal && (() => {
+        // Where the duplicates already live. Comes from the server job's
+        // cross_list_breakdown, so it names real lists rather than just
+        // asserting "these exist somewhere".
+        const breakdown: [string, number][] = Object.entries(job?.cross_list_breakdown || {})
+          .map(([k, v]) => [k, Number(v) || 0] as [string, number])
+          .sort((a, b) => b[1] - a[1]);
+        const withinFile = Number(job?.within_file_dupes || 0);
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowAllDuplicatesModal(false)}>
+            <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-lg flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>
+              <div className="flex items-start gap-3 px-6 py-4 border-b border-[#2e2e2e]">
+                <CheckCircle2 className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+                <div>
+                  <h3 className="text-sm font-bold text-white">Nothing new was added</h3>
+                  <p className="text-[11px] text-gray-500 mt-0.5">
+                    The import ran fine — every contact in this file is already in your database.
+                  </p>
+                </div>
+              </div>
+
+              <div className="px-6 py-4 space-y-3 max-h-[55vh] overflow-y-auto custom-scrollbar">
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-3 text-center">
+                    <p className="text-xl font-bold text-gray-500">0</p>
+                    <p className="text-[9px] text-gray-500 uppercase tracking-wider font-bold mt-1">New</p>
+                  </div>
+                  <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-3 text-center">
+                    <p className="text-xl font-bold text-amber-400">{importResult.duplicates.toLocaleString()}</p>
+                    <p className="text-[9px] text-gray-500 uppercase tracking-wider font-bold mt-1">Duplicates</p>
+                  </div>
+                  <div className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl p-3 text-center">
+                    <p className="text-xl font-bold text-gray-600">{totalRows.toLocaleString()}</p>
+                    <p className="text-[9px] text-gray-500 uppercase tracking-wider font-bold mt-1">Rows read</p>
+                  </div>
+                </div>
+
+                {/* No list is created when nothing is added, so say so rather
+                    than letting the user hunt for it in Import History. */}
+                <p className="text-[11px] text-gray-500">
+                  Because no contacts were added, <span className="text-gray-300 font-bold">no new list was created</span> —
+                  that is why this import will not appear in Import History. Nothing was lost.
+                </p>
+
+                {withinFile > 0 && (
+                  <p className="text-[11px] text-gray-500">
+                    {withinFile.toLocaleString()} of them were repeated inside this file itself.
+                  </p>
+                )}
+
+                {breakdown.length > 0 && (
+                  <div>
+                    <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold mb-2">Already filed under</p>
+                    <div className="space-y-1">
+                      {breakdown.slice(0, 8).map(([name, n]) => (
+                        <div key={name} className="flex items-center justify-between gap-3 bg-[#1c1c1c] border border-[#2e2e2e] rounded-lg px-3 py-2">
+                          <span className="text-[11px] text-gray-300 truncate">{name}</span>
+                          <span className="text-[11px] font-mono text-amber-300 shrink-0">{n.toLocaleString()}</span>
+                        </div>
+                      ))}
+                      {breakdown.length > 8 && (
+                        <p className="text-[10px] text-gray-600 pt-1">+{breakdown.length - 8} more list(s)</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center justify-end px-6 py-4 border-t border-[#2e2e2e]">
+                <button
+                  onClick={() => setShowAllDuplicatesModal(false)}
+                  className="px-4 py-2 rounded-lg text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#35b87d] transition-colors"
+                >
+                  Got it
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {showListNameWarning && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowListNameWarning(false)}>
           <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-md flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>
