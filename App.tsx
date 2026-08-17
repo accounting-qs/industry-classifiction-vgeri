@@ -3323,6 +3323,9 @@ function CSVImportWizard({
   const [file, setFile] = useState<File | null>(null);
   const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
   const [previewRows, setPreviewRows] = useState<Record<string, string>[]>([]);
+  // Per-header value profile from the server (see profileHeaders in
+  // server.ts). Sampled over ~200 rows, not just the 5 shown below.
+  const [headerStats, setHeaderStats] = useState<Record<string, { sampled: number; dateLike: number; examples: string[] }>>({});
   const [mapping, setMapping] = useState<Record<string, string>>({});
   const [totalRows, setTotalRows] = useState(0);
   const [importProgress, setImportProgress] = useState(0);
@@ -3344,6 +3347,9 @@ function CSVImportWizard({
   // Blocks Start Import when the list name would silently come from a CSV
   // column instead of the user. See csvListName below.
   const [showListNameWarning, setShowListNameWarning] = useState(false);
+  // Raised when a numeric firmographic column carries values a
+  // spreadsheet already turned into dates. See dateMangledColumns.
+  const [showDateWarning, setShowDateWarning] = useState(false);
   // Surfaced when an import lands zero new contacts. Without it the run looks
   // identical to a failure: nothing is added, and an all-duplicate import
   // registers no list either, so Import History stays empty too.
@@ -3467,6 +3473,7 @@ function CSVImportWizard({
 
       setCsvHeaders(up.headers);
       setPreviewRows(up.previewRows || []);
+      setHeaderStats(up.headerStats || {});
       setMapping(autoMap(up.headers));
       setUploadPhase('ready');
       setStep(2);
@@ -3533,15 +3540,34 @@ function CSVImportWizard({
   // name always wins server-side.
   const listNameComesFromCsv = !listNameOverride.trim() && !!csvListNameValue;
 
-  const handleStartClick = () => {
-    if (listNameComesFromCsv) {
-      setShowListNameWarning(true);
-    } else if (unmappedFields.length > 0) {
-      setShowMappingWarning(true);
-    } else {
-      startImport();
+  // Columns mapped to a numeric firmographic field whose values a
+  // spreadsheet has already rewritten as dates. This is how 738,077
+  // contacts ended up with an employees_count of "20/4/2025" (the range
+  // "4-20") and "19-Oct" ("10-19"): Excel/Sheets ate the range on the
+  // way out of ZoomInfo, and the import — a faithful TEXT passthrough —
+  // had no reason to object. The file is the only place it is visible.
+  const DATE_PRONE_TARGETS = ['employees_count', 'company_founded_year', 'company_total_funding', 'company_annual_revenue'];
+  const dateMangledColumns = Object.keys(mapping)
+    .filter(header => DATE_PRONE_TARGETS.includes(mapping[header]))
+    .map(header => ({ header, target: mapping[header], stat: headerStats[header] }))
+    .filter(c => c.stat && c.stat.dateLike > 0);
+
+  // Confirmation gates, most-damaging first. Each modal's "continue"
+  // button resumes the chain at the next index rather than jumping
+  // straight to the import, so a file that trips two gates shows both.
+  const startGates: { active: boolean; open: () => void }[] = [
+    { active: listNameComesFromCsv, open: () => setShowListNameWarning(true) },
+    { active: dateMangledColumns.length > 0, open: () => setShowDateWarning(true) },
+    { active: unmappedFields.length > 0, open: () => setShowMappingWarning(true) },
+  ];
+  const runGatesFrom = (from: number) => {
+    for (let i = from; i < startGates.length; i++) {
+      if (startGates[i].active) return startGates[i].open();
     }
+    startImport();
   };
+
+  const handleStartClick = () => runGatesFrom(0);
 
   // Backing out must discard the staged object too, otherwise a user who
   // changes their mind leaves a full-size CSV in the bucket until the TTL
@@ -3552,7 +3578,7 @@ function CSVImportWizard({
       fetch(`/api/import-jobs/${jobId}`, { method: 'DELETE' }).catch(() => {});
     }
     setJobId(null); setJob(null);
-    setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]);
+    setStep(1); setFile(null); setCsvHeaders([]); setPreviewRows([]); setHeaderStats({});
     setListNameOverride(''); setOverwriteDuplicates(false);
     setImportStatus('idle'); setUploadPhase('idle'); setUploadPct(0);
     setUploadError(null); setTotalRows(0); setImportProgress(0);
@@ -4334,14 +4360,61 @@ function CSVImportWizard({
                 Go back &amp; name it
               </button>
               <button
-                onClick={() => {
-                  setShowListNameWarning(false);
-                  if (unmappedFields.length > 0) setShowMappingWarning(true);
-                  else startImport();
-                }}
+                onClick={() => { setShowListNameWarning(false); runGatesFrom(1); }}
                 className="px-4 py-2 rounded-lg text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#35b87d] transition-colors"
               >
                 Use "{csvListNameValue.length > 24 ? csvListNameValue.slice(0, 24) + '…' : csvListNameValue}"
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showDateWarning && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowDateWarning(false)}>
+          <div className="bg-[#0e0e0e] border border-[#2e2e2e] rounded-2xl w-full max-w-md flex flex-col shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="flex items-start gap-3 px-6 py-4 border-b border-[#2e2e2e]">
+              <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+              <div>
+                <h3 className="text-sm font-bold text-white">Your spreadsheet turned these into dates</h3>
+                <p className="text-[11px] text-gray-500 mt-0.5">
+                  Excel and Google Sheets read an employee range like <span className="font-mono text-gray-400">10-19</span> as a date and rewrite it. The damage is already in the file — importing stores it as-is.
+                </p>
+              </div>
+            </div>
+
+            <div className="px-6 py-4 space-y-3 max-h-[40vh] overflow-y-auto custom-scrollbar">
+              {dateMangledColumns.map(({ header, target, stat }) => (
+                <div key={header} className="bg-[#1c1c1c] border border-[#2e2e2e] rounded-xl px-4 py-3">
+                  <p className="text-[10px] text-gray-500 uppercase tracking-wider font-bold">
+                    <span className="font-mono text-gray-400">{header}</span> → {target}
+                  </p>
+                  <p className="text-sm font-bold text-red-300 mt-1 break-all">
+                    {stat!.examples.join('  ·  ')}
+                  </p>
+                  <p className="text-[10px] text-gray-600 mt-1">
+                    {stat!.dateLike.toLocaleString()} of {stat!.sampled.toLocaleString()} sampled rows
+                    {stat!.dateLike === stat!.sampled ? ' — the whole column' : ''}
+                  </p>
+                </div>
+              ))}
+              <p className="text-[11px] text-gray-500">
+                Fix it at the source: re-export from ZoomInfo/Apollo and open the CSV with the affected column set to <span className="text-gray-300">Text</span> (Sheets: File → Import → "Convert text to numbers and dates" off), or don't open it in a spreadsheet at all.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-[#2e2e2e]">
+              <button
+                onClick={() => { setShowDateWarning(false); runGatesFrom(2); }}
+                className="px-4 py-2 rounded-lg text-xs font-bold bg-[#1c1c1c] border border-[#2e2e2e] text-gray-400 hover:border-gray-500 transition-colors"
+              >
+                Import anyway
+              </button>
+              <button
+                onClick={() => setShowDateWarning(false)}
+                className="px-4 py-2 rounded-lg text-xs font-bold bg-[#3ecf8e] text-black hover:bg-[#35b87d] transition-colors"
+              >
+                Go back &amp; fix the CSV
               </button>
             </div>
           </div>

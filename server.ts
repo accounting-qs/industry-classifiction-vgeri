@@ -4041,6 +4041,49 @@ const IMPORT_PREVIEW_BYTES = 256 * 1024;
 // 10M-row import doesn't hold one transaction open for hours. Safe to
 // re-run: the merge is ON CONFLICT-idempotent.
 const IMPORT_MERGE_BATCH = 100_000;
+// Rows sampled from the preview buffer to profile column values. Only 5
+// are shown in the wizard, but 5 is too few to catch a column that is
+// only partly mangled — the ZoomInfo file below had 13% bad rows, which
+// a 5-row sample would have missed half the time.
+const IMPORT_PROFILE_ROWS = 200;
+
+// Values that a spreadsheet produced by reinterpreting text as a date.
+// This is not hypothetical: 738,077 contacts were imported with an
+// employee range in employees_count that Excel/Sheets had already
+// eaten — "10-19" arrived as "19-Oct", and "4-20" as "20/4/2025". The
+// import is a faithful TEXT passthrough, so nothing downstream could
+// have noticed; the only place to catch it is the file itself.
+const DATE_MANGLED_PATTERNS = [
+    /^\d{1,2}[-/](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*$/i, // 19-Oct
+    /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[-/]\d{1,2}$/i, // Oct-19
+    /^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/,                                       // 20/4/2025
+    /^\d{4}-\d{2}-\d{2}([T ].*)?$/,                                          // 2025-04-20
+];
+const isDateMangled = (v: string) => DATE_MANGLED_PATTERNS.some(re => re.test(v));
+
+// Per-header value profile over the sampled rows, keyed by CSV header.
+// Every header is profiled; deciding which columns a date is actually
+// wrong for is the wizard's job (DATE_PRONE_TARGETS in App.tsx) — a date
+// in `title` or `industry` is legitimate data.
+type HeaderStat = { sampled: number; dateLike: number; examples: string[] };
+function profileHeaders(headers: string[], rows: Record<string, string>[]): Record<string, HeaderStat> {
+    const stats: Record<string, HeaderStat> = {};
+    for (const h of headers) {
+        let sampled = 0, dateLike = 0;
+        const examples: string[] = [];
+        for (const row of rows) {
+            const v = (row?.[h] ?? '').trim();
+            if (!v) continue;
+            sampled++;
+            if (isDateMangled(v)) {
+                dateLike++;
+                if (examples.length < 3 && !examples.includes(v)) examples.push(v);
+            }
+        }
+        stats[h] = { sampled, dateLike, examples };
+    }
+    return stats;
+}
 
 // Columns on public.contacts that an import may write. Doubles as the
 // injection allowlist — a mapping value not in this set is rejected
@@ -4099,6 +4142,7 @@ async function listAllImportObjects(): Promise<{ name: string; created_at?: stri
 // Content-Range header so we never trust a client-supplied size.
 async function readImportHead(objectPath: string): Promise<{
     headers: string[]; previewRows: Record<string, string>[]; totalBytes: number;
+    headerStats: Record<string, HeaderStat>;
 }> {
     const { data: signed, error } = await supabase.storage
         .from(IMPORT_BUCKET).createSignedUrl(objectPath, 300);
@@ -4128,13 +4172,20 @@ async function readImportHead(objectPath: string): Promise<{
         if (cut > 0) text = text.slice(0, cut);
     }
 
+    // Parse deeper than the 5 rows the wizard displays: the extra rows
+    // are only used to profile column values (see profileHeaders).
     const parsed = Papa.parse<Record<string, string>>(text, {
-        header: true, skipEmptyLines: true, preview: 5
+        header: true, skipEmptyLines: true, preview: IMPORT_PROFILE_ROWS
     });
     const headers = (parsed.meta.fields || []).filter(h => h !== undefined && h !== null);
     if (headers.length === 0) throw new Error('No column headers found — is this a CSV?');
 
-    return { headers, previewRows: parsed.data.slice(0, 5), totalBytes };
+    return {
+        headers,
+        previewRows: parsed.data.slice(0, 5),
+        totalBytes,
+        headerStats: profileHeaders(headers, parsed.data),
+    };
 }
 
 // ── Routes ──────────────────────────────────────────────────────────
@@ -4217,14 +4268,20 @@ app.post('/api/import-jobs/:id/uploaded', async (req, res) => {
             .from('contact_import_jobs').select('*').eq('id', jobId).single();
         if (error || !job) return res.status(404).json({ error: error?.message || 'Job not found' });
 
-        const { headers, previewRows, totalBytes } = await readImportHead(job.storage_path);
+        const { headers, previewRows, totalBytes, headerStats } = await readImportHead(job.storage_path);
         await updateImportJob(jobId, {
             status: 'uploaded',
             csv_headers: headers,
             preview_rows: previewRows,
             file_size_bytes: totalBytes,
         });
-        res.json({ job: { ...job, status: 'uploaded', file_size_bytes: totalBytes }, headers, previewRows });
+        // headerStats is deliberately not persisted — it is only ever
+        // consumed by the wizard that receives this response, and the
+        // job row has no resume path that would need it again.
+        res.json({
+            job: { ...job, status: 'uploaded', file_size_bytes: totalBytes },
+            headers, previewRows, headerStats,
+        });
     } catch (err: any) {
         await updateImportJob(jobId, { status: 'failed', error_message: String(err.message || err).slice(0, 1000) });
         res.status(400).json({ error: err.message });
