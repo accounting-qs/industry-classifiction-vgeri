@@ -1374,7 +1374,10 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
         const r = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}`);
         const d = await r.json();
         const p = d?.run?.progress;
-        if (p && p.step === 'finalize') {
+        // The service emits 'finalize_per_contact' (and
+        // 'finalize_per_contact_done'), never a bare 'finalize' — matching
+        // only the latter is why this bar sat at 0/0 for the whole call.
+        if (p && typeof p.step === 'string' && p.step.startsWith('finalize')) {
           setFinalizeProgress({
             current: Number(p.current || 0),
             total: Number(p.total || 0),
@@ -1394,6 +1397,17 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
         nullified: data.nullified || 0,
         failed: data.failed || 0
       });
+      // The taxonomy half can succeed while the per-contact explosion fails;
+      // the server treats that as non-fatal so the response is still ok:true.
+      // Say so, otherwise "Finalized" implies per-contact rows exist and an
+      // export comes back empty with no explanation.
+      if (data.per_contact_ok === false) {
+        onError(
+          'Taxonomy finalized, but per-contact rows were not written' +
+          (data.per_contact_error ? ` (${data.per_contact_error})` : '') +
+          '. Run Assign Buckets to populate them.'
+        );
+      }
       onRefresh();
     } catch (e: any) {
       onError(e.message);

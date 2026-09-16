@@ -1814,6 +1814,9 @@ export async function finalizeTaxonomyAgainstLibrary(
     per_contact_with_identity?: number;
     per_contact_with_sub?: number;
     per_contact_with_sector?: number;
+    /** False when the taxonomy finalized but the per-contact explosion did not. */
+    per_contact_ok: boolean;
+    per_contact_error: string | null;
 }> {
     const { data: run, error: runErr } = await supabase
         .from('bucketing_runs').select('*').eq('id', runId).single();
@@ -1891,7 +1894,7 @@ export async function finalizeTaxonomyAgainstLibrary(
         // that killed the explosion.
         let data: any;
         try {
-            data = await callHeavyRpc('finalize_taxonomy_candidates', [runId], { statementTimeoutMs: 15 * 60 * 1000 });
+            data = await callHeavyRpc('finalize_taxonomy_candidates', [runId], { statementTimeoutMs: 15 * 60 * 1000, ownerKey: runId });
         } catch (error: any) {
             throw new Error(`finalize_taxonomy_candidates scan failed: ${error.message}`);
         }
@@ -1915,9 +1918,17 @@ export async function finalizeTaxonomyAgainstLibrary(
     }
     ctx.log(`[Finalize ${runId}] ${candidates.length} orphan row(s) — keeping accepted proposals, routing rejected ones to General (library: ${snapshot.identities.length} identities / ${snapshot.sub_identities.length} sub-identities / ${snapshot.sectors.length} sectors)`);
 
-    if (candidates.length === 0) {
-        return { candidates: 0, rerouted: 0, nullified: 0, failed: 0, costUsd: 0 };
-    }
+    // No early return on an empty candidate list. Reconciling orphan tags and
+    // exploding taxonomy to per-contact rows are independent jobs, and only
+    // the first one is about orphans — bailing here meant that a run whose
+    // taxonomy was already fully canonical (the *good* case) silently got no
+    // per-contact rows and was never marked finalized, so the UI offered
+    // Finalize forever and an export came back empty.
+    //
+    // Everything below is already empty-safe: the keep/null loop iterates
+    // nothing, bulkUpsert returns immediately on zero rows, and the proposal
+    // re-synthesis reads the used_* accumulators, which are populated from the
+    // non-orphan rows regardless of how many candidates there were.
 
     let rerouted = 0;   // at least one layer survived (matched library)
     let nullified = 0;  // all proposed layers got nulled → General
@@ -1995,6 +2006,7 @@ export async function finalizeTaxonomyAgainstLibrary(
     try {
         await bulkUpsert('bucket_industry_map', updates, ['bucketing_run_id', 'industry_string'], {
             statementTimeoutMs: 15 * 60 * 1000,
+            ownerKey: runId,
             onRetry: (attempt, err) => ctx.log(
                 `[Finalize ${runId}] upsert retry ${attempt} after lock contention: ${err?.message}`, 'warn'
             ),
@@ -2064,6 +2076,11 @@ export async function finalizeTaxonomyAgainstLibrary(
         with_sub_identity?: number;
         with_sector?: number;
     } = {};
+    // Whether the explosion below actually landed. Finalize treats a failure
+    // here as non-fatal, so without this the caller cannot tell a clean
+    // finalize from one that wrote no per-contact rows at all.
+    let perContactOk = true;
+    let perContactError: string | null = null;
     try {
         // Direct Postgres, NOT supabase.rpc(). Measured at 76 s for 109k
         // contacts and scaling roughly linearly — ~8 min at the 700k target —
@@ -2080,6 +2097,7 @@ export async function finalizeTaxonomyAgainstLibrary(
             [runId],
             {
                 statementTimeoutMs: 30 * 60 * 1000,
+                ownerKey: runId,
                 onRetry: (attempt, err) => ctx.log(
                     `[Finalize ${runId}] per-contact explosion retry ${attempt} after lock contention: ${err?.message}`, 'warn'
                 ),
@@ -2107,11 +2125,19 @@ export async function finalizeTaxonomyAgainstLibrary(
         // the statement genuinely exceeded 30 min, so say so plainly rather
         // than implying the run is fine.
         const timedOut = e?.code === '57014' || /timeout/i.test(String(e?.message || ''));
+        perContactOk = false;
+        perContactError = String(e?.message || e);
+        // 'error', not 'warn'. The run continues, but "Finalized" on the UI
+        // means per-contact taxonomy is queryable and after this it is not,
+        // so this is the one line that explains an empty CSV export. The
+        // function is a single transaction, so nothing is half-written —
+        // bucket_contact_map / bucket_assignments keep whatever they held
+        // before, and Phase 1b still repopulates them from scratch.
         ctx.log(
             timedOut
-                ? `[Finalize ${runId}] per-contact explosion TIMED OUT after 30 min — the run is too large for a single statement, or the database is contended. Phase 1b will repopulate, but investigate before retrying: ${e.message}`
-                : `[Finalize ${runId}] per-contact explosion failed (non-fatal — Phase 1b will populate): ${e.message}`,
-            'warn'
+                ? `[Finalize ${runId}] per-contact explosion TIMED OUT after 30 min — taxonomy IS finalized, but per-contact rows were NOT written (rolled back). Run Assign Buckets to populate them. Investigate before retrying: ${e.message}`
+                : `[Finalize ${runId}] per-contact explosion failed — taxonomy IS finalized, but per-contact rows were NOT written. Run Assign Buckets to populate them: ${e.message}`,
+            'error'
         );
     }
 
@@ -2125,6 +2151,10 @@ export async function finalizeTaxonomyAgainstLibrary(
         per_contact_with_identity: perContactStats.with_primary_identity,
         per_contact_with_sub:      perContactStats.with_sub_identity,
         per_contact_with_sector:   perContactStats.with_sector,
+        // False means the taxonomy finalized but the per-contact rows did
+        // not land. The caller must not present this as a clean finalize.
+        per_contact_ok:            perContactOk,
+        per_contact_error:         perContactError,
     };
 }
 
@@ -2311,6 +2341,7 @@ export async function runBucketAssignment(
     try {
         result = await callHeavyRpc('apply_rollup_bucket_assignments', [runId, subMin, idMin], {
             statementTimeoutMs: 30 * 60 * 1000,
+            ownerKey: runId,
             onRetry: (attempt, err) => ctx.log(
                 `[BucketAssign ${runId}] rollup retry ${attempt} after lock contention: ${err?.message}`, 'warn'
             ),
@@ -4476,7 +4507,7 @@ async function loadProposedContactCounts(
     // showing every proposed tag as 0 contacts.
     let data: any[] = [];
     try {
-        data = await callHeavyRpcRows('get_proposed_tag_contact_counts', [runId], { statementTimeoutMs: 5 * 60 * 1000 });
+        data = await callHeavyRpcRows('get_proposed_tag_contact_counts', [runId], { statementTimeoutMs: 5 * 60 * 1000, ownerKey: runId });
     } catch { return {}; }
     const map: Record<string, number> = {};
     for (const r of (data || []) as any[]) {
@@ -5207,6 +5238,7 @@ export async function runAssignment(
     try {
         result = await callHeavyRpc('apply_rollup_bucket_assignments', [runId, subMin, idMin], {
             statementTimeoutMs: 30 * 60 * 1000,
+            ownerKey: runId,
             onRetry: (attempt, err) => ctx.log(
                 `[Bucketing ${runId}] rollup retry ${attempt} after lock contention: ${err?.message}`, 'warn'
             ),

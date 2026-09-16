@@ -95,6 +95,85 @@ export interface HeavyRpcOptions {
     retries?: number;
     /** Called before each attempt after the first, for progress logging. */
     onRetry?: (attempt: number, err: any) => void;
+    /**
+     * Groups this statement under a cancellable owner (for bucketing, the run
+     * id). While it runs, its Postgres backend pid is registered so
+     * `cancelHeavyStatements(ownerKey)` can actually stop it. Without this a
+     * statement is uncancellable from the app — see the registry below.
+     */
+    ownerKey?: string;
+}
+
+/**
+ * Backend pids of heavy statements currently in flight, keyed by owner.
+ *
+ * WHY: aborting on the client does nothing to Postgres. Closing the socket
+ * does not either — the server finishes the statement it was given. So
+ * "Stop" in the UI used to leave the statement running to completion,
+ * invisible to everyone, while the user started another one on top of it.
+ * Run 7258e616 was observed with three concurrent copies of the same
+ * 30-minute rollup, each queued behind the last, because each "stop and
+ * restart" added one instead of replacing it.
+ *
+ * Cancelling for real requires a *second* connection calling
+ * pg_cancel_backend(pid) — hence tracking pids here.
+ */
+const inFlightBackendPids = new Map<string, Set<number>>();
+
+function registerBackendPid(ownerKey: string, pid: number): void {
+    let pids = inFlightBackendPids.get(ownerKey);
+    if (!pids) {
+        pids = new Set();
+        inFlightBackendPids.set(ownerKey, pids);
+    }
+    pids.add(pid);
+}
+
+function unregisterBackendPid(ownerKey: string, pid: number): void {
+    const pids = inFlightBackendPids.get(ownerKey);
+    if (!pids) return;
+    pids.delete(pid);
+    if (pids.size === 0) inFlightBackendPids.delete(ownerKey);
+}
+
+/**
+ * Cancel every heavy statement currently running under `ownerKey`.
+ *
+ * Uses pg_cancel_backend (SIGINT-equivalent), not pg_terminate_backend: the
+ * statement dies with SQLSTATE 57014 and the connection survives, so the
+ * caller gets a normal error it can report rather than a dropped socket.
+ *
+ * Best-effort by design. A pid may have finished already, or belong to a
+ * different session after pid reuse — pg_cancel_backend simply returns false
+ * in that case. Never throws; a failed cancel must not break the cancel
+ * endpoint.
+ *
+ * Returns the number of backends Postgres reported it signalled.
+ */
+export async function cancelHeavyStatements(ownerKey: string): Promise<number> {
+    const pids = Array.from(inFlightBackendPids.get(ownerKey) ?? []);
+    if (pids.length === 0) return 0;
+    try {
+        const pool = getPgPool();
+        // state='active' guards against signalling a pid that has already
+        // finished. A pid is only registered for the window in which our own
+        // statement is running (the finally below removes it), so the residual
+        // risk is pid reuse inside that window — vanishingly unlikely, and the
+        // worst case is one cancelled query rather than a dropped connection.
+        const res = await pool.query(
+            `SELECT pid, pg_cancel_backend(pid) AS cancelled
+               FROM pg_stat_activity
+              WHERE pid = ANY($1::int[])
+                AND state = 'active'`,
+            [pids]
+        );
+        const cancelled = res.rows.filter(r => r.cancelled).length;
+        console.log(`[pgClient] cancel ${ownerKey}: signalled ${cancelled}/${pids.length} backend(s)`);
+        return cancelled;
+    } catch (err: any) {
+        console.warn(`[pgClient] cancel ${ownerKey} failed (non-fatal): ${err.message}`);
+        return 0;
+    }
 }
 
 /**
@@ -230,6 +309,7 @@ async function runHeavySql(sql: string, values: any[], opts: HeavyRpcOptions) {
         lockTimeoutMs = 30_000,
         retries = 3,
         onRetry,
+        ownerKey,
     } = opts;
 
     const pool = getPgPool();
@@ -240,8 +320,16 @@ async function runHeavySql(sql: string, values: any[], opts: HeavyRpcOptions) {
         // Per-attempt, NOT lastErr: a retry that succeeds after an earlier
         // failure must still return a healthy connection to the pool.
         let attemptErr: any = null;
+        let pid: number | null = null;
         try {
             client = await pool.connect();
+            if (ownerKey) {
+                // Register before the statement starts, so a cancel racing
+                // with the call still finds the pid.
+                const r = await client.query('SELECT pg_backend_pid() AS pid');
+                pid = Number(r.rows[0]?.pid) || null;
+                if (pid) registerBackendPid(ownerKey, pid);
+            }
             await client.query(`SET statement_timeout = ${Number(statementTimeoutMs) | 0}`);
             await client.query(`SET lock_timeout = ${Number(lockTimeoutMs) | 0}`);
             // Never leave a pooled session able to sit idle in a transaction:
@@ -261,6 +349,7 @@ async function runHeavySql(sql: string, values: any[], opts: HeavyRpcOptions) {
             }
             throw err;
         } finally {
+            if (ownerKey && pid) unregisterBackendPid(ownerKey, pid);
             if (client) {
                 // Discard a connection whose state we are unsure of; returning
                 // a session that may still be mid-transaction is how locks leak

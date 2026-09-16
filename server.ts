@@ -16,7 +16,7 @@ import Papa from 'papaparse';
 import { createClient } from '@supabase/supabase-js';
 import { type PoolClient } from 'pg';
 import pgCopyStreams from 'pg-copy-streams';
-import { getPgPool } from './services/pgClient';
+import { getPgPool, cancelHeavyStatements } from './services/pgClient';
 import { startMemoryMonitor, memorySnapshot, memoryHistory, writeHeapSnapshotTo, setMemoryContextProvider } from './services/memoryMonitor';
 const { to: copyTo, from: copyFrom } = pgCopyStreams;
 import { db } from './services/supabaseClient';
@@ -2805,14 +2805,35 @@ app.post('/api/bucketing/runs/:id/reopen-for-phase1b', async (req, res) => {
 // because the caller polls for refresh anyway — typically 5-30 s depending
 // on how many proposed-new entries remain. Returns the merge stats so the
 // UI can surface "5 sub-identity merges, 1 identity dropped" feedback.
-app.post('/api/bucketing/runs/:id/recalculate', async (req, res) => {
-    const id = req.params.id;
+// The synchronous bucketing endpoints (recalculate / finalize-taxonomy /
+// assign-buckets) used to report failure only in the HTTP response. The UI
+// showed a transient toast and a page reload lost it completely, so a
+// finalize that blew up left no trace anywhere — the run still read
+// 'taxonomy_ready' with an empty log. These run from 'taxonomy_ready' and
+// leave the run usable, so flipping status='failed' would be wrong;
+// appending to the per-run log is the honest record. Same ctx the worker
+// paths log through, so it lands in bucketing_run_logs and renders in the
+// run's log panel after a reload.
+async function runSyncBucketingStep(
+    label: string,
+    id: string,
+    res: any,
+    work: (ctx: ReturnType<typeof buildBucketingCtx>) => Promise<any>
+) {
+    const ctx = buildBucketingCtx(id);
     try {
-        const result = await recalculateTaxonomyWithLibrary(supabase, id, buildBucketingCtx(id));
+        const result = await work(ctx);
         res.json({ ok: true, ...result });
     } catch (err: any) {
+        ctx.log(`[${label} ${id}] failed: ${err?.message || err}`, 'error');
         res.status(400).json({ error: err.message });
     }
+}
+
+app.post('/api/bucketing/runs/:id/recalculate', async (req, res) => {
+    const id = req.params.id;
+    await runSyncBucketingStep('Recalculate', id, res,
+        ctx => recalculateTaxonomyWithLibrary(supabase, id, ctx));
 });
 
 // Finalize: re-tag every still-orphan row (is_new_*=true) using a
@@ -2822,12 +2843,8 @@ app.post('/api/bucketing/runs/:id/recalculate', async (req, res) => {
 // orphans, typically a few cents.
 app.post('/api/bucketing/runs/:id/finalize-taxonomy', async (req, res) => {
     const id = req.params.id;
-    try {
-        const result = await finalizeTaxonomyAgainstLibrary(supabase, id, buildBucketingCtx(id));
-        res.json({ ok: true, ...result });
-    } catch (err: any) {
-        res.status(400).json({ error: err.message });
-    }
+    await runSyncBucketingStep('Finalize', id, res,
+        ctx => finalizeTaxonomyAgainstLibrary(supabase, id, ctx));
 });
 
 // Bucket Assignment: separate from taxonomy tagging. For each Phase 1a
@@ -2838,12 +2855,8 @@ app.post('/api/bucketing/runs/:id/finalize-taxonomy', async (req, res) => {
 // distinct industries (typically a few cents per thousand).
 app.post('/api/bucketing/runs/:id/assign-buckets', async (req, res) => {
     const id = req.params.id;
-    try {
-        const result = await runBucketAssignment(supabase, id, buildBucketingCtx(id));
-        res.json({ ok: true, ...result });
-    } catch (err: any) {
-        res.status(400).json({ error: err.message });
-    }
+    await runSyncBucketingStep('BucketAssign', id, res,
+        ctx => runBucketAssignment(supabase, id, ctx));
 });
 
 // Diagnostic: read-only summary of what Phase 1a actually persisted for
@@ -3112,7 +3125,11 @@ app.post('/api/bucketing/runs/:id/cancel', async (req, res) => {
             // — cheap insurance even if the worker is already dead.
             runAbortControllers.get(id)?.abort();
             runAbortControllers.delete(id);
-            return res.json({ ok: true, forced: true });
+            // And cancel the statement itself. This is the case that most
+            // needs it: "no progress for >2 min" is exactly what a rollup
+            // grinding away inside Postgres looks like from out here.
+            const forcedCancelled = await cancelHeavyStatements(id);
+            return res.json({ ok: true, forced: true, statementsCancelled: forcedCancelled });
         }
 
         await supabase.from('bucketing_runs')
@@ -3122,7 +3139,13 @@ app.post('/api/bucketing/runs/:id/cancel', async (req, res) => {
         // Without this the worker waits up to 90 s for the next OpenAI
         // timeout before the cancel takes effect.
         runAbortControllers.get(id)?.abort();
-        res.json({ ok: true });
+        // The AbortController only reaches LLM fetches. A heavy RPC already
+        // handed to Postgres keeps running regardless of what this process
+        // does, so cancel it explicitly — otherwise "Stop" leaves a rollup
+        // grinding invisibly and the user's restart stacks a second one on
+        // top of it (observed three-deep on run 7258e616).
+        const statementsCancelled = await cancelHeavyStatements(id);
+        res.json({ ok: true, statementsCancelled });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }
