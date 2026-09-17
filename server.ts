@@ -4246,6 +4246,74 @@ async function readImportHead(objectPath: string): Promise<{
     };
 }
 
+
+/**
+ * How many fields the *data* rows actually carry.
+ *
+ * COPY runs with HEADER true, so Postgres skips the file's header line
+ * and the staging table's width only ever needed to match the data. Sizing
+ * it from the header instead is what broke every Ampleleads export: their
+ * writer emits a trailing header name ("List Name", "List Build - Segment
+ * Name") that no data row has a value for, so the header has 48 fields and
+ * every row has 47, and COPY rejects the very first row with
+ * `missing data for column "c47"`.
+ *
+ * Returns the set of widths seen across the sampled data rows. The caller
+ * only narrows the COPY column list when that set is a single value below
+ * the header count — a file whose rows genuinely disagree with each other
+ * is malformed, and guessing a width would bury real corruption instead of
+ * reporting it.
+ *
+ * Trailing-only is safe by construction: CSV cannot express a missing
+ * *middle* field, so a short row is always short at the end.
+ */
+async function probeDataWidths(objectPath: string): Promise<{ widths: number[]; sampled: number }> {
+    const { data: signed, error } = await supabase.storage
+        .from(IMPORT_BUCKET).createSignedUrl(objectPath, 300);
+    if (error || !signed?.signedUrl) return { widths: [], sampled: 0 };
+
+    const resp = await fetch(signed.signedUrl, {
+        headers: { Range: `bytes=0-${IMPORT_PREVIEW_BYTES - 1}` }
+    });
+    if (!resp.ok && resp.status !== 206) return { widths: [], sampled: 0 };
+
+    const buf = Buffer.from(await resp.arrayBuffer());
+
+    // A 206 whose content-range total matches what we hold means the range
+    // covered the entire file, so its last row is genuinely complete.
+    let totalBytes = buf.length;
+    const cr = resp.headers.get('content-range');
+    const m = cr && /\/(\d+)\s*$/.exec(cr);
+    if (m) totalBytes = Number(m[1]);
+    const whole = totalBytes <= buf.length;
+
+    let text = buf.toString('utf8');
+    if (!whole) {
+        const cut = text.lastIndexOf('\n');
+        if (cut > 0) text = text.slice(0, cut);
+    }
+
+    // header:false so we count raw fields per physical record. Papa handles
+    // quoted newlines, so a multi-line field is still one row.
+    const parsed = Papa.parse<string[]>(text, {
+        header: false, skipEmptyLines: true, preview: IMPORT_PROFILE_ROWS
+    });
+    const rows = (parsed.data || []).filter(r => Array.isArray(r));
+    if (rows.length < 2) return { widths: [], sampled: 0 };
+
+    let dataRows = rows.slice(1); // row 0 is the header
+    // Discard the final row of a partial read. Cutting at the last newline
+    // can land *inside* a quoted field, which leaves the tail unterminated
+    // and Papa yields a short, meaningless row — on the real 781MB file it
+    // reported 23 fields against a true width of 47, which was enough to
+    // make the widths look inconsistent and defeat the narrowing below.
+    if (!whole && dataRows.length > 1) dataRows = dataRows.slice(0, -1);
+    if (dataRows.length === 0) return { widths: [], sampled: 0 };
+
+    const widths = Array.from(new Set(dataRows.map(r => r.length))).sort((a, b) => a - b);
+    return { widths, sampled: dataRows.length };
+}
+
 // ── Routes ──────────────────────────────────────────────────────────
 
 // 1. Create a job + mint a signed upload token. The browser uploads
@@ -4584,6 +4652,37 @@ async function runContactImportJob(jobId: string): Promise<void> {
         const stageCols = headers.map((_, i) => `c${i} text`).join(', ');
         await client.query(`CREATE TEMP TABLE _imp_stage (${stageCols})`);
 
+        // How many fields the data rows actually have. COPY skips the
+        // header line (HEADER true), so it is the data width that has to
+        // match — see probeDataWidths for why these can differ.
+        let copyWidth = headers.length;
+        const probe = await probeDataWidths(objectPath!);
+        if (probe.widths.length === 1 && probe.widths[0] < headers.length && probe.widths[0] > 0) {
+            copyWidth = probe.widths[0];
+            const dropped = headers.slice(copyWidth);
+            // Only a problem if the user actually mapped one of them; an
+            // exporter's empty trailing column is noise, not data loss.
+            const droppedAndMapped = dropped.filter(h => {
+                const t = mapping[h];
+                return t && t !== '__skip__';
+            });
+            if (droppedAndMapped.length > 0) {
+                throw new Error(
+                    `The file's header has ${headers.length} columns but every row has only ${copyWidth}, ` +
+                    `so ${droppedAndMapped.map(h => `"${h}"`).join(', ')} has no data in it — ` +
+                    `yet it is mapped to an import field. Re-map it to "skip", or re-export the file with that column populated.`
+                );
+            }
+            console.warn(
+                `[import ${jobId}] header has ${headers.length} columns, data rows have ${copyWidth} ` +
+                `(${probe.sampled} sampled) — ignoring trailing header(s): ${dropped.map(h => `"${h}"`).join(', ')}`
+            );
+        }
+        // Naming the columns explicitly is what makes a short-but-consistent
+        // file loadable: COPY then expects exactly this many fields and
+        // leaves the rest of the row NULL, instead of failing on row 1.
+        const copyColumnList = Array.from({ length: copyWidth }, (_, i) => `c${i}`).join(', ');
+
         const { data: signed, error: sErr } = await supabase.storage
             .from(IMPORT_BUCKET).createSignedUrl(objectPath!, 24 * 60 * 60);
         if (sErr || !signed?.signedUrl) throw new Error(`Could not read staged file: ${sErr?.message || 'unknown'}`);
@@ -4608,7 +4707,7 @@ async function runContactImportJob(jobId: string): Promise<void> {
         });
 
         const copyStream = client.query(copyFrom(
-            `COPY _imp_stage FROM STDIN WITH (FORMAT csv, HEADER true)`
+            `COPY _imp_stage (${copyColumnList}) FROM STDIN WITH (FORMAT csv, HEADER true)`
         ));
         try {
             await streamPipeline(Readable.fromWeb(resp.body as any), byteCounter, copyStream);
@@ -4625,7 +4724,20 @@ async function runContactImportJob(jobId: string): Promise<void> {
             } else if (/extra data after last expected column/i.test(raw)) {
                 friendly = `A row has more columns than the header${at}. Usually an unescaped comma in a field. Re-export with quoting enabled.`;
             } else if (/missing data for column/i.test(raw)) {
-                friendly = `A row has fewer columns than the header${at}. The file is likely truncated or rows were hand-edited.`;
+                // Deliberately does not say "truncated". The width mismatch
+                // above is handled before we get here, so reaching this now
+                // means the rows disagree with *each other* — and a file that
+                // dies early is not truncated, it is inconsistent. Give the
+                // position so that is obvious at a glance.
+                const pct = totalBytes > 0 ? ((bytesRead / totalBytes) * 100).toFixed(1) : '?';
+                friendly =
+                    `A row has fewer columns than the rest of the file${at} — ${pct}% in. ` +
+                    (Number(pct) < 5
+                        ? `Failing this early means the file is not truncated; its rows are inconsistent with each other. `
+                        : `If this is near the end, the file is likely truncated. `) +
+                    `Header has ${headers.length} columns` +
+                    (probe.widths.length > 0 ? `, sampled rows have ${probe.widths.join(' / ')}` : '') +
+                    `. Re-export it from the source tool.`;
             } else if (/unterminated CSV quoted field/i.test(raw)) {
                 friendly = `A quoted field is never closed${at}. There is probably a stray double-quote in the data.`;
             } else if (/invalid byte sequence|encoding/i.test(raw)) {
