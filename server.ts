@@ -16,7 +16,7 @@ import Papa from 'papaparse';
 import { createClient } from '@supabase/supabase-js';
 import { type PoolClient } from 'pg';
 import pgCopyStreams from 'pg-copy-streams';
-import { getPgPool, cancelHeavyStatements } from './services/pgClient';
+import { getPgPool, cancelHeavyStatements, callHeavyRpc } from './services/pgClient';
 import { startMemoryMonitor, memorySnapshot, memoryHistory, writeHeapSnapshotTo, setMemoryContextProvider } from './services/memoryMonitor';
 const { to: copyTo, from: copyFrom } = pgCopyStreams;
 import { db } from './services/supabaseClient';
@@ -1583,10 +1583,14 @@ app.get('/api/import-lists/stats', async (_req, res) => {
 });
 
 // App-wide phase-funnel stats for the Enrichment Dashboard (/dashboard).
-// Thin wrapper over get_dashboard_stats() — Phase 0 (enrichment) sums the
-// cached list stats, Phase 1a/1b count distinct contacts in the bucket
-// tables. Fetched on load + manual Refresh only, so no background refresh
-// scheduling like /api/import-lists/stats needs.
+// Thin wrapper over get_dashboard_stats() — every field now comes from a
+// cached/metadata table, none of them scan raw contacts.
+//
+// Phase 1a/1b used to COUNT(DISTINCT contact_id) across the whole of
+// bucket_contact_map and bucket_assignments (4.8M rows / 6GB) on every
+// call, which measured ~90 s and evicted the buffer cache for everything
+// else. Those two now come from bucketing_global_stats_cache, refreshed
+// hourly by pg_cron and on demand below.
 app.get('/api/dashboard/stats', async (_req, res) => {
     try {
         const { data, error } = await supabase.rpc('get_dashboard_stats');
@@ -1628,6 +1632,17 @@ app.get('/api/dashboard/stats', async (_req, res) => {
             console.warn(`[dashboard/stats] awaiting-bucketing calc failed: ${err.message}`);
         }
 
+        // How old the two cached bucket counts are, so the UI can say so
+        // rather than presenting an hour-old number as live.
+        let bucket_stats_as_of: string | null = null;
+        try {
+            const { data: cache } = await supabase
+                .from('bucketing_global_stats_cache')
+                .select('refreshed_at')
+                .maybeSingle();
+            bucket_stats_as_of = (cache as any)?.refreshed_at ?? null;
+        } catch { /* best-effort — staleness display is not worth a 500 */ }
+
         res.json({
             phase0: {
                 total_imported: Number(row.total_imported) || 0,
@@ -1641,8 +1656,28 @@ app.get('/api/dashboard/stats', async (_req, res) => {
                 awaiting_bucketing,
                 run_count: Number(row.run_count) || 0,
                 completed_run_count: Number(row.completed_run_count) || 0,
+                stats_as_of: bucket_stats_as_of,
             },
         });
+
+        // Fire-and-forget AFTER responding: the recompute takes ~113 s, so
+        // it must never be on the request's critical path. A user who just
+        // finished a run gets current numbers on their next visit instead
+        // of waiting for the hourly cron. The RPC no-ops when the cache is
+        // younger than the threshold, so repeated dashboard loads do not
+        // stack recomputes.
+        //
+        // Direct Postgres, NOT supabase.rpc(): at ~113 s this is past both
+        // the ~60 s PostgREST gateway limit and the 120 s statement_timeout
+        // service_role carries, so the REST path would sever it every time
+        // and the cache would never advance between cron runs.
+        callHeavyRpc('refresh_bucketing_global_stats_if_stale', ['30 minutes'], {
+            statementTimeoutMs: 10 * 60 * 1000,
+            retries: 1,
+            ownerKey: 'dashboard-stats-refresh',
+        }).catch((err: any) =>
+            console.warn(`[dashboard/stats] background refresh failed: ${err.message}`)
+        );
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }
