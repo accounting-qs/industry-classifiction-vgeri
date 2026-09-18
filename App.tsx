@@ -3507,6 +3507,14 @@ function CSVImportWizard({
   };
 
   const mappedFields = Object.values(mapping).filter(v => v !== '__skip__');
+  // target field -> the CSV column currently claiming it. Lets a taken
+  // option say *who* took it instead of just refusing to be picked: a
+  // disabled <option> is styled by the OS, and on this dark theme the
+  // greying is easy to miss, which reads as "the dropdown is broken".
+  const mappedBy = Object.entries(mapping).reduce<Record<string, string>>((acc, [header, target]) => {
+    if (typeof target === 'string' && target !== '__skip__') acc[target] = header;
+    return acc;
+  }, {});
   // Email is mandatory. The server skips any contact without an email
   // (an emailless row never enters the DB), so an import with no email
   // column mapped would insert nothing — better to require it upfront
@@ -3976,11 +3984,22 @@ function CSVImportWizard({
                         } focus:border-[#3ecf8e]`}
                     >
                       <option value="__skip__">— Skip —</option>
-                      {CONTACTS_FIELDS.map(f => (
-                        <option key={f.key} value={f.key} disabled={mappedFields.includes(f.key) && mapping[header] !== f.key}>
-                          {f.label}
-                        </option>
-                      ))}
+                      {CONTACTS_FIELDS.map(f => {
+                        const takenBy = mapping[header] !== f.key ? mappedBy[f.key] : undefined;
+                        return (
+                          <option
+                            key={f.key}
+                            value={f.key}
+                            disabled={!!takenBy}
+                            // Native options ignore most CSS, but colour is
+                            // honoured widely enough to be worth setting so
+                            // the row reads as unavailable at a glance.
+                            style={takenBy ? { color: '#6b7280' } : undefined}
+                          >
+                            {takenBy ? `${f.label} — already mapped to "${takenBy}"` : f.label}
+                          </option>
+                        );
+                      })}
                     </select>
                   </div>
                 ))}

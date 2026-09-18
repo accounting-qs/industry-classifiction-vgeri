@@ -4660,22 +4660,41 @@ async function runContactImportJob(jobId: string): Promise<void> {
         if (probe.widths.length === 1 && probe.widths[0] < headers.length && probe.widths[0] > 0) {
             copyWidth = probe.widths[0];
             const dropped = headers.slice(copyWidth);
-            // Only a problem if the user actually mapped one of them; an
-            // exporter's empty trailing column is noise, not data loss.
-            const droppedAndMapped = dropped.filter(h => {
-                const t = mapping[h];
-                return t && t !== '__skip__';
-            });
-            if (droppedAndMapped.length > 0) {
+            const droppedAndMapped = dropped
+                .map(h => ({ header: h, target: mapping[h] }))
+                .filter(x => x.target && x.target !== '__skip__');
+
+            // A dataless column is only worth refusing over when it would
+            // make the import pointless. Blank cells already normalise to
+            // NULL (see `sel()` below), so a column that is absent behaves
+            // exactly like one that is empty in every row — which is what
+            // this is. Failing on any mapping at all was too strict: it
+            // rejected a 447MB file whose only offence was "List Name"
+            // mapped to lead_list_name, a mapping the merge discards anyway
+            // whenever the wizard supplied a list name.
+            const fatal = droppedAndMapped.filter(x =>
+                x.target === 'email' ||
+                (x.target === 'lead_list_name' && !job.list_name)
+            );
+            if (fatal.length > 0) {
+                const what = fatal.map(x => `"${x.header}" → ${x.target}`).join(', ');
                 throw new Error(
                     `The file's header has ${headers.length} columns but every row has only ${copyWidth}, ` +
-                    `so ${droppedAndMapped.map(h => `"${h}"`).join(', ')} has no data in it — ` +
-                    `yet it is mapped to an import field. Re-map it to "skip", or re-export the file with that column populated.`
+                    `so the trailing column(s) contain no data at all — and ${what} depends on one. ` +
+                    (fatal.some(x => x.target === 'email')
+                        ? `Without an email every row would be skipped, so nothing would import. `
+                        : `Without it the contacts would have no list name. `) +
+                    `Map that field to a column that has data, or re-export the file with this one populated.`
                 );
             }
+
+            const ignored = droppedAndMapped.filter(x => !fatal.includes(x));
             console.warn(
                 `[import ${jobId}] header has ${headers.length} columns, data rows have ${copyWidth} ` +
-                `(${probe.sampled} sampled) — ignoring trailing header(s): ${dropped.map(h => `"${h}"`).join(', ')}`
+                `(${probe.sampled} sampled) — ignoring trailing header(s): ${dropped.map(h => `"${h}"`).join(', ')}` +
+                (ignored.length > 0
+                    ? `; mapped but empty, so imported as NULL: ${ignored.map(x => `"${x.header}" → ${x.target}`).join(', ')}`
+                    : '')
             );
         }
         // Naming the columns explicitly is what makes a short-but-consistent
