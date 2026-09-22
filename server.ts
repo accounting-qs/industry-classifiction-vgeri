@@ -5821,6 +5821,45 @@ app.listen(PORT, async () => {
         console.warn('[startup] stale bucketing-run check failed:', e?.message || e);
     }
 
+    // Contact imports: the ingest worker is detached in THIS process, so a
+    // restart kills it mid-COPY or mid-merge and nothing ever reconciles the
+    // row. The job stays status='running' forever and the wizard spins on it
+    // with no error and no way out — which is exactly what a deploy did to a
+    // 263MB import 36 seconds after it started, 83,428 rows lost to a
+    // cosmetic release.
+    //
+    // Unlike the bucketing check above there is no heartbeat to consult and
+    // none is needed: a single instance owns every import, so anything still
+    // marked queued/running when that instance boots is by definition
+    // orphaned — this process is not running it. Mark them failed so the UI
+    // shows a real error with a retry, rather than a spinner that never ends.
+    //
+    // Marked, not auto-restarted: the staging TEMP table died with the old
+    // session so there is nothing to resume from, and re-running the whole
+    // merge unprompted is the user's call, not the server's. The uploaded
+    // file is still in Storage, so pressing Import again costs no re-upload.
+    try {
+        const { data: orphaned } = await supabase
+            .from('contact_import_jobs')
+            .select('id,list_name,stage,total_rows')
+            .in('status', ['queued', 'running']);
+        if ((orphaned || []).length > 0) {
+            const ids = (orphaned || []).map((j: any) => j.id);
+            await supabase.from('contact_import_jobs').update({
+                status: 'failed',
+                error_message:
+                    'Interrupted by a server restart (deploy or crash) — no rows were lost, but the import did not finish. ' +
+                    'Your uploaded file is still staged, so press Import again to re-run it; there is no need to upload it a second time.',
+            }).in('id', ids);
+            console.log(
+                `🟡 Marked ${ids.length} orphaned import job(s) as failed (restartable):`,
+                (orphaned || []).map((j: any) => `${j.id} (${j.stage || 'no stage'}, ${j.total_rows ?? '?'} rows)`)
+            );
+        }
+    } catch (e: any) {
+        console.warn('[startup] orphaned import-job check failed:', e?.message || e);
+    }
+
     // TRUTH CHECK: Verify isProcessing against the actual DB state.
     // If pipeline_state says "processing" but there are no active jobs/items,
     // force-reset to prevent the 409 guard from permanently blocking new enrichments.
