@@ -4198,6 +4198,38 @@ async function listAllImportObjects(): Promise<{ name: string; created_at?: stri
 // Range-read the head of an uploaded object and pull out the header row
 // + up to 5 preview rows. Returns the object's true total size from the
 // Content-Range header so we never trust a client-supplied size.
+
+/**
+ * Retry an operation that failed for a reason that is likely to pass.
+ *
+ * Aimed at Supabase Storage, whose metadata layer has its own Postgres
+ * pool: a busy moment surfaces as "Timed out acquiring connection from
+ * connection pool", which is nothing to do with the request and succeeds
+ * on a second attempt seconds later.
+ *
+ * Only retries transport-shaped failures. A genuinely absent object or a
+ * malformed CSV must still fail on the first attempt — retrying those
+ * would just delay the error the user needs to see.
+ */
+const TRANSIENT_RE = /connection pool|timeout|timed out|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|fetch failed|503|504|429/i;
+
+async function retryTransient<T>(fn: () => Promise<T>, label: string, attempts = 4): Promise<T> {
+    let lastErr: any;
+    for (let i = 1; i <= attempts; i++) {
+        try {
+            return await fn();
+        } catch (err: any) {
+            lastErr = err;
+            const msg = String(err?.message || err);
+            if (i === attempts || !TRANSIENT_RE.test(msg)) throw err;
+            const waitMs = [1000, 3000, 8000][i - 1] ?? 8000;
+            console.warn(`[retryTransient] ${label} attempt ${i}/${attempts} failed (${msg}); retrying in ${waitMs}ms`);
+            await new Promise(r => setTimeout(r, waitMs));
+        }
+    }
+    throw lastErr;
+}
+
 async function readImportHead(objectPath: string): Promise<{
     headers: string[]; previewRows: Record<string, string>[]; totalBytes: number;
     headerStats: Record<string, HeaderStat>;
@@ -4394,7 +4426,16 @@ app.post('/api/import-jobs/:id/uploaded', async (req, res) => {
             .from('contact_import_jobs').select('*').eq('id', jobId).single();
         if (error || !job) return res.status(404).json({ error: error?.message || 'Job not found' });
 
-        const { headers, previewRows, totalBytes, headerStats } = await readImportHead(job.storage_path);
+        // Storage keeps its object metadata in Postgres and reaches it
+        // through its own small connection pool. Under load that pool can
+        // refuse a checkout — "Timed out acquiring connection from
+        // connection pool" — and this step then failed outright, which
+        // stranded a finished upload: the bytes were safely in the bucket,
+        // but the job stayed 'awaiting_upload' forever and the only offer
+        // the UI could make was to upload the file again. On a 263MB file
+        // that is an expensive way to absorb a transient blip.
+        const { headers, previewRows, totalBytes, headerStats } =
+            await retryTransient(() => readImportHead(job.storage_path), `head-read ${jobId}`);
         await updateImportJob(jobId, {
             status: 'uploaded',
             csv_headers: headers,
@@ -4427,7 +4468,15 @@ app.post('/api/import-jobs/:id/start', async (req, res) => {
             .from('contact_import_jobs').select('*').eq('id', jobId).single();
         if (error || !job) return res.status(404).json({ error: error?.message || 'Job not found' });
         if (job.status !== 'uploaded' && job.status !== 'failed') {
-            return res.status(409).json({ error: `Job is ${job.status}, cannot start` });
+            // 'awaiting_upload' here almost always means the bytes arrived
+            // but the header read did not finish, so say what to do rather
+            // than naming an internal state the user cannot act on.
+            const hint = job.status === 'awaiting_upload'
+                ? ` The file may have finished uploading without being read — reload the Import page and it will resume from the mapping step, or re-select the file.`
+                : job.status === 'queued' || job.status === 'running'
+                    ? ` It is already importing.`
+                    : '';
+            return res.status(409).json({ error: `This import is not ready to start (status: ${job.status}).${hint}` });
         }
 
         // Validate every target against the allowlist before it can reach

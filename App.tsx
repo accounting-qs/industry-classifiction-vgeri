@@ -3327,6 +3327,12 @@ function CSVImportWizard({
   // server.ts). Sampled over ~200 rows, not just the 5 shown below.
   const [headerStats, setHeaderStats] = useState<Record<string, { sampled: number; dateLike: number; examples: string[] }>>({});
   const [mapping, setMapping] = useState<Record<string, string>>({});
+  // Set when an upload landed in Storage but the confirm step did not
+  // finish. Lets the error panel offer Resume instead of only "try another
+  // file", which would discard a completed multi-hundred-MB transfer.
+  const [resumableJobId, setResumableJobId] = useState<string | null>(null);
+  const [resumeMeta, setResumeMeta] = useState<{ name: string; size: number } | null>(null);
+  const [resuming, setResuming] = useState(false);
   const [totalRows, setTotalRows] = useState(0);
   const [importProgress, setImportProgress] = useState(0);
   const [importStatus, setImportStatus] = useState<'idle' | 'importing' | 'done' | 'error'>('idle');
@@ -3467,9 +3473,26 @@ function CSVImportWizard({
       await uploadToStorage(created.upload.url, selectedFile, setUploadPct);
 
       setUploadPhase('reading');
-      const upRes = await fetch(`/api/import-jobs/${created.job.id}/uploaded`, { method: 'POST' });
-      const up = await upRes.json();
-      if (!upRes.ok) throw new Error(up.error || 'Could not read the uploaded file');
+      // The bytes are in Storage by this point. This call only reads the
+      // header, so a transient failure here must not cost the upload —
+      // retry before giving up, and if it still fails keep the job id so
+      // "Resume" can finish the job instead of re-sending the whole file.
+      let up: any = null;
+      let confirmErr: string | null = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const upRes = await fetch(`/api/import-jobs/${created.job.id}/uploaded`, { method: 'POST' });
+        up = await upRes.json().catch(() => ({}));
+        if (upRes.ok) { confirmErr = null; break; }
+        confirmErr = up?.error || 'Could not read the uploaded file';
+        if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 2000));
+      }
+      if (confirmErr) {
+        setResumableJobId(created.job.id);
+        throw new Error(
+          `${confirmErr} — your file finished uploading, so this is only the header read. ` +
+          `Use Resume below; there is no need to upload it again.`
+        );
+      }
 
       setCsvHeaders(up.headers);
       setPreviewRows(up.previewRows || []);
@@ -3480,6 +3503,38 @@ function CSVImportWizard({
     } catch (err: any) {
       setUploadPhase('error');
       setUploadError(err.message || String(err));
+    }
+  };
+
+  // Finish a job whose bytes reached Storage but whose header read did
+  // not complete. Used both by the Resume button and by the reload
+  // recovery below — the endpoint is idempotent, so re-running it is safe.
+  const resumeJob = async (id: string, meta?: { name: string; size: number }) => {
+    setResuming(true);
+    try {
+      const res = await fetch(`/api/import-jobs/${id}/uploaded`, { method: 'POST' });
+      const up = await res.json();
+      if (!res.ok) throw new Error(up.error || 'Could not read the uploaded file');
+      setJobId(id);
+      setCsvHeaders(up.headers);
+      setPreviewRows(up.previewRows || []);
+      setHeaderStats(up.headerStats || {});
+      setMapping(autoMap(up.headers));
+      setResumeMeta(meta || {
+        name: up.job?.filename || 'uploaded file',
+        size: Number(up.job?.file_size_bytes || 0),
+      });
+      setResumableJobId(null);
+      setUploadError(null);
+      setUploadPhase('ready');
+      setStep(2);
+      return true;
+    } catch (err: any) {
+      setUploadError(err.message || String(err));
+      setUploadPhase('error');
+      return false;
+    } finally {
+      setResuming(false);
     }
   };
 
@@ -3674,13 +3729,30 @@ function CSVImportWizard({
         if (!res.ok) return;
         const { jobs } = await res.json();
         const live = (jobs || []).find((x: any) => x.status === 'queued' || x.status === 'running');
-        if (!live || cancelled) return;
-        setJobId(live.id);
-        setJob(live);
-        setCsvHeaders(live.csv_headers || []);
-        setStep(3);
-        setImportStatus('importing');
-        pollJob(live.id);
+        if (live && !cancelled) {
+          setJobId(live.id);
+          setJob(live);
+          setCsvHeaders(live.csv_headers || []);
+          setStep(3);
+          setImportStatus('importing');
+          pollJob(live.id);
+          return;
+        }
+        if (cancelled) return;
+        // Nothing running, but an upload may have completed without its
+        // header read finishing — that job sits at 'awaiting_upload' (or
+        // 'uploaded' if the read landed but the tab went away) with its
+        // bytes already in Storage. Pick it up at the mapping step rather
+        // than making the user re-send the file. A job whose object never
+        // arrived fails the confirm harmlessly and is left alone.
+        const stranded = (jobs || []).find(
+          (x: any) => x.status === 'uploaded' || x.status === 'awaiting_upload'
+        );
+        if (!stranded) return;
+        const ok = await resumeJob(stranded.id, stranded.file_size_bytes
+          ? { name: stranded.filename || 'uploaded file', size: Number(stranded.file_size_bytes) }
+          : undefined);
+        if (!ok) { setUploadPhase('idle'); setUploadError(null); }
       } catch { /* nothing in flight, or server unreachable */ }
     })();
     return () => { cancelled = true; };
@@ -3731,7 +3803,7 @@ function CSVImportWizard({
               {uploadPhase === 'uploading' ? 'Uploading to secure storage…' : 'Reading columns…'}
             </p>
             <p className="text-xs text-gray-500 mb-5">
-              {file?.name} • {(file?.size ? (file.size / 1024 / 1024).toFixed(1) : '0')} MB
+              {file?.name || resumeMeta?.name} • {(((file?.size ?? resumeMeta?.size) || 0) / 1024 / 1024).toFixed(1)} MB
             </p>
             <div className="w-full max-w-md mx-auto h-2 bg-[#1c1c1c] rounded-full overflow-hidden">
               <div
@@ -3754,14 +3826,27 @@ function CSVImportWizard({
         {step === 1 && uploadPhase === 'error' && (
           <div className="border-2 border-red-500/30 rounded-2xl p-10 text-center bg-red-500/5">
             <AlertCircle className="w-10 h-10 mx-auto mb-3 text-red-400" />
-            <p className="text-sm font-bold text-red-300 mb-2">Upload failed</p>
+            <p className="text-sm font-bold text-red-300 mb-2">
+              {resumableJobId ? 'Upload finished, but reading it failed' : 'Upload failed'}
+            </p>
             <p className="text-xs text-gray-400 max-w-lg mx-auto mb-5">{uploadError}</p>
-            <button
-              onClick={() => { setUploadPhase('idle'); setUploadError(null); setFile(null); setUploadPct(0); }}
-              className="text-xs font-bold px-4 py-2 rounded-lg bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 transition-colors"
-            >
-              Try another file
-            </button>
+            <div className="flex items-center justify-center gap-3">
+              {resumableJobId && (
+                <button
+                  onClick={() => resumeJob(resumableJobId)}
+                  disabled={resuming}
+                  className="text-xs font-bold px-4 py-2 rounded-lg bg-[#3ecf8e] text-black hover:bg-[#35b87d] disabled:opacity-50 transition-colors"
+                >
+                  {resuming ? 'Resuming…' : 'Resume — file is already uploaded'}
+                </button>
+              )}
+              <button
+                onClick={() => { setUploadPhase('idle'); setUploadError(null); setFile(null); setUploadPct(0); setResumableJobId(null); }}
+                className="text-xs font-bold px-4 py-2 rounded-lg bg-[#1c1c1c] border border-[#2e2e2e] text-gray-300 hover:border-gray-500 transition-colors"
+              >
+                Try another file
+              </button>
+            </div>
           </div>
         )}
 
@@ -3796,14 +3881,14 @@ function CSVImportWizard({
             <div className="flex items-center gap-4 p-4 bg-[#0e0e0e] border border-[#2e2e2e] rounded-xl">
               <FileSpreadsheet className="w-8 h-8 text-[#3ecf8e]" />
               <div className="flex-1">
-                <p className="text-sm font-bold text-white">{file?.name}</p>
+                <p className="text-sm font-bold text-white">{file?.name || resumeMeta?.name}</p>
                 {/* Row count is deliberately absent: the old wizard got it
                     by streaming the entire file through Papa.parse on the
                     main thread before mapping, which froze the tab on big
                     files. Postgres reports the exact count during ingest
                     instead. */}
                 <p className="text-[10px] text-gray-500 uppercase tracking-wider mt-0.5">
-                  {(file?.size ? (file.size / 1024 / 1024).toFixed(2) : '0')} MB • {csvHeaders.length} columns • uploaded
+                  {(((file?.size ?? resumeMeta?.size) || 0) / 1024 / 1024).toFixed(2)} MB • {csvHeaders.length} columns • uploaded
                 </p>
               </div>
               <button
