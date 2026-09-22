@@ -3602,6 +3602,12 @@ function CSVImportWizard({
   // Only a problem when the user supplied no name of their own — a typed
   // name always wins server-side.
   const listNameComesFromCsv = !listNameOverride.trim() && !!csvListNameValue;
+  // Whether that name lands in an existing list or creates a new one. This
+  // is the question the warning kept prompting and never answered — it was
+  // read as "these contacts are already in the app", which it never meant.
+  const csvListNameExisting = csvListNameValue
+    ? importLists.find((l: any) => (l.name || '').trim().toLowerCase() === csvListNameValue.trim().toLowerCase())
+    : undefined;
 
   // Columns mapped to a numeric firmographic field whose values a
   // spreadsheet has already rewritten as dates. This is how 738,077
@@ -3947,9 +3953,20 @@ function CSVImportWizard({
                         <p className="text-[10px] text-amber-400 mt-1 flex items-start gap-1.5">
                           <AlertCircle className="w-3 h-3 mt-0.5 shrink-0" />
                           <span>
-                            These contacts will be filed under{' '}
-                            <span className="font-bold">"{sampleValue}"</span>, taken from your{' '}
-                            <span className="font-bold">"{mappedHeader}"</span> column — not a name you typed.
+                            You haven't typed a list name, so your CSV decides it: every row will be filed
+                            under <span className="font-bold">"{sampleValue}"</span>, the value in its{' '}
+                            <span className="font-bold">"{mappedHeader}"</span> column.{' '}
+                            {csvListNameExisting ? (
+                              <span className="text-amber-300">
+                                That list already exists ({csvListNameExisting.contact_count?.toLocaleString?.() ?? '—'} contacts) —
+                                these will be added to it.
+                              </span>
+                            ) : (
+                              <span className="text-gray-400">
+                                That list doesn't exist yet, so it will be created. (This is about naming only —
+                                it says nothing about duplicates.)
+                              </span>
+                            )}{' '}
                             Type a name above to override it.
                           </span>
                         </p>
@@ -4452,7 +4469,13 @@ function CSVImportWizard({
                 </p>
               </div>
               <p className="text-[11px] text-gray-500">
-                If that isn't what you expected, go back and type a name — it overrides the column for every row.
+                {csvListNameExisting
+                  ? `That list already exists with ${(csvListNameExisting.contact_count ?? 0).toLocaleString()} contacts — these rows will be added to it.`
+                  : `No list with that name exists yet, so it will be created.`}
+              </p>
+              <p className="text-[11px] text-gray-500">
+                This is only about which list the contacts are filed under — it is not a duplicate check.
+                If it isn't what you expected, go back and type a name; it overrides the column for every row.
               </p>
             </div>
 
