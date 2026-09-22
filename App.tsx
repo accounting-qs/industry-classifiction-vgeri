@@ -3330,6 +3330,10 @@ function CSVImportWizard({
   // Set when an upload landed in Storage but the confirm step did not
   // finish. Lets the error panel offer Resume instead of only "try another
   // file", which would discard a completed multi-hundred-MB transfer.
+  // Ticks once a second purely so the elapsed clock on the progress panel
+  // advances. Without it the whole panel can be byte-identical for minutes
+  // during a single long statement, which is indistinguishable from hung.
+  const [nowTick, setNowTick] = useState(() => Date.now());
   const [resumableJobId, setResumableJobId] = useState<string | null>(null);
   const [resumeMeta, setResumeMeta] = useState<{ name: string; size: number } | null>(null);
   const [resuming, setResuming] = useState(false);
@@ -3712,6 +3716,12 @@ function CSVImportWizard({
     };
     tick();
   };
+
+  useEffect(() => {
+    if (importStatus !== 'importing') return;
+    const t = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [importStatus]);
 
   // An import that adds nothing is a real, common outcome — re-importing a
   // file whose leads are already in the database. It needs to be stated
@@ -4181,6 +4191,11 @@ function CSVImportWizard({
                 //   'merge' — deduping and writing rows. Row-based.
                 const stage = job?.stage as string | undefined;
                 const queued = job?.status === 'queued';
+                const startedMs = job?.started_at ? new Date(job.started_at).getTime() : 0;
+                const elapsedSec = startedMs ? Math.max(0, Math.floor((nowTick - startedMs) / 1000)) : 0;
+                const elapsedLabel = startedMs
+                  ? (elapsedSec < 60 ? `${elapsedSec}s` : `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`)
+                  : '';
                 const bytesDone = Number(job?.progress_bytes || 0);
                 const bytesTotal = Number(job?.file_size_bytes || 0);
                 const pct = queued ? 0
@@ -4190,26 +4205,43 @@ function CSVImportWizard({
                 const label = queued
                   ? 'Queued — waiting for the current job to finish…'
                   : stage === 'copy' ? 'Reading the file into the database…'
-                    : stage === 'merge' ? 'Matching duplicates and writing contacts…'
-                      : 'Starting…';
+                    : stage === 'normalise' ? 'Cleaning up the rows…'
+                      : stage === 'dedupe' ? 'Finding duplicates within the file…'
+                        : stage === 'analyse' ? 'Checking against contacts you already have…'
+                          : stage === 'merge' ? 'Writing contacts…'
+                            : 'Starting…';
+                // normalise/dedupe/analyse are single SQL statements over the
+                // whole file — there is no row counter to report, and showing
+                // a stalled "0 of N" was read as a hung import. Say what is
+                // happening and how long it has been going instead.
+                const stepOnly = stage === 'normalise' || stage === 'dedupe' || stage === 'analyse';
                 const detail = queued ? 'Your place is saved; this starts automatically.'
                   : stage === 'copy'
                     ? `${(bytesDone / 1024 / 1024).toFixed(1)} MB of ${(bytesTotal / 1024 / 1024).toFixed(1)} MB`
-                    : totalRows > 0
-                      ? `${importProgress.toLocaleString()} of ${totalRows.toLocaleString()} rows`
-                      : '';
+                    : stepOnly
+                      ? `${totalRows.toLocaleString()} rows — this step has no row-by-row progress`
+                      : totalRows > 0
+                        ? `${importProgress.toLocaleString()} of ${totalRows.toLocaleString()} rows`
+                        : '';
                 return (
                   <div className="text-center">
                     <Loader2 className="w-12 h-12 text-[#3ecf8e] animate-spin mx-auto mb-4" />
                     <p className="text-lg font-bold text-white mb-2">{label}</p>
                     <p className="text-sm text-gray-500 mb-6">{detail}</p>
                     <div className="w-full bg-[#2e2e2e] rounded-full h-3 overflow-hidden mb-2">
-                      <div
-                        className="h-full bg-gradient-to-r from-[#3ecf8e] to-[#2fb37a] rounded-full transition-all duration-300 shadow-[0_0_12px_rgba(62,207,142,0.4)]"
-                        style={{ width: `${pct}%` }}
-                      />
+                      {stepOnly ? (
+                        <div className="h-full w-1/3 bg-gradient-to-r from-[#3ecf8e] to-[#2fb37a] rounded-full animate-pulse shadow-[0_0_12px_rgba(62,207,142,0.4)]" />
+                      ) : (
+                        <div
+                          className="h-full bg-gradient-to-r from-[#3ecf8e] to-[#2fb37a] rounded-full transition-all duration-300 shadow-[0_0_12px_rgba(62,207,142,0.4)]"
+                          style={{ width: `${pct}%` }}
+                        />
+                      )}
                     </div>
-                    <p className="text-[10px] text-gray-600 font-mono">{Math.round(pct)}% complete</p>
+                    <p className="text-[10px] text-gray-600 font-mono">
+                      {stepOnly ? 'working…' : `${Math.round(pct)}% complete`}
+                      {elapsedLabel && <span className="text-gray-700"> · {elapsedLabel} elapsed</span>}
+                    </p>
                     <p className="text-[10px] text-gray-600 mt-4">
                       Running on the server — safe to close this tab or refresh.
                     </p>

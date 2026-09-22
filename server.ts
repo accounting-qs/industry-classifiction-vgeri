@@ -4098,7 +4098,13 @@ const IMPORT_PREVIEW_BYTES = 256 * 1024;
 // Rows per merge statement. Each batch is its own transaction, so a
 // 10M-row import doesn't hold one transaction open for hours. Safe to
 // re-run: the merge is ON CONFLICT-idempotent.
-const IMPORT_MERGE_BATCH = 100_000;
+// 10k, not 100k. Progress is only written after a batch commits, so the
+// batch size IS the progress resolution: at 100k a 304,478-row import
+// moved the bar exactly three times, and the first update landed minutes
+// in, after a 100k-row INSERT ... ON CONFLICT against 6M contacts. That
+// reads as a hung import — it was reported as one. The insert work is
+// identical either way; only the commit granularity changes.
+const IMPORT_MERGE_BATCH = 10_000;
 // Rows sampled from the preview buffer to profile column values. Only 5
 // are shown in the wizard, but 5 is too few to catch a column that is
 // only partly mangled — the ZoomInfo file below had 13% bad rows, which
@@ -4820,7 +4826,10 @@ async function runContactImportJob(jobId: string): Promise<void> {
             'SELECT count(*)::bigint AS n FROM _imp_stage'
         );
         const totalRows = Number(stagedRows);
-        await updateImportJob(jobId, { stage: 'merge', total_rows: totalRows });
+        // Distinct stages from here on. These steps each take real time on a
+        // 300k-row file, and reporting them all as 'merge' with 0 progress is
+        // why a working import looked frozen.
+        await updateImportJob(jobId, { stage: 'normalise', total_rows: totalRows });
 
         // ── Stage 2: normalise + classify, entirely in SQL ───────────
         // Blank cells become NULL (not ''), matching buildRow()'s
@@ -4858,6 +4867,8 @@ async function runContactImportJob(jobId: string): Promise<void> {
             invalidCount += Number(r.n);
         }
 
+        await updateImportJob(jobId, { stage: 'dedupe' });
+
         // Within-file dedup. Keeps the FIRST occurrence (ORDER BY rn),
         // matching the old seenInChunk behaviour — except this now sees
         // the whole file at once, so duplicates spanning what used to be
@@ -4890,6 +4901,7 @@ async function runContactImportJob(jobId: string): Promise<void> {
         `);
         const crossListBreakdown: Record<string, number> = {};
         let crossListDupes = 0;
+        await updateImportJob(jobId, { stage: 'analyse' });
         for (const r of breakdownRows) {
             // Same-list matches are a re-import of the same list, not a
             // cross-list collision — counted as duplicates but kept out
@@ -4917,6 +4929,12 @@ async function runContactImportJob(jobId: string): Promise<void> {
 
         let inserted = 0;
         let updated = 0;
+        // total_rows becomes the number of rows this phase will actually
+        // write. It was the file's row count, but progress counts deduped
+        // rows, so the bar could never reach 100% — a 83,428-row import
+        // finished at 82,753/83,428. The completion update below restores
+        // total_rows to the file count, which is what the history row wants.
+        await updateImportJob(jobId, { stage: 'merge', progress_rows: 0, total_rows: dedupedRows });
         for (let offset = 0; offset < dedupedRows; offset += IMPORT_MERGE_BATCH) {
             const { rows } = await client.query<{ was_insert: boolean; lead_list_name: string | null }>(`
                 WITH b AS (
