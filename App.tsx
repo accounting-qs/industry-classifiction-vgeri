@@ -96,6 +96,17 @@ interface LogEntry {
 
 type ThemeChoice = 'light' | 'dark' | 'system';
 
+// Server-side enqueue progress for one import list (from
+// /api/import-lists/stats → row.enqueue). POST /api/enrich answers 202
+// before any contact is resolved; this is how the row shows what that
+// click is actually doing, and why it failed if it did.
+type ListEnqueueState = {
+  phase: 'resolving' | 'queueing' | 'failed';
+  queued: number;
+  total: number;
+  error?: string | null;
+};
+
 interface ExportJob {
   id: string;
   listName: string;
@@ -196,7 +207,7 @@ export default function App() {
   const [leadListOptions, setLeadListOptions] = useState<string[]>([]);
   const [activeListFilter, setActiveListFilter] = useState<string | null>(null);
   const [contactsLoading, setContactsLoading] = useState(false);
-  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null }[]>([]);
+  const [importLists, setImportLists] = useState<{ id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null; enqueue?: ListEnqueueState | null }[]>([]);
   const [listStatsSource, setListStatsSource] = useState<'rpc' | 'fallback'>('rpc');
   const [importListsLoading, setImportListsLoading] = useState(true);
   // Tracks the lazy /api/import-lists/stats fetch independently of the
@@ -321,7 +332,7 @@ export default function App() {
           // coin flip, DONE/Resume buttons included. The raw value is
           // only used before the first stats response (old === undefined).
           setImportLists(prev => {
-            const prevByName: Record<string, { contact_count?: number; enriched_count?: number; failed_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null }> = {};
+            const prevByName: Record<string, { contact_count?: number; enriched_count?: number; failed_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null; enqueue?: ListEnqueueState | null }> = {};
             for (const p of prev) prevByName[p.name] = p;
             return lists.map((l: any) => {
               const old = prevByName[l.name];
@@ -331,6 +342,7 @@ export default function App() {
                 enriched_count: old?.enriched_count,
                 failed_count: old?.failed_count,
                 queue_state: old?.queue_state ?? null,
+                enqueue: old?.enqueue ?? null,
               };
             });
           });
@@ -350,24 +362,28 @@ export default function App() {
       .then(res => res.ok ? res.json() : Promise.reject(new Error(`stats ${res.status}`)))
       .then(data => {
         if (!isCurrent() || !data || !Array.isArray(data.stats)) return;
-        const byName = new Map<string, { completed: number; failed: number; total: number; queue_state: 'running' | 'queued' | 'paused' | 'cancelled' | null }>();
+        const byName = new Map<string, { completed: number; failed: number; total: number; queue_state: 'running' | 'queued' | 'paused' | 'cancelled' | null; enqueue: ListEnqueueState | null }>();
         for (const row of data.stats) {
           byName.set(row.lead_list_name, {
             completed: row.completed,
             failed: row.failed,
             total: row.total,
             queue_state: (['running', 'queued', 'paused', 'cancelled'] as const).includes(row.queue_state as any) ? (row.queue_state as 'running' | 'queued' | 'paused' | 'cancelled') : null,
+            enqueue: (row.enqueue && typeof row.enqueue === 'object' && ['resolving', 'queueing', 'failed'].includes(row.enqueue.phase))
+              ? { phase: row.enqueue.phase, queued: Number(row.enqueue.queued) || 0, total: Number(row.enqueue.total) || 0, error: row.enqueue.error ?? null }
+              : null,
           });
         }
         setImportLists(prev => prev.map(l => {
           const s = byName.get(l.name);
-          if (!s) return { ...l, enriched_count: 0, failed_count: 0, queue_state: null };
+          if (!s) return { ...l, enriched_count: 0, failed_count: 0, queue_state: null, enqueue: null };
           return {
             ...l,
             enriched_count: s.completed,
             failed_count: s.failed,
             contact_count: s.total || l.contact_count || 0,
             queue_state: s.queue_state,
+            enqueue: s.enqueue,
           };
         }));
         setListStatsSource(data.stats_source === 'fallback' ? 'fallback' : 'rpc');
@@ -736,10 +752,11 @@ export default function App() {
       } else {
         addLog(`✅ 202 Accepted: Backend cluster scaling up for list "${name}". Watch the queue log for the actual ${mode === 'reenrich' ? 're-enrich' : 'resume'} count.`);
         setActiveTab(AppTab.ENRICHMENT);
-        // total starts unknown — the server logs the resolved count once the
-        // background enqueue lands. Setting to 0 here so the progress bar
-        // doesn't show the inflated csv-row-count as the denominator.
-        setStats({ total: 0, completed: 0, failed: 0, isProcessing: true });
+        // No optimistic isProcessing flip: /api/status reports the real
+        // state on the next poll (it's cheap now), and the Import row
+        // shows the enqueue phase (Resolving… / Queueing N / M…) from
+        // the server, including the error if it fails.
+        refreshLists();
       }
     } catch (e: any) {
       addLog(`❌ Enrich error: ${e.message}`);
@@ -1280,7 +1297,7 @@ function ImportedListsTable({
   onGoToImport,
   showAllListsRow = true,
 }: {
-  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null }[];
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null; enqueue?: ListEnqueueState | null }[];
   loading: boolean;
   statsLoading?: boolean;
   statsSource: 'rpc' | 'fallback';
@@ -1739,6 +1756,28 @@ function ImportedListsTable({
                               );
                             }
 
+                            // Enqueue in flight for this row: POST /api/enrich
+                            // answered 202 and the server is still resolving
+                            // contacts or inserting job_items. Show what it's
+                            // doing instead of the idle button — a working
+                            // click used to look exactly like a dead one.
+                            const eq = l.enqueue;
+                            if (eq && eq.phase !== 'failed') {
+                              const busyLabel = eq.phase === 'resolving'
+                                ? 'Resolving contacts…'
+                                : `Queueing ${eq.queued.toLocaleString()} / ${eq.total.toLocaleString()}…`;
+                              return (
+                                <button
+                                  disabled
+                                  className={`${ctrlBtn} border-transparent bg-[#3ecf8e]/50 text-black cursor-wait`}
+                                  title="Enrichment is being queued in the background — the row switches to Pause / Cancel once the first items land."
+                                >
+                                  <Loader2 className="w-3 h-3 shrink-0 animate-spin" /> {busyLabel}
+                                </button>
+                              );
+                            }
+                            const enqueueError = eq?.phase === 'failed' ? (eq.error || 'unknown error') : null;
+
                             // Idle — the original three-state button.
                             const allDone = total > 0 && done >= total;
                             const fresh = done === 0;
@@ -1750,13 +1789,23 @@ function ImportedListsTable({
                                 ? 'Enrich all contacts in this list'
                                 : 'Resume — only contacts without an enrichment row will be queued';
                             return (
-                              <button
-                                onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count, mode); }}
-                                className={goCls}
-                                title={title}
-                              >
-                                <Zap className="w-3 h-3 shrink-0" /> {label}
-                              </button>
+                              <>
+                                {enqueueError && (
+                                  <span
+                                    className="text-[10px] text-red-400 max-w-[240px] truncate flex items-center gap-1"
+                                    title={`The last Enrich click failed on the server: ${enqueueError} — click ${label} to retry.`}
+                                  >
+                                    <AlertCircle className="w-3 h-3 shrink-0" /> Enrich failed: {enqueueError}
+                                  </span>
+                                )}
+                                <button
+                                  onClick={e => { e.stopPropagation(); onEnrichList(l.name, l.contact_count, mode); }}
+                                  className={goCls}
+                                  title={enqueueError ? `Retry — ${title}` : title}
+                                >
+                                  <Zap className="w-3 h-3 shrink-0" /> {label}
+                                </button>
+                              </>
                             );
                           })()}
                           <ExportButton job={job} listName={l.name} onStart={onStartExport} onClear={onClearExport} />
@@ -1810,7 +1859,7 @@ function ListSelectorModal({
   onSetListBucketed,
   onGoToImport,
 }: {
-  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null }[];
+  lists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; manually_bucketed?: boolean; bucketing_run_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null; enqueue?: ListEnqueueState | null }[];
   loading: boolean;
   statsLoading?: boolean;
   statsSource: 'rpc' | 'fallback';

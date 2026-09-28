@@ -207,6 +207,84 @@ app.use(express.static(path.join(__dirname, 'dist')));
  */
 /* Legacy runBackgroundEnrichment removed in favor of JobProcessor */
 
+// Live pipeline numbers for /api/status.
+//
+// Never count job_items by terminal status here. That count is a seq
+// scan over every job_item ever written (6.4M rows, 60-120 s under
+// load) the moment ANY job is pending/processing — and the old code ran
+// it twice per 2.5 s poll per open tab. On 2026-09-28 three empty
+// 'pending' jobs left by restart-killed enqueues were enough to turn it
+// on: 32 concurrent copies of that query sat on the pooler, and every
+// enqueue INSERT died with "Timed out acquiring connection from
+// connection pool" — the Enrich button silently did nothing.
+//
+// Completed/failed now come from the per-job counters the worker keeps
+// via increment_job_counters (O(live jobs), no job_items touch). Only
+// the open-item counts hit job_items, and they ride the partial index
+// idx_job_items_active_status. With no live job nothing is counted.
+//
+// Single-flight memo: N polling tabs share one DB round-trip. 2 s is
+// under the client's 2.5 s poll, so a lone tab still sees every tick.
+interface LiveJobStats {
+    completed: number;
+    failed: number;
+    total: number;
+    inQueue: number;
+    processing: number;
+    liveJobs: number;
+}
+const ACTIVE_PARENT_STATUSES = ['pending', 'processing'];
+const LIVE_STATS_MEMO_MS = 2_000;
+let liveStatsMemo: { at: number; promise: Promise<LiveJobStats> } | null = null;
+
+function readLiveJobStats(): Promise<LiveJobStats> {
+    const now = Date.now();
+    if (liveStatsMemo && now - liveStatsMemo.at < LIVE_STATS_MEMO_MS) return liveStatsMemo.promise;
+
+    const promise = (async (): Promise<LiveJobStats> => {
+        const { data: jobRows, error: jobsErr } = await supabase
+            .from('jobs')
+            .select('id, total_items, completed_items, failed_items')
+            .in('status', ACTIVE_PARENT_STATUSES);
+        if (jobsErr) throw jobsErr;
+
+        const rows = (jobRows || []) as Array<{ total_items: number | null; completed_items: number | null; failed_items: number | null }>;
+        if (rows.length === 0) {
+            return { completed: 0, failed: 0, total: 0, inQueue: 0, processing: 0, liveJobs: 0 };
+        }
+
+        let completed = 0, failed = 0, total = 0;
+        for (const r of rows) {
+            completed += Number(r.completed_items) || 0;
+            failed += Number(r.failed_items) || 0;
+            total += Number(r.total_items) || 0;
+        }
+
+        const [openRes, procRes] = await Promise.all([
+            supabase.from('job_items').select('jobs!inner(status)', { count: 'exact', head: true })
+                .in('status', ['pending', 'retrying']).in('jobs.status', ACTIVE_PARENT_STATUSES),
+            supabase.from('job_items').select('jobs!inner(status)', { count: 'exact', head: true })
+                .eq('status', 'processing').in('jobs.status', ACTIVE_PARENT_STATUSES),
+        ]);
+        if (openRes.error) throw openRes.error;
+        if (procRes.error) throw procRes.error;
+
+        return {
+            completed,
+            failed,
+            total,
+            inQueue: openRes.count || 0,
+            processing: procRes.count || 0,
+            liveJobs: rows.length,
+        };
+    })();
+
+    liveStatsMemo = { at: now, promise };
+    // A failed read must not be served from the memo for the next 2 s.
+    promise.catch(() => { if (liveStatsMemo?.promise === promise) liveStatsMemo = null; });
+    return promise;
+}
+
 app.get('/api/status', async (req, res) => {
     const { timeRange } = req.query;
 
@@ -235,60 +313,39 @@ app.get('/api/status', async (req, res) => {
 
     const { data: dbLogs } = await query;
 
-    // FETCH LIVE JOB STATS FROM DB (Issue #8: job_items is the single source of truth)
+    // FETCH LIVE JOB STATS FROM DB — see readLiveJobStats() for why this
+    // reads per-job counters instead of counting job_items.
     let liveStats = { ...jobStats };
-
-    // Active = parent jobs.status IN (pending, processing). Without this
-    // scoping, the Pipeline Monitor's combined progress bar would sum
-    // every job_item ever inserted in this workspace's history — the
-    // counter would grow monotonically across the DB's lifetime and the
-    // banner would still claim "X in queue" months after the queue
-    // drained. Joining via jobs!inner ties every count to the live FIFO
-    // window.
-    const ACTIVE_PARENT = ['pending', 'processing'];
-    const [
-        { count: completedCount },
-        { count: failedCount },
-        { count: pendingCount },
-    ] = await Promise.all([
-        supabase.from('job_items').select('jobs!inner(status)', { count: 'exact', head: true })
-            .eq('status', 'completed').in('jobs.status', ACTIVE_PARENT),
-        supabase.from('job_items').select('jobs!inner(status)', { count: 'exact', head: true })
-            .eq('status', 'failed').in('jobs.status', ACTIVE_PARENT),
-        supabase.from('job_items').select('jobs!inner(status)', { count: 'exact', head: true })
-            .in('status', ['pending', 'retrying']).in('jobs.status', ACTIVE_PARENT),
-    ]);
-
-    const dbCompleted = completedCount || 0;
-    const dbFailed = failedCount || 0;
-    const inQueue = pendingCount || 0;
+    let live: LiveJobStats | null = null;
+    try {
+        live = await readLiveJobStats();
+    } catch (err: any) {
+        // Serve the in-memory numbers rather than 500-ing the poll; the
+        // next tick retries.
+        console.warn(`[status] live stats read failed: ${err?.message || 'unknown'}`);
+    }
+    const inQueue = live?.inQueue || 0;
 
     // If processing, use DB counts; if not, use whatever memory has (which may be stale but matches last known state)
-    if (jobStats.isProcessing || inQueue > 0) {
-        liveStats.completed = dbCompleted;
-        liveStats.failed = dbFailed;
-        liveStats.total = dbCompleted + dbFailed + inQueue;
+    if (live && (jobStats.isProcessing || inQueue > 0)) {
+        liveStats.completed = live.completed;
+        liveStats.failed = live.failed;
+        // jobs.total_items is the full resolved count from the moment the
+        // job row exists, so the denominator is right even mid-enqueue.
+        liveStats.total = live.total > 0 ? live.total : live.completed + live.failed + inQueue;
 
         // Sync memory
         jobStats.completed = liveStats.completed;
         jobStats.failed = liveStats.failed;
         jobStats.total = liveStats.total;
 
-        // Auto-detect if processing actually finished. Same scoping as
-        // above so a lingering 'processing' job_item on a 'completed'
+        // Auto-detect if processing actually finished. Scoped to live
+        // parents so a lingering 'processing' job_item on a 'completed'
         // parent (legacy orphan) can't keep isProcessing stuck on.
-        if (inQueue === 0 && !jobStats.queueingPhase) {
-            const { count: processingCount } = await supabase
-                .from('job_items')
-                .select('jobs!inner(status)', { count: 'exact', head: true })
-                .eq('status', 'processing')
-                .in('jobs.status', ACTIVE_PARENT);
-
-            if (!processingCount || processingCount === 0) {
-                jobStats.isProcessing = false;
-                liveStats.isProcessing = false;
-                await supabase.from('pipeline_state').update({ is_processing: false, updated_at: new Date().toISOString() }).eq('id', 1).then();
-            }
+        if (inQueue === 0 && !jobStats.queueingPhase && live.processing === 0) {
+            jobStats.isProcessing = false;
+            liveStats.isProcessing = false;
+            await supabase.from('pipeline_state').update({ is_processing: false, updated_at: new Date().toISOString() }).eq('id', 1).then();
         }
     }
 
@@ -313,6 +370,13 @@ app.post('/api/enrich', async (req, res) => {
     if (!contactIds && !filters) {
         return res.status(400).json({ error: 'Provide contactIds or filters' });
     }
+
+    // A 'pending' job with no items is an enqueue that a restart killed
+    // between the jobs insert and the first job_items insert. It is
+    // never processed, never cleaned up, and it is enough to flip every
+    // "live jobs" query in the app into its expensive shape. Close any
+    // such job before this click adds a new one.
+    await JobProcessor.cancelEmptyPendingJobs();
 
     // Multi-list serial queueing. The processNextChunk SELECT in JobProcessor
     // already orders by job_items.id ASC, so each list's items (inserted as a
@@ -372,6 +436,7 @@ app.post('/api/enrich', async (req, res) => {
     backgroundEnqueue(contactIds, filters, searchQuery, joiningExisting).catch(err => {
         console.error('Background enqueue fatal error:', err);
         addServerLog(`❌ Fatal enqueue error: ${err.message}`, 'Pipeline', 'error');
+        setEnqueueState(leadListNameFromFilters(filters), { phase: 'failed', error: err.message });
         // Only clear flags if no other queueing/processing remains. The
         // background processor's poll loop will clear them naturally when
         // the queue drains, so just leave them alone here on a single-list
@@ -380,6 +445,55 @@ app.post('/api/enrich', async (req, res) => {
         if (!joiningExisting) jobStats.isProcessing = false;
     });
 });
+
+// Per-list enqueue progress, so the Import History row can show what the
+// click is doing. POST /api/enrich answers 202 before a single contact
+// is resolved; until now the only trace of a failed enqueue was a line
+// in the Pipeline log, and the row just kept offering "Enrich" as if the
+// click never happened. Keyed by lead_list_name; only single-list
+// enqueues (the Import row button) are tracked — raw-contactIds and
+// multi-list enqueues have no row to report to.
+//
+// Lifecycle: resolving → queueing (queued/total advance per chunk) →
+// cleared on success (the row then shows the queue badge from
+// get_list_enrichment_queue_state) or 'failed' with the error, which
+// the row shows for ENQUEUE_FAILED_TTL_MS or until the next click.
+interface EnqueueState {
+    phase: 'resolving' | 'queueing' | 'failed';
+    queued: number;
+    total: number;
+    error?: string;
+    updatedAt: number;
+}
+const ENQUEUE_FAILED_TTL_MS = 10 * 60_000;
+const enqueueByList = new Map<string, EnqueueState>();
+
+function leadListNameFromFilters(filters: any): string | null {
+    const leadListFilter = (Array.isArray(filters) ? filters : []).find((f: any) => f.column === 'lead_list_name' && f.operator === 'in');
+    return leadListFilter && Array.isArray(leadListFilter.value) && leadListFilter.value.length === 1
+        ? String(leadListFilter.value[0])
+        : null;
+}
+
+function setEnqueueState(listName: string | null, patch: Partial<Omit<EnqueueState, 'updatedAt'>>) {
+    if (!listName) return;
+    const prev = enqueueByList.get(listName) || { phase: 'resolving' as const, queued: 0, total: 0 };
+    enqueueByList.set(listName, { ...prev, ...patch, updatedAt: Date.now() });
+}
+
+function clearEnqueueState(listName: string | null) {
+    if (listName) enqueueByList.delete(listName);
+}
+
+function enqueueStateFor(listName: string): Omit<EnqueueState, 'updatedAt'> | null {
+    const st = enqueueByList.get(listName);
+    if (!st) return null;
+    if (st.phase === 'failed' && Date.now() - st.updatedAt > ENQUEUE_FAILED_TTL_MS) {
+        enqueueByList.delete(listName);
+        return null;
+    }
+    return { phase: st.phase, queued: st.queued, total: st.total, error: st.error };
+}
 
 /**
  * Background enqueue: resolves contact IDs from filters, creates job + job_items.
@@ -395,6 +509,15 @@ async function backgroundEnqueue(
 ) {
     let contactIds = rawContactIds;
 
+    // Denormalize the list name onto the job row so the per-list run
+    // controls (pause/continue/cancel) can target this job directly.
+    // Every enqueue is single-list (the list-modal button sends exactly one
+    // lead_list_name via the `in` filter); a multi-list or raw-contactIds
+    // enqueue leaves this null and simply opts out of per-list controls
+    // and of the row-level enqueue progress.
+    const jobLeadListName: string | null = leadListNameFromFilters(filters);
+    setEnqueueState(jobLeadListName, { phase: 'resolving', queued: 0, total: 0, error: undefined });
+
     // Step 1: Resolve IDs from filters if needed
     // IMPORTANT: Uses the server's `supabase` client (service role key) for full access,
     // NOT the `db` singleton which uses the anon key (capped at 1000 rows by PostgREST).
@@ -404,6 +527,7 @@ async function backgroundEnqueue(
             contactIds = await resolveFilteredContactIds(filters, searchQuery);
         } catch (e: any) {
             addServerLog(`❌ Failed to resolve filters: ${e.message}`, 'Pipeline', 'error');
+            setEnqueueState(jobLeadListName, { phase: 'failed', error: `Could not resolve the list's contacts: ${e.message}` });
             jobStats.isProcessing = false;
             jobStats.queueingPhase = false;
             return;
@@ -412,6 +536,7 @@ async function backgroundEnqueue(
 
     if (!contactIds || contactIds.length === 0) {
         addServerLog(`⚠️ No contacts found matching filters.`, 'Pipeline', 'warn');
+        setEnqueueState(jobLeadListName, { phase: 'failed', error: 'No contacts to queue — every contact in this list already has an enrichment row.' });
         jobStats.queueingPhase = false;
         if (!joiningExisting) jobStats.isProcessing = false;
         return;
@@ -430,17 +555,7 @@ async function backgroundEnqueue(
         addServerLog(`📊 Total contacts to enrich: ${totalToEnrich.toLocaleString()}`, 'Pipeline', 'phase');
     }
     addServerLog(`📦 Starting queue insertion for ${totalToEnrich.toLocaleString()} records...`, 'Pipeline', 'phase');
-
-    // Denormalize the list name onto the job row so the per-list run
-    // controls (pause/continue/cancel) can target this job directly.
-    // Every enqueue is single-list (the list-modal button sends exactly one
-    // lead_list_name via the `in` filter); a multi-list or raw-contactIds
-    // enqueue leaves this null and simply opts out of per-list controls.
-    const leadListFilter = (filters || []).find((f: any) => f.column === 'lead_list_name' && f.operator === 'in');
-    const jobLeadListName: string | null =
-        leadListFilter && Array.isArray(leadListFilter.value) && leadListFilter.value.length === 1
-            ? leadListFilter.value[0]
-            : null;
+    setEnqueueState(jobLeadListName, { phase: 'queueing', queued: 0, total: totalToEnrich });
 
     let jobId: string | null = null;
     try {
@@ -500,6 +615,7 @@ async function backgroundEnqueue(
             // by the chunk size rather than overwriting with this list's
             // running tally.
             jobStats.queued = (jobStats.queued || 0) + chunk.length;
+            setEnqueueState(jobLeadListName, { queued: enqueued });
             addServerLog(`📥 Queued ${enqueued.toLocaleString()} / ${totalToEnrich.toLocaleString()} (${Math.round(enqueued / totalToEnrich * 100)}%)`, 'Sync');
         }
 
@@ -536,9 +652,13 @@ async function backgroundEnqueue(
         // Step 5: Start the Background Processor (idempotent — returns early
         // if already running, so this is safe to call on every enqueue).
         JobProcessor.start();
+        // Items are in the DB, so the row now reports its state through
+        // get_list_enrichment_queue_state (queued/running badge).
+        clearEnqueueState(jobLeadListName);
     } catch (err: any) {
         console.error('Enqueue error:', err);
         addServerLog(`❌ Fatal enqueue error: ${err.message}`, 'Pipeline', 'error');
+        setEnqueueState(jobLeadListName, { phase: 'failed', error: err.message });
 
         // Roll back the job row and any partially-inserted job_items so
         // the FIFO doesn't see a corrupted job (total_items set to the
@@ -611,7 +731,11 @@ async function resolveFilteredContactIds(filters: any, searchQuery?: string): Pr
         addServerLog(`🔍 Trying RPC resolve_enrichment_targets...`, 'Pipeline', 'info');
         const { data: rpcData, error: rpcError } = await supabase.rpc('resolve_enrichment_targets', rpcParams);
 
-        if (!rpcError && rpcData && Array.isArray(rpcData) && rpcData.length > 0) {
+        // An empty array is a real answer (nothing left to enrich), not a
+        // missing RPC. Treating it as a fallback trigger sent every
+        // "already fully enriched" click through the offset-paginated
+        // PostgREST path — a minute of pointless load per click.
+        if (!rpcError && Array.isArray(rpcData)) {
             addServerLog(`✅ RPC resolved ${rpcData.length} contact IDs.`, 'Pipeline', 'info');
             return rpcData as string[];
         }
@@ -1040,9 +1164,13 @@ app.get('/api/distinct/:column', async (req, res) => {
 // the whole 2000-row chunk on the floor.
 const isTransientImportError = (err: any): boolean => {
     if (!err) return false;
-    if (err.code === '57014' || err.code === '40001' || err.code === '40P01') return true;
+    // 53300 = too_many_connections. The pooler's own "Timed out acquiring
+    // connection from connection pool" carries no SQLSTATE and is matched
+    // by message below — it killed a 53k-item enqueue after 4,000 rows on
+    // 2026-09-28 because nothing here recognised it as retryable.
+    if (err.code === '57014' || err.code === '40001' || err.code === '40P01' || err.code === '53300') return true;
     const msg = String(err?.message || err || '').toLowerCase();
-    return /fetch failed|econnreset|etimedout|eai_again|enotfound|socket hang up|network|aborted|connection reset/.test(msg);
+    return /fetch failed|econnreset|etimedout|eai_again|enotfound|socket hang up|network|aborted|connection reset|timed out acquiring|connection pool|too many connections|remaining connection slots/.test(msg);
 };
 
 // Wraps a Supabase builder call so transport throws and tuple-shaped
@@ -1541,6 +1669,8 @@ app.get('/api/import-lists/stats', async (_req, res) => {
             total: Number(row.total_count) || 0,
             queue_state: queueByList.get(row.lead_list_name as string) || null,
             refreshed_at: (row.refreshed_at as string | null) || null,
+            // In-flight / failed enqueue for this list (null when idle).
+            enqueue: enqueueStateFor(row.lead_list_name as string),
         }));
 
         // ---- background refresh scheduling (never blocks the response) ----

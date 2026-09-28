@@ -179,9 +179,12 @@ export class JobProcessor {
     // (server.ts:isTransientImportError) so behaviour is consistent.
     private static isTransientSupabaseError(err: any): boolean {
         if (!err) return false;
-        if (err.code === '57014' || err.code === '40001' || err.code === '40P01') return true;
+        // 53300 = too_many_connections; the pooler's "Timed out acquiring
+        // connection from connection pool" has no SQLSTATE, so it is
+        // matched by message. Keep in sync with server.ts:isTransientImportError.
+        if (err.code === '57014' || err.code === '40001' || err.code === '40P01' || err.code === '53300') return true;
         const msg = String(err?.message || err || '').toLowerCase();
-        return /fetch failed|econnreset|etimedout|eai_again|enotfound|socket hang up|network|aborted|connection reset/.test(msg);
+        return /fetch failed|econnreset|etimedout|eai_again|enotfound|socket hang up|network|aborted|connection reset|timed out acquiring|connection pool|too many connections|remaining connection slots/.test(msg);
     }
 
     // Wrap a Supabase op with transport-level retry. Mirrors
@@ -361,10 +364,65 @@ export class JobProcessor {
     }
 
     /**
+     * Cancel 'pending' jobs that have no open items and are older than
+     * minAgeMinutes. Such a job is an enqueue the process died in
+     * (Render restart / OOM) between the `jobs` insert and the first
+     * `job_items` chunk — backgroundEnqueue's rollback only runs on a
+     * caught error, so nothing else ever closes it. Left alone it is
+     * harmless to the worker (no items to claim) but it counts as a live
+     * job for every "jobs.status IN (pending, processing)" read, which
+     * is what turned the /api/status counts into full job_items scans.
+     *
+     * Age guard: a 100k-item enqueue takes ~5 min; a job mid-enqueue has
+     * no items for only its first seconds. 60 min is comfortably safe.
+     * The open-item probe rides idx_job_items_queue (job_id, status).
+     */
+    public static async cancelEmptyPendingJobs(minAgeMinutes = 60): Promise<number> {
+        let cancelled = 0;
+        try {
+            const cutoff = new Date(Date.now() - minAgeMinutes * 60_000).toISOString();
+            const { data: stale, error } = await supabase
+                .from('jobs')
+                .select('id, lead_list_name, created_at')
+                .eq('status', 'pending')
+                .lt('created_at', cutoff)
+                .limit(50);
+            if (error) throw error;
+
+            for (const j of (stale || []) as Array<{ id: string; lead_list_name: string | null; created_at: string }>) {
+                const { count, error: cntErr } = await supabase
+                    .from('job_items')
+                    .select('id', { count: 'exact', head: true })
+                    .eq('job_id', j.id)
+                    .in('status', ['pending', 'retrying', 'processing']);
+                if (cntErr) throw cntErr;
+                if ((count || 0) > 0) continue;
+
+                const { error: updErr } = await supabase
+                    .from('jobs')
+                    .update({ status: 'cancelled', finished_at: new Date().toISOString() })
+                    .eq('id', j.id)
+                    .eq('status', 'pending');
+                if (updErr) throw updErr;
+                cancelled++;
+                this.log(`🧹 Cancelled empty pending job ${j.id}${j.lead_list_name ? ` ("${j.lead_list_name}")` : ''} from ${j.created_at} — an enqueue a restart killed before any items landed.`, 'warn');
+            }
+        } catch (e: any) {
+            this.log(`⚠️ Empty-pending-job cleanup failed: ${e?.message || e}`, 'warn');
+        }
+        if (cancelled > 0) await this.flushLogs();
+        return cancelled;
+    }
+
+    /**
      * Resets jobs that were stuck in "processing" state from a previous server crash.
      */
     public static async recoverStaleJobs() {
         try {
+            // Recovery step 0: close restart-killed enqueues first so they
+            // neither trip the auto-start below nor count as live jobs.
+            await this.cancelEmptyPendingJobs();
+
             // Recovery step 1: any items left in 'processing' belonging to
             // a STILL-LIVE parent (pending/processing) are the result of a
             // crash mid-claim — flip them back to 'pending' so the worker
