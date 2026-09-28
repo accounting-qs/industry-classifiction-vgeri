@@ -534,6 +534,18 @@ async function backgroundEnqueue(
         }
     }
 
+    // Never hand job_items a duplicate contact_id: the partial unique
+    // index job_items_open_contact_uniq rejects the whole 2,000-row chunk
+    // and the enqueue rolls back. Callers can pass raw ids, and the
+    // paginated resolver could historically return overlaps.
+    if (contactIds && contactIds.length > 0) {
+        const before = contactIds.length;
+        contactIds = [...new Set(contactIds)];
+        if (contactIds.length < before) {
+            addServerLog(`⚠️ Dropped ${(before - contactIds.length).toLocaleString()} duplicate contact id(s) before queueing.`, 'Pipeline', 'warn');
+        }
+    }
+
     if (!contactIds || contactIds.length === 0) {
         addServerLog(`⚠️ No contacts found matching filters.`, 'Pipeline', 'warn');
         setEnqueueState(jobLeadListName, { phase: 'failed', error: 'No contacts to queue — every contact in this list already has an enrichment row.' });
@@ -765,10 +777,17 @@ async function resolveFilteredContactIds(filters: any, searchQuery?: string): Pr
             selectStr = 'contact_id, enrichments(status)';
         }
 
+        // Sort on a UNIQUE key. Offset paging over a non-unique sort is
+        // nondeterministic inside ties, and an imported list shares a
+        // handful of created_at values (the IT Services list: 53,249 rows,
+        // 32 distinct timestamps, up to 2,513 rows on one). Pages then
+        // overlap and skip rows — the resolved set carried duplicate
+        // contact_ids and the first job_items chunk died on
+        // job_items_open_contact_uniq (2026-09-24, 2026-09-25).
         let query: any = supabase
             .from('contacts')
             .select(selectStr)
-            .order('created_at', { ascending: true })
+            .order('contact_id', { ascending: true })
             .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
 
         const trimmedSearch = searchQuery?.trim();
