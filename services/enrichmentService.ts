@@ -152,9 +152,15 @@ export async function enrichSingle(item: BatchItem): Promise<any> {
     // whole run hits a dead OpenAI account).
     const isQuota = httpStatus === 429 &&
         /insufficient_quota|exceeded your current quota|check your plan and billing/i.test(err?.message || '');
-    let errorCategory: 'openai_quota' | 'openai_5xx' | 'openai_4xx' | 'openai_timeout' | 'parse_error' | 'unknown';
+    let errorCategory: 'openai_quota' | 'openai_rate_limit' | 'openai_5xx' | 'openai_4xx' | 'openai_timeout' | 'parse_error' | 'unknown';
     if (isAbort) errorCategory = 'openai_timeout';
     else if (isQuota) errorCategory = 'openai_quota';
+    // A 429 that is NOT a dead account is OpenAI asking us to slow down.
+    // The worker retries it with the transient backoff (30 s floor) rather
+    // than burning the three fast retries and failing the contact — which
+    // is what a plain 4xx would do, and what would happen to every item in
+    // flight the moment a higher concurrency setting brushes the TPM cap.
+    else if (httpStatus === 429) errorCategory = 'openai_rate_limit';
     else if (httpStatus && httpStatus >= 500) errorCategory = 'openai_5xx';
     else if (httpStatus && httpStatus >= 400) errorCategory = 'openai_4xx';
     else if (/JSON|parse|No model output/i.test(err?.message || '')) errorCategory = 'parse_error';

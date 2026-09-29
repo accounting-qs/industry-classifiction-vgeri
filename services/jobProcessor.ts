@@ -17,6 +17,14 @@ const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10);
 // Transient AI errors (5xx / timeout) get many more attempts than terminal
 // ones (4xx / parse). A 5-min OpenAI outage shouldn't permanently fail an item.
 const MAX_RETRIES_TRANSIENT = parseInt(process.env.MAX_RETRIES_TRANSIENT || '10', 10);
+// Retries for a scrape where every proxy already failed. These re-run the
+// full waterfall within seconds against the same site, so they almost never
+// help: on the 53k IT Services run 3,954 items went into scrape retry, 508
+// recovered (342 of them on the first retry) and 3,446 still failed after
+// four attempts — ~11,000 extra scrape attempts for 508 contacts. One retry
+// keeps two-thirds of the recoveries for a third of the cost. Set
+// MAX_RETRIES_SCRAPE=3 in the environment to restore the old behaviour.
+const MAX_RETRIES_SCRAPE = parseInt(process.env.MAX_RETRIES_SCRAPE || '1', 10);
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '2000', 10);
 const STALE_PROCESSING_MINUTES = 5; // Issue #7: Auto-reset items stuck processing longer than this
 
@@ -282,7 +290,7 @@ export class JobProcessor {
         // Fresh run → fresh per-list tallies. Baseline is queried lazily
         // the first time we see items from each list.
         this.listProgress.clear();
-        this.log(`🚀 JobProcessor started [Chunk: ${QUEUE_FETCH_CHUNK_SIZE}, Scrape: C${CONCURRENCY_SCRAPE}, AI: C${CONCURRENCY_AI}, GC: ${typeof global.gc === 'function' ? 'ENABLED' : 'DISABLED'}]`, 'phase');
+        this.log(`🚀 JobProcessor started [Chunk: ${QUEUE_FETCH_CHUNK_SIZE}, Scrape: C${CONCURRENCY_SCRAPE}, AI: C${CONCURRENCY_AI}, ScrapeRetries: ${MAX_RETRIES_SCRAPE}, GC: ${typeof global.gc === 'function' ? 'ENABLED' : 'DISABLED'}]`, 'phase');
 
         this.startHeartbeat();
 
@@ -938,7 +946,7 @@ export class JobProcessor {
                     // Scrape failed. Determine if retryable.
                     const isTerminal = e.message.includes('FastFail');
 
-                    if (!isTerminal && jobItem.attempt_count < MAX_RETRIES) {
+                    if (!isTerminal && jobItem.attempt_count < MAX_RETRIES_SCRAPE) {
                         return this.createRetry(jobItem, `Scraper error: ${e.message}`);
                     } else {
                         return this.createResult(jobItem, false, 'failed', `Scrape terminal error: ${e.message}`, undefined, undefined, 0, 'error:scrape');
@@ -969,7 +977,7 @@ export class JobProcessor {
                     return this.createResult(jobItem, false, 'failed', 'OpenAI quota exhausted (insufficient_quota) — enrichment auto-paused; fix billing then Resume.', undefined, undefined, 0, 'error:quota');
                 } else {
                     // Treat OpenAI 5xx / timeout as transient — don't burn a retry slot as fast.
-                    const isTransient = aiOutput.error_category === 'openai_5xx' || aiOutput.error_category === 'openai_timeout';
+                    const isTransient = aiOutput.error_category === 'openai_5xx' || aiOutput.error_category === 'openai_timeout' || aiOutput.error_category === 'openai_rate_limit';
                     const cap = isTransient ? MAX_RETRIES_TRANSIENT : MAX_RETRIES;
                     if (jobItem.attempt_count < cap) {
                         return this.createRetry(jobItem, `AI error: ${aiOutput.reasoning}`, { transient: isTransient });
