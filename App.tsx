@@ -750,12 +750,12 @@ export default function App() {
         // without waiting for the next 5s auto-poll cycle.
         refreshLists();
       } else {
-        addLog(`✅ 202 Accepted: Backend cluster scaling up for list "${name}". Watch the queue log for the actual ${mode === 'reenrich' ? 're-enrich' : 'resume'} count.`);
-        setActiveTab(AppTab.ENRICHMENT);
-        // No optimistic isProcessing flip: /api/status reports the real
-        // state on the next poll (it's cheap now), and the Import row
-        // shows the enqueue phase (Resolving… / Queueing N / M…) from
-        // the server, including the error if it fails.
+        addLog(`✅ Accepted — "${name}" is being queued in the background. The Import row shows progress; this log has the detail.`);
+        // Stay on Import: the row itself shows what the click is doing
+        // (Resolving… / Queueing N / M… / Enrich failed: …) and flips to
+        // Pause / Cancel once every item has landed. No optimistic
+        // isProcessing flip either — /api/status reports the real state.
+        // The Pipeline tab still carries the detailed log.
         refreshLists();
       }
     } catch (e: any) {
@@ -1714,6 +1714,35 @@ function ImportedListsTable({
                               </button>
                             );
 
+                            // Enqueue in flight for this row: POST /api/enrich
+                            // answered 202 and the server is still resolving
+                            // contacts or inserting job_items. Show what it's
+                            // doing — a working click used to look exactly
+                            // like a dead one. This wins over the queue badge:
+                            // items land in batches, so the list looks
+                            // 'queued' minutes before the fill is complete.
+                            // Cancel is offered once a job row exists.
+                            const eq = l.enqueue;
+                            if (eq && eq.phase !== 'failed') {
+                              const busyLabel = eq.phase === 'resolving'
+                                ? 'Resolving contacts…'
+                                : eq.queued > 0
+                                  ? `Queueing ${eq.queued.toLocaleString()} / ${eq.total.toLocaleString()}…`
+                                  : `Queueing ${eq.total.toLocaleString()} contacts…`;
+                              return (
+                                <>
+                                  <button
+                                    disabled
+                                    className={`${ctrlBtn} border-transparent bg-[#3ecf8e]/50 text-black cursor-wait`}
+                                    title="Enrichment is being queued in the background — the row switches to Pause / Cancel once every item has landed."
+                                  >
+                                    <Loader2 className="w-3 h-3 shrink-0 animate-spin" /> {busyLabel}
+                                  </button>
+                                  {eq.phase === 'queueing' && cancelBtn}
+                                </>
+                              );
+                            }
+
                             if (qs === 'running' || qs === 'queued') {
                               return (
                                 <>
@@ -1756,26 +1785,6 @@ function ImportedListsTable({
                               );
                             }
 
-                            // Enqueue in flight for this row: POST /api/enrich
-                            // answered 202 and the server is still resolving
-                            // contacts or inserting job_items. Show what it's
-                            // doing instead of the idle button — a working
-                            // click used to look exactly like a dead one.
-                            const eq = l.enqueue;
-                            if (eq && eq.phase !== 'failed') {
-                              const busyLabel = eq.phase === 'resolving'
-                                ? 'Resolving contacts…'
-                                : `Queueing ${eq.queued.toLocaleString()} / ${eq.total.toLocaleString()}…`;
-                              return (
-                                <button
-                                  disabled
-                                  className={`${ctrlBtn} border-transparent bg-[#3ecf8e]/50 text-black cursor-wait`}
-                                  title="Enrichment is being queued in the background — the row switches to Pause / Cancel once the first items land."
-                                >
-                                  <Loader2 className="w-3 h-3 shrink-0 animate-spin" /> {busyLabel}
-                                </button>
-                              );
-                            }
                             const enqueueError = eq?.phase === 'failed' ? (eq.error || 'unknown error') : null;
 
                             // Idle — the original three-state button.

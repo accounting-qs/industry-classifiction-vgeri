@@ -16,7 +16,7 @@ import Papa from 'papaparse';
 import { createClient } from '@supabase/supabase-js';
 import { type PoolClient } from 'pg';
 import pgCopyStreams from 'pg-copy-streams';
-import { getPgPool, cancelHeavyStatements, callHeavyRpc } from './services/pgClient';
+import { getPgPool, cancelHeavyStatements, callHeavyRpc, heavyQuery } from './services/pgClient';
 import { startMemoryMonitor, memorySnapshot, memoryHistory, writeHeapSnapshotTo, setMemoryContextProvider } from './services/memoryMonitor';
 const { to: copyTo, from: copyFrom } = pgCopyStreams;
 import { db } from './services/supabaseClient';
@@ -378,6 +378,22 @@ app.post('/api/enrich', async (req, res) => {
     // such job before this click adds a new one.
     await JobProcessor.cancelEmptyPendingJobs();
 
+    // One enqueue per list at a time. On 2026-09-29 three clicks 20 s apart
+    // started three concurrent resolves of a 302k list; each held a pooler
+    // connection for minutes and two of them died. The Import row is
+    // disabled while this state exists, so this only fires from a stale
+    // tab or a double-click — but it must never start a second run.
+    const clickedList = leadListNameFromFilters(filters);
+    if (clickedList) {
+        const inFlight = enqueueStateFor(clickedList);
+        if (inFlight && inFlight.phase !== 'failed') {
+            return res.status(409).json({
+                error: `"${clickedList}" is already being queued (${inFlight.phase}) — wait for the row to switch to Pause / Cancel.`,
+                enqueue: inFlight,
+            });
+        }
+    }
+
     // Multi-list serial queueing. The processNextChunk SELECT in JobProcessor
     // already orders by job_items.id ASC, so each list's items (inserted as a
     // contiguous bigserial range) fully drain before the next list's items
@@ -495,6 +511,206 @@ function enqueueStateFor(listName: string): Omit<EnqueueState, 'updatedAt'> | nu
     return { phase: st.phase, queued: st.queued, total: st.total, error: st.error };
 }
 
+// ---- Direct-Postgres enqueue (Import-row Enrich / Resume / Re-enrich) ----
+//
+// The REST enqueue resolves every contact_id into a JSON array through
+// PostgREST (24 MB for a 634k list), then issues one 2,000-row insert per
+// chunk: 300+ round trips, each racing the pooler's 10 s acquisition
+// timeout and the 8 s / 120 s statement ceilings, and the whole run is
+// lost if any one of them gives up. On 2026-09-29 a 302k list died twice
+// that way, at 6% and 5%. Here the list is queued with a handful of
+// set-based INSERT … SELECT statements over the direct connection: no
+// gateway, our own statement_timeout, no id array in Node. Measured on
+// prod: ~1 ms/row, so 300k queues in ~5 min and 634k in ~10.
+//
+// Only the shape the Import row sends qualifies — one lead_list_name,
+// optionally status=['new'] (Resume), no search, no explicit ids. Every
+// other caller (Contacts page filters, raw ids) keeps the generic path.
+type DirectEnqueueMode = 'resume' | 'reenrich';
+
+function directEnqueueMode(rawContactIds: string[] | undefined, filters: any, searchQuery: string | undefined): DirectEnqueueMode | null {
+    if (rawContactIds || !Array.isArray(filters) || filters.length === 0) return null;
+    if (searchQuery && searchQuery.trim()) return null;
+    let listFilters = 0;
+    let mode: DirectEnqueueMode = 'reenrich';
+    for (const f of filters) {
+        if (f?.column === 'lead_list_name' && f.operator === 'in' && Array.isArray(f.value) && f.value.length === 1) {
+            listFilters++;
+            continue;
+        }
+        if (f?.column === 'status' && f.operator === 'in' && Array.isArray(f.value) && f.value.length === 1 && f.value[0] === 'new') {
+            mode = 'resume';
+            continue;
+        }
+        return null;
+    }
+    return listFilters === 1 ? mode : null;
+}
+
+const DIRECT_ENQUEUE_BATCH = 25_000;
+const DIRECT_ENQUEUE_OPTS = {
+    statementTimeoutMs: 10 * 60 * 1000,
+    lockTimeoutMs: 30_000,
+    retries: 3,
+    ownerKey: 'enrich-enqueue',
+};
+
+async function enqueueListDirect(listName: string, mode: DirectEnqueueMode, joiningExisting: boolean): Promise<void> {
+    const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
+
+    // Progress denominator: every contact in the list. Resume mode skips
+    // contacts that already have an enrichment row, so total_items is
+    // corrected to the real inserted count at the end.
+    const { rows: cntRows } = await heavyQuery<{ n: string }>(
+        `SELECT count(*)::text AS n FROM contacts WHERE lead_list_name = $1`,
+        [listName], DIRECT_ENQUEUE_OPTS);
+    const listSize = Number(cntRows[0]?.n) || 0;
+    if (listSize === 0) {
+        addServerLog(`⚠️ No contacts found for list "${listName}".`, 'Pipeline', 'warn');
+        setEnqueueState(listName, { phase: 'failed', error: 'No contacts found for this list.' });
+        jobStats.queueingPhase = false;
+        if (!joiningExisting) jobStats.isProcessing = false;
+        await persistPipelineState();
+        return;
+    }
+    addServerLog(`📊 Total contacts to enrich: up to ${listSize.toLocaleString()} (${mode === 'resume' ? 'contacts without an enrichment row' : 'every contact in the list'})`, 'Pipeline', 'phase');
+
+    // The job row stays 'pending' while it fills. The FIFO walker only
+    // claims 'processing' jobs, and the orphan-rescue path only promotes a
+    // pending job once it has items — by then the fill is far ahead of the
+    // worker (~1,000 rows/s in vs ~5/s out), so the job cannot drain to a
+    // premature 'completed' underneath us. If this process dies mid-fill,
+    // the rescue promotes what landed, the worker drains it, and the rest
+    // of the list is still 'new' for the next Resume click.
+    const { rows: jobRows } = await heavyQuery<{ id: string }>(
+        `INSERT INTO jobs (status, total_items, started_at, lead_list_name)
+         VALUES ('pending', $1, now(), $2) RETURNING id`,
+        [listSize, listName], DIRECT_ENQUEUE_OPTS);
+    const jobId = jobRows[0].id;
+    addServerLog(`🆔 Job created (pending): ${jobId} (up to ${listSize.toLocaleString()} items)`, 'Pipeline', 'info');
+    if (joiningExisting) {
+        jobStats.total = (jobStats.total || 0) + listSize;
+        addServerLog(`📥 Appending "${listName}" to the active queue (will start after the current list completes).`, 'Pipeline', 'phase');
+    } else {
+        jobStats.total = listSize;
+    }
+    setEnqueueState(listName, { phase: 'queueing', queued: 0, total: listSize });
+    addServerLog(`📦 Starting queue insertion for "${listName}" — direct Postgres, ${DIRECT_ENQUEUE_BATCH.toLocaleString()} rows per statement...`, 'Pipeline', 'phase');
+
+    let cursor = ZERO_UUID;
+    let inserted = 0;
+    while (true) {
+        // Cancel mid-fill (Import row → Cancel) flips the job to 'cancelled'
+        // and deletes its open items; stop, and drop anything that landed
+        // after that delete. A job the orphan-rescue path already promoted
+        // to 'processing' is fine — keep filling it.
+        const { rows: st } = await heavyQuery<{ status: string }>(
+            `SELECT status FROM jobs WHERE id = $1`, [jobId], DIRECT_ENQUEUE_OPTS);
+        const jobStatus = st[0]?.status;
+        if (jobStatus !== 'pending' && jobStatus !== 'processing') {
+            addServerLog(`🚫 Job ${jobId} is '${jobStatus ?? 'gone'}' — stopping queue insertion for "${listName}" at ${inserted.toLocaleString()} rows.`, 'Pipeline', 'warn');
+            if (jobStatus === 'cancelled') {
+                await heavyQuery(
+                    `DELETE FROM job_items WHERE job_id = $1 AND status IN ('pending','retrying','processing')`,
+                    [jobId], DIRECT_ENQUEUE_OPTS);
+            }
+            clearEnqueueState(listName);
+            jobStats.queueingPhase = false;
+            if (!joiningExisting) jobStats.isProcessing = false;
+            await persistPipelineState();
+            return;
+        }
+
+        // Keyset on contact_id over idx_contacts_list_contactid: each batch
+        // is an ordered index-only scan starting after the last row we
+        // took. Rows the NOT EXISTS excludes are skipped for good because
+        // the cursor only ever moves forward past them. Idempotent — the
+        // partial unique index turns a re-run into DO NOTHING — so a
+        // transient failure just retries the same batch.
+        let rows: Array<{ scanned: string; inserted: string; last_id: string | null }> = [];
+        for (let attempt = 1; ; attempt++) {
+            try {
+                ({ rows } = await heavyQuery<{ scanned: string; inserted: string; last_id: string | null }>(
+                    `WITH batch AS (
+                         SELECT c.contact_id, c.lead_list_name
+                         FROM contacts c
+                         WHERE c.lead_list_name = $1
+                           AND c.contact_id > $2::uuid
+                           AND ($3::boolean OR NOT EXISTS (SELECT 1 FROM enrichments e WHERE e.contact_id = c.contact_id))
+                         ORDER BY c.contact_id
+                         LIMIT $4
+                     ), ins AS (
+                         INSERT INTO job_items (job_id, contact_id, status, attempt_count, lead_list_name)
+                         SELECT $5::uuid, b.contact_id, 'pending', 0, b.lead_list_name
+                         FROM batch b
+                         ON CONFLICT (contact_id) WHERE status IN ('pending','retrying','processing') DO NOTHING
+                         RETURNING 1
+                     )
+                     SELECT (SELECT count(*) FROM batch)::text AS scanned,
+                            (SELECT count(*) FROM ins)::text AS inserted,
+                            (SELECT contact_id FROM batch ORDER BY contact_id DESC LIMIT 1)::text AS last_id`,
+                    [listName, cursor, mode === 'reenrich', DIRECT_ENQUEUE_BATCH, jobId], DIRECT_ENQUEUE_OPTS));
+                break;
+            } catch (err: any) {
+                if (attempt >= 3 || !isTransientImportError(err)) throw err;
+                addServerLog(`↻ Queue insertion transient (${err.message}); retry ${attempt}/2 in ${5 * attempt}s`, 'Pipeline', 'warn');
+                await new Promise(r => setTimeout(r, 5000 * attempt));
+            }
+        }
+
+        const got = Number(rows[0]?.scanned) || 0;
+        const ins = Number(rows[0]?.inserted) || 0;
+        if (got === 0) break;
+        inserted += ins;
+        cursor = rows[0].last_id as string;
+        jobStats.queued = (jobStats.queued || 0) + ins;
+        setEnqueueState(listName, { queued: inserted });
+        addServerLog(`📥 Queued ${inserted.toLocaleString()} / up to ${listSize.toLocaleString()}`, 'Sync');
+        if (got < DIRECT_ENQUEUE_BATCH) break;
+    }
+
+    if (inserted === 0) {
+        await heavyQuery(
+            `DELETE FROM jobs WHERE id = $1 AND status = 'pending'
+               AND NOT EXISTS (SELECT 1 FROM job_items WHERE job_id = $1)`,
+            [jobId], DIRECT_ENQUEUE_OPTS);
+        const why = mode === 'resume'
+            ? 'No contacts to queue — every contact in this list already has an enrichment row (or is queued in another run).'
+            : 'No contacts to queue — every contact in this list is already queued in another run.';
+        addServerLog(`⚠️ ${why}`, 'Pipeline', 'warn');
+        setEnqueueState(listName, { phase: 'failed', error: why });
+        jobStats.queueingPhase = false;
+        if (!joiningExisting) { jobStats.isProcessing = false; jobStats.total = 0; }
+        else jobStats.total = Math.max(0, (jobStats.total || 0) - listSize);
+        await persistPipelineState();
+        return;
+    }
+
+    // Every item is in: record the real total and hand the job to the
+    // FIFO walker. If the orphan-rescue path promoted it already, leave
+    // the status alone and only fix the total.
+    await heavyQuery(
+        `UPDATE jobs
+            SET total_items = $2,
+                status = CASE WHEN status = 'pending' THEN 'processing' ELSE status END
+          WHERE id = $1 AND status IN ('pending','processing')`,
+        [jobId, inserted], DIRECT_ENQUEUE_OPTS);
+
+    jobStats.total = Math.max(0, (jobStats.total || 0) - listSize + inserted);
+    jobStats.queueingPhase = false;
+    await persistPipelineState();
+    if (joiningExisting) {
+        addServerLog(`✅ ${inserted.toLocaleString()} records queued behind the active list (FIFO). They'll start as soon as the in-flight list completes.`, 'Pipeline', 'phase');
+    } else {
+        addServerLog(`✅ All ${inserted.toLocaleString()} records queued. Starting enrichment...`, 'Pipeline', 'phase');
+        addServerLog(`📊 Pipeline summary: ${inserted.toLocaleString()} submitted → ${inserted.toLocaleString()} queued → 0 completed, 0 failed`, 'Pipeline', 'info');
+    }
+    JobProcessor.start();
+    // Items are in the DB, so the row now reports its state through
+    // get_list_enrichment_queue_state (queued/running badge).
+    clearEnqueueState(listName);
+}
+
 /**
  * Background enqueue: resolves contact IDs from filters, creates job + job_items.
  * Runs AFTER the HTTP response is sent, so there's no timeout risk.
@@ -517,6 +733,29 @@ async function backgroundEnqueue(
     // and of the row-level enqueue progress.
     const jobLeadListName: string | null = leadListNameFromFilters(filters);
     setEnqueueState(jobLeadListName, { phase: 'resolving', queued: 0, total: 0, error: undefined });
+
+    // Fast path for the Import-row button: queue the whole list with a few
+    // set-based statements over the direct Postgres connection. See
+    // enqueueListDirect for why the REST path below cannot be made
+    // reliable at 300k–600k contacts.
+    const directMode = directEnqueueMode(rawContactIds, filters, searchQuery);
+    if (directMode && jobLeadListName) {
+        if (!process.env.DATABASE_URL) {
+            addServerLog(`⚠️ DATABASE_URL is not set — queueing "${jobLeadListName}" through PostgREST instead (slow and fragile at volume).`, 'Pipeline', 'warn');
+        } else {
+            try {
+                await enqueueListDirect(jobLeadListName, directMode, joiningExisting);
+            } catch (err: any) {
+                console.error('Direct enqueue error:', err);
+                addServerLog(`❌ Fatal enqueue error: ${err.message}`, 'Pipeline', 'error');
+                setEnqueueState(jobLeadListName, { phase: 'failed', error: err.message });
+                jobStats.queueingPhase = false;
+                if (!joiningExisting) jobStats.isProcessing = false;
+                await persistPipelineState();
+            }
+            return;
+        }
+    }
 
     // Step 1: Resolve IDs from filters if needed
     // IMPORTANT: Uses the server's `supabase` client (service role key) for full access,
@@ -762,7 +1001,10 @@ async function resolveFilteredContactIds(filters: any, searchQuery?: string): Pr
     // --- Strategy 2: Paginated PostgREST fallback ---
     const allIds: string[] = [];
     const PAGE_SIZE = 1000; // Supabase PostgREST max-rows cap
-    let page = 0;
+    // Keyset on contact_id, not OFFSET: with OFFSET, page N re-reads the
+    // N×1000 rows before it, so a 300k list costs ~45M row visits and a
+    // 634k list ~200M — every page slower than the last until one times out.
+    let lastId: string | null = null;
 
     const enrichmentCols = ['status', 'classification', 'confidence', 'cost', 'processed_at'];
     const hasEnrichmentFilter = (filters || []).some((f: any) => enrichmentCols.includes(f.column));
@@ -788,7 +1030,8 @@ async function resolveFilteredContactIds(filters: any, searchQuery?: string): Pr
             .from('contacts')
             .select(selectStr)
             .order('contact_id', { ascending: true })
-            .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
+            .limit(PAGE_SIZE);
+        if (lastId) query = query.gt('contact_id', lastId);
 
         const trimmedSearch = searchQuery?.trim();
         if (trimmedSearch) {
@@ -840,19 +1083,19 @@ async function resolveFilteredContactIds(filters: any, searchQuery?: string): Pr
 
         const { data, error } = await query;
         if (error) {
-            addServerLog(`⚠️ Filter resolve page error (page=${page}): ${error.message}`, 'Pipeline', 'warn');
+            addServerLog(`⚠️ Filter resolve page error (after=${lastId ?? 'start'}): ${error.message}`, 'Pipeline', 'warn');
             throw error;
         }
         if (!data || data.length === 0) break;
 
         allIds.push(...data.map((d: any) => d.contact_id));
+        lastId = (data[data.length - 1] as any).contact_id;
 
         if (allIds.length % 10000 < PAGE_SIZE) {
             addServerLog(`🔍 Resolved ${allIds.length} contact IDs so far...`, 'Pipeline', 'info');
         }
 
         if (data.length < PAGE_SIZE) break;
-        page++;
     }
 
     addServerLog(`✅ Resolved ${allIds.length} total contact IDs from filters.`, 'Pipeline', 'info');
@@ -1189,7 +1432,7 @@ const isTransientImportError = (err: any): boolean => {
     // 2026-09-28 because nothing here recognised it as retryable.
     if (err.code === '57014' || err.code === '40001' || err.code === '40P01' || err.code === '53300') return true;
     const msg = String(err?.message || err || '').toLowerCase();
-    return /fetch failed|econnreset|etimedout|eai_again|enotfound|socket hang up|network|aborted|connection reset|timed out acquiring|connection pool|too many connections|remaining connection slots/.test(msg);
+    return /fetch failed|econnreset|etimedout|eai_again|enotfound|socket hang up|network|aborted|connection reset|timed out acquiring|connection pool|too many connections|remaining connection slots|connection terminated|terminating connection|timeout exceeded when trying to connect/.test(msg);
 };
 
 // Wraps a Supabase builder call so transport throws and tuple-shaped

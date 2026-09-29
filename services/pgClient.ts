@@ -303,6 +303,23 @@ async function runHeavy(
  * identical connection hygiene — there is exactly one place that decides how a
  * possibly-poisoned connection is returned to the pool.
  */
+/**
+ * Run one arbitrary statement over the direct connection with the same
+ * hygiene as callHeavyRpc: our own statement/lock timeouts, the
+ * idle-in-transaction guard, lock-contention retry, and discard of a
+ * possibly-poisoned connection. For the few hot paths that are a single
+ * set-based DML statement rather than a function call — the enrichment
+ * enqueue is one. Values are always bound parameters.
+ */
+export async function heavyQuery<R = any>(
+    sql: string,
+    values: any[] = [],
+    opts: HeavyRpcOptions = {}
+): Promise<{ rows: R[]; rowCount: number | null }> {
+    const res = await runHeavySql(sql, values, opts);
+    return { rows: res.rows as R[], rowCount: res.rowCount };
+}
+
 async function runHeavySql(sql: string, values: any[], opts: HeavyRpcOptions) {
     const {
         statementTimeoutMs = 15 * 60 * 1000,
