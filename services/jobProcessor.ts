@@ -28,6 +28,22 @@ const MAX_RETRIES_SCRAPE = parseInt(process.env.MAX_RETRIES_SCRAPE || '1', 10);
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '2000', 10);
 const STALE_PROCESSING_MINUTES = 5; // Issue #7: Auto-reset items stuck processing longer than this
 
+// PostgREST `in.(...)` filters travel in the URL. A 200-id list (~7.5 KB) has
+// run for months; a 400-id list (~15 KB) was refused on Render on
+// 2026-09-29 — every `contacts` GET failed with `TypeError: fetch failed`
+// and the run stalled — while the same request succeeds from a developer
+// machine, so the ceiling sits somewhere in Render's egress path, not in
+// PostgREST. Every id/domain list is therefore sent in slices of this size,
+// so QUEUE_FETCH_CHUNK_SIZE can grow without changing the request shape
+// that is known to work.
+const IN_LIST_MAX = parseInt(process.env.PGRST_IN_LIST_MAX || '200', 10);
+
+function slices<T>(arr: T[], size: number): T[][] {
+    const out: T[][] = [];
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+}
+
 // Issue #9: Common email domains that should be skipped (scraping gmail.com is pointless)
 const PERSONAL_EMAIL_DOMAINS = new Set([
     'gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'msn.com',
@@ -290,7 +306,7 @@ export class JobProcessor {
         // Fresh run → fresh per-list tallies. Baseline is queried lazily
         // the first time we see items from each list.
         this.listProgress.clear();
-        this.log(`🚀 JobProcessor started [Chunk: ${QUEUE_FETCH_CHUNK_SIZE}, Scrape: C${CONCURRENCY_SCRAPE}, AI: C${CONCURRENCY_AI}, ScrapeRetries: ${MAX_RETRIES_SCRAPE}, GC: ${typeof global.gc === 'function' ? 'ENABLED' : 'DISABLED'}]`, 'phase');
+        this.log(`🚀 JobProcessor started [Chunk: ${QUEUE_FETCH_CHUNK_SIZE}, Scrape: C${CONCURRENCY_SCRAPE}, AI: C${CONCURRENCY_AI}, ScrapeRetries: ${MAX_RETRIES_SCRAPE}, InListMax: ${IN_LIST_MAX}, GC: ${typeof global.gc === 'function' ? 'ENABLED' : 'DISABLED'}]`, 'phase');
 
         this.startHeartbeat();
 
@@ -766,6 +782,23 @@ export class JobProcessor {
     }
 
     /**
+     * Put claimed items back to 'pending' so the next tick can re-claim them.
+     * Only rows still 'processing' are touched. Failure is logged, not
+     * thrown: the stale-processing sweep reclaims anything left behind
+     * within STALE_PROCESSING_MINUTES.
+     */
+    private static async releaseClaims(ids: string[]): Promise<void> {
+        for (const idSlice of slices(ids, IN_LIST_MAX)) {
+            const { error } = await supabase
+                .from('job_items')
+                .update({ status: 'pending', locked_at: null })
+                .in('id', idSlice)
+                .eq('status', 'processing');
+            if (error) this.log(`⚠️ Could not release ${idSlice.length} claimed item(s): ${error.message} — the stale-processing sweep will reclaim them.`, 'warn');
+        }
+    }
+
+    /**
      * Claim a chunk of pending/retrying items belonging to a SPECIFIC job.
      * Extracted so the FIFO + orphan-fallback paths in processNextChunk
      * share the same locking + dispatch code.
@@ -796,22 +829,31 @@ export class JobProcessor {
         // we'd notice immediately if someone re-broadened the claim later.
         const activeJobIds = [...new Set(itemIdsToClaim.map(row => row.job_id))];
 
-        // Mark as processing
-        const { data: claimedItems, error: lockError } = await supabase
-            .from('job_items')
-            .update({
-                status: 'processing',
-                locked_at: new Date().toISOString()
-            })
-            .in('id', ids)
-            .select('*');
+        // Mark as processing, one URL-sized slice at a time. The status
+        // condition keeps the claim atomic: a row something else moved since
+        // the select above is not returned instead of being re-claimed.
+        const claimedItems: any[] = [];
+        for (const idSlice of slices(ids, IN_LIST_MAX)) {
+            const { data: part, error: lockError } = await supabase
+                .from('job_items')
+                .update({
+                    status: 'processing',
+                    locked_at: new Date().toISOString()
+                })
+                .in('id', idSlice)
+                .in('status', ['pending', 'retrying'])
+                .select('*');
 
-        if (lockError) {
-            // Same reasoning as fetchError above — this is a DB error, not
-            // an empty queue. Must bubble up so auto-stop can't fire.
-            throw lockError;
+            if (lockError) {
+                // Same reasoning as fetchError above — this is a DB error, not
+                // an empty queue. Must bubble up so auto-stop can't fire.
+                // Hand back whatever an earlier slice already claimed.
+                await this.releaseClaims(claimedItems.map(i => i.id));
+                throw lockError;
+            }
+            if (part) claimedItems.push(...part);
         }
-        if (!claimedItems || claimedItems.length === 0) {
+        if (claimedItems.length === 0) {
             this.log('Lock Error: Lost race — another worker claimed these rows first', 'warn');
             return 0;
         }
@@ -819,15 +861,27 @@ export class JobProcessor {
         // 1.5 Manually fetch contacts since we dropped the Foreign Key to fix the UUID mismatch
         const contactIds = [...new Set(claimedItems.map(item => item.contact_id))];
         // Fix #3: Only fetch the columns we actually use — reduces memory by ~60%
-        const { data: contactData, error: contactErr } = await supabase
-            .from('contacts')
-            .select('contact_id, id, email, company_website, lead_list_name')
-            .in('contact_id', contactIds);
+        const contactData: any[] = [];
+        let contactErr: any = null;
+        try {
+            const parts = await Promise.all(slices(contactIds, IN_LIST_MAX).map(idSlice =>
+                supabase
+                    .from('contacts')
+                    .select('contact_id, id, email, company_website, lead_list_name')
+                    .in('contact_id', idSlice)
+            ));
+            for (const part of parts) {
+                if (part.error) throw part.error;
+                contactData.push(...(part.data || []));
+            }
+        } catch (e: any) {
+            contactErr = e;
+        }
 
         if (contactErr) {
             this.log('Contact Join Error: ' + contactErr.message, 'error');
             // Revert claims
-            await supabase.from('job_items').update({ status: 'pending', locked_at: null }).in('id', ids);
+            await this.releaseClaims(claimedItems.map(i => i.id));
             return 0;
         }
 
@@ -888,14 +942,16 @@ export class JobProcessor {
             }
 
             try {
-                // Fetch prior scraped digests
-                const { data: cachedDigests } = await supabase
-                    .from('scraped_data')
-                    .select('domain, content')
-                    .in('domain', uniqueDomains);
-
-                if (cachedDigests) {
-                    cachedDigests.forEach((d: any) => digestCache[d.domain] = d.content);
+                // Fetch prior scraped digests, one URL-sized slice at a time.
+                const digestParts = await Promise.all(slices(uniqueDomains as string[], IN_LIST_MAX).map(domainSlice =>
+                    supabase
+                        .from('scraped_data')
+                        .select('domain, content')
+                        .in('domain', domainSlice)
+                ));
+                for (const part of digestParts) {
+                    if (part.error) throw new Error(part.error.message);
+                    (part.data || []).forEach((d: any) => digestCache[d.domain] = d.content);
                 }
             } catch (digestErr: any) {
                 // Non-fatal: we'll just re-scrape
