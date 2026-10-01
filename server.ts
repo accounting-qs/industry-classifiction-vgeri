@@ -3302,6 +3302,8 @@ app.get('/api/bucketing/runs/:id/phase1a-stats', async (req, res) => {
         let llmRows = 0;
         let dqPassthrough = 0;
         let needsQa = 0;
+        // LLM rows whose batch failed open: no tags, headed for General.
+        let taggingErrorRows = 0;
         const identityCounts = new Map<string, number>();
         const sampleNullSub: Array<{ industry_string: string; primary_identity: string | null; llm_reason: string | null }> = [];
 
@@ -3318,6 +3320,7 @@ app.get('/api/bucketing/runs/:id/phase1a-stats', async (req, res) => {
                 if (r.source === 'llm_phase1a') llmRows++;
                 if (r.source === 'general_passthrough') dqPassthrough++;
                 if (r.needs_qa) needsQa++;
+                if (r.source === 'llm_phase1a' && /^(tagging_error|parse_empty):/.test(r.llm_reason || '')) taggingErrorRows++;
                 if (r.primary_identity) {
                     withIdentity++;
                     identityCounts.set(r.primary_identity, (identityCounts.get(r.primary_identity) || 0) + 1);
@@ -3349,6 +3352,7 @@ app.get('/api/bucketing/runs/:id/phase1a-stats', async (req, res) => {
             llm_rows: llmRows,
             dq_passthrough_rows: dqPassthrough,
             needs_qa_rows: needsQa,
+            tagging_error_rows: taggingErrorRows,
             with_identity: withIdentity,
             with_sub_identity: withSubIdentity,
             with_sector: withSector,
@@ -3412,13 +3416,17 @@ app.post('/api/bucketing/debug/test-tag', async (req, res) => {
     }
 });
 
-// Re-run Phase 1a from scratch on an existing run. Used to recover runs
-// tagged before the May 9 prompt-key fix (where sub_identity came back
-// null on every row). runTaxonomyProposal is idempotent — wipes prior
-// bucket_industry_map rows for the run before re-tagging — so this is
-// safe to fire on any completed run.
+// Re-run Phase 1a on an existing run. Body { mode }:
+//   'all' (default) — re-tag every industry and overwrite its map row
+//                     (the "Re-tag Phase 1a" button).
+//   'failed'        — re-tag only industries whose batch failed open
+//                     (tagging_error / parse_empty rows), which costs cents
+//                     instead of a full run.
+// Rows are upserted on the (run_id, industry_string) PK, so this is safe
+// to fire on any taxonomy_ready / completed / failed run.
 app.post('/api/bucketing/runs/:id/retag-phase1a', async (req, res) => {
     const id = req.params.id;
+    const mode: 'all' | 'failed' = req.body?.mode === 'failed' ? 'failed' : 'all';
     try {
         const { data: run, error } = await supabase
             .from('bucketing_runs').select('status').eq('id', id).single();
@@ -3436,9 +3444,9 @@ app.post('/api/bucketing/runs/:id/retag-phase1a', async (req, res) => {
         const ctx = buildBucketingCtx(id);
         // Fire-and-forget. The worker handles its own error state — same
         // pattern as the initial run dispatch in /determine.
-        runTaxonomyProposal(supabase, id, ctx).catch(async (err: any) => {
+        runTaxonomyProposal(supabase, id, ctx, { retag: mode }).catch(async (err: any) => {
             const cancelled = err instanceof BucketingCancelledError;
-            console.error(`[Bucketing] Re-tag Phase 1a ${cancelled ? 'cancelled' : 'failed'} for ${id}:`, err);
+            console.error(`[Bucketing] Re-tag Phase 1a (${mode}) ${cancelled ? 'cancelled' : 'failed'} for ${id}:`, err);
             await supabase.from('bucketing_runs').update({
                 status: cancelled ? 'cancelled' : 'failed',
                 cancel_requested: false,
@@ -3446,7 +3454,7 @@ app.post('/api/bucketing/runs/:id/retag-phase1a', async (req, res) => {
             }).eq('id', id);
         });
 
-        res.status(202).json({ ok: true, retag_started: true });
+        res.status(202).json({ ok: true, retag_started: true, mode });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
     }

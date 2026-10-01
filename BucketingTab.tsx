@@ -27,6 +27,12 @@ const RESERVED_DISQUALIFIED = 'Disqualified';
 // Recognize legacy names too, in case a run was created before v2.3.
 const RESERVED_NAMES = new Set(['general', 'generic', 'disqualified', 'other']);
 
+// Shown when a background refresh (run list, library, the open run) can't
+// reach the server, and cleared by the next one that does. Before this,
+// one dropped poll left the browser's bare "Failed to fetch" up for good,
+// which read like the run itself had failed.
+const CONNECTION_LOST = "Couldn't reach the server. Showing the last loaded data — reload if this doesn't clear.";
+
 // Hover tooltips for the 3 taxonomy column headers on the AI-proposed
 // additions panel. Plain strings — rendered via the browser's native
 // title= tooltip on the column label + ⓘ icon.
@@ -66,41 +72,53 @@ export function BucketingTab({ view = 'index', importLists }: {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Background refreshes only ever raise or clear CONNECTION_LOST, so they
+  // never hide or dismiss an error from something the user clicked.
+  const reportConnectionLost = useCallback(() => {
+    setError(prev => prev ?? CONNECTION_LOST);
+  }, []);
+  const clearConnectionLost = useCallback(() => {
+    setError(prev => (prev === CONNECTION_LOST ? null : prev));
+  }, []);
+
   const refreshRuns = useCallback(async () => {
     try {
       const res = await fetch('/api/bucketing/runs');
       const data = await res.json();
+      clearConnectionLost();
       if (Array.isArray(data.runs)) setRuns(data.runs);
-    } catch (e: any) {
-      setError(e.message);
+    } catch {
+      reportConnectionLost();
     }
-  }, []);
+  }, [clearConnectionLost, reportConnectionLost]);
 
   const refreshLibrary = useCallback(async () => {
     try {
       const res = await fetch('/api/bucketing/library');
       const data = await res.json();
+      clearConnectionLost();
       if (Array.isArray(data.buckets)) setLibrary(data.buckets);
-    } catch (e: any) {
-      setError(e.message);
+    } catch {
+      reportConnectionLost();
     }
-  }, []);
+  }, [clearConnectionLost, reportConnectionLost]);
 
   const fetchActive = useCallback(async () => {
     if (!activeRunId) return;
     try {
       const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(activeRunId)}`);
       const data = await res.json();
+      clearConnectionLost();
       if (data.run) {
         setActiveRun(data.run);
         setBucketCounts(Array.isArray(data.bucket_counts) ? data.bucket_counts : []);
         setSectorMix(Array.isArray(data.sector_mix) ? data.sector_mix : []);
         setGeneralBreakdown(Array.isArray(data.general_breakdown) ? data.general_breakdown : []);
       }
-    } catch (e: any) {
-      setError(e.message);
+    } catch {
+      reportConnectionLost();
     }
-  }, [activeRunId]);
+  }, [activeRunId, clearConnectionLost, reportConnectionLost]);
 
   useEffect(() => { refreshRuns(); refreshLibrary(); }, [refreshRuns, refreshLibrary]);
 
@@ -1453,6 +1471,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
     llm_rows: number;
     dq_passthrough_rows: number;
     needs_qa_rows: number;
+    tagging_error_rows?: number;
     with_identity: number;
     with_sub_identity: number;
     with_sector: number;
@@ -1478,16 +1497,20 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
 
   useEffect(() => { refreshBucketPanels(); }, [refreshBucketPanels]);
 
-  // Re-tag from scratch. Used to recover runs whose Phase 1a ran with
-  // the broken prompt key (May 8 and earlier — sub_identity came back
-  // null on every row). Confirm before firing because it costs LLM
-  // tokens and overwrites every map row for the run.
-  const triggerRetagPhase1a = useCallback(async () => {
-    if (!confirm('Re-tag Phase 1a from scratch? This wipes the current bucket_industry_map for this run and re-calls the LLM tagger on every industry. Costs LLM tokens; takes 1–5 minutes for a 70k-contact run.')) return;
+  // Re-tag Phase 1a. 'all' re-tags every industry and overwrites its map
+  // row — recovers runs whose Phase 1a ran with the broken prompt key
+  // (May 8 and earlier — sub_identity came back null on every row).
+  // 'failed' re-tags only the industries whose AI request failed. Both
+  // confirm first because they cost LLM tokens.
+  const startRetag = useCallback(async (mode: 'all' | 'failed') => {
     setRetagging(true);
     onError(null);
     try {
-      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/retag-phase1a`, { method: 'POST' });
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}/retag-phase1a`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode })
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `Re-tag failed (${res.status})`);
       // The endpoint returns 202 immediately and the tagger runs in
@@ -1499,6 +1522,23 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
       setRetagging(false);
     }
   }, [run.id, onError, onRefresh]);
+
+  const triggerRetagPhase1a = useCallback(() => {
+    if (!confirm('Re-tag Phase 1a from scratch? This re-calls the LLM tagger on every industry and overwrites this run\'s bucket_industry_map rows. Costs LLM tokens; takes 1–5 minutes for a 70k-contact run.')) return;
+    startRetag('all');
+  }, [startRetag]);
+
+  const failedTagRows = phase1aStats?.tagging_error_rows || 0;
+  const triggerRetagFailed = useCallback(() => {
+    // Rough cost: this run's spend per taggable industry × failed industries.
+    const taggable = Number(run.coverage_summary?.taggable_classifications) || 0;
+    const estimate = run.cost_usd && taggable > 0
+      ? ` (about $${((Number(run.cost_usd) / taggable) * failedTagRows).toFixed(2)})`
+      : '';
+    const refinalize = run.finalize_completed_at ? ' You already ran Finalize — run it again afterwards.' : '';
+    if (!confirm(`Re-tag the ${failedTagRows.toLocaleString()} industries whose AI request failed? Only those industries go back to the LLM${estimate}.${refinalize}`)) return;
+    startRetag('failed');
+  }, [startRetag, run.coverage_summary, run.cost_usd, run.finalize_completed_at, failedTagRows]);
 
   // Run a bucket-assignment POST with live progress polling. Both the
   // standalone "Run Bucket Assignment" button and the "Accept all +
@@ -1694,9 +1734,44 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
     }
   };
 
+  // Contacts + cause are recorded by Phase 1a runs from Oct 2026 on; only
+  // trust them while they describe the same rows the live count sees.
+  const failedTagSummary = run.coverage_summary?.tagging_error_industries === failedTagRows
+    ? run.coverage_summary
+    : null;
+
   return (
     <div className="space-y-4">
       <RunCoveragePanel runId={run.id} />
+
+      {/* Industries whose AI request failed every attempt were saved with
+          no tags and would land in General. Shown until they're re-tagged. */}
+      {failedTagRows > 0 && (
+        <div className="border border-amber-500/40 rounded-xl bg-amber-500/5 p-4">
+          <div className="flex items-start justify-between gap-3 flex-wrap">
+            <div className="flex-1 min-w-0">
+              <div className="text-[10px] font-bold text-amber-300 uppercase tracking-widest mb-1">
+                {failedTagRows.toLocaleString()} industries weren't tagged
+              </div>
+              <div className="text-[11px] text-gray-300">
+                The AI request for these industries failed{failedTagSummary?.tagging_first_error ? <> (<span className="font-mono">{failedTagSummary.tagging_first_error}</span>)</> : null}, so they have no identity and would land in General
+                {failedTagSummary?.tagging_error_contacts ? <> — <span className="font-mono text-white">{Number(failedTagSummary.tagging_error_contacts).toLocaleString()}</span> contacts</> : null}.
+                {' '}Re-tag them before you Finalize. Only these industries go back to the LLM.
+              </div>
+            </div>
+            <button
+              onClick={triggerRetagFailed}
+              disabled={retagging || finalizing || recalcing || assigningBuckets}
+              className="shrink-0 px-3 py-1.5 rounded text-[10px] font-bold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-50 flex items-center gap-1"
+              title="Re-call the Phase 1a tagger on just the industries whose AI request failed."
+            >
+              {retagging ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
+              {retagging ? 'Re-tagging…' : `Re-tag ${failedTagRows.toLocaleString()} failed`}
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="border border-[#2e2e2e] rounded-xl bg-[#0e0e0e] p-4">
         <div className="text-xs text-gray-300">
           <span className="font-bold text-white">{primaryIdentities.length}</span> primary identities · <span className="font-bold text-white" title="Pairs where Phase 1a committed BOTH identity and sub-identity. Zero is normal if the LLM only committed identity-level tags.">{sourceBuckets.length}</span> sub-identity pairs · <span className="font-bold text-white" title="Buckets the bucket-assignment pass mapped industries to (post Run Bucket Assignment).">{discoveredBuckets.length}</span> discovered buckets · <span className="font-bold text-white">{run.total_contacts?.toLocaleString() || '?'}</span> contacts
@@ -1736,7 +1811,7 @@ function BucketingReview({ run, library, bucketCounts, onRefresh, onError }: {
               onClick={triggerRetagPhase1a}
               disabled={retagging || finalizing || recalcing || assigningBuckets}
               className="shrink-0 px-3 py-1.5 rounded text-[10px] font-bold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-50 flex items-center gap-1"
-              title="Wipe this run's bucket_industry_map and re-call the Phase 1a tagger on every industry. Costs LLM tokens."
+              title="Re-call the Phase 1a tagger on every industry and overwrite this run's bucket_industry_map rows. Costs LLM tokens."
             >
               {retagging ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
               {retagging ? 'Re-tagging…' : 'Re-tag Phase 1a'}
@@ -2392,7 +2467,7 @@ function PipelineRerunPanel({ run, onRefresh, onError }: {
     if (bucketAssignPollRef.current) { window.clearInterval(bucketAssignPollRef.current); bucketAssignPollRef.current = null; }
   }, []);
 
-  const post = async (endpoint: string, label: typeof busy, errorPrefix: string) => {
+  const post = async (endpoint: string, label: typeof busy, errorPrefix: string, body?: object) => {
     setBusy(label);
     onError(null);
     // Spin up live progress polling for the synchronous bucket-assign
@@ -2416,7 +2491,9 @@ function PipelineRerunPanel({ run, onRefresh, onError }: {
       }, 1000);
     }
     try {
-      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}${endpoint}`, { method: 'POST' });
+      const res = await fetch(`/api/bucketing/runs/${encodeURIComponent(run.id)}${endpoint}`, body
+        ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+        : { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || `${errorPrefix} failed (${res.status})`);
       // Wait one tick before refreshing so the status flip on the server
@@ -2439,12 +2516,12 @@ function PipelineRerunPanel({ run, onRefresh, onError }: {
   const rerunPhase1a = () => {
     if (!confirm(
       'Re-tag Phase 1a from scratch?\n\n' +
-      'This wipes bucket_industry_map for this run and re-calls the LLM tagger ' +
-      'on every distinct industry. Bucket Assignment + Phase 1b results stay ' +
+      'This re-calls the LLM tagger on every distinct industry and overwrites ' +
+      'this run\'s bucket_industry_map rows. Bucket Assignment + Phase 1b results stay ' +
       'in the DB but will be stale until you re-run them too.\n\n' +
       'Cost: ~$15–150 depending on the model. Takes 1–5 min for a 70k-contact run.'
     )) return;
-    post('/retag-phase1a', 'phase1a', 'Phase 1a re-tag');
+    post('/retag-phase1a', 'phase1a', 'Phase 1a re-tag', { mode: 'all' });
   };
 
   const rerunBucketAssign = () => {

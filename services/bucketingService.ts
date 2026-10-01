@@ -29,7 +29,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { callHeavyRpc, callHeavyRpcRows, bulkUpsert } from './pgClient';
+import { callHeavyRpc, callHeavyRpcRows, bulkUpsert, heavyQuery } from './pgClient';
 import pLimit from 'p-limit';
 import Anthropic from '@anthropic-ai/sdk';
 import { getSetting } from './appSettings';
@@ -201,6 +201,42 @@ const PHASE1A_QA_FLOOR = 6;
 const PHASE1A_DQ_FLOOR = 7;
 const PHASE1A_BATCH_SIZE = 20;
 const PHASE1A_CONCURRENCY = 300;
+// A run opens PHASE1A_CONCURRENCY provider calls at once. On 2026-10-01
+// (run 9575d5a1) 21 calls in that first burst died with undici "fetch
+// failed". With no retry, their 420 industries (8,903 contacts) were
+// written untagged and later dropped into General. A transient failure
+// now backs off and retries. Only a batch that fails every attempt fails open.
+const PHASE1A_MAX_ATTEMPTS = 4;
+const PHASE1A_RETRY_BASE_MS = 2_000;
+const PHASE1A_RETRY_MAX_MS = 30_000;
+
+// undici reports every network failure as the bare "fetch failed" and
+// puts the real reason (ECONNRESET, EAI_AGAIN, connect timeout…) on
+// err.cause. Fold the cause into the message so logs say what broke.
+function describeFetchError(err: any): string {
+    const msg = err?.message || String(err);
+    const cause = err?.cause;
+    if (!cause) return msg;
+    const code = cause.code || cause.name || '';
+    const detail = cause.message && cause.message !== msg ? cause.message : '';
+    const parts = [code, detail].filter(Boolean).join(': ');
+    return parts ? `${msg} (${parts})` : msg;
+}
+
+// Retry only what a second attempt can fix. The network pattern mirrors
+// server.ts:isTransientImportError and JobProcessor.isTransientSupabaseError.
+function isTransientTaggerError(err: any, runSignal?: AbortSignal): boolean {
+    if (!err || runSignal?.aborted) return false;          // user clicked Stop
+    const status = Number(err.status ?? err.statusCode);
+    if (status === 429) return !/insufficient_quota/i.test(err.message || '');
+    if (status >= 500 && status < 600) return true;
+    if (status >= 400 && status < 500) return false;       // bad key / bad request
+    // The run signal isn't aborted (checked above), so an abort here is
+    // the per-call TAXONOMY_TIMEOUT_MS firing.
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') return true;
+    const text = `${err.message || ''} ${err.cause?.code || ''} ${err.cause?.message || ''}`.toLowerCase();
+    return /fetch failed|econnreset|etimedout|eai_again|enotfound|econnrefused|und_err|socket hang up|other side closed|connection error|network|timed out|timeout|request was aborted/.test(text);
+}
 
 const ANTHROPIC_KEY_NAME = 'ANTHROPIC_API_KEY';
 
@@ -249,6 +285,14 @@ interface TaxonomySnapshot {
     identities: TaxonomyEntry[];
     sub_identities: TaxonomyEntry[];
     sectors: TaxonomyEntry[];
+}
+
+// Proposal names (is_new_*) a run has already coined, with how many of its
+// industries use each. Seeds tagIndustries for a partial re-tag.
+interface InRunProposalSeed {
+    identities: Array<{ name: string; usage: number }>;
+    subIdentities: Array<{ name: string; parent: string; usage: number }>;
+    sectors: Array<{ name: string; usage: number }>;
 }
 
 // ─── AI proposal-routing suggestions ───────────────────────────────
@@ -938,10 +982,16 @@ CRITICAL CONSTRAINTS
 // PHASE 1A — DISCOVERY
 // ────────────────────────────────────────────────────────────────────
 
+// opts.retag — how an existing run is re-tagged (unset for a new run or a
+// Resume, which skip what is already tagged):
+//   'all'    — re-tag every industry and overwrite its row.
+//   'failed' — re-tag only industries whose batch failed open, reusing the
+//              run's proposal names.
 export async function runTaxonomyProposal(
     supabase: SupabaseClient,
     runId: string,
-    ctx: BucketingCtx
+    ctx: BucketingCtx,
+    opts: { retag?: 'all' | 'failed' } = {}
 ): Promise<void> {
     ctx.log(`[Bucketing ${runId}] Phase 1a: tag-based classification`, 'phase');
     ctx.progress({ phase: 'phase1a', step: 'load_vocabulary', note: 'Loading vocabulary from selected lists…' });
@@ -990,22 +1040,42 @@ export async function runTaxonomyProposal(
     // RPC stays defined in the DB but is no longer called.
     ctx.log(`[Bucketing ${runId}] cross-run tag inheritance disabled — tagging from scratch against current library + prompt`);
 
-    // Resume support: don't wipe. Read existing rows (including just-inherited
-    // ones from the prior step) so we know which industries are already tagged
-    // and skip them in the tagger loop. A server restart / OOM mid-tag would
-    // otherwise force a full re-tag at ~$20-30 per run. The (run_id,
-    // industry_string) PK keeps the upsert idempotent for overlaps.
-    const { data: existingRowsData, error: existingErr } = await supabase
-        .from('bucket_industry_map')
-        .select('industry_string,source')
-        .eq('bucketing_run_id', runId);
-    if (existingErr) throw new Error(`existing bucket_industry_map read failed: ${existingErr.message}`);
-    const existingByIndustry = new Set((existingRowsData || []).map((r: any) => r.industry_string as string));
-    const existingLLMTagged = new Set((existingRowsData || [])
-        .filter((r: any) => r.source === 'llm_phase1a' || r.source === 'inherited_phase1a')
-        .map((r: any) => r.industry_string as string));
+    // Resume support: don't wipe. Read existing rows so we know which
+    // industries are already tagged and skip them in the tagger loop. A
+    // server restart / OOM mid-tag would otherwise force a full re-tag at
+    // ~$20-30 per run. The (run_id, industry_string) PK keeps the upsert
+    // idempotent for overlaps.
+    //
+    // Read over direct Postgres. A plain PostgREST select is capped at
+    // db-max-rows (1,000), which silently shrank the skip set to an arbitrary
+    // 1,000 rows. A row whose batch failed open (tagging_error / parse_empty)
+    // carries no tags, so it doesn't count as tagged and is tagged again.
+    //
+    // retag='all' skips nothing: every row is re-tagged and overwritten.
+    const retagAll = opts.retag === 'all';
+    const existingByIndustry = new Set<string>();
+    const existingLLMTagged = new Set<string>();
+    if (!retagAll) {
+        const { rows: existingRows } = await heavyQuery<{ industry_string: string; tagged: boolean }>(
+            `SELECT industry_string,
+                    source IN ('llm_phase1a', 'inherited_phase1a')
+                      AND coalesce(llm_reason, '') NOT LIKE 'tagging_error:%'
+                      AND coalesce(llm_reason, '') NOT LIKE 'parse_empty:%' AS tagged
+               FROM bucket_industry_map
+              WHERE bucketing_run_id = $1`,
+            [runId],
+            { statementTimeoutMs: 5 * 60 * 1000, ownerKey: runId }
+        );
+        for (const r of existingRows) {
+            existingByIndustry.add(r.industry_string);
+            if (r.tagged) existingLLMTagged.add(r.industry_string);
+        }
+    }
     if (existingByIndustry.size > 0) {
         ctx.log(`[Bucketing ${runId}] resume — ${existingByIndustry.size.toLocaleString()} existing rows in map (${existingLLMTagged.size.toLocaleString()} already tagged — LLM or inherited). Skipping those to avoid re-spending.`);
+    }
+    if (retagAll) {
+        ctx.log(`[Bucketing ${runId}] re-tag from scratch — every industry is tagged again and its map row overwritten`);
     }
 
     // ── Partition vocabulary by enrichment status ────────────────────
@@ -1119,6 +1189,11 @@ export async function runTaxonomyProposal(
         ctx.log(`[Bucketing ${runId}] resume — ${skippedTaggedCount.toLocaleString()} industries already tagged, ${completedVocabToTag.length.toLocaleString()} remaining`);
     }
 
+    // Industries this invocation could not tag (their batch failed every
+    // attempt). Rows from earlier failures were re-queued above, so after
+    // this run these are the only untagged LLM rows left in the map.
+    let failedToTag = { industries: 0, contacts: 0, firstError: null as string | null };
+
     if (completedVocabToTag.length > 0) {
         // ── Tag completed industries (batched, model selected at Setup) ────
         await ctx.checkCancel();
@@ -1126,6 +1201,38 @@ export async function runTaxonomyProposal(
         // bucketing_runs.taxonomy_model in /determine. Fall back to the
         // historical Anthropic default if a run pre-dates the picker.
         const phase1aModel: string = (run as any).taxonomy_model || TAXONOMY_MODEL_ANTHROPIC;
+
+        // A failed-only re-tag starts from the proposal names the rest of
+        // this run already uses, so its batches don't coin near-duplicates.
+        let seedProposals: InRunProposalSeed | undefined;
+        if (opts.retag === 'failed') {
+            const { rows: seedRows } = await heavyQuery<{ layer: string; name: string; parent: string | null; usage: number }>(
+                `SELECT 'identity' AS layer, primary_identity AS name, NULL::text AS parent, count(*)::int AS usage
+                   FROM bucket_industry_map
+                  WHERE bucketing_run_id = $1 AND is_new_identity AND primary_identity IS NOT NULL
+                  GROUP BY primary_identity
+                 UNION ALL
+                 SELECT 'sub', sub_identity, primary_identity, count(*)::int
+                   FROM bucket_industry_map
+                  WHERE bucketing_run_id = $1 AND is_new_sub_identity
+                    AND sub_identity IS NOT NULL AND primary_identity IS NOT NULL
+                  GROUP BY sub_identity, primary_identity
+                 UNION ALL
+                 SELECT 'sector', sector, NULL, count(*)::int
+                   FROM bucket_industry_map
+                  WHERE bucketing_run_id = $1 AND is_new_sector AND sector IS NOT NULL
+                  GROUP BY sector`,
+                [runId],
+                { statementTimeoutMs: 5 * 60 * 1000, ownerKey: runId }
+            );
+            seedProposals = {
+                identities: seedRows.filter(r => r.layer === 'identity').map(r => ({ name: r.name, usage: r.usage })),
+                subIdentities: seedRows.filter(r => r.layer === 'sub').map(r => ({ name: r.name, parent: r.parent || '', usage: r.usage })),
+                sectors: seedRows.filter(r => r.layer === 'sector').map(r => ({ name: r.name, usage: r.usage })),
+            };
+            ctx.log(`[Bucketing ${runId}] re-tag failed — reusing this run's proposals: ${seedProposals.identities.length} identities, ${seedProposals.subIdentities.length} sub-identities, ${seedProposals.sectors.length} sectors`);
+        }
+
         ctx.progress({
             phase: 'phase1a',
             step: 'tagging',
@@ -1135,11 +1242,22 @@ export async function runTaxonomyProposal(
         });
         const tagResult = await withHeartbeat(
             `${phase1aModel} tagging (${completedVocabToTag.length} industries)`,
-            () => tagIndustries(supabase, phase1aModel, completedVocabToTag, snapshot, runId, ctx),
+            () => tagIndustries(supabase, phase1aModel, completedVocabToTag, snapshot, runId, ctx, seedProposals),
             ctx
         );
         totalCost += tagResult.costUsd;
-        ctx.log(`[Bucketing ${runId}] tagging: ${tagResult.taggings.length} results, $${tagResult.costUsd.toFixed(4)}, model=${tagResult.modelUsed}`);
+        failedToTag = {
+            industries: tagResult.failedIndustries,
+            contacts: tagResult.failedContacts,
+            firstError: tagResult.firstError,
+        };
+        ctx.log(
+            `[Bucketing ${runId}] tagging: ${tagResult.taggings.length} results, $${tagResult.costUsd.toFixed(4)}, model=${tagResult.modelUsed}` +
+            (failedToTag.industries > 0
+                ? ` — ${failedToTag.industries.toLocaleString()} industries (${failedToTag.contacts.toLocaleString()} contacts) FAILED to tag after ${PHASE1A_MAX_ATTEMPTS} attempts: ${failedToTag.firstError}`
+                : ''),
+            failedToTag.industries > 0 ? 'warn' : 'info'
+        );
 
         // Post-batch consolidation: collapse near-duplicate tags across the
         // 40-concurrent batches that don't see each other's output. Critical
@@ -1208,9 +1326,12 @@ export async function runTaxonomyProposal(
         // never clear min_volume anyway and bloat the library across runs.
         // Runs AFTER LLM identity consolidation so any near-duplicate that
         // could've merged into a higher-count peer has already been merged.
-        const singletonDrop = dropSingletonNewIdentities(
-            tagResult.taggings, snapshot, runId, ctx
-        );
+        // Skipped on a failed-only re-tag: it only counts uses inside the few
+        // re-tagged industries, so it would drop proposals the rest of the
+        // run uses many times over.
+        const singletonDrop = opts.retag === 'failed'
+            ? { dropped: 0, rerouted: 0 }
+            : dropSingletonNewIdentities(tagResult.taggings, snapshot, runId, ctx);
 
         // Re-run the cheap normalizer-based dedup so any new identical names
         // produced by the LLM merges collapse into one canonical.
@@ -1458,7 +1579,9 @@ export async function runTaxonomyProposal(
         },
         // taxonomy_model is now set by /determine from the user's Setup
         // screen choice — don't overwrite it here.
-        cost_usd: totalCost,
+        // Cumulative, like recalc and finalize: a re-tag adds to what the
+        // run's earlier tagging already cost.
+        cost_usd: (Number(run.cost_usd) || 0) + totalCost,
         total_contacts: totalContacts,
         coverage_summary: {
             phase1a_contacts: phase1aCoveredContacts,
@@ -1468,16 +1591,30 @@ export async function runTaxonomyProposal(
                 : 0,
             distinct_classifications: proposalRows.length,
             taggable_classifications: completedVocab.length,
-            passthrough_classifications: dqVocab.length
+            passthrough_classifications: dqVocab.length,
+            tagging_error_industries: failedToTag.industries,
+            tagging_error_contacts: failedToTag.contacts,
+            tagging_first_error: failedToTag.firstError
         },
-        quality_warnings: phase1aCoveredContacts === totalContacts ? [] : [
-            `Phase 1a taxonomy covers ${phase1aCoveredContacts.toLocaleString()} of ${totalContacts.toLocaleString()} selected contacts.`
+        quality_warnings: [
+            ...(phase1aCoveredContacts === totalContacts ? [] : [
+                `Phase 1a taxonomy covers ${phase1aCoveredContacts.toLocaleString()} of ${totalContacts.toLocaleString()} selected contacts.`
+            ]),
+            ...(failedToTag.industries > 0 ? [
+                `${failedToTag.industries.toLocaleString()} industries (${failedToTag.contacts.toLocaleString()} contacts) couldn't be tagged — the AI request failed ${PHASE1A_MAX_ATTEMPTS} times (${failedToTag.firstError}). They'll land in General unless you click "Re-tag failed" before Finalize.`
+            ] : [])
         ],
         status: 'taxonomy_ready',
         taxonomy_completed_at: new Date().toISOString()
     }).eq('id', runId);
 
-    ctx.log(`[Bucketing ${runId}] Phase 1a done — tagged ${finalRows.length} industries (${dqVocab.length} DQ, ${completedVocab.length} via LLM), $${totalCost.toFixed(4)}`, 'phase');
+    ctx.log(
+        `[Bucketing ${runId}] Phase 1a done — tagged ${finalRows.length} industries (${dqVocab.length} DQ, ${completedVocab.length} via LLM), $${totalCost.toFixed(4)}` +
+        (failedToTag.industries > 0
+            ? ` — ${failedToTag.industries.toLocaleString()} industries (${failedToTag.contacts.toLocaleString()} contacts) still untagged; use Re-tag failed`
+            : ''),
+        'phase'
+    );
     ctx.progress({
         phase: 'phase1a', step: 'done', current: 1, total: 1,
         note: `Tagging complete — ${primaryIdentities.length} identities, ${buckets.length} sub-identities, ${usedSectors.size} sectors used`
@@ -2587,8 +2724,18 @@ async function tagIndustries(
     vocab: VocabRow[],
     snapshot: TaxonomySnapshot,
     runId: string,
-    ctx: BucketingCtx
-): Promise<{ taggings: IndustryTagging[]; costUsd: number; modelUsed: string }> {
+    ctx: BucketingCtx,
+    seedProposals?: InRunProposalSeed
+): Promise<{
+    taggings: IndustryTagging[];
+    costUsd: number;
+    modelUsed: string;
+    // Industries whose batch failed every attempt and failed open
+    // (identity NULL, reason "tagging_error: …"), and the contacts they cover.
+    failedIndustries: number;
+    failedContacts: number;
+    firstError: string | null;
+}> {
     const isAnthropic = model.startsWith('claude-');
     const isOpenAI = model.startsWith('gpt-');
     if (!isAnthropic && !isOpenAI) {
@@ -2612,7 +2759,13 @@ async function tagIndustries(
     let done = 0;
     let batchesAttempted = 0;
     let batchesFailed = 0;
+    let failedIndustries = 0;
+    let failedContacts = 0;
     let firstError: string | null = null;
+    const markFailed = (b: VocabRow[]) => {
+        failedIndustries += b.length;
+        for (const v of b) failedContacts += Number(v.n || 0);
+    };
     const taggings: IndustryTagging[] = [];
 
     // Telemetry: track 429s and per-batch latency so we can detect when we
@@ -2679,6 +2832,19 @@ async function tagIndustries(
     const inRunIdentities = new Map<string, TaxonomyEntry & { _usage: number }>();
     const inRunSubIdentities = new Map<string, TaxonomyEntry & { _usage: number }>();
     const inRunSectors = new Map<string, TaxonomyEntry & { _usage: number }>();
+    // A partial re-tag starts from the proposals the run already coined, so
+    // its batches reuse those names instead of inventing near-duplicates.
+    if (seedProposals) {
+        for (const p of seedProposals.identities) {
+            inRunIdentities.set(p.name, { id: '', name: p.name, archived: false, _usage: p.usage });
+        }
+        for (const p of seedProposals.subIdentities) {
+            inRunSubIdentities.set(p.name, { id: '', name: p.name, parent_identity: p.parent, archived: false, _usage: p.usage });
+        }
+        for (const p of seedProposals.sectors) {
+            inRunSectors.set(p.name, { id: '', name: p.name, archived: false, _usage: p.usage });
+        }
+    }
     const originalIdNames = new Set(snapshot.identities.map(i => i.name));
     const originalSubNames = new Set(snapshot.sub_identities.map(i => i.name));
     const originalSecNames = new Set(snapshot.sectors.map(i => i.name));
@@ -2737,33 +2903,32 @@ async function tagIndustries(
                 sample_companies: v.sample_companies?.slice(0, 2) || []
             }))
         });
-        const callStart = Date.now();
         try {
-            let text = '';
-            if (isAnthropic) {
-                // Two system blocks: stable prefix is cached, appendix isn't.
-                // When the appendix is empty (first batch) the stable block is
-                // the entire system; the cache write still happens on this call
-                // and every subsequent batch can read from it.
-                const systemBlocks: any[] = [
-                    { type: 'text', text: stableSystemPrompt, cache_control: { type: 'ephemeral' } }
-                ];
-                if (proposalAppendix) {
-                    systemBlocks.push({ type: 'text', text: proposalAppendix });
+            const callProvider = async (): Promise<string> => {
+                if (isAnthropic) {
+                    // Two system blocks: stable prefix is cached, appendix isn't.
+                    // When the appendix is empty (first batch) the stable block is
+                    // the entire system; the cache write still happens on this call
+                    // and every subsequent batch can read from it.
+                    const systemBlocks: any[] = [
+                        { type: 'text', text: stableSystemPrompt, cache_control: { type: 'ephemeral' } }
+                    ];
+                    if (proposalAppendix) {
+                        systemBlocks.push({ type: 'text', text: proposalAppendix });
+                    }
+                    const resp = await anthropic!.messages.create({
+                        model,
+                        max_tokens: 4000,
+                        system: systemBlocks,
+                        messages: [{ role: 'user', content: userPrompt }]
+                    }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
+                    const usage: any = (resp as any).usage || {};
+                    totalIn += usage.input_tokens || 0;
+                    totalOut += usage.output_tokens || 0;
+                    totalCachedIn += usage.cache_read_input_tokens || 0;
+                    return (resp.content as any[])
+                        .filter(b => b.type === 'text').map(b => b.text).join('\n');
                 }
-                const resp = await anthropic!.messages.create({
-                    model,
-                    max_tokens: 4000,
-                    system: systemBlocks,
-                    messages: [{ role: 'user', content: userPrompt }]
-                }, { signal: combinedAbortSignal(TAXONOMY_TIMEOUT_MS, ctx.abortSignal) });
-                const usage: any = (resp as any).usage || {};
-                totalIn += usage.input_tokens || 0;
-                totalOut += usage.output_tokens || 0;
-                totalCachedIn += usage.cache_read_input_tokens || 0;
-                text = (resp.content as any[])
-                    .filter(b => b.type === 'text').map(b => b.text).join('\n');
-            } else {
                 // OpenAI chat completions with json_object response_format
                 // forces valid JSON without us hand-rolling a schema.
                 // OpenAI's automatic prefix cache matches on the longest
@@ -2789,11 +2954,9 @@ async function tagIndustries(
                 });
                 if (!resp.ok) {
                     const body = await resp.text();
-                    if (resp.status === 429) {
-                        rateLimitHits++;
-                        lastRateLimitAt = Date.now();
-                    }
-                    throw new Error(`OpenAI ${resp.status}: ${body.slice(0, 300)}`);
+                    const httpErr: any = new Error(`OpenAI ${resp.status}: ${body.slice(0, 300)}`);
+                    httpErr.status = resp.status;
+                    throw httpErr;
                 }
                 const json: any = await resp.json();
                 const usage = json.usage || {};
@@ -2801,9 +2964,36 @@ async function tagIndustries(
                 totalIn += (usage.prompt_tokens || 0);
                 totalCachedIn += cached;
                 totalOut += usage.completion_tokens || 0;
-                text = json.choices?.[0]?.message?.content || '';
+                return json.choices?.[0]?.message?.content || '';
+            };
+
+            let text = '';
+            for (let attempt = 1; ; attempt++) {
+                const attemptStart = Date.now();
+                try {
+                    text = await callProvider();
+                    recordLatency(Date.now() - attemptStart);
+                    break;
+                } catch (callErr: any) {
+                    recordLatency(Date.now() - attemptStart);
+                    if (isRateLimitError(callErr)) {
+                        rateLimitHits++;
+                        lastRateLimitAt = Date.now();
+                    }
+                    if (attempt >= PHASE1A_MAX_ATTEMPTS || !isTransientTaggerError(callErr, ctx.abortSignal)) {
+                        throw callErr;
+                    }
+                    const waitMs = Math.min(PHASE1A_RETRY_MAX_MS, PHASE1A_RETRY_BASE_MS * 2 ** (attempt - 1))
+                        + Math.floor(Math.random() * 1000);
+                    ctx.log(
+                        `[Bucketing ${runId}] tagging batch attempt ${attempt}/${PHASE1A_MAX_ATTEMPTS} failed ` +
+                        `(${batch.length} industries): ${describeFetchError(callErr)} — retrying in ${(waitMs / 1000).toFixed(1)}s`,
+                        'warn'
+                    );
+                    await new Promise(resolve => setTimeout(resolve, waitMs));
+                    await ctx.checkCancel();
+                }
             }
-            recordLatency(Date.now() - callStart);
             maybeLogTelemetry();
             const parsedRaw = parseTaggingJson(text, batch);
             // Snap against the effective snapshot (library + in-run proposals
@@ -2825,6 +3015,7 @@ async function tagIndustries(
             });
             if (parsed.length === 0) {
                 batchesFailed++;
+                markFailed(batch);
                 if (!firstError) firstError = `LLM returned a valid JSON shape but no parseable taggings. Sample: ${text.slice(0, 200)}`;
                 ctx.log(`[Bucketing ${runId}] tagging batch parsed to 0 results (${batch.length} industries) — output: ${text.slice(0, 200)}`, 'warn');
                 for (const v of batch) {
@@ -2928,15 +3119,14 @@ async function tagIndustries(
                 }
             }
         } catch (err: any) {
+            // Stop pressed during a retry wait: cancel the run, don't fail open.
+            if (err instanceof BucketingCancelledError) throw err;
             batchesFailed++;
-            recordLatency(Date.now() - callStart);
-            if (isRateLimitError(err)) {
-                rateLimitHits++;
-                lastRateLimitAt = Date.now();
-            }
+            markFailed(batch);
             maybeLogTelemetry();
-            if (!firstError) firstError = err.message || String(err);
-            ctx.log(`[Bucketing ${runId}] tagging batch error (${batch.length} industries): ${err.message}`, 'error');
+            const errText = describeFetchError(err);
+            if (!firstError) firstError = errText;
+            ctx.log(`[Bucketing ${runId}] tagging batch error (${batch.length} industries): ${errText}`, 'error');
             // Fail-open: emit needs_qa rows so we don't lose contacts.
             for (const v of batch) {
                 taggings.push({
@@ -2952,7 +3142,7 @@ async function tagIndustries(
                     sub_identity_confidence: 0,
                     sector_confidence: 0,
                     confidence: 0,
-                    reason: `tagging_error: ${err.message?.slice(0, 200)}`
+                    reason: `tagging_error: ${errText.slice(0, 200)}`
                 });
             }
         }
@@ -2996,7 +3186,7 @@ async function tagIndustries(
         ? computeAnthropicCost(model, totalIn, totalOut)
             + (totalCachedIn / 1_000_000) * (ANTHROPIC_PRICING[model]?.input || 3) * 0.1
         : computeOpenAICost(model, totalIn - totalCachedIn, totalCachedIn, totalOut);
-    return { taggings, costUsd, modelUsed: model };
+    return { taggings, costUsd, modelUsed: model, failedIndustries, failedContacts, firstError };
 }
 
 // Render a compact appendix listing taxonomy values that were proposed
