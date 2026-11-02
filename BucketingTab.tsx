@@ -47,7 +47,7 @@ const TAXONOMY_LAYER_HELP = {
 
 export function BucketingTab({ view = 'index', importLists }: {
   view?: BucketingView;
-  importLists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; bucketed?: boolean; bucketing_run_count?: number; manually_bucketed?: boolean }[]
+  importLists: { id: string; name: string; contact_count: number; created_at: string; enriched_count?: number; failed_count?: number; bucketed?: boolean; bucketing_run_count?: number; manually_bucketed?: boolean }[]
 }) {
   const navigate = useNavigate();
   const params = useParams<{ runId?: string }>();
@@ -534,7 +534,7 @@ const PHASE1A_MODEL_OPTIONS = [
 type Phase1aModel = typeof PHASE1A_MODEL_OPTIONS[number]['id'];
 
 function BucketingSetup({ importLists, onCancel, onStart, loading }: {
-  importLists: { name: string; contact_count: number; enriched_count?: number; bucketed?: boolean; bucketing_run_count?: number; manually_bucketed?: boolean }[];
+  importLists: { name: string; contact_count: number; enriched_count?: number; failed_count?: number; bucketed?: boolean; bucketing_run_count?: number; manually_bucketed?: boolean }[];
   onCancel: () => void;
   onStart: (p: { name: string; list_names: string[]; apply_identity_dq_cascade: boolean; phase1a_model: Phase1aModel }) => void;
   loading: boolean;
@@ -607,6 +607,18 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
               const badgeTitle = runCount > 0
                 ? `Previously bucketed ${runCount} run${runCount === 1 ? '' : 's'}`
                 : (l.manually_bucketed ? 'Manually marked as bucketed' : '');
+              // Enrichment status, same rule as the Import tab's DONE:
+              // every contact is either enriched or failed. Failed rows
+              // mean "enriched" alone never reaches the total, so the
+              // DONE / % marker is what says the list is ready to bucket.
+              // enriched_count is undefined until the stats fetch lands.
+              const total = l.contact_count || 0;
+              const enriched = l.enriched_count;
+              const failed = l.failed_count || 0;
+              const processed = (enriched || 0) + failed;
+              const enrichDone = total > 0 && processed >= total;
+              const statsTitle = enriched === undefined ? '' :
+                `${enriched.toLocaleString()} enriched · ${failed.toLocaleString()} failed · ${Math.max(0, total - processed).toLocaleString()} pending`;
               return (
                 <button
                   key={l.name}
@@ -625,8 +637,17 @@ function BucketingSetup({ importLists, onCancel, onStart, loading }: {
                       </span>
                     )}
                   </span>
-                  <span className="font-mono text-[10px] text-gray-500 flex-shrink-0 ml-2">
-                    {(l.enriched_count || 0).toLocaleString()} enriched / {l.contact_count.toLocaleString()}
+                  <span title={statsTitle} className="font-mono text-[10px] text-gray-500 flex-shrink-0 ml-2 flex items-center gap-2">
+                    {enriched === undefined ? (
+                      <span className="animate-pulse">loading… / {total.toLocaleString()}</span>
+                    ) : (
+                      <span>{enriched.toLocaleString()} enriched / {total.toLocaleString()}</span>
+                    )}
+                    <span className="w-9 text-right tabular-nums">
+                      {enriched === undefined || total === 0 ? '' : enrichDone
+                        ? <span className="font-bold text-[#3ecf8e]">DONE</span>
+                        : `${Math.floor((processed / total) * 100)}%`}
+                    </span>
                   </span>
                 </button>
               );

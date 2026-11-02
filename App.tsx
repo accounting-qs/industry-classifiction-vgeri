@@ -107,6 +107,30 @@ type ListEnqueueState = {
   error?: string | null;
 };
 
+// One row of /api/import-lists/stats, keyed by list name client-side.
+type ListStats = {
+  completed: number;
+  failed: number;
+  total: number;
+  queue_state: 'running' | 'queued' | 'paused' | 'cancelled' | null;
+  enqueue: ListEnqueueState | null;
+};
+
+// Folds a stats row into an import-list row. A list missing from the
+// stats snapshot has no enrichments yet, so it reads as 0 rather than
+// staying undefined (which the UI renders as "still loading").
+function withListStats<T extends { contact_count: number }>(l: T, s: ListStats | undefined) {
+  if (!s) return { ...l, enriched_count: 0, failed_count: 0, queue_state: null, enqueue: null };
+  return {
+    ...l,
+    enriched_count: s.completed,
+    failed_count: s.failed,
+    contact_count: s.total || l.contact_count || 0,
+    queue_state: s.queue_state,
+    enqueue: s.enqueue,
+  };
+}
+
 interface ExportJob {
   id: string;
   listName: string;
@@ -296,8 +320,18 @@ export default function App() {
   // two values on consecutive loads. Each invocation aborts the
   // previous tick's in-flight requests and stamps itself with a seq;
   // handlers ignore everything but the newest seq.
+  //
+  // The list fetch and the stats fetch also race each other, and the
+  // stats one (two ~5ms cache reads) usually wins. The stats handler
+  // can only fold counts into rows that already exist, so on a fresh
+  // page load they were mapped over an empty array and dropped. The
+  // Import tab hid it by re-polling 5s later; /bucketing/setup doesn't
+  // re-poll by itself and sat on "0 enriched" for every list. The
+  // latest snapshot is kept here so whichever response lands second
+  // applies it. null until the first stats response.
   const refreshSeqRef = useRef(0);
   const refreshAbortRef = useRef<AbortController | null>(null);
+  const listStatsRef = useRef<Map<string, ListStats> | null>(null);
   const refreshLists = useCallback(() => {
     refreshAbortRef.current?.abort();
     const ctrl = new AbortController();
@@ -331,7 +365,10 @@ export default function App() {
           // between two values (e.g. 59,797 ↔ 59,511) on a per-tick
           // coin flip, DONE/Resume buttons included. The raw value is
           // only used before the first stats response (old === undefined).
+          // Once a stats snapshot exists it's applied directly instead.
+          const stats = listStatsRef.current;
           setImportLists(prev => {
+            if (stats) return lists.map((l: any) => withListStats(l, stats.get(l.name)));
             const prevByName: Record<string, { contact_count?: number; enriched_count?: number; failed_count?: number; queue_state?: 'running' | 'queued' | 'paused' | 'cancelled' | null; enqueue?: ListEnqueueState | null }> = {};
             for (const p of prev) prevByName[p.name] = p;
             return lists.map((l: any) => {
@@ -362,7 +399,7 @@ export default function App() {
       .then(res => res.ok ? res.json() : Promise.reject(new Error(`stats ${res.status}`)))
       .then(data => {
         if (!isCurrent() || !data || !Array.isArray(data.stats)) return;
-        const byName = new Map<string, { completed: number; failed: number; total: number; queue_state: 'running' | 'queued' | 'paused' | 'cancelled' | null; enqueue: ListEnqueueState | null }>();
+        const byName = new Map<string, ListStats>();
         for (const row of data.stats) {
           byName.set(row.lead_list_name, {
             completed: row.completed,
@@ -374,18 +411,8 @@ export default function App() {
               : null,
           });
         }
-        setImportLists(prev => prev.map(l => {
-          const s = byName.get(l.name);
-          if (!s) return { ...l, enriched_count: 0, failed_count: 0, queue_state: null, enqueue: null };
-          return {
-            ...l,
-            enriched_count: s.completed,
-            failed_count: s.failed,
-            contact_count: s.total || l.contact_count || 0,
-            queue_state: s.queue_state,
-            enqueue: s.enqueue,
-          };
-        }));
+        listStatsRef.current = byName;
+        setImportLists(prev => prev.map(l => withListStats(l, byName.get(l.name))));
         setListStatsSource(data.stats_source === 'fallback' ? 'fallback' : 'rpc');
       })
       .catch(() => {
@@ -408,11 +435,15 @@ export default function App() {
   // the queue_state badge transitions (queued → running → none) without
   // requiring a manual refresh. Pure DB reads, so cheap. 5s cadence is a
   // good balance: post-FIFO-advance the badge clears within a tab cycle.
+  // The bucketing setup screen polls too — its list picker shows the
+  // same enriched counts, and a list still enriching should tick up there
+  // rather than freeze at whatever it was when the page opened.
+  const pollListStats = activeTab === AppTab.IMPORT || location.pathname.startsWith('/bucketing/setup');
   useEffect(() => {
-    if (activeTab !== AppTab.IMPORT) return;
+    if (!pollListStats) return;
     const tick = setInterval(() => { refreshLists(); }, 5_000);
     return () => clearInterval(tick);
-  }, [activeTab, refreshLists]);
+  }, [pollListStats, refreshLists]);
 
   // Poll server for status — only when on the Pipeline tab or actively processing
   useEffect(() => {
