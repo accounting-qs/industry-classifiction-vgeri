@@ -2,18 +2,24 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { Contact, Enrichment, MergedContact, FilterCondition } from '../types';
 
+// Server side only. Never read import.meta.env by a dynamic key: Vite then
+// inlines every VITE_* var into the public browser bundle.
 const getEnv = (key: string) => {
-  if (typeof import.meta !== 'undefined' && (import.meta as any).env && (import.meta as any).env[key]) {
-    return (import.meta as any).env[key];
-  }
   if (typeof process !== 'undefined' && process.env && process.env[key]) {
     return process.env[key];
   }
   return undefined;
 };
 
-const SUPABASE_URL = getEnv('VITE_SUPABASE_URL') || getEnv('SUPABASE_URL');
-const DEFAULT_ANON_KEY = getEnv('VITE_SUPABASE_ANON_KEY') || getEnv('SUPABASE_ANON_KEY');
+// In the browser Vite swaps these static reads for their build-time values.
+// The server (tsx) has no import.meta.env, so it takes the process.env branch.
+const IS_BROWSER = typeof window !== 'undefined';
+const SUPABASE_URL = IS_BROWSER
+  ? import.meta.env.VITE_SUPABASE_URL
+  : getEnv('VITE_SUPABASE_URL') || getEnv('SUPABASE_URL');
+const DEFAULT_ANON_KEY = IS_BROWSER
+  ? import.meta.env.VITE_SUPABASE_ANON_KEY
+  : getEnv('VITE_SUPABASE_ANON_KEY') || getEnv('SUPABASE_ANON_KEY');
 
 console.log('🔍 Supabase Config Check:', {
   url: SUPABASE_URL ? 'PRESENT' : 'MISSING',
