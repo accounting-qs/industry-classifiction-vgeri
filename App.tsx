@@ -26,7 +26,6 @@ function tabFromPath(pathname: string): AppTab {
   return AppTab.IMPORT;
 }
 import { db } from './services/supabaseClient';
-import { enrichBatch } from './services/enrichmentService';
 import {
   Users,
   Zap,

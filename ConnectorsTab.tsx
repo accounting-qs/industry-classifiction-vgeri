@@ -211,7 +211,7 @@ export function ConnectorsTab() {
             </p>
           </div>
           <div className="px-5 py-3 text-[11px] text-gray-500">
-            Configured via <code className="bg-[#1c1c1c] px-1 rounded text-[10px]">VITE_OPENAI_API_KEY</code> env var.
+            Configured via <code className="bg-[#1c1c1c] px-1 rounded text-[10px]">OPENAI_API_KEY</code> env var.
           </div>
         </div>
 

@@ -242,8 +242,8 @@ const ANTHROPIC_KEY_NAME = 'ANTHROPIC_API_KEY';
 
 // ─── secret access ─────────────────────────────────────────────────
 function getOpenAIKey(): string {
-    const key = process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
-    if (!key) throw new Error('VITE_OPENAI_API_KEY missing');
+    const key = process.env.OPENAI_API_KEY || process.env.VITE_OPENAI_API_KEY;
+    if (!key) throw new Error('OPENAI_API_KEY missing');
     return key.trim();
 }
 
