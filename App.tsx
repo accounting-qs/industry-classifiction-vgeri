@@ -4,6 +4,7 @@ import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-
 import { AppTab, Contact, Enrichment, BatchStats, MergedContact, FilterCondition, FilterOperator, BucketingRun, BucketProposal, BucketCount, BucketAssignmentCount, LibraryBucket } from './types';
 import { BucketingTab } from './BucketingTab';
 import { ConnectorsTab } from './ConnectorsTab';
+import { useAuth } from './AuthGate';
 
 const TAB_TO_PATH: Record<AppTab, string> = {
   [AppTab.DASHBOARD]: '/dashboard',
@@ -76,6 +77,7 @@ import {
   LayoutDashboard,
   Pause,
   Ban,
+  LogOut,
 } from 'lucide-react';
 
 /**
@@ -158,6 +160,7 @@ interface DeleteJob {
 export default function App() {
   const location = useLocation();
   const navigate = useNavigate();
+  const { user, signOut } = useAuth();
   const activeTab = tabFromPath(location.pathname);
   const setActiveTab = useCallback((tab: AppTab) => {
     navigate(TAB_TO_PATH[tab]);
@@ -918,6 +921,16 @@ export default function App() {
         <div className="p-2 border-t border-[#2e2e2e] space-y-1">
           <SidebarIconButton active={activeTab === AppTab.CONNECTORS} href="/connectors" onClick={() => navigate('/connectors')} icon={<KeyRound className="w-5 h-5" />} label="Connectors" />
           <SidebarIconButton active={activeTab === AppTab.PROXIES} href="/proxies" onClick={() => navigate('/proxies')} icon={<BarChart2 className={`w-5 h-5 ${activeTab === AppTab.PROXIES ? 'text-[#3ecf8e]' : ''}`} />} label="Proxy Performance" />
+        </div>
+        <div className="p-2 border-t border-[#2e2e2e] flex items-center gap-2">
+          <span className="flex-1 min-w-0 truncate px-2 text-[11px] text-gray-500" title={user.email}>{user.email}</span>
+          <button
+            onClick={signOut}
+            title="Sign out"
+            className="p-2 rounded-md text-gray-400 hover:text-white hover:bg-[#2e2e2e] transition-all"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
         </div>
       </aside>
 

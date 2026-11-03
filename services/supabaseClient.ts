@@ -1,5 +1,6 @@
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { createBrowserClient } from '@supabase/ssr';
 import { Contact, Enrichment, MergedContact, FilterCondition } from '../types';
 
 const getEnv = (key: string) => {
@@ -19,6 +20,21 @@ console.log('🔍 Supabase Config Check:', {
   url: SUPABASE_URL ? 'PRESENT' : 'MISSING',
   key: DEFAULT_ANON_KEY ? 'PRESENT' : 'MISSING'
 });
+
+/**
+ * Browser only: the client that holds the signed-in user's session.
+ * @supabase/ssr keeps the session in cookies rather than localStorage, so
+ * the Express server can read it on every /api request (see
+ * services/requireAuth.ts). createBrowserClient hands back the same
+ * instance on every call, so the sign-in screen and `db` below share one
+ * session and one token-refresh timer.
+ */
+export function getBrowserSupabase(): SupabaseClient {
+  if (!SUPABASE_URL || !DEFAULT_ANON_KEY) {
+    throw new Error('Supabase is not configured: VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY must be set at build time.');
+  }
+  return createBrowserClient(SUPABASE_URL, DEFAULT_ANON_KEY);
+}
 
 // Columns the global "Search contacts..." box matches. All are columns
 // on the contacts table so the search stays a single-table OR. `industry`
@@ -57,10 +73,17 @@ class SupabaseService {
   public isConnected: boolean = false;
 
   constructor() {
-    const isBrowser = typeof window !== 'undefined';
-    const key = (isBrowser ? localStorage.getItem('supabase_anon_key') : null) || DEFAULT_ANON_KEY;
-    if (key) {
-      this.init(key);
+    if (typeof window !== 'undefined') {
+      // In the browser, query as the signed-in user so requests carry
+      // their access token instead of the bare anon key.
+      try {
+        this.client = getBrowserSupabase();
+        this.isConnected = true;
+      } catch (e) {
+        console.error("❌ Supabase initialization failed:", e);
+      }
+    } else if (DEFAULT_ANON_KEY) {
+      this.init(DEFAULT_ANON_KEY);
     }
   }
 
@@ -71,9 +94,6 @@ class SupabaseService {
       }
       this.client = createClient(SUPABASE_URL, key);
       this.isConnected = true;
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('supabase_anon_key', key);
-      }
       console.log("✅ Supabase initialized successfully");
       return true;
     } catch (e) {

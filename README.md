@@ -22,6 +22,31 @@ View your app in AI Studio: https://ai.studio/apps/drive/1SsZS6oTE5W2czc9diNkXfH
 # industry-classifiction-vgeri
 # industry-classifiction-vgeri
 
+## Sign-in (Supabase Auth)
+
+The app is invite-only, with email + password sign-in through Supabase Auth.
+
+- **Browser:** [AuthGate.tsx](AuthGate.tsx) shows the sign-in screen until
+  there is a session. The session lives in cookies (`@supabase/ssr`), so
+  every same-origin `/api` call and download link carries it automatically.
+- **Server:** [services/requireAuth.ts](services/requireAuth.ts) guards every
+  `/api` route and answers `401` without a valid session. `GET /api/health`
+  stays public for health checks. Scripts can send
+  `Authorization: Bearer <access token>` instead of the cookie.
+
+### Adding someone
+
+Supabase dashboard → Authentication → Users → **Invite user**. The invite
+email signs them in and asks them to choose a password. "Forgot password?"
+on the sign-in screen sends a reset link.
+
+### One-time Supabase settings
+
+- Authentication → Sign In / Providers: **Allow new users to sign up = off**.
+  With it on, anyone could create an account with the public anon key.
+- Authentication → URL Configuration: Site URL = the Render URL; add
+  `<Render URL>/set-password` and `http://localhost:3000/**` to Redirect URLs.
+
 ## Bucketing V3 process
 
 ### Deleting a bucketing run

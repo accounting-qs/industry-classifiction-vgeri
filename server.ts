@@ -2,7 +2,6 @@
 import './loadEnv';
 
 import express from 'express';
-import cors from 'cors';
 import compression from 'compression';
 import path from 'path';
 import fs from 'fs';
@@ -34,6 +33,7 @@ import {
     bulkImportLibraryFromText
 } from './services/bucketLibraryService';
 import { getSetting, setSetting, maskSecret } from './services/appSettings';
+import { requireAuth, INTERNAL_API_HEADER, INTERNAL_API_TOKEN } from './services/requireAuth';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -56,6 +56,8 @@ const PORT = process.env.PORT || 3001;
 // Supabase Init (Using SERVICE_ROLE_KEY for background updates)
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
+// Only used to verify signed-in users on /api (see requireAuth below).
+const SUPABASE_ANON_KEY = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
 
 if (!SUPABASE_URL) {
     console.error("❌ CRITICAL: SUPABASE_URL is missing!");
@@ -195,12 +197,25 @@ async function restorePipelineState() {
     }
 }
 
-app.use(cors());
+// No cors(): the UI is served from this same origin (and through the
+// Vite proxy in dev), so nothing legitimate needs cross-origin access.
 app.use(compression());
-app.use(express.json({ limit: '50mb' }));
 
-// Serve static files from Vite build
+// Serve static files from Vite build. The page and its JS stay public;
+// the app shows its own sign-in screen.
 app.use(express.static(path.join(__dirname, 'dist')));
+
+// Public liveness check (e.g. for Render's health check path). Registered
+// before requireAuth so it needs no session.
+app.get('/api/health', (_req, res) => {
+    res.json({ ok: true });
+});
+
+// Every other /api route needs a signed-in Supabase user. Runs before
+// express.json so an unauthenticated request never gets its body parsed.
+app.use('/api', requireAuth(SUPABASE_URL, SUPABASE_ANON_KEY));
+
+app.use(express.json({ limit: '50mb' }));
 
 /**
  * Background Enrichment Logic (Ported from App.tsx)
@@ -5427,8 +5442,9 @@ async function runContactImportJob(jobId: string): Promise<void> {
         for (const reg of registrations) {
             if (reg.inserted + reg.updated === 0 && invalidCount === 0) continue;
             try {
-                await fetch(`http://127.0.0.1:${PORT}/api/import-lists`, {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                const r = await fetch(`http://127.0.0.1:${PORT}/api/import-lists`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', [INTERNAL_API_HEADER]: INTERNAL_API_TOKEN },
                     body: JSON.stringify({
                         name: reg.name,
                         contact_count: reg.inserted + reg.updated,
@@ -5450,6 +5466,9 @@ async function runContactImportJob(jobId: string): Promise<void> {
                         },
                     }),
                 });
+                if (!r.ok) {
+                    console.warn(`[import-job ${jobId}] import-lists registration failed: HTTP ${r.status} ${await r.text()}`);
+                }
             } catch (e: any) {
                 console.warn(`[import-job ${jobId}] import-lists registration failed: ${e?.message}`);
             }
