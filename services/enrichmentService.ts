@@ -4,18 +4,12 @@
  * Uses the specific v1/responses endpoint and prompt ID architecture.
  */
 
-const getEnv = (key: string) => {
-  if (typeof import.meta !== 'undefined' && (import.meta as any).env && (import.meta as any).env[key]) {
-    return (import.meta as any).env[key];
-  }
-  if (typeof process !== 'undefined' && process.env && process.env[key]) {
-    return process.env[key];
-  }
-  return undefined;
-};
+// Server only (JobProcessor). The VITE_ names are a fallback until the
+// Render env is renamed; they must never be read from browser code.
+const getEnv = (key: string) => process.env[key] || undefined;
 
 const getOpenAIKey = () => {
-  const key = getEnv('VITE_OPENAI_API_KEY');
+  const key = getEnv('OPENAI_API_KEY') || getEnv('VITE_OPENAI_API_KEY');
   return key ? key.trim() : undefined;
 };
 
@@ -24,7 +18,7 @@ const OUTPUT_COST_PER_1M = 3.20;
 // 60s hard timeout on OpenAI fetch. Without it, a degraded OpenAI can hang
 // sockets indefinitely and freeze the entire JobProcessor pollLoop.
 const OPENAI_TIMEOUT_MS = 60000;
-const getPromptId = () => getEnv('VITE_OPENAI_PROMPT_ID');
+const getPromptId = () => getEnv('OPENAI_PROMPT_ID') || getEnv('VITE_OPENAI_PROMPT_ID');
 
 console.log('🔍 OpenAI Config Check (Module Load):', {
   key: getOpenAIKey() ? 'PRESENT' : 'MISSING'

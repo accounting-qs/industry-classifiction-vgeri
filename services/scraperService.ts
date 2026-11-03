@@ -14,25 +14,10 @@ import {
  * Fires multiple proxy requests in parallel and takes the first success.
  */
 
-const getZenRowsKey = () => {
-  try {
-    // @ts-ignore
-    const key = (import.meta as any)?.env?.VITE_ZENROWS_API_KEY || (process as any)?.env?.VITE_ZENROWS_API_KEY || (typeof process !== 'undefined' ? process.env.VITE_ZENROWS_API_KEY : undefined);
-    return key;
-  } catch (e) {
-    return undefined;
-  }
-};
+// Server only. The VITE_ names are a fallback until the Render env is renamed.
+const getZenRowsKey = () => process.env.ZENROWS_API_KEY || process.env.VITE_ZENROWS_API_KEY;
 
-const getScrapingBeeKey = () => {
-  try {
-    // @ts-ignore
-    const key = (import.meta as any)?.env?.VITE_SCRAPINGBEE_API_KEY || (process as any)?.env?.VITE_SCRAPINGBEE_API_KEY || (typeof process !== 'undefined' ? process.env.VITE_SCRAPINGBEE_API_KEY : undefined);
-    return key;
-  } catch (e) {
-    return undefined;
-  }
-};
+const getScrapingBeeKey = () => process.env.SCRAPINGBEE_API_KEY || process.env.VITE_SCRAPINGBEE_API_KEY;
 
 const CORSPROXY_API_KEY = process.env.CORSPROXY_API_KEY || "";
 
