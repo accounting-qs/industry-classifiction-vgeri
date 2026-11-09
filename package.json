@@ -22,7 +22,6 @@
     "@types/papaparse": "^5.5.2",
     "cheerio": "^1.2.0",
     "compression": "^1.8.1",
-    "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "lucide-react": "^0.563.0",
@@ -36,7 +35,6 @@
     "tsx": "^4.19.2"
   },
   "devDependencies": {
-    "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/node": "^22.14.0",
     "@types/pg": "^8.11.10",

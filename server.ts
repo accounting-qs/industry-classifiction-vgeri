@@ -2,7 +2,6 @@
 import './loadEnv';
 
 import express from 'express';
-import cors from 'cors';
 import compression from 'compression';
 import path from 'path';
 import fs from 'fs';
@@ -34,6 +33,7 @@ import {
     bulkImportLibraryFromText
 } from './services/bucketLibraryService';
 import { getSetting, setSetting, maskSecret } from './services/appSettings';
+import { createPasswordGate, LOGIN_PATH, INTERNAL_API_HEADER, INTERNAL_API_TOKEN } from './services/requireAuth';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -195,12 +195,32 @@ async function restorePipelineState() {
     }
 }
 
-app.use(cors());
+// Render terminates HTTPS at one proxy hop. Trusting it makes req.secure
+// (Secure cookie flag) and req.ip (sign-in rate limit) reflect the client.
+app.set('trust proxy', 1);
+
+// No cors(): the UI is served from this same origin (and through the
+// Vite proxy in dev), so nothing legitimate needs cross-origin access.
 app.use(compression());
-app.use(express.json({ limit: '50mb' }));
+
+// Public liveness check (e.g. for Render's health check path).
+app.get('/api/health', (_req, res) => {
+    res.json({ ok: true });
+});
+
+// One shared team password (APP_PASSWORD), see services/requireAuth.ts.
+// Only the sign-in page and /api/health are reachable without it; the
+// gate runs before express.static so the built JS is protected too, and
+// before express.json so an unauthenticated body is never parsed.
+const passwordGate = createPasswordGate(process.env.APP_PASSWORD);
+app.get(LOGIN_PATH, passwordGate.loginPage);
+app.post(LOGIN_PATH, express.urlencoded({ extended: false, limit: '4kb' }), passwordGate.login);
+app.use(passwordGate.requireAuth);
 
 // Serve static files from Vite build
 app.use(express.static(path.join(__dirname, 'dist')));
+
+app.use(express.json({ limit: '50mb' }));
 
 /**
  * Background Enrichment Logic (Ported from App.tsx)
@@ -5427,8 +5447,9 @@ async function runContactImportJob(jobId: string): Promise<void> {
         for (const reg of registrations) {
             if (reg.inserted + reg.updated === 0 && invalidCount === 0) continue;
             try {
-                await fetch(`http://127.0.0.1:${PORT}/api/import-lists`, {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                const r = await fetch(`http://127.0.0.1:${PORT}/api/import-lists`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', [INTERNAL_API_HEADER]: INTERNAL_API_TOKEN },
                     body: JSON.stringify({
                         name: reg.name,
                         contact_count: reg.inserted + reg.updated,
@@ -5450,6 +5471,9 @@ async function runContactImportJob(jobId: string): Promise<void> {
                         },
                     }),
                 });
+                if (!r.ok) {
+                    console.warn(`[import-job ${jobId}] import-lists registration failed: HTTP ${r.status} ${await r.text()}`);
+                }
             } catch (e: any) {
                 console.warn(`[import-job ${jobId}] import-lists registration failed: ${e?.message}`);
             }
