@@ -22,6 +22,23 @@ View your app in AI Studio: https://ai.studio/apps/drive/1SsZS6oTE5W2czc9diNkXfH
 # industry-classifiction-vgeri
 # industry-classifiction-vgeri
 
+## Sign-in (team password)
+
+The whole app sits behind one shared password, set as `APP_PASSWORD` in the
+server's environment (Render → Environment, or `.env.local` for local dev).
+
+- Anyone who opens the app sees a password page first. The built JS is only
+  served after sign-in.
+- A correct password sets a cookie that lasts 90 days and renews itself while
+  the browser keeps using the app.
+- Every `/api` route answers `401` without that cookie, except
+  `GET /api/health`, which stays public for health checks.
+- 10 wrong passwords from one IP lock that IP out for 15 minutes.
+- To sign everyone out (for example, after someone leaves), change
+  `APP_PASSWORD` and redeploy.
+
+Code: [services/requireAuth.ts](services/requireAuth.ts).
+
 ## Bucketing V3 process
 
 ### Deleting a bucketing run
