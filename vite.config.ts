@@ -15,11 +15,13 @@ export default defineConfig({
     }
   },
   plugins: [react()],
-  // Allowlist of env vars that may reach the public browser bundle. Both are
-  // public by design. Every other var (API keys, including old VITE_* names
-  // still set on Render) stays server-side, even if browser code reads
-  // import.meta.env dynamically.
-  envPrefix: ['VITE_SUPABASE_URL', 'VITE_SUPABASE_ANON_KEY'],
+  // Env vars that may reach the public browser bundle: none. The browser
+  // talks only to this app's /api, never to Supabase, so it needs no URL or
+  // key. Vite rejects an empty envPrefix, so this one matches no var we set.
+  // Every var (API keys, VITE_SUPABASE_* and old VITE_* names still set on
+  // Render) stays server-side, even if browser code reads import.meta.env
+  // dynamically. Give a var this prefix only if it is public by design.
+  envPrefix: 'PUBLIC_BROWSER_',
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './'),

@@ -1,13 +1,10 @@
-import { createClient } from '@supabase/supabase-js';
 import pLimit from 'p-limit';
 import { fetchDigest, proxyStats } from './scraperService';
 import { enrichSingle } from './enrichmentService';
+import { createServiceRoleClient } from './supabaseServiceRole';
 
-// Supabase Init (Service Role Key preferred for background processor)
-const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+// service_role only; throws at startup without SUPABASE_SERVICE_ROLE_KEY.
+const supabase = createServiceRoleClient();
 
 // Tuning Parameters from Environment (with aggressive default fallbacks for speed)
 const QUEUE_FETCH_CHUNK_SIZE = parseInt(process.env.QUEUE_FETCH_CHUNK_SIZE || '200', 10);
@@ -736,9 +733,8 @@ export class JobProcessor {
                     // forget; the poll-driven refresh is the backstop.
                     const runLists = [...this.listProgress.keys()];
                     if (runLists.length > 0) {
-                        // Gated wrapper, not the raw refresh RPC — works
-                        // even when this process fell back to the anon key
-                        // (no SUPABASE_SERVICE_ROLE_KEY in the deploy env).
+                        // Gated wrapper, not the raw refresh RPC: it
+                        // single-flights and skips lists refreshed seconds ago.
                         Promise.resolve(supabase.rpc('request_list_stats_refresh', { p_lists: runLists }))
                             .then(({ error }: { error: any }) => {
                                 if (error) this.log(`⚠️ Post-drain stats refresh failed: ${error.message}`, 'warn');

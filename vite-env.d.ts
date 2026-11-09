@@ -1,8 +1,6 @@
 /// <reference types="vite/client" />
 
-// The only env vars browser code may read (see envPrefix in vite.config.ts).
-// Read them with static property access so Vite inlines just that value.
-interface ImportMetaEnv {
-  readonly VITE_SUPABASE_URL?: string;
-  readonly VITE_SUPABASE_ANON_KEY?: string;
-}
+// Browser code reads no env vars (see envPrefix in vite.config.ts). If one
+// is ever needed, it must be public by design: declare it here and read it
+// with static property access so Vite inlines just that value.
+interface ImportMetaEnv {}

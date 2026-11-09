@@ -12,13 +12,13 @@ import { Transform, Readable } from 'node:stream';
 import { pipeline as streamPipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'url';
 import Papa from 'papaparse';
-import { createClient } from '@supabase/supabase-js';
 import { type PoolClient } from 'pg';
 import pgCopyStreams from 'pg-copy-streams';
 import { getPgPool, cancelHeavyStatements, callHeavyRpc, heavyQuery } from './services/pgClient';
 import { startMemoryMonitor, memorySnapshot, memoryHistory, writeHeapSnapshotTo, setMemoryContextProvider } from './services/memoryMonitor';
 const { to: copyTo, from: copyFrom } = pgCopyStreams;
-import { db } from './services/supabaseClient';
+import { createServiceRoleClient } from './services/supabaseServiceRole';
+import { getPaginatedContacts, FILTER_OPERATORS } from './services/contactsQuery';
 import { JobProcessor } from './services/jobProcessor';
 import { runTaxonomyProposal, applyTaxonomyEdits, runAssignment, recalculateTaxonomyWithLibrary, finalizeTaxonomyAgainstLibrary, runBucketAssignment, BucketingCancelledError, debugTagSingleIndustry, suggestProposalRoutings, loadRunProposals } from './services/bucketingService';
 import {
@@ -53,61 +53,11 @@ const INSTANCE_ID = Math.random().toString(36).substring(2, 7); // e.g. "pp9n9"
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Supabase Init (Using SERVICE_ROLE_KEY for background updates)
-const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
-
-if (!SUPABASE_URL) {
-    console.error("❌ CRITICAL: SUPABASE_URL is missing!");
-}
-if (!SUPABASE_SERVICE_KEY) {
-    console.error("❌ CRITICAL: SUPABASE_SERVICE_ROLE_KEY / ANON_KEY is missing!");
-}
-
-// Which Postgres role will this key actually authenticate as?
-//
-// SUPABASE_SERVICE_KEY above falls back to the *anon* key when
-// SUPABASE_SERVICE_ROLE_KEY is unset, and the old "key: PRESENT" log
-// could not tell the two apart. So a box missing the service-role key
-// looked perfectly healthy while quietly running as `anon`: everything
-// touching tables kept working (anon has grants there), and only
-// operations that genuinely need service_role failed — most visibly
-// Storage, whose policies we scope to service_role, which surfaced as
-// "new row violates row-level security policy" on the import upload.
-// Decode the role so that misconfiguration is impossible to miss.
-function supabaseKeyRole(key: string | undefined): string {
-    if (!key) return 'missing';
-    // Newer Supabase key format isn't a JWT.
-    if (key.startsWith('sb_secret_')) return 'service_role';
-    if (key.startsWith('sb_publishable_')) return 'anon';
-    try {
-        const claims = JSON.parse(Buffer.from(key.split('.')[1], 'base64').toString());
-        return String(claims.role || 'unknown');
-    } catch { return 'unrecognised'; }
-}
-const SUPABASE_KEY_ROLE = supabaseKeyRole(SUPABASE_SERVICE_KEY);
-const SUPABASE_KEY_SOURCE = process.env.SUPABASE_SERVICE_ROLE_KEY ? 'SUPABASE_SERVICE_ROLE_KEY'
-    : process.env.VITE_SUPABASE_ANON_KEY ? 'VITE_SUPABASE_ANON_KEY (fallback)'
-        : process.env.SUPABASE_ANON_KEY ? 'SUPABASE_ANON_KEY (fallback)' : 'none';
-
-console.log('🔍 Server Supabase Config Check:', {
-    url: SUPABASE_URL ? 'PRESENT' : 'MISSING',
-    key: SUPABASE_SERVICE_KEY ? 'PRESENT' : 'MISSING',
-    role: SUPABASE_KEY_ROLE,
-    from: SUPABASE_KEY_SOURCE,
-});
-
-if (SUPABASE_KEY_ROLE !== 'service_role') {
-    console.error(
-        `❌ CRITICAL: the server is authenticating as "${SUPABASE_KEY_ROLE}", not service_role ` +
-        `(key came from ${SUPABASE_KEY_SOURCE}). Set SUPABASE_SERVICE_ROLE_KEY in this ` +
-        `environment. Until you do, Storage-backed CSV import will fail with ` +
-        `"new row violates row-level security policy", and any other service_role-only ` +
-        `operation will fail too.`
-    );
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY || '');
+// Supabase: service_role only. createServiceRoleClient() refuses to start
+// the process without SUPABASE_SERVICE_ROLE_KEY. There is no anon-key
+// fallback any more: the anon role has no access to the database.
+const supabase = createServiceRoleClient();
+console.log('🔍 Server Supabase Config Check:', { url: 'PRESENT', role: 'service_role' });
 
 // Direct Postgres connection pool used exclusively by the CSV export
 // streaming path (runCsvExportJob). Everything else goes through
@@ -734,8 +684,7 @@ async function enqueueListDirect(listName: string, mode: DirectEnqueueMode, join
 /**
  * Background enqueue: resolves contact IDs from filters, creates job + job_items.
  * Runs AFTER the HTTP response is sent, so there's no timeout risk.
- * Uses the server's service-role supabase client for ID resolution to bypass
- * the 1000-row PostgREST limit that the anon-key db singleton has.
+ * Uses the server's service-role supabase client for ID resolution.
  */
 async function backgroundEnqueue(
     rawContactIds: string[] | undefined,
@@ -778,8 +727,6 @@ async function backgroundEnqueue(
     }
 
     // Step 1: Resolve IDs from filters if needed
-    // IMPORTANT: Uses the server's `supabase` client (service role key) for full access,
-    // NOT the `db` singleton which uses the anon key (capped at 1000 rows by PostgREST).
     if (filters && !contactIds) {
         addServerLog(`🔍 Resolving contacts from filters...`, 'Pipeline', 'phase');
         try {
@@ -1084,7 +1031,7 @@ async function resolveFilteredContactIds(filters: any, searchQuery?: string): Pr
                     case 'greater_than': query = query.gt(colPath, f.value); break;
                     case 'less_than': query = query.lt(colPath, f.value); break;
                     case 'in': {
-                        // Same PostgREST quirk as services/supabaseClient.ts: `in.("quoted")`
+                        // Same PostgREST quirk as services/contactsQuery.ts: `in.("quoted")`
                         // loses the index. Collapse 1-element `in` → `eq`.
                         const vals = Array.isArray(f.value) ? f.value : [f.value];
                         if (vals.length === 1) query = query.eq(colPath, vals[0]);
@@ -1384,6 +1331,37 @@ app.get('/api/stats/proxies', async (req, res) => {
         return res.json({ byProxy, byReuse, byError, unknown, total });
     } catch (e: any) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+// One page of the Contacts table (Contacts tab): filters, list pill and
+// search box, estimated count. The browser used to run this query itself
+// with the anon key; it now comes through here, behind the password gate,
+// so the anon role can have no access to the database. POST because the
+// filter list (e.g. many list names) can outgrow a query string.
+const CONTACTS_PAGE_MAX = 1000; // the page-size menu's largest option and PostgREST's max-rows
+const FILTER_COLUMN_RE = /^[a-z_][a-z0-9_]*$/;
+app.post('/api/contacts/page', async (req, res) => {
+    const { page, pageSize, filters = [], search } = req.body || {};
+    if (!Number.isInteger(page) || page < 1) {
+        return res.status(400).json({ error: 'page must be a positive integer' });
+    }
+    if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > CONTACTS_PAGE_MAX) {
+        return res.status(400).json({ error: `pageSize must be an integer from 1 to ${CONTACTS_PAGE_MAX}` });
+    }
+    if (search !== undefined && search !== null && typeof search !== 'string') {
+        return res.status(400).json({ error: 'search must be a string' });
+    }
+    if (!Array.isArray(filters) || !filters.every((f: any) =>
+        f && typeof f.column === 'string' && FILTER_COLUMN_RE.test(f.column)
+        && (FILTER_OPERATORS as readonly string[]).includes(f.operator))) {
+        return res.status(400).json({ error: 'filters must be a list of { column, operator, value }' });
+    }
+    try {
+        res.json(await getPaginatedContacts(supabase, page, pageSize, filters, search ?? undefined));
+    } catch (err: any) {
+        console.error('[Contacts] page query failed:', err?.message || err);
+        res.status(500).json({ error: err?.message || 'Contacts query failed' });
     }
 });
 
@@ -1873,13 +1851,9 @@ function kickStatsRefresh(lists: string[] | null, reason: string) {
     if (Date.now() - statsRefreshLastFailureAt < STATS_REFRESH_FAILURE_BACKOFF_MS) return;
     statsRefreshInFlight = true;
     const label = lists ? `${lists.length} list(s)` : 'all lists';
-    // request_list_stats_refresh (not the raw refresh RPC): the Render
-    // env can lack SUPABASE_SERVICE_ROLE_KEY, in which case this server
-    // runs on the anon key (server.ts:55 fallback) and the raw,
-    // service_role-only refresh 401s. The wrapper is anon-callable but
+    // request_list_stats_refresh (not the raw refresh RPC): the wrapper is
     // self-gating — advisory-lock single-flight + skips rows refreshed
-    // within the last 5s (targeted) / 30s (full) — so correctness no
-    // longer depends on which key the deploy ended up with.
+    // within the last 5s (targeted) / 30s (full).
     Promise.resolve(supabase.rpc('request_list_stats_refresh', { p_lists: lists }))
         .then(({ error }: { error: any }) => {
             if (error) {
@@ -4793,18 +4767,7 @@ app.post('/api/import-jobs', async (req, res) => {
             .from(IMPORT_BUCKET).createSignedUploadUrl(objectPath, { upsert: true });
         if (sErr || !signed) {
             await supabase.from('contact_import_jobs').delete().eq('id', job.id);
-            // An RLS rejection here has exactly one cause: this process is
-            // not running as service_role. Say so outright rather than
-            // asking the operator to go and check — the role is already
-            // known at boot.
-            const isRls = /row-level security/i.test(sErr?.message || '');
-            return res.status(500).json({
-                error: isRls && SUPABASE_KEY_ROLE !== 'service_role'
-                    ? `The server is running as "${SUPABASE_KEY_ROLE}" instead of service_role, so it cannot create the upload. ` +
-                      `Set SUPABASE_SERVICE_ROLE_KEY in this environment's variables and redeploy ` +
-                      `(the key currently in use came from ${SUPABASE_KEY_SOURCE}).`
-                    : `Could not create upload URL: ${sErr?.message || 'unknown'}`
-            });
+            return res.status(500).json({ error: `Could not create upload URL: ${sErr?.message || 'unknown'}` });
         }
         await updateImportJob(job.id, { storage_path: objectPath });
 

@@ -25,7 +25,6 @@ function tabFromPath(pathname: string): AppTab {
   if (pathname.startsWith('/contacts')) return AppTab.MANAGER;
   return AppTab.IMPORT;
 }
-import { db } from './services/supabaseClient';
 import {
   Users,
   Zap,
@@ -290,13 +289,16 @@ export default function App() {
       const combinedFilters: FilterCondition[] = activeListFilter
         ? [...activeFilters, { id: '__list_pill__', column: 'lead_list_name', operator: 'equals' as FilterOperator, value: activeListFilter }]
         : activeFilters;
-      const { data, count } = await db.getPaginatedContacts(
-        currentPage,
-        pageSize,
-        false,
-        combinedFilters,
-        debouncedSearchQuery
-      );
+      // Runs on the server with its service_role client; the browser has
+      // no Supabase access of its own.
+      const res = await fetch('/api/contacts/page', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page: currentPage, pageSize, filters: combinedFilters, search: debouncedSearchQuery }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Contacts request failed (HTTP ${res.status})`);
+      const { data, count } = body as { data: MergedContact[]; count: number };
       setContacts(data);
       setTotalCount(count);
     } catch (err: any) {

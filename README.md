@@ -39,6 +39,22 @@ server's environment (Render → Environment, or `.env.local` for local dev).
 
 Code: [services/requireAuth.ts](services/requireAuth.ts).
 
+## Database access (server only)
+
+Only the server talks to Supabase. The browser has no Supabase URL, key or
+client; everything, the Contacts table included, goes through `/api`
+behind the password above.
+
+- The server needs `VITE_SUPABASE_URL` (or `SUPABASE_URL`) and
+  `SUPABASE_SERVICE_ROLE_KEY`, and refuses to start without a service_role
+  key. There is no anon-key fallback.
+- `DATABASE_URL` (direct Postgres, the `postgres` role) is used for COPY
+  streaming and the heavy bucketing statements.
+- [supabase/migrations/20261109_lock_down_anon_access.sql](supabase/migrations/20261109_lock_down_anon_access.sql)
+  gives the `anon` and `authenticated` roles no access to the database: RLS
+  on for every public table with no policies, and their grants revoked. In a
+  new migration, enable RLS on any table you create.
+
 ## Bucketing V3 process
 
 ### Deleting a bucketing run
