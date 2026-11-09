@@ -2,11 +2,9 @@
 -- Lock the anon and authenticated roles out of the database
 --
 -- WHY
--- The anon key shipped in the public JS bundle for months, so treat it as
--- known. Until now anon could SELECT/INSERT/UPDATE/DELETE every public
--- table (contacts ~7.9M rows, enrichments, job_items, app_settings with
--- the saved Anthropic key) and EXECUTE 47 of the 50 public functions,
--- delete_import_list_page included. RLS was off everywhere.
+-- The anon key is public by design (it is the browser key), so nothing
+-- should depend on keeping it secret. Only the server should reach the
+-- database, so anon and authenticated get no access at all.
 --
 -- The app no longer needs either role:
 --   - The browser talks only to the password-gated Express server. Its
@@ -21,7 +19,7 @@
 --   service_role and postgres both have BYPASSRLS, and postgres owns every
 --   object below. Nothing they do changes.
 --
--- Checked on the live project (zxnaxtdeujunujnjaweo) on 2026-11-09:
+-- Checked on the live project on 2026-11-09:
 --   - 7 days of API logs: every anon request is the browser's GET
 --     /rest/v1/contacts. Everything else is service_role from Render, or
 --     signed Storage URLs, which carry their own token.
