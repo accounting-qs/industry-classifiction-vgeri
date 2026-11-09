@@ -135,6 +135,22 @@ let jobStats = {
     queued: 0
 };
 
+// Enrich clicks whose background enqueue is still running in this process
+// (resolving contacts or filling job_items). Counted from the click until
+// backgroundEnqueue settles, including its error handler. Several lists can
+// fill at once, so the shared queueing flags belong to all of them.
+let activeEnqueues = 0;
+
+// One enqueue is done (queued, nothing to queue, or failed). Clear the
+// shared flags only if no other enqueue is still filling; otherwise the
+// first list to finish would mark the pipeline idle under the others.
+// Call it while this enqueue is still counted in activeEnqueues.
+function endQueueingPhase(clearProcessing: boolean) {
+    const othersStillQueueing = activeEnqueues > 1;
+    jobStats.queueingPhase = othersStillQueueing;
+    if (clearProcessing && !othersStillQueueing) jobStats.isProcessing = false;
+}
+
 const addServerLog = async (msg: string, module: string = 'Pipeline', level: LogEntry['level'] = 'info') => {
     const entry: LogEntry = {
         timestamp: new Date().toISOString(),
@@ -428,17 +444,29 @@ app.post('/api/enrich', async (req, res) => {
     // background, so a 100k-contact resolve+insert doesn't block the response.
     //
     // Self-heal kept: if both in-memory flags say "busy" but the DB shows zero
-    // active items, the flags got stuck (crash mid-queueing, etc.) — clear
-    // them so the request goes through cleanly.
+    // active items AND no enqueue is running in this process, the flags got
+    // stuck (crash mid-queueing, etc.) — clear them so the request goes
+    // through cleanly.
+    //
+    // The activeEnqueues check matters: an enqueue has no job_items for its
+    // first seconds (resolve + count + first 25k-row batch). On 2026-11-09
+    // three Enrich clicks ~10 s apart each landed in that window, so clicks
+    // 2 and 3 "cleared stale state" under list 1's live fill and all three
+    // ran as fresh starts, overwriting each other's totals.
     let joiningExisting = false;
-    if (jobStats.isProcessing || jobStats.queueingPhase) {
+    let clearedStaleState = false;
+    if (activeEnqueues > 0) {
+        // Another click's enqueue is still resolving/filling — join it.
+        joiningExisting = true;
+    } else if (jobStats.isProcessing || jobStats.queueingPhase) {
         const { count } = await supabase
             .from('job_items')
             .select('*', { count: 'exact', head: true })
             .in('status', ['pending', 'processing', 'retrying']);
 
-        if (count && count > 0) {
-            // Real active queue — join it serially.
+        if ((count && count > 0) || activeEnqueues > 0) {
+            // Real active queue (or a click that started while we counted)
+            // — join it serially.
             joiningExisting = true;
         } else {
             // Stale flags — reset and start fresh.
@@ -450,9 +478,15 @@ app.post('/api/enrich', async (req, res) => {
             jobStats.isProcessing = false;
             jobStats.queueingPhase = false;
             jobStats.queued = 0;
-            await persistPipelineState();
+            clearedStaleState = true;
         }
     }
+
+    // Count this enqueue before the next await, so a click that arrives
+    // while we persist sees it in flight and joins instead of resetting.
+    // Released in the .finally below, after the error handler has run.
+    activeEnqueues++;
+    if (clearedStaleState) await persistPipelineState();
 
     if (joiningExisting) {
         // Mark queueing phase but DON'T reset totals — backgroundEnqueue will
@@ -477,8 +511,9 @@ app.post('/api/enrich', async (req, res) => {
         // background processor's poll loop will clear them naturally when
         // the queue drains, so just leave them alone here on a single-list
         // failure inside a multi-list queue.
-        jobStats.queueingPhase = false;
-        if (!joiningExisting) jobStats.isProcessing = false;
+        endQueueingPhase(!joiningExisting);
+    }).finally(() => {
+        activeEnqueues--;
     });
 });
 
@@ -588,8 +623,7 @@ async function enqueueListDirect(listName: string, mode: DirectEnqueueMode, join
     if (listSize === 0) {
         addServerLog(`⚠️ No contacts found for list "${listName}".`, 'Pipeline', 'warn');
         setEnqueueState(listName, { phase: 'failed', error: 'No contacts found for this list.' });
-        jobStats.queueingPhase = false;
-        if (!joiningExisting) jobStats.isProcessing = false;
+        endQueueingPhase(!joiningExisting);
         await persistPipelineState();
         return;
     }
@@ -612,7 +646,10 @@ async function enqueueListDirect(listName: string, mode: DirectEnqueueMode, join
         jobStats.total = (jobStats.total || 0) + listSize;
         addServerLog(`📥 Appending "${listName}" to the active queue (will start after the current list completes).`, 'Pipeline', 'phase');
     } else {
-        jobStats.total = listSize;
+        // Additive even on a fresh start (the click zeroed jobStats): a list
+        // that joined while this one was still counting its contacts has
+        // already added its share.
+        jobStats.total = (jobStats.total || 0) + listSize;
     }
     setEnqueueState(listName, { phase: 'queueing', queued: 0, total: listSize });
     addServerLog(`📦 Starting queue insertion for "${listName}" — direct Postgres, ${DIRECT_ENQUEUE_BATCH.toLocaleString()} rows per statement...`, 'Pipeline', 'phase');
@@ -635,8 +672,7 @@ async function enqueueListDirect(listName: string, mode: DirectEnqueueMode, join
                     [jobId], DIRECT_ENQUEUE_OPTS);
             }
             clearEnqueueState(listName);
-            jobStats.queueingPhase = false;
-            if (!joiningExisting) jobStats.isProcessing = false;
+            endQueueingPhase(!joiningExisting);
             await persistPipelineState();
             return;
         }
@@ -699,9 +735,9 @@ async function enqueueListDirect(listName: string, mode: DirectEnqueueMode, join
             : 'No contacts to queue — every contact in this list is already queued in another run.';
         addServerLog(`⚠️ ${why}`, 'Pipeline', 'warn');
         setEnqueueState(listName, { phase: 'failed', error: why });
-        jobStats.queueingPhase = false;
-        if (!joiningExisting) { jobStats.isProcessing = false; jobStats.total = 0; }
-        else jobStats.total = Math.max(0, (jobStats.total || 0) - listSize);
+        // Take back only this list's share: other lists may be filling too.
+        jobStats.total = Math.max(0, (jobStats.total || 0) - listSize);
+        endQueueingPhase(!joiningExisting);
         await persistPipelineState();
         return;
     }
@@ -717,7 +753,7 @@ async function enqueueListDirect(listName: string, mode: DirectEnqueueMode, join
         [jobId, inserted], DIRECT_ENQUEUE_OPTS);
 
     jobStats.total = Math.max(0, (jobStats.total || 0) - listSize + inserted);
-    jobStats.queueingPhase = false;
+    endQueueingPhase(false);
     await persistPipelineState();
     if (joiningExisting) {
         addServerLog(`✅ ${inserted.toLocaleString()} records queued behind the active list (FIFO). They'll start as soon as the in-flight list completes.`, 'Pipeline', 'phase');
@@ -769,8 +805,7 @@ async function backgroundEnqueue(
                 console.error('Direct enqueue error:', err);
                 addServerLog(`❌ Fatal enqueue error: ${err.message}`, 'Pipeline', 'error');
                 setEnqueueState(jobLeadListName, { phase: 'failed', error: err.message });
-                jobStats.queueingPhase = false;
-                if (!joiningExisting) jobStats.isProcessing = false;
+                endQueueingPhase(!joiningExisting);
                 await persistPipelineState();
             }
             return;
@@ -787,8 +822,7 @@ async function backgroundEnqueue(
         } catch (e: any) {
             addServerLog(`❌ Failed to resolve filters: ${e.message}`, 'Pipeline', 'error');
             setEnqueueState(jobLeadListName, { phase: 'failed', error: `Could not resolve the list's contacts: ${e.message}` });
-            jobStats.isProcessing = false;
-            jobStats.queueingPhase = false;
+            endQueueingPhase(!joiningExisting);
             return;
         }
     }
@@ -808,8 +842,7 @@ async function backgroundEnqueue(
     if (!contactIds || contactIds.length === 0) {
         addServerLog(`⚠️ No contacts found matching filters.`, 'Pipeline', 'warn');
         setEnqueueState(jobLeadListName, { phase: 'failed', error: 'No contacts to queue — every contact in this list already has an enrichment row.' });
-        jobStats.queueingPhase = false;
-        if (!joiningExisting) jobStats.isProcessing = false;
+        endQueueingPhase(!joiningExisting);
         return;
     }
 
@@ -822,7 +855,8 @@ async function backgroundEnqueue(
         jobStats.total = (jobStats.total || 0) + totalToEnrich;
         addServerLog(`📥 Appending ${totalToEnrich.toLocaleString()} contacts to the active queue (will start after the current list completes).`, 'Pipeline', 'phase');
     } else {
-        jobStats.total = totalToEnrich;
+        // Additive for the same reason as enqueueListDirect.
+        jobStats.total = (jobStats.total || 0) + totalToEnrich;
         addServerLog(`📊 Total contacts to enrich: ${totalToEnrich.toLocaleString()}`, 'Pipeline', 'phase');
     }
     addServerLog(`📦 Starting queue insertion for ${totalToEnrich.toLocaleString()} records...`, 'Pipeline', 'phase');
@@ -910,7 +944,7 @@ async function backgroundEnqueue(
         }
 
         // Step 4: Queueing complete — switch to processing phase
-        jobStats.queueingPhase = false;
+        endQueueingPhase(false);
         await persistPipelineState();
 
         if (joiningExisting) {
@@ -967,8 +1001,7 @@ async function backgroundEnqueue(
         // Same logic as the wrapper's catch: don't kill the in-flight list's
         // isProcessing flag when a later list's enqueue fails. The current
         // list keeps draining; the failing one is just dropped.
-        jobStats.queueingPhase = false;
-        if (!joiningExisting) jobStats.isProcessing = false;
+        endQueueingPhase(!joiningExisting);
     }
 }
 
