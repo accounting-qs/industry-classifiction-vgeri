@@ -1,5 +1,6 @@
 
-import dns from 'dns/promises';
+import { Resolver } from 'dns/promises';
+import { Agent, fetch as undiciFetch } from 'undici';
 import {
   stripCssJs,
   extractOne,
@@ -73,6 +74,36 @@ export const proxyStats = {
   }
 };
 
+// Every scrape fetch goes through this agent, never Node's global fetch.
+//
+// The global fetch on Node 22 is undici 6, whose Agent keeps one Pool per
+// origin forever ("This introduces a tiny memory leak, as dispatchers are
+// never removed from the map" — lib/dispatcher/agent.js). The scraper talks
+// to a new origin for almost every contact (https://site, its http://
+// fallback, its www. redirect), so the heap grew ~20 KB per scraped domain:
+// a local heap-snapshot diff over 1,000 origins shows +1,000 Pool, Client,
+// URL and FinalizationRegistry objects and +16.7 MB of array storage (each
+// Pool's empty 2,048-slot request queue). In production that was +450–550
+// MB/h until the 3 GB heap cap crashed the process (2026-11-09 21:07 and
+// 2026-11-10 04:21). undici 7 drops an origin's pool once its last
+// connection closes; the same test retains ~0.1 KB per origin.
+//
+// Timeouts here are a backstop: every request also carries its own
+// AbortController deadline below.
+const scrapeAgent = new Agent({
+  keepAliveTimeout: 4_000,
+  connect: { timeout: 10_000 },
+  headersTimeout: 20_000,
+  bodyTimeout: 20_000,
+});
+
+const scrapeFetch = (url: string, init: Record<string, any>) =>
+  undiciFetch(url, { ...init, dispatcher: scrapeAgent } as any);
+
+// The DNS pre-check gets its own resolver with a short, explicit deadline
+// (2 tries x 3 s) instead of the default channel's.
+const dnsResolver = new Resolver({ timeout: 3_000, tries: 2 });
+
 function normalizeUrl(url_or_domain: string): string {
   let s = (url_or_domain || "").trim();
   if (!s) return "";
@@ -93,9 +124,10 @@ export async function fetchDigest(
   let hostname = start_url;
   try {
     hostname = new URL(start_url).hostname;
+    if (onProgress) onProgress(`🔎 [Scraper] DNS check for ${hostname}`);
     // Use resolve4 instead of lookup to bypass Node's libuv threadpool limits.
     // lookup can get jammed under high concurrency and falsely throw ESERVFAIL.
-    await dns.resolve4(hostname);
+    await dnsResolver.resolve4(hostname);
   } catch (e: any) {
     // We strictly catch ENOTFOUND & ENODATA. ESERVFAIL and others might be temporary or DNS firewall issues (like Cloudflare)
     if (e.code === 'ENOTFOUND' || e.code === 'ENODATA') {
@@ -223,9 +255,9 @@ async function attemptDirectFetch(targetUrl: string, timeoutMs: number = 15000, 
   }
 
   try {
-    const fetchOptions: RequestInit = {
+    const fetchOptions = {
       signal: controller.signal,
-      redirect: "follow",
+      redirect: "follow" as const,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -243,12 +275,14 @@ async function attemptDirectFetch(targetUrl: string, timeoutMs: number = 15000, 
       }
     };
 
-    let response = await fetch(targetUrl, fetchOptions);
+    let response = await scrapeFetch(targetUrl, fetchOptions);
 
     // Manual HTTP fallback instead of recursive call to avoid dangling listeners
     if (!response.ok && targetUrl.startsWith('https://')) {
+      // Release the first response's connection before opening a second one.
+      response.body?.cancel().catch(() => {});
       const httpUrl = targetUrl.replace('https://', 'http://');
-      response = await fetch(httpUrl, fetchOptions);
+      response = await scrapeFetch(httpUrl, fetchOptions);
     }
 
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -283,7 +317,7 @@ async function attemptStandardProxy(index: number, targetUrl: string, timeoutMs:
 
   try {
     const proxyDomain = PROXY_DOMAINS[index] || "https://corsproxy.io";
-    const response = await fetch(proxyUrl, {
+    const response = await scrapeFetch(proxyUrl, {
       signal: controller.signal,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -298,7 +332,7 @@ async function attemptStandardProxy(index: number, targetUrl: string, timeoutMs:
 
     let raw_html = "";
     if (proxyUrl.includes('allorigins')) {
-      const json = await response.json();
+      const json: any = await response.json();
       raw_html = json.contents || "";
     } else {
       raw_html = await response.text();

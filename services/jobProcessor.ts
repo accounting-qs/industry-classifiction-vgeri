@@ -7,7 +7,17 @@ import { enrichSingle } from './enrichmentService';
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+// Per-request deadline on every PostgREST call the worker makes. supabase-js
+// sets none by default, so one request on a socket that never answers parks
+// the chunk until CHUNK_TIMEOUT_MS (10 min). With this, the request fails
+// as "AbortError: … aborted", which isTransientSupabaseError treats as
+// transient, so retrySupabaseOp retries it. The longest legitimate worker
+// query is well under PostgREST's ~60 s gateway limit.
+const SUPABASE_REQUEST_TIMEOUT_MS = parseInt(process.env.SUPABASE_REQUEST_TIMEOUT_MS || '90000', 10);
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+    db: { timeout: SUPABASE_REQUEST_TIMEOUT_MS },
+});
 
 // Tuning Parameters from Environment (with aggressive default fallbacks for speed)
 const QUEUE_FETCH_CHUNK_SIZE = parseInt(process.env.QUEUE_FETCH_CHUNK_SIZE || '200', 10);
@@ -128,6 +138,35 @@ const CHUNK_TIMEOUT_MS = parseInt(process.env.CHUNK_TIMEOUT_MS || '600000', 10);
 // Heartbeat emits a log line at this interval regardless of pipeline state,
 // so a silent pollLoop is immediately visible in Render logs.
 const HEARTBEAT_MS = parseInt(process.env.HEARTBEAT_MS || '60000', 10);
+
+// Hard ceilings on one item's scrape and AI step, measured INSIDE the
+// p-limit slot (queue wait doesn't count). A chunk is one Promise.all over
+// 400 items, so one item whose await never settles holds the whole chunk
+// until CHUNK_TIMEOUT_MS, and keeps its scrapeLimit/aiLimit slot, which
+// every later chunk shares. Chunks stalled for 10 min three times
+// (2026-11-05 14:02, 2026-11-09 21:17 and 21:46): each time their scrapes
+// had run (their proxy wins show up in the next chunk's Scraper Stats line)
+// but nothing was written and no error was logged, so the stall sat after
+// scraping and before the job_items upsert. That window holds only these
+// per-item awaits and the Supabase writes, now bounded by
+// SUPABASE_REQUEST_TIMEOUT_MS. A scrape is normally ≤ ~15 s (DNS
+// 2×3 s + an 8 s proxy race) and an AI call ≤ 60 s (its own abort), so
+// these deadlines only fire on a genuine stall. The item becomes a normal
+// retry and the log names the domain and the last step it reached.
+const SCRAPE_DEADLINE_MS = parseInt(process.env.SCRAPE_DEADLINE_MS || '45000', 10);
+const AI_DEADLINE_MS = parseInt(process.env.AI_DEADLINE_MS || '90000', 10);
+
+class DeadlineError extends Error {}
+
+function withDeadline<T>(p: Promise<T>, ms: number, describe: () => string): Promise<T> {
+    let timer: NodeJS.Timeout;
+    return Promise.race([
+        p,
+        new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new DeadlineError(describe())), ms);
+        }),
+    ]).finally(() => clearTimeout(timer));
+}
 
 export class JobProcessor {
     private static isRunning = false;
@@ -498,9 +537,10 @@ export class JobProcessor {
      * loop. Without this, a hung Supabase socket (no TCP reset) stalls the
      * whole pipeline indefinitely with no signal in the logs.
      */
-    private static withTimeout<T>(label: string, p: Promise<T>, ms: number): Promise<T> {
+    private static withTimeout<T>(label: string, p: Promise<T>, ms: number, onTimeout?: () => void): Promise<T> {
         return new Promise<T>((resolve, reject) => {
             const timer = setTimeout(() => {
+                onTimeout?.();
                 reject(new Error(`Timeout after ${ms}ms: ${label}`));
             }, ms);
             p.then(v => { clearTimeout(timer); resolve(v); },
@@ -535,10 +575,16 @@ export class JobProcessor {
                     }
                 }
 
+                // withTimeout can't cancel the chunk it gives up on: that
+                // chunk keeps running in the background. Flag it so that, if
+                // it ever finishes, it doesn't write stale results over
+                // items the stale sweep has already handed to a newer chunk.
+                const chunkCtx = { abandoned: false };
                 const processedCount = await this.withTimeout(
                     'processNextChunk',
-                    this.processNextChunk(),
-                    CHUNK_TIMEOUT_MS
+                    this.processNextChunk(chunkCtx),
+                    CHUNK_TIMEOUT_MS,
+                    () => { chunkCtx.abandoned = true; }
                 );
                 this.loopTick++;
                 this.lastTickAt = Date.now();
@@ -657,7 +703,7 @@ export class JobProcessor {
         }
     }
 
-    private static async processNextChunk(): Promise<number> {
+    private static async processNextChunk(ctx: { abandoned: boolean } = { abandoned: false }): Promise<number> {
         // FIFO across jobs (real serial multi-list queueing):
         //   - Walk 'processing' jobs oldest-first.
         //   - For each, claim a chunk filtered to that job_id only.
@@ -681,7 +727,7 @@ export class JobProcessor {
 
         if (candidates && candidates.length > 0) {
             for (const cand of candidates) {
-                const claimed = await this.claimChunkFromJob(cand.id);
+                const claimed = await this.claimChunkFromJob(cand.id, ctx);
                 if (claimed > 0) return claimed;
 
                 // Zero items CLAIMABLE doesn't mean the job is drained — it
@@ -775,7 +821,7 @@ export class JobProcessor {
                     .update({ status: 'processing' })
                     .eq('id', cand.id);
             }
-            const claimed = await this.claimChunkFromJob(cand.id);
+            const claimed = await this.claimChunkFromJob(cand.id, ctx);
             if (claimed > 0) return claimed;
         }
         return 0;
@@ -803,7 +849,7 @@ export class JobProcessor {
      * Extracted so the FIFO + orphan-fallback paths in processNextChunk
      * share the same locking + dispatch code.
      */
-    private static async claimChunkFromJob(jobId: string): Promise<number> {
+    private static async claimChunkFromJob(jobId: string, ctx: { abandoned: boolean } = { abandoned: false }): Promise<number> {
         const { data: itemIdsToClaim, error: fetchError } = await supabase
             .from('job_items')
             .select('id, job_id')
@@ -990,7 +1036,17 @@ export class JobProcessor {
             if (!digest) {
                 try {
                     // Bounded Scraping
-                    const scrapeRes = await scrapeLimit(() => fetchDigest(domain, undefined));
+                    // The last progress step names where a stalled scrape
+                    // was stuck if the deadline fires.
+                    let lastStep = 'queued';
+                    const scrapeRes = await scrapeLimit(() => withDeadline(
+                        fetchDigest(domain, msg => { lastStep = msg; }),
+                        SCRAPE_DEADLINE_MS,
+                        () => `Scrape deadline ${SCRAPE_DEADLINE_MS}ms exceeded for ${domain} (last step: ${lastStep})`
+                    ).catch((e: any) => {
+                        if (e instanceof DeadlineError) this.log(`⏱️ ${e.message}`, 'warn');
+                        throw e;
+                    }));
                     digest = scrapeRes.digest;
                     proxyUsed = scrapeRes.proxyName;
 
@@ -1013,10 +1069,19 @@ export class JobProcessor {
             // C. Classify with AI
             try {
                 // Bounded AI
-                const aiOutput = await aiLimit(() => enrichSingle({
-                    contact_id: contact.contact_id,
-                    email: contact.email,
-                    digest: digest
+                // A deadline hit throws "…timeout…", which the catch below
+                // treats as transient and retries.
+                const aiOutput = await aiLimit(() => withDeadline(
+                    enrichSingle({
+                        contact_id: contact.contact_id,
+                        email: contact.email,
+                        digest: digest
+                    }),
+                    AI_DEADLINE_MS,
+                    () => `AI timeout: deadline ${AI_DEADLINE_MS}ms exceeded for ${domain}`
+                ).catch((e: any) => {
+                    if (e instanceof DeadlineError) this.log(`⏱️ ${e.message}`, 'warn');
+                    throw e;
                 }));
 
                 if (aiOutput.status === 'completed' && aiOutput.classification !== 'ERROR') { // Success
@@ -1050,6 +1115,15 @@ export class JobProcessor {
                 return this.createResult(jobItem, false, 'failed', `AI terminal exception: ${aiErr.message}`, undefined, undefined, 0, 'error:ai');
             }
         }));
+
+        // The poll loop gave up on this chunk (CHUNK_TIMEOUT_MS) and the
+        // stale sweep has since handed its items to a newer chunk. Writing
+        // now would overwrite those rows with stale state and count every
+        // item twice in the job counters.
+        if (ctx.abandoned) {
+            this.log(`🗑️ Discarding results of a chunk abandoned after ${CHUNK_TIMEOUT_MS}ms (${results.length} items); its items were already re-queued.`, 'warn');
+            return 0;
+        }
 
         // --- BULK DATABASE UPDATE ---
         let jobsToUpdate: Record<string, { completed: number, failed: number }> = {};
