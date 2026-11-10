@@ -223,7 +223,7 @@ export function ConnectorsTab() {
             </p>
           </div>
           <div className="px-5 py-3 text-[11px] text-gray-500">
-            Configured via <code className="bg-[#1c1c1c] px-1 rounded text-[10px]">VITE_SUPABASE_URL</code> and <code className="bg-[#1c1c1c] px-1 rounded text-[10px]">SUPABASE_SERVICE_ROLE_KEY</code>.
+            Configured via <code className="bg-[#1c1c1c] px-1 rounded text-[10px]">SUPABASE_URL</code> and <code className="bg-[#1c1c1c] px-1 rounded text-[10px]">SUPABASE_SERVICE_ROLE_KEY</code>.
           </div>
         </div>
       </div>

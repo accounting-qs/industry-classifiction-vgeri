@@ -242,7 +242,7 @@ const ANTHROPIC_KEY_NAME = 'ANTHROPIC_API_KEY';
 
 // ─── secret access ─────────────────────────────────────────────────
 function getOpenAIKey(): string {
-    const key = process.env.OPENAI_API_KEY || process.env.VITE_OPENAI_API_KEY;
+    const key = process.env.OPENAI_API_KEY;
     if (!key) throw new Error('OPENAI_API_KEY missing');
     return key.trim();
 }
@@ -251,7 +251,7 @@ async function getAnthropicKey(supabase: SupabaseClient): Promise<string | null>
     // Prefer DB-stored key (Connectors UI). Fall back to env if set.
     const stored = await getSetting(supabase, ANTHROPIC_KEY_NAME);
     if (stored) return stored.trim();
-    const envKey = process.env.ANTHROPIC_API_KEY || process.env.VITE_ANTHROPIC_API_KEY;
+    const envKey = process.env.ANTHROPIC_API_KEY;
     return envKey ? envKey.trim() : null;
 }
 

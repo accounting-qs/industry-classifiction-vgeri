@@ -45,8 +45,9 @@ Only the server talks to Supabase. The browser has no Supabase URL, key or
 client; everything, the Contacts table included, goes through `/api`
 behind the password above.
 
-- The server needs `VITE_SUPABASE_URL` (or `SUPABASE_URL`) and
-  `SUPABASE_SERVICE_ROLE_KEY`, and refuses to start without a service_role
+- The server needs `SUPABASE_URL` and
+  `SUPABASE_SERVICE_ROLE_KEY` (the `sb_secret_` key; legacy JWT keys are
+  disabled), and refuses to start without a service_role
   key. There is no anon-key fallback.
 - `DATABASE_URL` (direct Postgres, the `postgres` role) is used for COPY
   streaming and the heavy bucketing statements.

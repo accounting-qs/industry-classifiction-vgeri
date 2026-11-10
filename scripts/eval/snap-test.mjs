@@ -5,7 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 dotenv.config({ path: path.join(path.dirname(__filename), '../../.env.local') });
-const supabase = createClient(process.env.VITE_SUPABASE_URL || '', process.env.SUPABASE_SERVICE_ROLE_KEY || '');
+const supabase = createClient(process.env.SUPABASE_URL || '', process.env.SUPABASE_SERVICE_ROLE_KEY || '');
 
 // 1. Enrichment cost per contact
 const { data: enr } = await supabase

@@ -12,7 +12,7 @@ import { createClient, type SupabaseClient, type SupabaseClientOptions } from '@
  * the failed deploy never takes traffic and the previous one keeps serving.
  */
 
-export const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
+export const SUPABASE_URL = process.env.SUPABASE_URL || '';
 
 // Which Postgres role a Supabase API key authenticates as.
 export function supabaseKeyRole(key: string | undefined): string {
@@ -30,7 +30,7 @@ export function createServiceRoleClient(options?: SupabaseClientOptions<'public'
     const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
     const role = supabaseKeyRole(key);
     if (!SUPABASE_URL) {
-        throw new Error('SUPABASE_URL (or VITE_SUPABASE_URL) is not set. The server cannot start without it.');
+        throw new Error('SUPABASE_URL is not set. The server cannot start without it.');
     }
     if (role !== 'service_role') {
         throw new Error(

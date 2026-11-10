@@ -32,7 +32,7 @@ const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '../../.env.local') });
 dotenv.config({ path: path.join(__dirname, '../../.env') });
 
-const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
+const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 if (!SUPABASE_URL || !SUPABASE_KEY) {
     console.error('Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY');
@@ -45,7 +45,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 async function loadAnthropicClient(): Promise<Anthropic> {
     const { data } = await supabase.from('app_settings').select('value').eq('key', 'ANTHROPIC_API_KEY').maybeSingle();
     const stored = (data?.value || '').trim();
-    const key = stored || (process.env.ANTHROPIC_API_KEY || process.env.VITE_ANTHROPIC_API_KEY || '').trim();
+    const key = stored || (process.env.ANTHROPIC_API_KEY || '').trim();
     if (!key) {
         console.error('No Anthropic key found in app_settings or env. Set one via the Connectors page or export ANTHROPIC_API_KEY.');
         process.exit(1);

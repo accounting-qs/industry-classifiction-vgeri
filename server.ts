@@ -6180,7 +6180,7 @@ const ANTHROPIC_KEY_NAME = 'ANTHROPIC_API_KEY';
 app.get('/api/settings/anthropic-key', async (_req, res) => {
     try {
         const stored = await getSetting(supabase, ANTHROPIC_KEY_NAME);
-        const envFallback = process.env.ANTHROPIC_API_KEY || process.env.VITE_ANTHROPIC_API_KEY || null;
+        const envFallback = process.env.ANTHROPIC_API_KEY || null;
         const value = stored || envFallback;
         res.json({
             configured: !!value,
