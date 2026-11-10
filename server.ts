@@ -3061,8 +3061,12 @@ function buildBucketingCtx(runId: string) {
 // Create a new run + fire taxonomy proposal in the background. The two
 // rollup thresholds + preferred_library_ids are collected on the Phase 1b
 // review screen (after the tagger has proposed a taxonomy), so /determine only
-// needs the bare minimum. The DB column defaults seed the row; the user
-// finalises the values via PATCH /taxonomy before clicking Apply & Assign.
+// needs the bare minimum. The two thresholds are seeded here with the team's
+// defaults (sub-identity 1000, identity 100) rather than the DB column
+// defaults (50 / 1); the user can still change them via PATCH /taxonomy
+// before clicking Apply & Assign.
+const DEFAULT_SUB_IDENTITY_MIN_VOLUME = 1000;
+const DEFAULT_IDENTITY_MIN_VOLUME = 100;
 app.post('/api/bucketing/determine', async (req, res) => {
     const { name, list_names, apply_identity_dq_cascade, phase1a_model } = req.body || {};
     if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name is required' });
@@ -3081,6 +3085,8 @@ app.post('/api/bucketing/determine', async (req, res) => {
             list_names,
             apply_identity_dq_cascade: !!apply_identity_dq_cascade,
             taxonomy_model: phase1aModel,
+            min_volume: DEFAULT_SUB_IDENTITY_MIN_VOLUME,
+            identity_min_volume: DEFAULT_IDENTITY_MIN_VOLUME,
             status: 'taxonomy_pending'
         }).select().single();
         if (error) return res.status(500).json({ error: error.message });
